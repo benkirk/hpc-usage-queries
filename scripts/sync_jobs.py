@@ -136,6 +136,10 @@ def main():
         print(f"  Inserted: {stats['inserted']}")
         print(f"  Skipped:  {stats['fetched'] - stats['inserted'] - stats['errors']} (duplicates)")
         print(f"  Errors:   {stats['errors']}")
+        if stats.get("days_failed", 0) > 0:
+            print(f"  Days failed: {stats['days_failed']} (missing accounting data)")
+            if args.verbose and stats.get("failed_days"):
+                print(f"    Failed dates: {', '.join(stats['failed_days'])}")
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

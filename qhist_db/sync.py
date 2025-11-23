@@ -362,26 +362,32 @@ def sync_jobs_bulk(
     Returns:
         Dictionary with sync statistics
     """
-    stats = {"fetched": 0, "inserted": 0, "errors": 0}
+    stats = {"fetched": 0, "inserted": 0, "errors": 0, "days_failed": 0, "failed_days": []}
 
     # If date range specified, loop one day at a time
     if start_date and end_date:
         for day in date_range(start_date, end_date):
             if verbose:
                 print(f"  Fetching {day}...", end=" ", flush=True)
-            day_stats = _sync_single_day(session, machine, day, dry_run, batch_size)
+            day_stats = _sync_single_day(session, machine, day, dry_run, batch_size, verbose)
             stats["fetched"] += day_stats["fetched"]
             stats["inserted"] += day_stats["inserted"]
             stats["errors"] += day_stats["errors"]
-            if verbose:
+            if day_stats.get("failed"):
+                stats["days_failed"] += 1
+                stats["failed_days"].append(day)
+            elif verbose:
                 print(f"{day_stats['fetched']} jobs, {day_stats['inserted']} new")
     else:
         # Single day or no date specified
         target_period = period or start_date or end_date
-        day_stats = _sync_single_day(session, machine, target_period, dry_run, batch_size)
+        day_stats = _sync_single_day(session, machine, target_period, dry_run, batch_size, verbose)
         stats["fetched"] = day_stats["fetched"]
         stats["inserted"] = day_stats["inserted"]
         stats["errors"] = day_stats["errors"]
+        if day_stats.get("failed"):
+            stats["days_failed"] = 1
+            stats["failed_days"] = [target_period]
 
     return stats
 
@@ -392,6 +398,7 @@ def _sync_single_day(
     period: str | None,
     dry_run: bool,
     batch_size: int,
+    verbose: bool = False,
 ) -> dict:
     """Sync jobs for a single day.
 
@@ -401,32 +408,46 @@ def _sync_single_day(
         period: Date in YYYYMMDD format
         dry_run: If True, don't insert
         batch_size: Batch size for inserts
+        verbose: If True, print warnings
 
     Returns:
         Dictionary with sync statistics for this day
     """
-    stats = {"fetched": 0, "inserted": 0, "errors": 0}
+    stats = {"fetched": 0, "inserted": 0, "errors": 0, "failed": False, "error_msg": None}
     batch = []
 
-    for record in fetch_jobs_ssh(machine, period=period):
-        stats["fetched"] += 1
+    try:
+        for record in fetch_jobs_ssh(machine, period=period):
+            stats["fetched"] += 1
 
-        if not record.get("id"):
-            stats["errors"] += 1
-            continue
+            if not record.get("id"):
+                stats["errors"] += 1
+                continue
 
-        batch.append(record)
+            batch.append(record)
 
-        if len(batch) >= batch_size:
-            if not dry_run:
-                inserted = _insert_batch(session, batch)
-                stats["inserted"] += inserted
-            batch = []
+            if len(batch) >= batch_size:
+                if not dry_run:
+                    inserted = _insert_batch(session, batch)
+                    stats["inserted"] += inserted
+                batch = []
 
-    # Insert remaining records
-    if batch and not dry_run:
-        inserted = _insert_batch(session, batch)
-        stats["inserted"] += inserted
+        # Insert remaining records
+        if batch and not dry_run:
+            inserted = _insert_batch(session, batch)
+            stats["inserted"] += inserted
+
+    except RuntimeError as e:
+        # Handle qhist failures gracefully (e.g., missing accounting data)
+        stats["failed"] = True
+        stats["error_msg"] = str(e)
+        if verbose:
+            # Extract just the warning message if present
+            error_str = str(e)
+            if "missing records" in error_str.lower():
+                print(f"SKIPPED (missing accounting data)")
+            else:
+                print(f"FAILED: {error_str[:100]}")
 
     return stats
 
