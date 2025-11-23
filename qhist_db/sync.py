@@ -410,7 +410,7 @@ def sync_jobs_bulk(
                 stats["failed_days"].append(day)
             else:
                 if verbose:
-                    print(f"{day_stats['fetched']} jobs, {day_stats['inserted']} new")
+                    print(f"{day_stats['fetched']:,} jobs, {day_stats['inserted']:,} new")
 
                 # Generate summary for this day
                 if generate_summary and not dry_run and day_stats["fetched"] > 0:
@@ -476,6 +476,14 @@ def _sync_single_day(
 
             if not record.get("job_id"):
                 stats["errors"] += 1
+                continue
+
+            # watch for bad timestamps - very very rarely some of these have been 0 - the UNIX epoch
+            if record.get("submit") <= record.get("eligible") <= record.get("start") <= record.get("end"):
+                pass
+            else:
+                stats["errors"] += 1
+                stats["error_msg"] = "bad timestamp"
                 continue
 
             batch.append(record)
