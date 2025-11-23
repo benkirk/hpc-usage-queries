@@ -82,12 +82,7 @@ dt = dt.replace(tzinfo=mountain).astimezone(timezone.utc)
 
 **Location**: `qhist_db/charging.py`, lines 9-60
 
-The Python functions `derecho_charge()` and `casper_charge()` are defined but never called - only the SQL views are used. Options:
-1. **Remove them** (simplest)
-2. **Use them** for in-Python calculations when needed
-3. **Generate SQL from them** (single source of truth)
-
-Recommendation: Keep for potential future use (e.g., ad-hoc calculations), but document that SQL views are the primary charging source.
+The Python functions `derecho_charge()` and `casper_charge()` are defined but never called - only the SQL views are used. Keep for potential future use (e.g., ad-hoc calculations), but document that SQL views are the primary charging source.
 
 ### 1.5 Fix Path Handling
 
