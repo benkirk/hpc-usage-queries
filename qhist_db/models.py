@@ -61,8 +61,13 @@ class JobMixin:
     @declared_attr
     def __table_args__(cls):
         return (
+            # Existing composite indexes
             Index(f"ix_{cls.__tablename__}_user_account", "user", "account"),
             Index(f"ix_{cls.__tablename__}_submit_end", "submit", "end"),
+            # Date-filtered aggregation indexes
+            Index(f"ix_{cls.__tablename__}_user_submit", "user", "submit"),
+            Index(f"ix_{cls.__tablename__}_account_submit", "account", "submit"),
+            Index(f"ix_{cls.__tablename__}_queue_submit", "queue", "submit"),
         )
 
     def __repr__(self):

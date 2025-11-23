@@ -68,6 +68,20 @@ All timestamps are converted to UTC before storage for consistency, regardless o
 | `avgcpu` | REAL | YES | NO | Average CPU usage |
 | `count` | INTEGER | YES | NO | Job array count |
 
+### Indexes
+
+**Single-column indexes:** `short_id`, `user`, `account`, `queue`, `status`, `submit`, `start`, `end`
+
+**Composite indexes for common query patterns:**
+
+| Index | Columns | Use Case |
+|-------|---------|----------|
+| `ix_*_user_account` | `(user, account)` | Filter by user within account |
+| `ix_*_submit_end` | `(submit, end)` | Date range queries |
+| `ix_*_user_submit` | `(user, submit)` | User's jobs in date range |
+| `ix_*_account_submit` | `(account, submit)` | Account usage over time |
+| `ix_*_queue_submit` | `(queue, submit)` | Queue analysis by date |
+
 ## Derived Metrics
 
 These metrics can be computed from stored fields for analysis:
