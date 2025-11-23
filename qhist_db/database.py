@@ -3,10 +3,11 @@
 import os
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from .models import Base
+from .charging import get_view_sql
 
 # Default database directory
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -71,8 +72,23 @@ def get_session(machine: str, engine=None):
     return Session()
 
 
+def create_views(engine, machine: str):
+    """Create charging views for a specific machine.
+
+    Args:
+        engine: SQLAlchemy engine
+        machine: Machine name ('casper' or 'derecho')
+    """
+    view_sql = get_view_sql(machine)
+    with engine.connect() as conn:
+        # Drop existing view first (SQLite doesn't support CREATE OR REPLACE VIEW)
+        conn.execute(text("DROP VIEW IF EXISTS v_jobs_charged"))
+        conn.execute(text(view_sql))
+        conn.commit()
+
+
 def init_db(machine: str | None = None, echo: bool = False):
-    """Initialize database(s) by creating all tables.
+    """Initialize database(s) by creating all tables and views.
 
     Args:
         machine: Machine name, or None to initialize all machines
@@ -84,6 +100,7 @@ def init_db(machine: str | None = None, echo: bool = False):
     if machine is not None:
         engine = get_engine(machine, echo=echo)
         Base.metadata.create_all(engine)
+        create_views(engine, machine)
         return engine
 
     # Initialize all machines
@@ -91,4 +108,5 @@ def init_db(machine: str | None = None, echo: bool = False):
     for m in VALID_MACHINES:
         engines[m] = get_engine(m, echo=echo)
         Base.metadata.create_all(engines[m])
+        create_views(engines[m], m)
     return engines

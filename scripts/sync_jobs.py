@@ -9,7 +9,8 @@ from datetime import datetime
 sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
 
 from qhist_db import init_db, get_session, get_db_path
-from qhist_db.sync import sync_jobs_bulk
+from qhist_db.sync import sync_jobs_bulk, date_range
+from qhist_db.summary import generate_summaries_for_range
 
 
 def parse_args():
@@ -61,6 +62,21 @@ def parse_args():
         action="store_true",
         help="Enable verbose output"
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force sync even for days already summarized"
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="Skip generating daily summaries after sync"
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Only regenerate summaries (no data fetch)"
+    )
 
     return parser.parse_args()
 
@@ -109,6 +125,31 @@ def main():
         start_date = args.start
         end_date = args.end
 
+        # Handle summary-only mode
+        if args.summary_only:
+            if args.verbose:
+                print(f"Regenerating summaries for {args.machine}")
+
+            if period:
+                day_date = datetime.strptime(period, "%Y%m%d").date()
+                from qhist_db.summary import generate_daily_summary
+                result = generate_daily_summary(session, args.machine, day_date, replace=True)
+                print(f"\nSummary regenerated: {result['rows_inserted']} rows")
+            elif start_date and end_date:
+                start_dt = datetime.strptime(start_date, "%Y%m%d").date()
+                end_dt = datetime.strptime(end_date, "%Y%m%d").date()
+                result = generate_summaries_for_range(
+                    session, args.machine, start_dt, end_dt,
+                    replace=True, verbose=args.verbose
+                )
+                print(f"\nSummaries regenerated:")
+                print(f"  Days processed: {result['days_processed']}")
+                print(f"  Total rows: {result['total_rows']}")
+            else:
+                print("Error: --summary-only requires --date or --start/--end", file=sys.stderr)
+                sys.exit(1)
+            return
+
         if args.verbose:
             if period:
                 print(f"Syncing {args.machine} for date: {period}")
@@ -117,6 +158,8 @@ def main():
 
             if args.dry_run:
                 print("(DRY RUN - no data will be inserted)")
+            if args.force:
+                print("(FORCE - will sync even if already summarized)")
 
         # Run sync
         stats = sync_jobs_bulk(
@@ -128,6 +171,8 @@ def main():
             dry_run=args.dry_run,
             batch_size=args.batch_size,
             verbose=args.verbose,
+            force=args.force,
+            generate_summary=not args.no_summary,
         )
 
         # Print results
@@ -136,10 +181,14 @@ def main():
         print(f"  Inserted: {stats['inserted']}")
         print(f"  Skipped:  {stats['fetched'] - stats['inserted'] - stats['errors']} (duplicates)")
         print(f"  Errors:   {stats['errors']}")
+        if stats.get("days_skipped", 0) > 0:
+            print(f"  Days skipped: {stats['days_skipped']} (already summarized)")
         if stats.get("days_failed", 0) > 0:
             print(f"  Days failed: {stats['days_failed']} (missing accounting data)")
             if args.verbose and stats.get("failed_days"):
                 print(f"    Failed dates: {', '.join(stats['failed_days'])}")
+        if stats.get("days_summarized", 0) > 0:
+            print(f"  Days summarized: {stats['days_summarized']}")
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

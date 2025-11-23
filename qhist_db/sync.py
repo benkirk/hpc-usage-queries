@@ -347,6 +347,8 @@ def sync_jobs_bulk(
     dry_run: bool = False,
     batch_size: int = 1000,
     verbose: bool = False,
+    force: bool = False,
+    generate_summary: bool = True,
 ) -> dict:
     """Sync job records using bulk insert for better performance.
 
@@ -363,36 +365,83 @@ def sync_jobs_bulk(
         dry_run: If True, don't actually insert records
         batch_size: Number of records to insert per batch
         verbose: If True, print progress for each day
+        force: If True, sync even if day has already been summarized
+        generate_summary: If True, generate daily summary after syncing
 
     Returns:
         Dictionary with sync statistics
     """
-    stats = {"fetched": 0, "inserted": 0, "errors": 0, "days_failed": 0, "failed_days": []}
+    from .summary import get_summarized_dates, generate_daily_summary
+
+    stats = {
+        "fetched": 0, "inserted": 0, "errors": 0,
+        "days_failed": 0, "failed_days": [],
+        "days_skipped": 0, "skipped_days": [],
+        "days_summarized": 0,
+    }
+
+    # Get already-summarized dates if smart skip is enabled
+    summarized_dates = set()
+    if not force and not dry_run:
+        summarized_dates = get_summarized_dates(session)
 
     # If date range specified, loop one day at a time
     if start_date and end_date:
         for day in date_range(start_date, end_date):
+            day_date = datetime.strptime(day, "%Y%m%d").date()
+
+            # Smart skip: if already summarized, skip fetching
+            if day_date in summarized_dates:
+                if verbose:
+                    print(f"  Skipping {day}... (already summarized)")
+                stats["days_skipped"] += 1
+                stats["skipped_days"].append(day)
+                continue
+
             if verbose:
                 print(f"  Fetching {day}...", end=" ", flush=True)
             day_stats = _sync_single_day(session, machine, day, dry_run, batch_size, verbose)
             stats["fetched"] += day_stats["fetched"]
             stats["inserted"] += day_stats["inserted"]
             stats["errors"] += day_stats["errors"]
+
             if day_stats.get("failed"):
                 stats["days_failed"] += 1
                 stats["failed_days"].append(day)
-            elif verbose:
-                print(f"{day_stats['fetched']} jobs, {day_stats['inserted']} new")
+            else:
+                if verbose:
+                    print(f"{day_stats['fetched']} jobs, {day_stats['inserted']} new")
+
+                # Generate summary for this day
+                if generate_summary and not dry_run and day_stats["fetched"] > 0:
+                    generate_daily_summary(session, machine, day_date, replace=True)
+                    stats["days_summarized"] += 1
     else:
         # Single day or no date specified
         target_period = period or start_date or end_date
+        if target_period:
+            day_date = datetime.strptime(target_period, "%Y%m%d").date()
+
+            # Smart skip for single day
+            if day_date in summarized_dates:
+                if verbose:
+                    print(f"  Skipping {target_period}... (already summarized)")
+                stats["days_skipped"] = 1
+                stats["skipped_days"] = [target_period]
+                return stats
+
         day_stats = _sync_single_day(session, machine, target_period, dry_run, batch_size, verbose)
         stats["fetched"] = day_stats["fetched"]
         stats["inserted"] = day_stats["inserted"]
         stats["errors"] = day_stats["errors"]
+
         if day_stats.get("failed"):
             stats["days_failed"] = 1
             stats["failed_days"] = [target_period]
+        elif generate_summary and not dry_run and target_period and day_stats["fetched"] > 0:
+            day_date = datetime.strptime(target_period, "%Y%m%d").date()
+            generate_daily_summary(session, machine, day_date, replace=True)
+            stats["days_summarized"] = 1
 
     return stats
 

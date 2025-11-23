@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for HPC job history data."""
 
-from sqlalchemy import BigInteger, Column, DateTime, Float, Index, Integer, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Column, Date, DateTime, Float, Index, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -85,3 +85,44 @@ class Job(Base):
     def to_dict(self):
         """Convert job record to dictionary."""
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class DailySummary(Base):
+    """Daily summary of job charges per user/account/queue.
+
+    Aggregates charging data for fast retrieval of usage statistics.
+    """
+
+    __tablename__ = "daily_summary"
+
+    # Auto-incrementing primary key
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Summary dimensions
+    date = Column(Date, nullable=False)
+    user = Column(Text, nullable=False)
+    account = Column(Text, nullable=False)
+    queue = Column(Text, nullable=False)
+
+    # Aggregated metrics
+    job_count = Column(Integer, default=0)
+
+    # Derecho uses charge_hours (core-hours or GPU-hours depending on queue)
+    charge_hours = Column(Float, default=0)
+
+    # Casper tracks CPU, GPU, and memory hours
+    cpu_hours = Column(Float, default=0)
+    gpu_hours = Column(Float, default=0)
+    memory_hours = Column(Float, default=0)
+
+    __table_args__ = (
+        # Each (date, user, account, queue) combination is unique
+        UniqueConstraint("date", "user", "account", "queue", name="uq_daily_summary"),
+        # Index for date-based queries
+        Index("ix_daily_summary_date", "date"),
+        # Index for user/account lookups
+        Index("ix_daily_summary_user_account", "user", "account"),
+    )
+
+    def __repr__(self):
+        return f"<DailySummary(date='{self.date}', user='{self.user}', account='{self.account}')>"

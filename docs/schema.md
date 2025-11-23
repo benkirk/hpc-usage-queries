@@ -7,15 +7,16 @@ This document describes the database schema for storing historical job data from
 - **Databases**: Separate SQLite files per machine
   - `data/casper.db` - Casper cluster jobs
   - `data/derecho.db` - Derecho cluster jobs
-- **Table**: `jobs` (same schema in each database)
-- **Primary Key**: `id` (TEXT) - full job ID including array index (e.g., "6049117[28]")
+- **Tables**: `jobs`, `daily_summary`
+- **Views**: `v_jobs_charged` (machine-specific charging calculations)
+- **Primary Keys**: Auto-incrementing integers (handles job ID wrap-around)
 - **Timestamps**: Stored in UTC
 
 ## Design Decisions
 
 ### Separate Database Files per Machine
 
-Casper and Derecho have independent job numbering systems ("epochs"). Using separate database files:
+Casper and Derecho have independent job numbering systems. Using separate database files:
 
 - Enables independent backup/archive per machine
 - Keeps individual databases smaller and more manageable
@@ -24,13 +25,13 @@ Casper and Derecho have independent job numbering systems ("epochs"). Using sepa
 
 ### Primary Key Choice
 
-`id` (TEXT) is used as the primary key because:
+`id` (INTEGER AUTO-INCREMENT) is used as the primary key because:
 
-- Job arrays produce multiple jobs with IDs like `6049117[0]`, `6049117[1]`, etc.
-- Each array element is a separate job with its own resources and timing
-- Using the full ID (with array index) ensures uniqueness
-
-`short_id` (INTEGER) stores just the base job number (without array index) for efficient queries and grouping array jobs together.
+- Job IDs from the scheduler can wrap around (Derecho 2025 started from low IDs that overlapped with 2024)
+- Using auto-increment avoids collisions across years
+- `job_id` (TEXT) stores the full scheduler ID (e.g., "2712367.desched1")
+- `short_id` (INTEGER) stores just the numeric part for efficient queries
+- Unique constraint on `(job_id, submit)` prevents duplicate imports
 
 ### Timestamp Handling
 
@@ -42,8 +43,9 @@ All timestamps are converted to UTC before storage for consistency, regardless o
 
 | Column | Type | Nullable | Index | Description |
 |--------|------|----------|-------|-------------|
-| `id` | TEXT | NO | PK | Full job ID including array index (e.g., "6049117[28]") |
-| `short_id` | INTEGER | YES | YES | Base job ID (array index stripped) for queries |
+| `id` | INTEGER | NO | PK | Auto-incrementing primary key |
+| `job_id` | TEXT | NO | YES | Full job ID from scheduler (e.g., "2712367.desched1") |
+| `short_id` | INTEGER | YES | YES | Base job number (array index stripped) |
 | `name` | TEXT | YES | NO | Job name |
 | `user` | TEXT | YES | YES | Username who submitted the job |
 | `account` | TEXT | YES | YES | Account/allocation charged |
@@ -72,58 +74,95 @@ All timestamps are converted to UTC before storage for consistency, regardless o
 | `avgcpu` | REAL | YES | NO | Average CPU usage |
 | `count` | INTEGER | YES | NO | Job array count |
 
-### Indexes
+### daily_summary table
 
-**Single-column indexes:** `short_id`, `user`, `account`, `queue`, `status`, `submit`, `start`, `end`
+Aggregated charging data for fast usage queries.
+
+| Column | Type | Nullable | Index | Description |
+|--------|------|----------|-------|-------------|
+| `id` | INTEGER | NO | PK | Auto-incrementing primary key |
+| `date` | DATE | NO | YES | Summary date |
+| `user` | TEXT | NO | YES | Username |
+| `account` | TEXT | NO | YES | Account charged |
+| `queue` | TEXT | NO | NO | Queue/partition |
+| `job_count` | INTEGER | YES | NO | Number of jobs |
+| `charge_hours` | REAL | YES | NO | Derecho: core-hours or GPU-hours |
+| `cpu_hours` | REAL | YES | NO | Casper: CPU-hours |
+| `gpu_hours` | REAL | YES | NO | Casper: GPU-hours |
+| `memory_hours` | REAL | YES | NO | Casper: Memory GB-hours |
+
+**Unique constraint**: `(date, user, account, queue)`
+
+### v_jobs_charged view
+
+Machine-specific view that adds computed charging columns to the jobs table.
+
+**Derecho** (`charge_hours` column):
+- GPU dev queues: `elapsed * numgpus / 3600`
+- CPU dev queues: `elapsed * numcpus / 3600`
+- GPU production: `elapsed * numnodes * 4 / 3600` (4 GPUs per node)
+- CPU production: `elapsed * numnodes * 128 / 3600` (128 cores per node)
+
+**Casper** (`cpu_hours`, `gpu_hours`, and `memory_hours` columns):
+- `cpu_hours = elapsed * numcpus / 3600`
+- `gpu_hours = elapsed * numgpus / 3600`
+- `memory_hours = elapsed * memory_gb / 3600`
+
+## Indexes
+
+**Single-column indexes:** `job_id`, `short_id`, `user`, `account`, `queue`, `status`, `submit`, `start`, `end`
 
 **Composite indexes for common query patterns:**
 
 | Index | Columns | Use Case |
 |-------|---------|----------|
-| `ix_*_user_account` | `(user, account)` | Filter by user within account |
-| `ix_*_submit_end` | `(submit, end)` | Date range queries |
-| `ix_*_user_submit` | `(user, submit)` | User's jobs in date range |
-| `ix_*_account_submit` | `(account, submit)` | Account usage over time |
-| `ix_*_queue_submit` | `(queue, submit)` | Queue analysis by date |
-
-## Derived Metrics
-
-These metrics can be computed from stored fields for analysis:
-
-| Metric | Calculation | Description |
-|--------|-------------|-------------|
-| Wait Time | `start - submit` | Time spent in queue |
-| Eligible Wait | `start - eligible` | Time from eligible to running |
-| Memory Efficiency | `memory / reqmem` | Ratio of used vs requested memory |
-| CPU Efficiency | `cputime / (elapsed * numcpus)` | CPU utilization ratio |
-| Walltime Efficiency | `elapsed / walltime` | Ratio of used vs requested time |
+| `uq_jobs_job_id_submit` | `(job_id, submit)` | Duplicate detection |
+| `ix_jobs_user_account` | `(user, account)` | Filter by user within account |
+| `ix_jobs_submit_end` | `(submit, end)` | Date range queries |
+| `ix_jobs_user_submit` | `(user, submit)` | User's jobs in date range |
+| `ix_jobs_account_submit` | `(account, submit)` | Account usage over time |
+| `ix_jobs_queue_submit` | `(queue, submit)` | Queue analysis by date |
 
 ## Example Queries
 
 ### Jobs by User
 ```sql
 SELECT user, COUNT(*) as job_count, SUM(elapsed) as total_runtime
-FROM derecho_jobs
+FROM jobs
 GROUP BY user
 ORDER BY total_runtime DESC;
+```
+
+### Charging Summary by Account
+```sql
+-- Derecho
+SELECT account, SUM(charge_hours) as total_hours
+FROM v_jobs_charged
+WHERE date(end) BETWEEN '2025-01-01' AND '2025-01-31'
+GROUP BY account;
+
+-- Casper
+SELECT account, SUM(cpu_hours) as cpu_hours, SUM(memory_hours) as mem_hours
+FROM v_jobs_charged
+WHERE date(end) BETWEEN '2025-01-01' AND '2025-01-31'
+GROUP BY account;
+```
+
+### Daily Usage from Summary Table
+```sql
+SELECT date, user, account, job_count, charge_hours
+FROM daily_summary
+WHERE date >= '2025-01-01'
+ORDER BY date, charge_hours DESC;
 ```
 
 ### Average Wait Time by Queue
 ```sql
 SELECT queue,
        AVG(strftime('%s', start) - strftime('%s', submit)) as avg_wait_seconds
-FROM casper_jobs
+FROM jobs
 WHERE start IS NOT NULL AND submit IS NOT NULL
 GROUP BY queue;
-```
-
-### Memory Efficiency Analysis
-```sql
-SELECT user, account,
-       AVG(CAST(memory AS REAL) / NULLIF(reqmem, 0)) as avg_mem_efficiency
-FROM derecho_jobs
-WHERE memory IS NOT NULL AND reqmem > 0
-GROUP BY user, account;
 ```
 
 ## Data Sources
@@ -131,11 +170,13 @@ GROUP BY user, account;
 Data is fetched from the `qhist` command available on Casper and Derecho:
 
 ```bash
-ssh derecho qhist --period 20251121 --json --format="id,short_id,..."
+ssh derecho qhist -p 20251121 -J -f="id,short_id,..."
 ```
 
 The sync process:
 1. Connects via SSH to the target machine
-2. Runs qhist with JSON output and specified date range
+2. Runs qhist with JSON output for specified date
 3. Parses JSON and converts timestamps to UTC
-4. Inserts new records (skips existing based on `short_id`)
+4. Inserts new records (skips duplicates via unique constraint)
+5. Generates daily summary for the synced day
+6. Skips days that have already been summarized (use `--force` to override)
