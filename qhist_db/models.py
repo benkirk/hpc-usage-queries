@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for HPC job history data."""
 
-from sqlalchemy import BigInteger, Column, DateTime, Float, Index, Integer, Text
+from sqlalchemy import BigInteger, Column, DateTime, Float, Index, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -14,10 +14,13 @@ class Job(Base):
 
     __tablename__ = "jobs"
 
-    # Primary key - full job ID including array index (e.g., "6049117[28]")
-    id = Column(Text, primary_key=True)
+    # Auto-incrementing primary key (avoids job ID wrap-around issues)
+    id = Column(Integer, primary_key=True, autoincrement=True)
 
-    # Base job ID as integer for efficient queries (array index stripped)
+    # Full job ID from scheduler (e.g., "2712367.desched1" or "6049117[28].desched1")
+    job_id = Column(Text, nullable=False, index=True)
+
+    # Base job number as integer for efficient queries (array index stripped)
     short_id = Column(Integer, index=True)
 
     # Job identification
@@ -64,6 +67,9 @@ class Job(Base):
     count = Column(Integer)
 
     __table_args__ = (
+        # Unique constraint: same job_id + submit time = same job
+        # This handles job ID wrap-around across years
+        UniqueConstraint("job_id", "submit", name="uq_jobs_job_id_submit"),
         # Existing composite indexes
         Index("ix_jobs_user_account", "user", "account"),
         Index("ix_jobs_submit_end", "submit", "end"),

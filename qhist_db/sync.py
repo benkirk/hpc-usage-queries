@@ -128,7 +128,7 @@ def parse_float(value) -> float | None:
         return None
 
 
-def parse_job_record(record: dict) -> dict:
+def parse_job_record(record: dict, full_job_id: str | None = None) -> dict:
     """Parse and normalize a job record from qhist JSON output.
 
     The qhist JSON has a nested structure that needs to be flattened
@@ -136,6 +136,7 @@ def parse_job_record(record: dict) -> dict:
 
     Args:
         record: Raw job record dictionary from qhist
+        full_job_id: Full job ID from JSON key (e.g., "2712367.desched1")
 
     Returns:
         Normalized record with proper types matching database schema
@@ -175,9 +176,12 @@ def parse_job_record(record: dict) -> dict:
     # Get the short_id which may include array index like "6049117[28]"
     raw_short_id = record.get("short_id", "")
 
+    # Use full_job_id from JSON key (e.g., "2712367.desched1")
+    full_id = full_job_id if full_job_id else raw_short_id
+
     result = {
-        # Job identification - id is the full identifier (primary key)
-        "id": raw_short_id,
+        # job_id is the scheduler's identifier (not globally unique across years)
+        "job_id": full_id,
         # short_id is just the base job number for efficient queries
         "short_id": parse_job_id(raw_short_id),
         "name": record.get("jobname"),
@@ -273,7 +277,7 @@ def fetch_jobs_ssh(
         data = json.loads(result.stdout)
         jobs = data.get("Jobs", {})
         for job_id, job_data in jobs.items():
-            yield parse_job_record(job_data)
+            yield parse_job_record(job_data, full_job_id=job_id)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Failed to parse qhist JSON output: {e}")
 
@@ -308,13 +312,14 @@ def sync_jobs(
             continue
 
         try:
-            # Check if record already exists
-            job_id = record.get("id")
+            # Check if record already exists (by job_id + submit time)
+            job_id = record.get("job_id")
+            submit = record.get("submit")
             if not job_id:
                 stats["errors"] += 1
                 continue
 
-            existing = session.query(Job).filter_by(id=job_id).first()
+            existing = session.query(Job).filter_by(job_id=job_id, submit=submit).first()
 
             if existing:
                 stats["skipped"] += 1
@@ -325,7 +330,7 @@ def sync_jobs(
 
         except Exception as e:
             stats["errors"] += 1
-            print(f"Error processing record {record.get('id')}: {e}")
+            print(f"Error processing record {record.get('job_id')}: {e}")
 
     if not dry_run:
         session.commit()
@@ -420,7 +425,7 @@ def _sync_single_day(
         for record in fetch_jobs_ssh(machine, period=period):
             stats["fetched"] += 1
 
-            if not record.get("id"):
+            if not record.get("job_id"):
                 stats["errors"] += 1
                 continue
 
@@ -455,6 +460,8 @@ def _sync_single_day(
 def _insert_batch(session: Session, records: list[dict]) -> int:
     """Insert a batch of records, ignoring duplicates.
 
+    Duplicates are detected by the unique constraint on (job_id, submit).
+
     Returns:
         Number of records actually inserted
     """
@@ -462,8 +469,9 @@ def _insert_batch(session: Session, records: list[dict]) -> int:
         return 0
 
     # Use SQLite's INSERT OR IGNORE via on_conflict_do_nothing
+    # Conflict is on the unique constraint (job_id, submit)
     stmt = sqlite_insert(Job.__table__).values(records)
-    stmt = stmt.on_conflict_do_nothing(index_elements=["id"])
+    stmt = stmt.on_conflict_do_nothing(index_elements=["job_id", "submit"])
 
     result = session.execute(stmt)
     session.commit()
