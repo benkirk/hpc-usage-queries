@@ -151,7 +151,7 @@ LIMIT 10;
 
 -- Average wait time by queue
 SELECT queue,
-       AVG(strftime('%s', start) - strftime('%s', submit))/60.0 as avg_wait_min
+       AVG(strftime('%s', start) - strftime('%s', eligible))/60.0 as avg_wait_min
 FROM jobs
 WHERE start IS NOT NULL AND submit IS NOT NULL
 GROUP BY queue;
