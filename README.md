@@ -73,7 +73,62 @@ Each machine has its own database file with a `jobs` table:
 
 See [docs/schema.md](docs/schema.md) for the complete schema.
 
-## Example Queries
+## Python Query Interface
+
+The `JobQueries` class provides a high-level Python API for common queries:
+
+```python
+from datetime import date, timedelta
+from qhist_db import get_session, JobQueries
+
+# Connect to a machine's database
+session = get_session("derecho")
+queries = JobQueries(session)
+
+# Get jobs for a specific user
+end_date = date.today()
+start_date = end_date - timedelta(days=7)
+jobs = queries.jobs_by_user("username", start=start_date, end=end_date)
+
+# Get usage summary for an account
+summary = queries.usage_summary("NCAR0001", start=start_date, end=end_date)
+print(f"Job count: {summary['job_count']}")
+print(f"Total CPU-seconds: {summary['total_cpu_seconds']:,}")
+print(f"Users: {', '.join(summary['users'])}")
+
+# Get top users by job count
+top_users = queries.top_users_by_jobs(start=start_date, end=end_date, limit=10)
+for user_stat in top_users:
+    print(f"{user_stat['user']}: {user_stat['job_count']} jobs")
+
+# Get queue statistics
+stats = queries.queue_statistics(start=start_date, end=end_date)
+for stat in stats:
+    print(f"{stat['queue']}: {stat['job_count']} jobs, "
+          f"avg {stat['avg_elapsed_seconds']/3600:.2f} hours")
+
+# Get daily summaries (if available)
+daily = queries.daily_summary_by_user("username", start=start_date, end=end_date)
+for summary in daily:
+    print(f"{summary.date}: {summary.job_count} jobs")
+
+session.close()
+```
+
+**Available query methods:**
+- `jobs_by_user(user, start, end, status, queue)` - Get jobs for a user
+- `jobs_by_account(account, start, end, status)` - Get jobs for an account
+- `jobs_by_queue(queue, start, end)` - Get jobs for a queue
+- `usage_summary(account, start, end)` - Aggregate usage for an account
+- `user_summary(user, start, end)` - Aggregate usage for a user
+- `top_users_by_jobs(start, end, limit)` - Get top users by job count
+- `queue_statistics(start, end)` - Get statistics by queue
+- `daily_summary_by_account(account, start, end)` - Get daily summaries
+- `daily_summary_by_user(user, start, end)` - Get daily summaries
+
+See `qhist_db/queries.py` for complete API documentation and examples.
+
+## SQL Query Examples
 
 ```bash
 # Query Derecho jobs

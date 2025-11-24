@@ -41,19 +41,20 @@ This document tracks the remaining work for the qhist-queries codebase after com
 
 ## Current State
 
-**Project Size**: ~1,270 lines of Python across 10 modules
-**Test Coverage**: 57 tests, covering all core functionality
-**Module Sizes**: All modules ≤ 280 lines
+**Project Size**: ~1,770 lines of Python across 11 modules
+**Test Coverage**: 78 tests, covering all core functionality
+**Module Sizes**: All modules ≤ 500 lines
 
 ### Module Structure
 ```
 qhist_db/
-├── __init__.py      (15 lines)  - Package exports
+├── __init__.py      (17 lines)  - Package exports
 ├── charging.py     (185 lines)  - Charging rules and SQL generation
 ├── database.py     (112 lines)  - Connection management
 ├── logging.py       (58 lines)  - Logging configuration
 ├── models.py       (128 lines)  - SQLAlchemy ORM models
 ├── parsers.py      (258 lines)  - Field parsing utilities
+├── queries.py      (500 lines)  - High-level query interface
 ├── remote.py       (100 lines)  - SSH command execution
 ├── summary.py      (134 lines)  - Daily summary generation
 └── sync.py         (280 lines)  - Sync orchestration
@@ -61,36 +62,38 @@ qhist_db/
 
 ---
 
-## Phase 5: Features & Scalability (Future)
+## Phase 5: Features & Scalability
 
-The following items are planned for future implementation as needed.
+### 5.1 Query Interface ✓
 
-### 5.1 Query Interface
+Added a comprehensive Python API for common queries in `qhist_db/queries.py`:
 
-Add a Python API for common queries:
+**JobQueries class provides:**
+- `jobs_by_user()` - Get jobs for a user with date/status/queue filtering
+- `jobs_by_account()` - Get jobs for an account with date filtering
+- `jobs_by_queue()` - Get jobs for a queue with date filtering
+- `usage_summary()` - Aggregate usage metrics for an account
+- `user_summary()` - Aggregate usage metrics for a user
+- `top_users_by_jobs()` - Get top users by job count
+- `queue_statistics()` - Get statistics by queue
+- `daily_summary_by_account()` - Get daily summaries for an account
+- `daily_summary_by_user()` - Get daily summaries for a user
 
-```python
-# qhist_db/queries.py
-class JobQueries:
-    def __init__(self, session: Session):
-        self.session = session
+**Testing:**
+- Added 21 comprehensive tests in `tests/test_queries.py`
+- All tests pass (78 total tests in suite)
 
-    def jobs_by_user(self, user: str, start: date = None, end: date = None):
-        """Get all jobs for a user, optionally filtered by date range."""
-        query = self.session.query(Job).filter(Job.user == user)
-        if start:
-            query = query.filter(Job.end >= start)
-        if end:
-            query = query.filter(Job.end <= end)
-        return query.all()
+**Documentation:**
+- Added Python Query Interface section to README.md with examples
+- Included `if __name__ == "__main__":` examples in queries.py
+- Documented all methods with docstrings
 
-    def usage_summary(self, account: str, start: date, end: date):
-        """Get usage summary for an account over a date range."""
-        ...
-```
-along with examples at the bottom of the file to be run in a `if __name__ == "__main__":` construct
+**Benefits:**
+- High-level API eliminates need for raw SQL in most cases
+- Type hints and docstrings for better IDE support
+- Tested and documented for production use
 
-### 5.2 CI/CD
+### 5.2 CI/CD (Future)
 
 Consider extending current GitHub Action for code coverage reporting
 
