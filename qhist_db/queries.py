@@ -490,11 +490,11 @@ if __name__ == "__main__":
                 print(f"User: {example_user}")
                 print(f"Found {len(daily)} daily summary records")
 
-                if daily:
+                if len(daily) > 3:
                     print("\nFirst 3 days:")
                     for summary in daily[:3]:
                         print(f"  {summary.date}: {summary.job_count} jobs, "
-                              f"{summary.charge_hours:.2f} charge-hours")
+                              f"{summary.cpu_hours:.2f} CPU-hours")
             else:
                 print("No daily summaries found in database")
 
