@@ -22,12 +22,11 @@ This project fetches job history from HPC systems via the `qhist` command over S
 # Initialize databases (creates both casper.db and derecho.db)
 make init-db
 
-# Sync jobs for a specific date
-make sync-derecho DATE=20251121
-make sync-casper DATE=20251121
-
 # Sync a date range
-make sync-all START=20250801 END=20250831
+make sync-all START=20250801 END=20251123
+
+# Run the built-in examples with your database
+python -m qhist_db.queries
 ```
 
 ## Project Structure
@@ -72,6 +71,69 @@ Each machine has its own database file with a `jobs` table:
 | `reqmem` | BIGINT | Memory requested (bytes) |
 
 See [docs/schema.md](docs/schema.md) for the complete schema.
+
+## SQL Query Examples
+
+```bash
+# Query Derecho jobs
+sqlite3 data/derecho.db "SELECT user, COUNT(*) as jobs FROM jobs GROUP BY user LIMIT 10;"
+
+# Query Casper jobs
+sqlite3 data/casper.db "SELECT queue, COUNT(*) FROM jobs GROUP BY queue;"
+```
+
+```sql
+-- Jobs by user for August 2025 (run against derecho.db)
+SELECT user, COUNT(*) as jobs, SUM(elapsed)/3600.0 as total_hours
+FROM jobs
+WHERE submit >= '2025-08-01' AND submit < '2025-09-01'
+GROUP BY user
+ORDER BY total_hours DESC
+LIMIT 10;
+
+-- Average wait time by queue
+SELECT queue,
+       AVG(strftime('%s', start) - strftime('%s', eligible))/60.0 as avg_wait_min
+FROM jobs
+WHERE start IS NOT NULL AND submit IS NOT NULL
+GROUP BY queue;
+
+-- Memory efficiency (used vs requested)
+SELECT user,
+       AVG(CAST(memory AS REAL) / NULLIF(reqmem, 0)) * 100 as mem_efficiency_pct
+FROM jobs
+WHERE memory IS NOT NULL AND reqmem > 0
+GROUP BY user
+HAVING COUNT(*) > 100;
+```
+
+## CLI Sync Usage
+
+```bash
+# Sync with options
+python scripts/sync_jobs.py -m derecho -d 20251121 -v
+python scripts/sync_jobs.py -m casper --start 20250801 --end 20250831 -v
+
+# Dry run (fetch but don't insert)
+python scripts/sync_jobs.py -m derecho -d 20251121 --dry-run -v
+```
+
+## Charging
+
+The project includes charging views (`v_jobs_charged`) that compute resource hours using machine-specific rules. The Python query interface automatically uses these views for accurate usage calculations.
+
+**Derecho charging rules:**
+- **Production CPU queues**: core-hours = `elapsed * numnodes * 128 / 3600`
+- **Production GPU queues**: GPU-hours = `elapsed * numnodes * 4 / 3600`
+- **Development queues**: actual resources used (not full-node allocation)
+- Memory-hours = `elapsed * memory_gb / 3600`
+
+**Casper charging rules:**
+- CPU-hours = `elapsed * numcpus / 3600`
+- GPU-hours = `elapsed * numgpus / 3600`
+- Memory-hours = `elapsed * memory_gb / 3600`
+
+The charging views are created automatically by `init_db()` and are used by `JobQueries.usage_summary()` and `JobQueries.user_summary()` to provide accurate resource usage calculations.
 
 ## Python Query Interface
 
@@ -137,69 +199,6 @@ python -m qhist_db.queries
 ```
 
 This will demonstrate all query methods with real data from your Derecho database.
-
-## SQL Query Examples
-
-```bash
-# Query Derecho jobs
-sqlite3 data/derecho.db "SELECT user, COUNT(*) as jobs FROM jobs GROUP BY user LIMIT 10;"
-
-# Query Casper jobs
-sqlite3 data/casper.db "SELECT queue, COUNT(*) FROM jobs GROUP BY queue;"
-```
-
-```sql
--- Jobs by user for August 2025 (run against derecho.db)
-SELECT user, COUNT(*) as jobs, SUM(elapsed)/3600.0 as total_hours
-FROM jobs
-WHERE submit >= '2025-08-01' AND submit < '2025-09-01'
-GROUP BY user
-ORDER BY total_hours DESC
-LIMIT 10;
-
--- Average wait time by queue
-SELECT queue,
-       AVG(strftime('%s', start) - strftime('%s', eligible))/60.0 as avg_wait_min
-FROM jobs
-WHERE start IS NOT NULL AND submit IS NOT NULL
-GROUP BY queue;
-
--- Memory efficiency (used vs requested)
-SELECT user,
-       AVG(CAST(memory AS REAL) / NULLIF(reqmem, 0)) * 100 as mem_efficiency_pct
-FROM jobs
-WHERE memory IS NOT NULL AND reqmem > 0
-GROUP BY user
-HAVING COUNT(*) > 100;
-```
-
-## CLI Usage
-
-```bash
-# Sync with options
-python scripts/sync_jobs.py -m derecho -d 20251121 -v
-python scripts/sync_jobs.py -m casper --start 20250801 --end 20250831 -v
-
-# Dry run (fetch but don't insert)
-python scripts/sync_jobs.py -m derecho -d 20251121 --dry-run -v
-```
-
-## Charging
-
-The project includes charging views (`v_jobs_charged`) that compute resource hours using machine-specific rules. The Python query interface automatically uses these views for accurate usage calculations.
-
-**Derecho charging rules:**
-- **Production CPU queues**: core-hours = `elapsed * numnodes * 128 / 3600`
-- **Production GPU queues**: GPU-hours = `elapsed * numnodes * 4 / 3600`
-- **Development queues**: actual resources used (not full-node allocation)
-- Memory-hours = `elapsed * memory_gb / 3600`
-
-**Casper charging rules:**
-- CPU-hours = `elapsed * numcpus / 3600`
-- GPU-hours = `elapsed * numgpus / 3600`
-- Memory-hours = `elapsed * memory_gb / 3600`
-
-The charging views are created automatically by `init_db()` and are used by `JobQueries.usage_summary()` and `JobQueries.user_summary()` to provide accurate resource usage calculations.
 
 ## Requirements
 
