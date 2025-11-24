@@ -1,0 +1,60 @@
+name: QHist Database CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: Run Test Suite
+    runs-on: ubuntu-latest
+
+    # defaults:
+    #   run:
+    #     working-directory: containers/sam-sql-dev
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: List Source Tree
+        run: |
+          pwd
+          find * ! -type d
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: ./conda-env/
+          environment-file: conda-env.yaml
+
+      - name: Set Up Runtime Environment
+        run: |
+          make conda-env
+          #source etc/config_env.sh
+
+      - name: Interrogate Environment
+        run: |
+          conda list
+          df -h
+          cat /etc/os-release 2>/dev/null || true
+          uname -a
+          nvidia-smi 2>/dev/null || true
+          free -g
+          lscpu
+          echo && echo && echo
+          echo '----------------------------------------------------------------'
+          which python3
+          echo "CONDA_PREFIX=${CONDA_PREFIX}"
+          echo "PYTHONPATH=${PYTHONPATH}"
+          python3 --version
+
+      - name: Run Test Suite
+        run: |
+          cd tests && pytest -v
