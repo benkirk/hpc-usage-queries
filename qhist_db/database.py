@@ -81,8 +81,13 @@ def create_views(engine, machine: str):
     """
     view_sql = get_view_sql(machine)
     with engine.connect() as conn:
-        # Drop existing view first (SQLite doesn't support CREATE OR REPLACE VIEW)
-        conn.execute(text("DROP VIEW IF EXISTS v_jobs_charged"))
+        # Drop existing view/table first (SQLite doesn't support CREATE OR REPLACE VIEW)
+        # Try dropping as view first, then as table if that fails
+        try:
+            conn.execute(text("DROP VIEW IF EXISTS v_jobs_charged"))
+        except Exception:
+            # If it's a table instead of a view, drop it as a table
+            conn.execute(text("DROP TABLE IF EXISTS v_jobs_charged"))
         conn.execute(text(view_sql))
         conn.commit()
 
