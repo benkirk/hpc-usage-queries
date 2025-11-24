@@ -10,6 +10,7 @@ dependencies:
   - sqlalchemy
   - sqlite
   - tqdm
+  - tzdata
   - pip:
       - pipdeptree
       - pytest
