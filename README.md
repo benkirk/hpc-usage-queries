@@ -90,10 +90,12 @@ end_date = date.today()
 start_date = end_date - timedelta(days=7)
 jobs = queries.jobs_by_user("username", start=start_date, end=end_date)
 
-# Get usage summary for an account
+# Get usage summary for an account (uses charging view for accurate hours)
 summary = queries.usage_summary("NCAR0001", start=start_date, end=end_date)
 print(f"Job count: {summary['job_count']}")
-print(f"Total CPU-seconds: {summary['total_cpu_seconds']:,}")
+print(f"Total CPU-hours: {summary['total_cpu_hours']:,.2f}")
+print(f"Total GPU-hours: {summary['total_gpu_hours']:,.2f}")
+print(f"Total Memory-hours: {summary['total_memory_hours']:,.2f}")
 print(f"Users: {', '.join(summary['users'])}")
 
 # Get top users by job count

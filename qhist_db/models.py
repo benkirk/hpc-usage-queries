@@ -126,3 +126,60 @@ class DailySummary(Base):
 
     def __repr__(self):
         return f"<DailySummary(date='{self.date}', user='{self.user}', account='{self.account}')>"
+
+
+class JobCharged(Base):
+    """View of jobs with computed charging hours.
+
+    This maps to the v_jobs_charged view which includes all Job columns
+    plus computed cpu_hours, gpu_hours, and memory_hours based on
+    machine-specific charging rules.
+
+    Note: This is a read-only view. Use the Job model for inserts/updates.
+    The view must be created manually via create_views() after creating tables.
+    """
+
+    __tablename__ = "v_jobs_charged"
+    __table_args__ = {'extend_existing': True}
+
+    # Primary key (same as Job)
+    id = Column(Integer, primary_key=True)
+
+    # All columns from Job table
+    job_id = Column(Text)
+    short_id = Column(Integer)
+    name = Column(Text)
+    user = Column(Text)
+    account = Column(Text)
+    queue = Column(Text)
+    status = Column(Text)
+    submit = Column(DateTime)
+    eligible = Column(DateTime)
+    start = Column(DateTime)
+    end = Column(DateTime)
+    elapsed = Column(Integer)
+    walltime = Column(Integer)
+    cputime = Column(Integer)
+    numcpus = Column(Integer)
+    numgpus = Column(Integer)
+    numnodes = Column(Integer)
+    mpiprocs = Column(Integer)
+    ompthreads = Column(Integer)
+    reqmem = Column(BigInteger)
+    memory = Column(BigInteger)
+    vmemory = Column(BigInteger)
+    cputype = Column(Text)
+    gputype = Column(Text)
+    resources = Column(Text)
+    ptargets = Column(Text)
+    cpupercent = Column(Float)
+    avgcpu = Column(Float)
+    count = Column(Integer)
+
+    # Computed charging columns (from view)
+    cpu_hours = Column(Float)
+    gpu_hours = Column(Float)
+    memory_hours = Column(Float)
+
+    def __repr__(self):
+        return f"<JobCharged(id='{self.id}', user='{self.user}', cpu_hours={self.cpu_hours:.2f})>"

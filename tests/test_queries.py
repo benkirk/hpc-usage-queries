@@ -246,8 +246,13 @@ class TestJobQueries:
 
         assert summary["job_count"] == 3
         assert summary["total_elapsed_seconds"] == 3600 + 7200 + 1800
-        assert summary["total_cpu_seconds"] == (128 * 3600) + (256 * 7200) + (32 * 1800)
-        assert summary["total_gpu_seconds"] == 0
+        # Using Casper charging: cpu_hours = elapsed * numcpus / 3600
+        # Job 1: 3600 * 128 / 3600 = 128 hours
+        # Job 2: 7200 * 256 / 3600 = 512 hours
+        # Job 3: 1800 * 32 / 3600 = 16 hours
+        assert summary["total_cpu_hours"] == 128 + 512 + 16
+        assert summary["total_gpu_hours"] == 0
+        assert "total_memory_hours" in summary
         assert "alice" in summary["users"]
         assert "charlie" in summary["users"]
         assert "main" in summary["queues"]
@@ -264,8 +269,9 @@ class TestJobQueries:
 
         assert summary["job_count"] == 0
         assert summary["total_elapsed_seconds"] == 0
-        assert summary["total_cpu_seconds"] == 0
-        assert summary["total_gpu_seconds"] == 0
+        assert summary["total_cpu_hours"] == 0.0
+        assert summary["total_gpu_hours"] == 0.0
+        assert summary["total_memory_hours"] == 0.0
         assert summary["users"] == []
         assert summary["queues"] == []
 
@@ -279,7 +285,9 @@ class TestJobQueries:
         summary = queries.usage_summary("NCAR0002", start, end)
 
         assert summary["job_count"] == 1
-        assert summary["total_gpu_seconds"] == 4 * 3600  # 4 GPUs * 1 hour
+        # Using Casper charging: gpu_hours = elapsed * numgpus / 3600
+        # Job: 3600 * 4 / 3600 = 4 hours
+        assert summary["total_gpu_hours"] == 4.0
 
     def test_user_summary(self, in_memory_session, sample_jobs):
         """Test user summary."""

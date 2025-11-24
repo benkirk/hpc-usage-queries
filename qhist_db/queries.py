@@ -13,7 +13,7 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
 
-from .models import Job, DailySummary
+from .models import Job, DailySummary, JobCharged
 
 
 class JobQueries:
@@ -132,8 +132,8 @@ class JobQueries:
     ) -> Dict[str, Any]:
         """Get usage summary for an account over a date range.
 
-        Aggregates job counts and resource usage (elapsed time, CPU/GPU counts)
-        for all jobs in the account during the specified period.
+        Aggregates job counts and resource usage using charging hours from
+        the v_jobs_charged view, which applies machine-specific charging rules.
 
         Args:
             account: Account name to query
@@ -144,16 +144,17 @@ class JobQueries:
             Dict with aggregated metrics:
                 - job_count: Total number of jobs
                 - total_elapsed_seconds: Sum of all job elapsed times
-                - total_cpu_seconds: Sum of elapsed * numcpus
-                - total_gpu_seconds: Sum of elapsed * numgpus
+                - total_cpu_hours: Sum of computed CPU hours (from charging view)
+                - total_gpu_hours: Sum of computed GPU hours (from charging view)
+                - total_memory_hours: Sum of computed memory hours (from charging view)
                 - users: List of unique users
                 - queues: List of unique queues
         """
-        query = self.session.query(Job).filter(
+        query = self.session.query(JobCharged).filter(
             and_(
-                Job.account == account,
-                Job.end >= datetime.combine(start, datetime.min.time()),
-                Job.end <= datetime.combine(end, datetime.max.time()),
+                JobCharged.account == account,
+                JobCharged.end >= datetime.combine(start, datetime.min.time()),
+                JobCharged.end <= datetime.combine(end, datetime.max.time()),
             )
         )
 
@@ -163,15 +164,17 @@ class JobQueries:
             return {
                 "job_count": 0,
                 "total_elapsed_seconds": 0,
-                "total_cpu_seconds": 0,
-                "total_gpu_seconds": 0,
+                "total_cpu_hours": 0.0,
+                "total_gpu_hours": 0.0,
+                "total_memory_hours": 0.0,
                 "users": [],
                 "queues": [],
             }
 
         total_elapsed = sum((j.elapsed or 0) for j in jobs)
-        total_cpu_seconds = sum((j.elapsed or 0) * (j.numcpus or 0) for j in jobs)
-        total_gpu_seconds = sum((j.elapsed or 0) * (j.numgpus or 0) for j in jobs)
+        total_cpu_hours = sum((j.cpu_hours or 0.0) for j in jobs)
+        total_gpu_hours = sum((j.gpu_hours or 0.0) for j in jobs)
+        total_memory_hours = sum((j.memory_hours or 0.0) for j in jobs)
 
         unique_users = sorted(set(j.user for j in jobs if j.user))
         unique_queues = sorted(set(j.queue for j in jobs if j.queue))
@@ -179,8 +182,9 @@ class JobQueries:
         return {
             "job_count": len(jobs),
             "total_elapsed_seconds": total_elapsed,
-            "total_cpu_seconds": total_cpu_seconds,
-            "total_gpu_seconds": total_gpu_seconds,
+            "total_cpu_hours": total_cpu_hours,
+            "total_gpu_hours": total_gpu_hours,
+            "total_memory_hours": total_memory_hours,
             "users": unique_users,
             "queues": unique_queues,
         }
@@ -193,8 +197,8 @@ class JobQueries:
     ) -> Dict[str, Any]:
         """Get usage summary for a user over a date range.
 
-        Aggregates job counts and resource usage for all jobs by the user
-        during the specified period.
+        Aggregates job counts and resource usage using charging hours from
+        the v_jobs_charged view, which applies machine-specific charging rules.
 
         Args:
             user: Username to query
@@ -204,11 +208,11 @@ class JobQueries:
         Returns:
             Dict with aggregated metrics similar to usage_summary
         """
-        query = self.session.query(Job).filter(
+        query = self.session.query(JobCharged).filter(
             and_(
-                Job.user == user,
-                Job.end >= datetime.combine(start, datetime.min.time()),
-                Job.end <= datetime.combine(end, datetime.max.time()),
+                JobCharged.user == user,
+                JobCharged.end >= datetime.combine(start, datetime.min.time()),
+                JobCharged.end <= datetime.combine(end, datetime.max.time()),
             )
         )
 
@@ -218,15 +222,17 @@ class JobQueries:
             return {
                 "job_count": 0,
                 "total_elapsed_seconds": 0,
-                "total_cpu_seconds": 0,
-                "total_gpu_seconds": 0,
+                "total_cpu_hours": 0.0,
+                "total_gpu_hours": 0.0,
+                "total_memory_hours": 0.0,
                 "accounts": [],
                 "queues": [],
             }
 
         total_elapsed = sum((j.elapsed or 0) for j in jobs)
-        total_cpu_seconds = sum((j.elapsed or 0) * (j.numcpus or 0) for j in jobs)
-        total_gpu_seconds = sum((j.elapsed or 0) * (j.numgpus or 0) for j in jobs)
+        total_cpu_hours = sum((j.cpu_hours or 0.0) for j in jobs)
+        total_gpu_hours = sum((j.gpu_hours or 0.0) for j in jobs)
+        total_memory_hours = sum((j.memory_hours or 0.0) for j in jobs)
 
         unique_accounts = sorted(set(j.account for j in jobs if j.account))
         unique_queues = sorted(set(j.queue for j in jobs if j.queue))
@@ -234,8 +240,9 @@ class JobQueries:
         return {
             "job_count": len(jobs),
             "total_elapsed_seconds": total_elapsed,
-            "total_cpu_seconds": total_cpu_seconds,
-            "total_gpu_seconds": total_gpu_seconds,
+            "total_cpu_hours": total_cpu_hours,
+            "total_gpu_hours": total_gpu_hours,
+            "total_memory_hours": total_memory_hours,
             "accounts": unique_accounts,
             "queues": unique_queues,
         }
@@ -430,8 +437,9 @@ if __name__ == "__main__":
             print(f"Date range: {start_date} to {end_date}")
             print(f"Job count: {summary['job_count']}")
             print(f"Total elapsed: {summary['total_elapsed_seconds']:,} seconds")
-            print(f"Total CPU-seconds: {summary['total_cpu_seconds']:,}")
-            print(f"Total GPU-seconds: {summary['total_gpu_seconds']:,}")
+            print(f"Total CPU-hours: {summary['total_cpu_hours']:,.2f}")
+            print(f"Total GPU-hours: {summary['total_gpu_hours']:,.2f}")
+            print(f"Total Memory-hours: {summary['total_memory_hours']:,.2f}")
             print(f"Users: {', '.join(summary['users'][:5])}")
             print(f"Queues: {', '.join(summary['queues'])}")
         else:
