@@ -36,11 +36,23 @@ qhist-queries/
 ├── qhist_db/              # Python package
 │   ├── models.py          # SQLAlchemy ORM (Job class)
 │   ├── database.py        # Engine/session management
-│   └── sync.py            # SSH fetch and bulk insert
+│   ├── sync.py            # SSH fetch and bulk insert
+│   ├── queries.py         # High-level query interface
+│   ├── charging.py        # Charging view creation
+│   ├── summary.py         # Daily summary table management
+│   ├── parsers.py         # qhist output parsers
+│   ├── remote.py          # SSH remote execution
+│   └── log_config.py      # Logging configuration
 ├── scripts/
 │   └── sync_jobs.py       # CLI sync script
+├── tests/                 # Test suite
+│   ├── test_models.py     # Model tests
+│   ├── test_queries.py    # Query interface tests
+│   ├── test_charging.py   # Charging logic tests
+│   ├── test_parsers.py    # Parser tests
+│   └── test_summary.py    # Summary table tests
 ├── docs/
-│   └── schema.md          # Database schema documentation
+│   ├── schema.md          # Database schema documentation
 ├── data/
 │   ├── casper.db          # Casper jobs (gitignored)
 │   └── derecho.db         # Derecho jobs (gitignored)
