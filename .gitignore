@@ -16,6 +16,8 @@ build/
 venv/
 .venv/
 ENV/
+conda-env/
+samples/
 
 # IDE
 .idea/
