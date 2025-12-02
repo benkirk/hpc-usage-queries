@@ -284,6 +284,44 @@ RESOURCE_REPORTS = [
         ]
     ),
 
+    # Memory-per-rank histogram reports
+    ReportConfig(
+        command_name="cpu-job-memory-per-rank",
+        description="CPU job memory-per-rank histogram by day",
+        query_method="job_memory_per_rank_by_day",
+        query_params={"resource_type": "cpu"},
+        filename_base="cpu_job_memory_per_rank",
+        columns=[
+            ColumnSpec("date", "Date", 20, "s"),
+            ColumnSpec("<128MB", "<128MB", 12, ".1f"),
+            ColumnSpec("128MB-512MB", "128MB-512MB", 14, ".1f"),
+            ColumnSpec("512MB-1GB", "512MB-1GB", 12, ".1f"),
+            ColumnSpec("1-2GB", "1-2GB", 12, ".1f"),
+            ColumnSpec("2-4GB", "2-4GB", 12, ".1f"),
+            ColumnSpec("4-8GB", "4-8GB", 12, ".1f"),
+            ColumnSpec("8-16GB", "8-16GB", 12, ".1f"),
+            ColumnSpec(">16GB", ">16GB", 0, ".1f"),
+        ]
+    ),
+    ReportConfig(
+        command_name="gpu-job-memory-per-rank",
+        description="GPU job memory-per-rank histogram by day",
+        query_method="job_memory_per_rank_by_day",
+        query_params={"resource_type": "gpu"},
+        filename_base="gpu_job_memory_per_rank",
+        columns=[
+            ColumnSpec("date", "Date", 20, "s"),
+            ColumnSpec("<128MB", "<128MB", 12, ".1f"),
+            ColumnSpec("128MB-512MB", "128MB-512MB", 14, ".1f"),
+            ColumnSpec("512MB-1GB", "512MB-1GB", 12, ".1f"),
+            ColumnSpec("1-2GB", "1-2GB", 12, ".1f"),
+            ColumnSpec("2-4GB", "2-4GB", 12, ".1f"),
+            ColumnSpec("4-8GB", "4-8GB", 12, ".1f"),
+            ColumnSpec("8-16GB", "8-16GB", 12, ".1f"),
+            ColumnSpec(">16GB", ">16GB", 0, ".1f"),
+        ]
+    ),
+
     # Wait time reports
     ReportConfig(
         command_name="gpu-job-waits",
@@ -473,7 +511,7 @@ def create_resource_command(config: ReportConfig):
         query_params = dict(config.query_params)
 
         # Add period parameter for time-series queries that support it
-        if config.query_method == 'usage_history_by_day':
+        if config.query_method in ['usage_history_by_day', 'job_durations_by_day', 'job_memory_per_rank_by_day']:
             query_params['period'] = group_by
 
         # Execute query (single or multi-machine)

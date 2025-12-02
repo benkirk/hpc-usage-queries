@@ -106,6 +106,47 @@ class QueryConfig:
             ">18h": Job.elapsed >= 64800,
         }
 
+    @staticmethod
+    def get_memory_per_rank_buckets():
+        """Get memory-per-rank bucket definitions (mixed MB/GB units).
+
+        Returns buckets for memory per rank histogram using Job.memory
+        (actual memory used) divided by mpiprocs.
+
+        Returns as a static method to avoid issues with Job reference at import time.
+        """
+        from .charging import BYTES_PER_GB
+        BYTES_PER_MB = 1024 * 1024
+
+        return {
+            "<128MB": Job.memory / Job.mpiprocs < (128 * BYTES_PER_MB),
+            "128MB-512MB": and_(
+                Job.memory / Job.mpiprocs >= (128 * BYTES_PER_MB),
+                Job.memory / Job.mpiprocs < (512 * BYTES_PER_MB)
+            ),
+            "512MB-1GB": and_(
+                Job.memory / Job.mpiprocs >= (512 * BYTES_PER_MB),
+                Job.memory / Job.mpiprocs < BYTES_PER_GB
+            ),
+            "1-2GB": and_(
+                Job.memory / Job.mpiprocs >= BYTES_PER_GB,
+                Job.memory / Job.mpiprocs < (2 * BYTES_PER_GB)
+            ),
+            "2-4GB": and_(
+                Job.memory / Job.mpiprocs >= (2 * BYTES_PER_GB),
+                Job.memory / Job.mpiprocs < (4 * BYTES_PER_GB)
+            ),
+            "4-8GB": and_(
+                Job.memory / Job.mpiprocs >= (4 * BYTES_PER_GB),
+                Job.memory / Job.mpiprocs < (8 * BYTES_PER_GB)
+            ),
+            "8-16GB": and_(
+                Job.memory / Job.mpiprocs >= (8 * BYTES_PER_GB),
+                Job.memory / Job.mpiprocs < (16 * BYTES_PER_GB)
+            ),
+            ">16GB": Job.memory / Job.mpiprocs >= (16 * BYTES_PER_GB),
+        }
+
 
 class JobQueries:
     """High-level query interface for job history data.
@@ -432,8 +473,9 @@ class JobQueries:
         resource_type: str,
         start: Optional[date] = None,
         end: Optional[date] = None,
+        period: str = "day",
     ) -> List[Dict[str, Any]]:
-        """Get job duration statistics by day.
+        """Get job duration statistics by day or month.
 
         Generic factory method replacing duration queries.
 
@@ -441,15 +483,16 @@ class JobQueries:
             resource_type: 'cpu' | 'gpu' | 'all' - type of resources to filter
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
+            period: Grouping period ('day' or 'month')
 
         Returns:
             List of dicts with keys: 'date', '<30s', '30s-30m', '30-60m', '1-5h', '5-12h', '12-18h', '>18h'
 
         Examples:
-            >>> # GPU job durations (replaces gpu_job_durations_by_day)
+            >>> # GPU job durations by day (replaces gpu_job_durations_by_day)
             >>> queries.job_durations_by_day('gpu', start_date, end_date)
-            >>> # CPU job durations (replaces cpu_job_durations_by_day)
-            >>> queries.job_durations_by_day('cpu', start_date, end_date)
+            >>> # CPU job durations by month
+            >>> queries.job_durations_by_day('cpu', start_date, end_date, period='month')
         """
         # Determine queues and hours field (machine-specific)
         if resource_type == 'cpu':
@@ -465,9 +508,17 @@ class JobQueries:
         # Get duration buckets
         duration_buckets = QueryConfig.get_duration_buckets()
 
+        # Period grouping
+        if period == "day":
+            period_func = func.date(Job.end)
+        elif period == "month":
+            period_func = func.strftime("%Y-%m", Job.end)
+        else:
+            raise ValueError("period must be 'day' or 'month'")
+
         # Build query
         query = self.session.query(
-            func.date(Job.end).label("job_date"),
+            period_func.label("job_date"),
             *[
                 func.sum(case((bucket, hours_field), else_=0)).label(label)
                 for label, bucket in duration_buckets.items()
@@ -481,6 +532,79 @@ class JobQueries:
             {
                 "date": row[0],
                 **{label: row[i+1] or 0.0 for i, label in enumerate(duration_buckets.keys())}
+            }
+            for row in results
+        ]
+
+    def job_memory_per_rank_by_day(
+        self,
+        resource_type: str,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        period: str = "day",
+    ) -> List[Dict[str, Any]]:
+        """Get job memory-per-rank histogram by day or month.
+
+        Calculates memory per rank as memory_bytes / mpiprocs.
+        Filters out jobs where mpiprocs is 0 or NULL.
+
+        Args:
+            resource_type: 'cpu' | 'gpu' - type of resources to filter
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+            period: Grouping period ('day' or 'month')
+
+        Returns:
+            List of dicts with date + histogram bucket columns
+
+        Examples:
+            >>> # CPU job memory-per-rank by day
+            >>> queries.job_memory_per_rank_by_day('cpu', start_date, end_date)
+            >>> # GPU job memory-per-rank by month
+            >>> queries.job_memory_per_rank_by_day('gpu', start_date, end_date, period='month')
+        """
+        # Determine queues and hours field (machine-specific)
+        if resource_type == 'cpu':
+            queues = QueryConfig.get_cpu_queues(self.machine)
+            hours_field = JobCharged.cpu_hours
+        elif resource_type == 'gpu':
+            queues = QueryConfig.get_gpu_queues(self.machine)
+            hours_field = JobCharged.gpu_hours
+        else:
+            raise ValueError("resource_type must be 'cpu' or 'gpu'")
+
+        # Get memory-per-rank buckets
+        memory_buckets = QueryConfig.get_memory_per_rank_buckets()
+
+        # Period grouping
+        if period == "day":
+            period_func = func.date(Job.end)
+        elif period == "month":
+            period_func = func.strftime("%Y-%m", Job.end)
+        else:
+            raise ValueError("period must be 'day' or 'month'")
+
+        # Build query with CASE statements for each bucket
+        query = self.session.query(
+            period_func.label("job_date"),
+            *[
+                func.sum(case((bucket, hours_field), else_=0)).label(label)
+                for label, bucket in memory_buckets.items()
+            ]
+        ).join(JobCharged, Job.id == JobCharged.id).filter(
+            Job.queue.in_(queues),
+            Job.mpiprocs.isnot(None),  # Filter NULL
+            Job.mpiprocs > 0,           # Filter zero (prevents division by zero)
+            Job.memory.isnot(None)      # Filter NULL memory
+        )
+
+        query = self._apply_date_filter(query, start, end)
+        results = query.group_by("job_date").order_by("job_date").all()
+
+        return [
+            {
+                "date": row[0],
+                **{label: row[i+1] or 0.0 for i, label in enumerate(memory_buckets.keys())}
             }
             for row in results
         ]
