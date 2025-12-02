@@ -81,7 +81,7 @@ from .exporters import get_exporter
 @click.group(invoke_without_command=True)
 @click.option("--start-date", type=str, callback=parse_date, help="Start date for analysis (YYYY-MM-DD).")
 @click.option("--end-date", type=str, callback=parse_date, help="End date for analysis (YYYY-MM-DD).")
-@click.option("--group-by", type=click.Choice(["day", "month", "quarter"]), default="day", help="Group results by day, month, or quarter.")
+@click.option("--group-by", type=click.Choice(["day", "month"]), default="day", help="Group results by day or month.")
 @click.option("-m", "--machine", type=click.Choice(["casper", "derecho"]), default="derecho", help="The machine to query.")
 @click.pass_context
 def history(ctx, start_date, end_date, group_by, machine):
@@ -467,6 +467,14 @@ def create_resource_command(config: ReportConfig):
         machine = ctx.obj['machine']
         output_dir = ctx.obj['output_dir']
         output_format = ctx.obj.get('output_format', 'dat')
+        group_by = ctx.obj.get('group_by', 'day')
+
+        # Prepare query parameters
+        query_params = dict(config.query_params)
+
+        # Add period parameter for time-series queries that support it
+        if config.query_method == 'usage_history_by_day':
+            query_params['period'] = group_by
 
         # Execute query (single or multi-machine)
         if machine == "all":
@@ -475,7 +483,7 @@ def create_resource_command(config: ReportConfig):
             data = JobQueries.multi_machine_query(
                 machines=machines,
                 method_name=config.query_method,
-                **config.query_params,
+                **query_params,
                 start=start_date,
                 end=end_date
             )
@@ -485,7 +493,7 @@ def create_resource_command(config: ReportConfig):
             session = get_session(machine)
             queries = JobQueries(session, machine=machine)
             query_func = getattr(queries, config.query_method)
-            data = query_func(**config.query_params, start=start_date, end=end_date)
+            data = query_func(**query_params, start=start_date, end=end_date)
             session.close()
             machine_label = machine
 
@@ -505,8 +513,9 @@ def create_resource_command(config: ReportConfig):
 @click.option("-m", "--machine", type=click.Choice(["casper", "derecho", "all"]), default="derecho", help="The machine to query (use 'all' for both).")
 @click.option("--output-dir", type=click.Path(file_okay=False, dir_okay=True, writable=True, resolve_path=True), default=".", help="Directory to save the reports.")
 @click.option("--format", "output_format", type=click.Choice(["dat", "json", "csv", "md"]), default="dat", help="Output format (dat, json, csv, md).")
+@click.option("--group-by", type=click.Choice(["day", "month"]), default="day", help="Group time-based results by day or month.")
 @click.pass_context
-def resource(ctx, start_date, end_date, machine, output_dir, output_format):
+def resource(ctx, start_date, end_date, machine, output_dir, output_format, group_by):
     """Resource-centric view of job data."""
     ctx.ensure_object(dict)
     ctx.obj['start_date'] = start_date
@@ -514,6 +523,7 @@ def resource(ctx, start_date, end_date, machine, output_dir, output_format):
     ctx.obj['machine'] = machine
     ctx.obj['output_dir'] = output_dir
     ctx.obj['output_format'] = output_format
+    ctx.obj['group_by'] = group_by
     if ctx.invoked_subcommand is None:
         machines_desc = "all machines" if machine == "all" else machine
         click.echo(f"Resource view for {machines_desc} from {start_date} to {end_date}, output to {output_dir}")

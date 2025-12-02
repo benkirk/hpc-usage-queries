@@ -7,7 +7,7 @@ database. It wraps SQLAlchemy queries with a convenient interface for:
 - Filtering by date ranges and status
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 from sqlalchemy import func, and_, or_
@@ -541,18 +541,28 @@ class JobQueries:
         self,
         start: Optional[date] = None,
         end: Optional[date] = None,
+        period: str = "day",
     ) -> List[Dict[str, Any]]:
-        """Get usage history by day.
+        """Get usage history by time period.
 
         Args:
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
+            period: Grouping period ('day' or 'month')
 
         Returns:
-            A list of dicts with usage history statistics for each day.
+            A list of dicts with usage history statistics for each period.
         """
         cpu_queues = QueryConfig.get_cpu_queues(self.machine)
         gpu_queues = QueryConfig.get_gpu_queues(self.machine)
+
+        # Determine period format string
+        if period == "day":
+            period_format = "%Y-%m-%d"
+        elif period == "month":
+            period_format = "%Y-%m"
+        else:
+            raise ValueError("Invalid period specified. Must be 'day' or 'month'.")
 
         # Common subquery for date filtering
         date_filter = []
@@ -561,39 +571,39 @@ class JobQueries:
         if end:
             date_filter.append(Job.end <= datetime.combine(end, datetime.max.time()))
 
-        # 1. Total unique users per day
+        # 1. Total unique users per period
         total_users_subquery = self.session.query(
-            func.strftime("%Y-%m-%d", Job.end).label("day"),
+            func.strftime(period_format, Job.end).label("period"),
             func.count(func.distinct(Job.user)).label("total_users")
-        ).filter(*date_filter).group_by("day").subquery()
+        ).filter(*date_filter).group_by("period").subquery()
 
-        # 2. Total unique projects per day
+        # 2. Total unique projects per period
         total_projects_subquery = self.session.query(
-            func.strftime("%Y-%m-%d", Job.end).label("day"),
+            func.strftime(period_format, Job.end).label("period"),
             func.count(func.distinct(Job.account)).label("total_projects")
-        ).filter(*date_filter).group_by("day").subquery()
-        
-        # 3. CPU stats per day
+        ).filter(*date_filter).group_by("period").subquery()
+
+        # 3. CPU stats per period
         cpu_stats_subquery = self.session.query(
-            func.strftime("%Y-%m-%d", Job.end).label("day"),
+            func.strftime(period_format, Job.end).label("period"),
             func.count(func.distinct(Job.user)).label("cpu_users"),
             func.count(func.distinct(Job.account)).label("cpu_projects"),
             func.count(Job.id).label("cpu_jobs"),
             func.sum(JobCharged.cpu_hours).label("cpu_hours")
-        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(cpu_queues), *date_filter).group_by("day").subquery()
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(cpu_queues), *date_filter).group_by("period").subquery()
 
-        # 4. GPU stats per day
+        # 4. GPU stats per period
         gpu_stats_subquery = self.session.query(
-            func.strftime("%Y-%m-%d", Job.end).label("day"),
+            func.strftime(period_format, Job.end).label("period"),
             func.count(func.distinct(Job.user)).label("gpu_users"),
             func.count(func.distinct(Job.account)).label("gpu_projects"),
             func.count(Job.id).label("gpu_jobs"),
             func.sum(JobCharged.gpu_hours).label("gpu_hours")
-        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(gpu_queues), *date_filter).group_by("day").subquery()
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(gpu_queues), *date_filter).group_by("period").subquery()
 
         # Join all the subqueries
         query = self.session.query(
-            total_users_subquery.c.day,
+            total_users_subquery.c.period,
             total_users_subquery.c.total_users,
             total_projects_subquery.c.total_projects,
             cpu_stats_subquery.c.cpu_users,
@@ -605,12 +615,12 @@ class JobQueries:
             gpu_stats_subquery.c.gpu_jobs,
             gpu_stats_subquery.c.gpu_hours
         ).join(
-            total_projects_subquery, total_users_subquery.c.day == total_projects_subquery.c.day
+            total_projects_subquery, total_users_subquery.c.period == total_projects_subquery.c.period
         ).outerjoin(
-            cpu_stats_subquery, total_users_subquery.c.day == cpu_stats_subquery.c.day
+            cpu_stats_subquery, total_users_subquery.c.period == cpu_stats_subquery.c.period
         ).outerjoin(
-            gpu_stats_subquery, total_users_subquery.c.day == gpu_stats_subquery.c.day
-        ).order_by(total_users_subquery.c.day)
+            gpu_stats_subquery, total_users_subquery.c.period == gpu_stats_subquery.c.period
+        ).order_by(total_users_subquery.c.period)
 
         results = query.all()
 
