@@ -259,9 +259,12 @@ def _sync_single_day(
             # Extract just the warning message if present
             error_str = str(e)
             if "missing records" in error_str.lower():
-                print("SKIPPED (missing accounting data)")
+                print(f"  Skipping {period}... (missing accounting data)")
+            elif "Failed to parse qhist JSON output" in error_str:
+                # JSON parse errors usually indicate missing/corrupted accounting data
+                print(f"  Skipping {period}... (malformed accounting data)")
             else:
-                print(f"FAILED: {error_str[:100]}")
+                print(f"  Failed to sync {period}: {error_str[:80]}")
 
     return stats
 
