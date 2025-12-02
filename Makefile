@@ -1,11 +1,15 @@
 # QHist Database Makefile
 # Convenience targets for database management and job sync
 
-# full bash login shell requied for our complex make rules
-#SHELL := /bin/bash --login
+# full bash shell requied for our complex make rules
+
+.ONESHELL:
+SHELL := /bin/bash
+
+CONDA_ROOT := $(shell conda info --base)
 
 # common way to inialize enviromnent across various types of systems
-config_env := module load conda >/dev/null 2>&1 || true
+config_env := module load conda >/dev/null 2>&1 || true && . $(CONDA_ROOT)/etc/profile.d/conda.sh
 
 PYTHON := python3
 SCRIPTS := scripts
@@ -79,11 +83,14 @@ dry-run-derecho:
 	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m derecho -d $(DATE) --dry-run -v
 
 %: %.yaml
+	$(config_env)
 	[ -d $@ ] && mv $@ $@.old && rm -rf $@.old &
-	$(config_env) && conda env create --file $< --prefix $@
-	$(config_env) && conda activate ./$@ && conda list
-	$(config_env) && conda activate ./$@ && conda-tree deptree --small 2>/dev/null || true
-	$(config_env) && conda activate ./$@ && pipdeptree --all 2>/dev/null || true
+	conda env create --file $< --prefix $@
+	conda activate ./$@
+	conda list
+	pip install -e ".[dev]"
+	pipdeptree --all 2>/dev/null || true
 
 solve-%: %.yaml
-	$(config_env) && conda env create --file $< --prefix $@ --dry-run
+	$(config_env)
+	conda env create --file $< --prefix $@ --dry-run

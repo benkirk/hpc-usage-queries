@@ -3,14 +3,9 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - conda-tree
   - python
   - pip
-  - rich
-  - sqlalchemy
   - sqlite
-  - tqdm
+  - sqlite-utils
   - pip:
       - pipdeptree
-      - pytest
-      - pytest-cov
