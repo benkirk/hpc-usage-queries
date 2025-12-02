@@ -27,36 +27,36 @@ FLOAT_FIELDS = {"cpupercent", "avgcpu"}
 
 
 def parse_date_string(date_str: str) -> datetime:
-    """Parse YYYYMMDD string to datetime object.
+    """Parse YYYY-MM-DD string to datetime object.
 
     Args:
-        date_str: Date string in YYYYMMDD format
+        date_str: Date string in YYYY-MM-DD format
 
     Returns:
         datetime object
 
     Raises:
-        ValueError: If date_str is not in YYYYMMDD format
+        ValueError: If date_str is not in YYYY-MM-DD format
     """
-    return datetime.strptime(date_str, "%Y%m%d")
+    return datetime.strptime(date_str, "%Y-%m-%d")
 
 
 def date_range(start_date: str, end_date: str) -> Iterator[str]:
     """Iterate through dates from start to end (inclusive).
 
     Args:
-        start_date: Start date in YYYYMMDD format
-        end_date: End date in YYYYMMDD format
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
 
     Yields:
-        Date strings in YYYYMMDD format
+        Date strings in YYYY-MM-DD format
     """
     start = parse_date_string(start_date)
     end = parse_date_string(end_date)
 
     current = start
     while current <= end:
-        yield current.strftime("%Y%m%d")
+        yield current.strftime("%Y-%m-%d")
         current += timedelta(days=1)
 
 
@@ -64,8 +64,8 @@ def date_range_length(start_date: str, end_date: str) -> int:
     """Determine the length of a date range (inclusive).
 
     Args:
-        start_date: Start date in YYYYMMDD format
-        end_date: End date in YYYYMMDD format
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
 
     Returns:
         The number of days in the range

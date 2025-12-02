@@ -31,17 +31,17 @@ def parse_args():
     date_group = parser.add_argument_group("date selection")
     date_group.add_argument(
         "-d", "--date",
-        metavar="YYYYMMDD",
+        metavar="YYYY-MM-DD",
         help="Sync jobs for a specific date"
     )
     date_group.add_argument(
         "--start",
-        metavar="YYYYMMDD",
+        metavar="YYYY-MM-DD",
         help="Start date for range sync"
     )
     date_group.add_argument(
         "--end",
-        metavar="YYYYMMDD",
+        metavar="YYYY-MM-DD",
         help="End date for range sync"
     )
 
@@ -87,7 +87,7 @@ def validate_date(date_str: str) -> bool:
     if not date_str:
         return True
     try:
-        datetime.strptime(date_str, "%Y%m%d")
+        datetime.strptime(date_str, "%Y-%m-%d")
         return True
     except ValueError:
         return False
@@ -104,7 +104,7 @@ def main():
         (args.end, "--end"),
     ]:
         if date_arg and not validate_date(date_arg):
-            print(f"Error: {date_name} must be in YYYYMMDD format", file=sys.stderr)
+            print(f"Error: {date_name} must be in YYYY-MM-DD format", file=sys.stderr)
             sys.exit(1)
 
     # Check that at least one date option is provided
@@ -132,13 +132,13 @@ def main():
                 print(f"Regenerating summaries for {args.machine}")
 
             if period:
-                day_date = datetime.strptime(period, "%Y%m%d").date()
+                day_date = datetime.strptime(period, "%Y-%m-%d").date()
                 from qhist_db.summary import generate_daily_summary
                 result = generate_daily_summary(session, args.machine, day_date, replace=True)
                 print(f"\nSummary regenerated: {result['rows_inserted']} rows")
             elif start_date and end_date:
-                start_dt = datetime.strptime(start_date, "%Y%m%d").date()
-                end_dt = datetime.strptime(end_date, "%Y%m%d").date()
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
                 result = generate_summaries_for_range(
                     session, args.machine, start_dt, end_dt,
                     replace=True, verbose=args.verbose
