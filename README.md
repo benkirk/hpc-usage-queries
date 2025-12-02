@@ -212,71 +212,6 @@ python -m qhist_db.queries
 
 This will demonstrate all query methods with real data from your Derecho database.
 
-## Python Query Interface
-
-The `JobQueries` class provides a high-level Python API for common queries:
-
-```python
-from datetime import date, timedelta
-from qhist_db import get_session, JobQueries
-
-# Connect to a machine's database
-session = get_session("derecho")
-queries = JobQueries(session)
-
-# Get jobs for a specific user
-end_date = date.today()
-start_date = end_date - timedelta(days=7)
-jobs = queries.jobs_by_user("username", start=start_date, end=end_date)
-
-# Get usage summary for an account (uses charging view for accurate hours)
-summary = queries.usage_summary("NCAR0001", start=start_date, end=end_date)
-print(f"Job count: {summary['job_count']}")
-print(f"Total CPU-hours: {summary['total_cpu_hours']:,.2f}")
-print(f"Total GPU-hours: {summary['total_gpu_hours']:,.2f}")
-print(f"Total Memory-hours: {summary['total_memory_hours']:,.2f}")
-print(f"Users: {', '.join(summary['users'])}")
-
-# Get top users by job count
-top_users = queries.top_users_by_jobs(start=start_date, end=end_date, limit=10)
-for user_stat in top_users:
-    print(f"{user_stat['user']}: {user_stat['job_count']} jobs")
-
-# Get queue statistics
-stats = queries.queue_statistics(start=start_date, end=end_date)
-for stat in stats:
-    print(f"{stat['queue']}: {stat['job_count']} jobs, "
-          f"avg {stat['avg_elapsed_seconds']/3600:.2f} hours")
-
-# Get daily summaries (if available)
-daily = queries.daily_summary_by_user("username", start=start_date, end=end_date)
-for summary in daily:
-    print(f"{summary.date}: {summary.job_count} jobs")
-
-session.close()
-```
-
-**Available query methods:**
-- `jobs_by_user(user, start, end, status, queue)` - Get jobs for a user
-- `jobs_by_account(account, start, end, status)` - Get jobs for an account
-- `jobs_by_queue(queue, start, end)` - Get jobs for a queue
-- `usage_summary(account, start, end)` - Aggregate usage for an account
-- `user_summary(user, start, end)` - Aggregate usage for a user
-- `top_users_by_jobs(start, end, limit)` - Get top users by job count
-- `queue_statistics(start, end)` - Get statistics by queue
-- `daily_summary_by_account(account, start, end)` - Get daily summaries
-- `daily_summary_by_user(user, start, end)` - Get daily summaries
-
-See `qhist_db/queries.py` for complete API documentation and examples.
-
-**Try the examples:**
-```bash
-# Run the built-in examples with your database
-python -m qhist_db.queries
-```
-
-This will demonstrate all query methods with real data from your Derecho database.
-
 ## CLI Tool
 
 The `qhist` command-line interface provides convenient access to job history data.
@@ -313,21 +248,31 @@ The `resource` command generates reports on resource usage.
 - `-m [casper|derecho]`: The machine to query (default: `derecho`).
 - `--output-dir PATH`: Directory to save the reports (default: `.`).
 
-**Subcommands (Implemented so far):**
+**Subcommands:**
 - `job-sizes`: Generates a report on job sizes by core count.
 - `job-waits`: Generates a report on job waits by core count.
 - `cpu-job-durations`: Generates a report on CPU job durations by day.
 - `cpu-job-sizes`: Generates a report on CPU job sizes by node count.
 - `cpu-job-waits`: Generates a report on CPU job waits by node count.
+- `usage-history`: Generates a report on daily usage history.
+- `gpu-job-sizes`: Generates a report on GPU job sizes by GPU count.
+- `gpu-job-waits`: Generates a report on GPU job waits by GPU count.
+- `gpu-job-durations`: Generates a report on GPU job durations by day.
+- `pie-group-cpu`: Generates a pie chart report of CPU usage grouped by account.
+- `pie-group-gpu`: Generates a pie chart report of GPU usage grouped by account.
+- `pie-proj-cpu`: Generates a pie chart report of CPU usage grouped by project.
+- `pie-proj-gpu`: Generates a pie chart report of GPU usage grouped by project.
+- `pie-user-cpu`: Generates a pie chart report of CPU usage grouped by user.
+- `pie-user-gpu`: Generates a pie chart report of GPU usage grouped by user.
 
 **Examples:**
 ```bash
 qhist resource --start-date 2025-11-01 --end-date 2025-11-30 job-sizes
 qhist resource --start-date 2025-11-01 --end-date 2025-11-30 --output-dir reports/ cpu-job-durations
+qhist resource --start-date 2025-11-01 --end-date 2025-11-30 pie-user-cpu
 ```
 
 ## Requirements
-
 
 - Python 3.10+
 - SQLAlchemy

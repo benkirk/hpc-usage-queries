@@ -39,6 +39,433 @@ class JobQueries:
         """
         self.session = session
 
+    def gpu_job_waits_by_gpu_ranges(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get GPU job wait statistics grouped by GPU count ranges.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+
+        Returns:
+            A list of dicts with 'gpu_range', 'avg_wait_hours', and 'job_count' keys.
+        """
+        gpu_ranges = [
+            (4, 4), (8, 8), (9, 16), (17, 32), (33, 64), (65, 96), 
+            (97, 128), (129, 256), (257, 320)
+        ]
+        gpu_queues = ['gpu', 'gpudev', 'pgpu']
+
+        gpu_range_case = case(
+            *[
+                (and_(Job.numgpus >= low, Job.numgpus <= high), f"{low}-{high}" if low != high else str(low))
+                for low, high in gpu_ranges
+            ],
+            else_=">320"
+        ).label("gpu_range_label")
+
+        wait_time_seconds = func.julianday(Job.start) - func.julianday(Job.eligible)
+        wait_time_hours = wait_time_seconds * 24
+
+        subquery = self.session.query(
+            Job.id,
+            gpu_range_case,
+            wait_time_hours.label("wait_hours")
+        ).filter(Job.queue.in_(gpu_queues))
+
+        if start:
+            subquery = subquery.filter(Job.end >= datetime.combine(start, datetime.min.time()))
+        if end:
+            subquery = subquery.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+        
+        subquery = subquery.subquery()
+
+        query = self.session.query(
+            subquery.c.gpu_range_label,
+            func.avg(subquery.c.wait_hours).label("avg_wait_hours"),
+            func.count(subquery.c.id).label("job_count")
+        ).group_by(subquery.c.gpu_range_label)
+
+        order_cases = {f"{low}-{high}" if low != high else str(low): i for i, (low, high) in enumerate(gpu_ranges)}
+        order_cases['>320'] = len(gpu_ranges)
+        order_expression = case(
+            order_cases,
+            value=subquery.c.gpu_range_label
+        )
+
+        results = query.order_by(order_expression).all()
+
+        return [
+            {
+                "gpu_range": row[0],
+                "avg_wait_hours": row[1] or 0.0,
+                "job_count": row[2],
+            }
+            for row in results
+        ]
+
+    def pie_user_gpu(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get GPU usage statistics grouped by user for a pie chart.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+
+        Returns:
+            A list of dicts with 'User-ids', 'Usage' (GPU hours), and 'Counts' (job count) keys.
+        """
+        gpu_queues = ['gpu', 'gpudev', 'pgpu']
+
+        query = self.session.query(
+            Job.user.label("User-ids"),
+            func.sum(JobCharged.gpu_hours).label("Usage"),
+            func.count(Job.id).label("Counts")
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(gpu_queues))
+
+        if start:
+            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
+        if end:
+            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+
+        results = query.group_by(Job.user).order_by(func.sum(JobCharged.gpu_hours).desc()).all()
+
+        return [
+            {
+                "User-ids": row[0],
+                "Usage": row[1] or 0.0,
+                "Counts": row[2] or 0,
+            }
+            for row in results
+        ]
+
+    def pie_user_cpu(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get CPU usage statistics grouped by user for a pie chart.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+
+        Returns:
+            A list of dicts with 'User-ids', 'Usage' (CPU hours), and 'Counts' (job count) keys.
+        """
+        cpu_queues = ['cpu', 'cpudev']
+
+        query = self.session.query(
+            Job.user.label("User-ids"),
+            func.sum(JobCharged.cpu_hours).label("Usage"),
+            func.count(Job.id).label("Counts")
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(cpu_queues))
+
+        if start:
+            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
+        if end:
+            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+
+        results = query.group_by(Job.user).order_by(func.sum(JobCharged.cpu_hours).desc()).all()
+
+        return [
+            {
+                "User-ids": row[0],
+                "Usage": row[1] or 0.0,
+                "Counts": row[2] or 0,
+            }
+            for row in results
+        ]
+
+    def pie_group_gpu(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get GPU usage statistics grouped by account for a pie chart.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+
+        Returns:
+            A list of dicts with 'Accounts', 'Usage' (GPU hours), and 'Counts' (job count) keys.
+        """
+        gpu_queues = ['gpu', 'gpudev', 'pgpu']
+
+        query = self.session.query(
+            Job.account.label("Accounts"),
+            func.sum(JobCharged.gpu_hours).label("Usage"),
+            func.count(Job.id).label("Counts")
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(gpu_queues))
+
+        if start:
+            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
+        if end:
+            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+
+        results = query.group_by(Job.account).order_by(func.sum(JobCharged.gpu_hours).desc()).all()
+
+        return [
+            {
+                "Accounts": row[0],
+                "Usage": row[1] or 0.0,
+                "Counts": row[2] or 0,
+            }
+            for row in results
+        ]
+
+    def pie_group_cpu(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get CPU usage statistics grouped by account for a pie chart.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+
+        Returns:
+            A list of dicts with 'Accounts', 'Usage' (CPU hours), and 'Counts' (job count) keys.
+        """
+        cpu_queues = ['cpu', 'cpudev']
+
+        query = self.session.query(
+            Job.account.label("Accounts"),
+            func.sum(JobCharged.cpu_hours).label("Usage"),
+            func.count(Job.id).label("Counts")
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(cpu_queues))
+
+        if start:
+            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
+        if end:
+            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+
+        results = query.group_by(Job.account).order_by(func.sum(JobCharged.cpu_hours).desc()).all()
+
+        return [
+            {
+                "Accounts": row[0],
+                "Usage": row[1] or 0.0,
+                "Counts": row[2] or 0,
+            }
+            for row in results
+        ]
+
+    def gpu_job_durations_by_day(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get GPU job duration statistics by day.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+
+        Returns:
+            A list of dicts with 'date' and duration bucket keys.
+        """
+        duration_buckets = {
+            "<30s": Job.elapsed < 30,
+            "30s-30m": and_(Job.elapsed >= 30, Job.elapsed < 1800),
+            "30-60m": and_(Job.elapsed >= 1800, Job.elapsed < 3600),
+            "1-5h": and_(Job.elapsed >= 3600, Job.elapsed < 18000),
+            "5-12h": and_(Job.elapsed >= 18000, Job.elapsed < 43200),
+            "12-18h": and_(Job.elapsed >= 43200, Job.elapsed < 64800),
+            ">18h": Job.elapsed >= 64800,
+        }
+        gpu_queues = ['gpu', 'gpudev', 'pgpu']
+
+        query = self.session.query(
+            func.date(Job.end).label("job_date"),
+            *[func.sum(case((bucket, JobCharged.gpu_hours), else_=0)).label(label) for label, bucket in duration_buckets.items()]
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(gpu_queues))
+
+        if start:
+            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
+        if end:
+            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+
+        results = query.group_by("job_date").order_by("job_date").all()
+
+        return [
+            {
+                "date": row[0],
+                **{label: row[i+1] or 0.0 for i, label in enumerate(duration_buckets.keys())}
+            }
+            for row in results
+        ]
+        
+    def gpu_job_sizes_by_gpu_ranges(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get GPU job size statistics grouped by GPU count ranges.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+
+        Returns:
+            A list of dicts with 'gpu_range', 'job_count', 'user_count', and 'gpu_hours' keys.
+        """
+        gpu_ranges = [
+            (4, 4), (8, 8), (9, 16), (17, 32), (33, 64), (65, 96), 
+            (97, 128), (129, 256), (257, 320)
+        ]
+        gpu_queues = ['gpu', 'gpudev', 'pgpu']
+
+        gpu_range_case = case(
+            *[
+                (and_(Job.numgpus >= low, Job.numgpus <= high), f"{low}-{high}" if low != high else str(low))
+                for low, high in gpu_ranges
+            ],
+            else_=">320"
+        ).label("gpu_range_label")
+
+        subquery = self.session.query(
+            Job.id,
+            Job.user,
+            JobCharged.gpu_hours,
+            gpu_range_case
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(gpu_queues))
+
+        if start:
+            subquery = subquery.filter(Job.end >= datetime.combine(start, datetime.min.time()))
+        if end:
+            subquery = subquery.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+        
+        subquery = subquery.subquery()
+
+        query = self.session.query(
+            subquery.c.gpu_range_label,
+            func.count(subquery.c.id).label("job_count"),
+            func.count(func.distinct(subquery.c.user)).label("user_count"),
+            func.sum(subquery.c.gpu_hours).label("gpu_hours")
+        ).group_by(subquery.c.gpu_range_label)
+        
+        order_cases = {f"{low}-{high}" if low != high else str(low): i for i, (low, high) in enumerate(gpu_ranges)}
+        order_cases['>320'] = len(gpu_ranges)
+        order_expression = case(
+            order_cases,
+            value=subquery.c.gpu_range_label
+        )
+
+        results = query.order_by(order_expression).all()
+
+        return [
+            {
+                "gpu_range": row[0],
+                "job_count": row[1],
+                "user_count": row[2],
+                "gpu_hours": row[3] or 0.0,
+            }
+            for row in results
+        ]
+
+    def usage_history_by_day(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get usage history by day.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+
+        Returns:
+            A list of dicts with usage history statistics for each day.
+        """
+        cpu_queues = ['cpu', 'cpudev']
+        gpu_queues = ['gpu', 'gpudev', 'pgpu']
+
+        # Common subquery for date filtering
+        date_filter = []
+        if start:
+            date_filter.append(Job.end >= datetime.combine(start, datetime.min.time()))
+        if end:
+            date_filter.append(Job.end <= datetime.combine(end, datetime.max.time()))
+
+        # 1. Total unique users per day
+        total_users_subquery = self.session.query(
+            func.strftime("%Y-%m-%d", Job.end).label("day"),
+            func.count(func.distinct(Job.user)).label("total_users")
+        ).filter(*date_filter).group_by("day").subquery()
+
+        # 2. Total unique projects per day
+        total_projects_subquery = self.session.query(
+            func.strftime("%Y-%m-%d", Job.end).label("day"),
+            func.count(func.distinct(Job.account)).label("total_projects")
+        ).filter(*date_filter).group_by("day").subquery()
+        
+        # 3. CPU stats per day
+        cpu_stats_subquery = self.session.query(
+            func.strftime("%Y-%m-%d", Job.end).label("day"),
+            func.count(func.distinct(Job.user)).label("cpu_users"),
+            func.count(func.distinct(Job.account)).label("cpu_projects"),
+            func.count(Job.id).label("cpu_jobs"),
+            func.sum(JobCharged.cpu_hours).label("cpu_hours")
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(cpu_queues), *date_filter).group_by("day").subquery()
+
+        # 4. GPU stats per day
+        gpu_stats_subquery = self.session.query(
+            func.strftime("%Y-%m-%d", Job.end).label("day"),
+            func.count(func.distinct(Job.user)).label("gpu_users"),
+            func.count(func.distinct(Job.account)).label("gpu_projects"),
+            func.count(Job.id).label("gpu_jobs"),
+            func.sum(JobCharged.gpu_hours).label("gpu_hours")
+        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(gpu_queues), *date_filter).group_by("day").subquery()
+
+        # Join all the subqueries
+        query = self.session.query(
+            total_users_subquery.c.day,
+            total_users_subquery.c.total_users,
+            total_projects_subquery.c.total_projects,
+            cpu_stats_subquery.c.cpu_users,
+            cpu_stats_subquery.c.cpu_projects,
+            cpu_stats_subquery.c.cpu_jobs,
+            cpu_stats_subquery.c.cpu_hours,
+            gpu_stats_subquery.c.gpu_users,
+            gpu_stats_subquery.c.gpu_projects,
+            gpu_stats_subquery.c.gpu_jobs,
+            gpu_stats_subquery.c.gpu_hours
+        ).join(
+            total_projects_subquery, total_users_subquery.c.day == total_projects_subquery.c.day
+        ).outerjoin(
+            cpu_stats_subquery, total_users_subquery.c.day == cpu_stats_subquery.c.day
+        ).outerjoin(
+            gpu_stats_subquery, total_users_subquery.c.day == gpu_stats_subquery.c.day
+        ).order_by(total_users_subquery.c.day)
+
+        results = query.all()
+
+        return [
+            {
+                "Date": row[0],
+                "#-Users": row[1] or 0,
+                "#-Proj": row[2] or 0,
+                "#-CPU-Users": row[3] or 0,
+                "#-CPU-Proj": row[4] or 0,
+                "#-CPU-Jobs": row[5] or 0,
+                "#-CPU-Hrs": row[6] or 0.0,
+                "#-GPU-Users": row[7] or 0,
+                "#-GPU-Proj": row[8] or 0,
+                "#-GPU-Jobs": row[9] or 0,
+                "#-GPU-Hrs": row[10] or 0.0,
+            }
+            for row in results
+        ]
+
     def cpu_job_waits_by_node_ranges(
         self,
         start: Optional[date] = None,

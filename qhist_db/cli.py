@@ -134,6 +134,310 @@ import os
 
 # ... (other imports)
 
+@resource.command("pie-proj-cpu")
+@click.pass_context
+def pie_proj_cpu(ctx):
+    """Generates a pie chart report of CPU usage grouped by project."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.pie_group_cpu(start=start_date, end=end_date) # Reusing existing query
+
+    filename = f"{machine[:2].capitalize()}_pie_proj_cpu_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'Accounts':<15}{'Usage':<15}{'Counts'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['Accounts']:<15}{row['Usage']:<15.1f}{row['Counts']}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("pie-user-gpu")
+@click.pass_context
+def pie_user_gpu(ctx):
+    """Generates a pie chart report of GPU usage grouped by user."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.pie_user_gpu(start=start_date, end=end_date)
+
+    filename = f"{machine[:2].capitalize()}_pie_user_gpu_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'User-ids':<15}{'Usage':<15}{'Counts'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['User-ids']:<15}{row['Usage']:<15.1f}{row['Counts']}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("pie-user-cpu")
+@click.pass_context
+def pie_user_cpu(ctx):
+    """Generates a pie chart report of CPU usage grouped by user."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.pie_user_cpu(start=start_date, end=end_date)
+
+    filename = f"{machine[:2].capitalize()}_pie_user_cpu_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'User-ids':<15}{'Usage':<15}{'Counts'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['User-ids']:<15}{row['Usage']:<15.1f}{row['Counts']}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("pie-proj-gpu")
+@click.pass_context
+def pie_proj_gpu(ctx):
+    """Generates a pie chart report of GPU usage grouped by project."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.pie_group_gpu(start=start_date, end=end_date) # Reusing existing query
+
+    filename = f"{machine[:2].capitalize()}_pie_proj_gpu_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'Accounts':<15}{'Usage':<15}{'Counts'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['Accounts']:<15}{row['Usage']:<15.1f}{row['Counts']}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("pie-group-gpu")
+@click.pass_context
+def pie_group_gpu(ctx):
+    """Generates a pie chart report of GPU usage grouped by account."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.pie_group_gpu(start=start_date, end=end_date)
+
+    filename = f"{machine[:2].capitalize()}_pie_group_gpu_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'Accounts':<15}{'Usage':<15}{'Counts'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['Accounts']:<15}{row['Usage']:<15.1f}{row['Counts']}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("pie-group-cpu")
+@click.pass_context
+def pie_group_cpu(ctx):
+    """Generates a pie chart report of CPU usage grouped by account."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.pie_group_cpu(start=start_date, end=end_date)
+
+    filename = f"{machine[:2].capitalize()}_pie_group_cpu_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'Accounts':<15}{'Usage':<15}{'Counts'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['Accounts']:<15}{row['Usage']:<15.1f}{row['Counts']}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("gpu-job-durations")
+@click.pass_context
+def gpu_job_durations(ctx):
+    """Generates a report on GPU job durations by day."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.gpu_job_durations_by_day(start=start_date, end=end_date)
+
+    filename = f"{machine[:2].capitalize()}_gpu_job_durations_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'Date':<20}{'<30s':<12}{'30s-30m':<12}{'30-60m':<12}{'1-5h':<12}{'5-12h':<12}{'12-18h':<12}{'>18h'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['date']:<20}"
+                f"{row['<30s']:<12.1f}"
+                f"{row['30s-30m']:<12.1f}"
+                f"{row['30-60m']:<12.1f}"
+                f"{row['1-5h']:<12.1f}"
+                f"{row['5-12h']:<12.1f}"
+                f"{row['12-18h']:<12.1f}"
+                f"{row['>18h']:.1f}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("gpu-job-waits")
+@click.pass_context
+def gpu_job_waits(ctx):
+    """Generates a report on GPU job waits by GPU count."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.gpu_job_waits_by_gpu_ranges(start=start_date, end=end_date)
+
+    filename = f"{machine[:2].capitalize()}_gpu_job_waits_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'GPUs':<20}{'AveWait-hrs':<12}{'#-Jobs'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['gpu_range']:<20}{row['avg_wait_hours']:<12.4f}{row['job_count']}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("gpu-job-sizes")
+@click.pass_context
+def gpu_job_sizes(ctx):
+    """Generates a report on GPU job sizes by GPU count."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.gpu_job_sizes_by_gpu_ranges(start=start_date, end=end_date)
+
+    filename = f"{machine[:2].capitalize()}_gpu_job_sizes_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = f"{'GPUs':<20}{'#-Jobs':<12}{'#-Users':<12}{'Cr-hrs'}\n"
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['gpu_range']:<20}{row['job_count']:<12}{row['user_count']:<12}{row['gpu_hours']:.1f}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
+@resource.command("usage-history")
+@click.pass_context
+def usage_history(ctx):
+    """Generates a report on daily usage history."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+    output_dir = ctx.obj['output_dir']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.usage_history_by_day(start=start_date, end=end_date)
+
+    filename = f"{machine[:2].capitalize()}_usage_history_{start_date}_{end_date}.dat"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "w") as f:
+        header = (
+            f"{'Date':<18}{'#-Users':<12}{'#-Proj':<8}{'#-CPU-Users':<13}{'#-CPU-Proj':<13}"
+            f"{'#-CPU-Jobs':<13}{'#-CPU-Hrs':<12}{'#-GPU-Users':<13}{'#-GPU-Proj':<13}"
+            f"{'#-GPU-Jobs':<13}{'#-GPU-Hrs'}\n"
+        )
+        f.write(header)
+        for row in data:
+            f.write(
+                f"{row['Date']:<18}{row['#-Users']:<12}{row['#-Proj']:<8}{row['#-CPU-Users']:<13}"
+                f"{row['#-CPU-Proj']:<13}{row['#-CPU-Jobs']:<13}{row['#-CPU-Hrs']:<12.1f}"
+                f"{row['#-GPU-Users']:<13}{row['#-GPU-Proj']:<13}{row['#-GPU-Jobs']:<13}"
+                f"{row['#-GPU-Hrs']:.1f}\n"
+            )
+
+    click.echo(f"Report saved to {filepath}")
+
+    session.close()
+
 @resource.command("cpu-job-waits")
 @click.pass_context
 def cpu_job_waits(ctx):
