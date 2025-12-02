@@ -18,9 +18,8 @@ subcommands=(
   usage-history
 )
 
-for start in 2024-12-01 2025-11-01; do
-    for cmd in "${subcommands[@]}"; do
-        echo $cmd
-        qhist-report resource --machine derecho --start-date ${start} --end-date 2025-11-30 ${cmd}
-    done
+for cmd in "${subcommands[@]}"; do
+    echo $cmd
+    qhist-report resource --machine derecho --start-date 2025-11-01 --end-date 2025-11-30 --group-by day ${cmd}
+    qhist-report resource --machine derecho --start-date 2024-12-01 --end-date 2025-11-30 --group-by month ${cmd}
 done
