@@ -360,7 +360,7 @@ class JobQueries:
         subquery = self.session.query(
             Job.id,
             Job.user,
-            hours_field,
+            hours_field.label("hours_field"),
             range_case
         ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(queues))
 
@@ -372,7 +372,7 @@ class JobQueries:
             subquery.c.range_label,
             func.count(subquery.c.id).label("job_count"),
             func.count(func.distinct(subquery.c.user)).label("user_count"),
-            func.sum(subquery.c.anon_1).label("hours")  # hours_field column
+            func.sum(subquery.c.hours_field).label("hours")
         ).group_by(subquery.c.range_label)
 
         # Apply custom ordering
