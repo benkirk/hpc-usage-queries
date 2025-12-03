@@ -17,7 +17,6 @@ hilight_green='#A8C700'
 
 # https://stackoverflow.com/questions/7726852/how-to-use-a-random-otf-or-ttf-font-in-matplotlib
 def load_matplotlib_local_fonts():
-    return
     # Load a font from TTF file,
     # relative to this Python module
     # https://stackoverflow.com/a/69016300/315168
