@@ -1,6 +1,6 @@
 """Sync job data from remote HPC machines via qhist command."""
 
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -111,9 +111,9 @@ def sync_jobs_bulk(
     Args:
         session: SQLAlchemy session (ignored when machine='all')
         machine: Machine name ('casper', 'derecho', or 'all')
-        period: Single date in YYYY-MM-DD format
-        start_date: Start date for range (YYYY-MM-DD)
-        end_date: End date for range (YYYY-MM-DD)
+        period: Single date in YYYY-MM-DD format (takes precedence over start/end)
+        start_date: Start date for range (YYYY-MM-DD). Defaults to '2024-01-01' if None and period is None.
+        end_date: End date for range (YYYY-MM-DD). Defaults to yesterday if None and period is None.
         dry_run: If True, don't actually insert records
         batch_size: Number of records to insert per batch
         verbose: If True, print progress for each day
@@ -180,6 +180,14 @@ def sync_jobs_bulk(
         "days_skipped": 0, "skipped_days": [],
         "days_summarized": 0,
     }
+
+    # Apply default date range if not syncing a single period
+    if period is None:
+        if start_date is None:
+            start_date = "2024-01-01"  # Default epoch
+        if end_date is None:
+            yesterday = date.today() - timedelta(days=1)
+            end_date = yesterday.strftime("%Y-%m-%d")
 
     # Get already-summarized dates if smart skip is enabled
     summarized_dates = set()

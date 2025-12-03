@@ -3,7 +3,7 @@
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Add parent directory to path for imports (cross-platform)
@@ -28,7 +28,7 @@ def parse_args():
     )
 
     # Date options
-    date_group = parser.add_argument_group("date selection")
+    date_group = parser.add_argument_group("date selection (all optional)")
     date_group.add_argument(
         "-d", "--date",
         metavar="YYYY-MM-DD",
@@ -37,12 +37,12 @@ def parse_args():
     date_group.add_argument(
         "--start",
         metavar="YYYY-MM-DD",
-        help="Start date for range sync"
+        help="Start date for range sync (default: 2024-01-01)"
     )
     date_group.add_argument(
         "--end",
         metavar="YYYY-MM-DD",
-        help="End date for range sync"
+        help="End date for range sync (default: yesterday)"
     )
 
     # Other options
@@ -107,10 +107,8 @@ def main():
             print(f"Error: {date_name} must be in YYYY-MM-DD format", file=sys.stderr)
             sys.exit(1)
 
-    # Check that at least one date option is provided
-    if not any([args.date, args.start, args.end]):
-        print("Error: Must specify --date or --start/--end", file=sys.stderr)
-        sys.exit(1)
+    # Date options are now optional - defaults will be applied in sync_jobs_bulk
+    # If none specified, will sync from 2024-01-01 to yesterday
 
     # Initialize database(s)
     if args.machine == "all":
@@ -187,7 +185,10 @@ def main():
             if period:
                 print(f"Syncing {args.machine} for date: {period}")
             else:
-                print(f"Syncing {args.machine} from {start_date or 'beginning'} to {end_date or 'now'}")
+                # Show actual defaults that will be used
+                display_start = start_date or '2024-01-01'
+                display_end = end_date or (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+                print(f"Syncing {args.machine} from {display_start} to {display_end}")
 
             if args.dry_run:
                 print("(DRY RUN - no data will be inserted)")
