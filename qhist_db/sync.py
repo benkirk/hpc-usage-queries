@@ -12,6 +12,7 @@ try:
 except ImportError:
     track = None
 
+from .database import VALID_MACHINES
 from .models import Job
 from .parsers import date_range, date_range_length, parse_date_string
 from .remote import fetch_jobs_ssh
@@ -108,8 +109,8 @@ def sync_jobs_bulk(
     overwhelming the remote system with large result sets.
 
     Args:
-        session: SQLAlchemy session
-        machine: Machine name ('casper' or 'derecho')
+        session: SQLAlchemy session (ignored when machine='all')
+        machine: Machine name ('casper', 'derecho', or 'all')
         period: Single date in YYYY-MM-DD format
         start_date: Start date for range (YYYY-MM-DD)
         end_date: End date for range (YYYY-MM-DD)
@@ -120,9 +121,58 @@ def sync_jobs_bulk(
         generate_summary: If True, generate daily summary after syncing
 
     Returns:
-        Dictionary with sync statistics
+        Dictionary with sync statistics (when machine='all', aggregates stats from all machines)
     """
+    from .database import get_session as get_db_session
     from .summary import get_summarized_dates, generate_daily_summary
+
+    # Handle machine='all' by recursively syncing all machines
+    if machine == "all":
+        combined_stats = {
+            "fetched": 0, "inserted": 0, "errors": 0,
+            "days_failed": 0, "failed_days": [],
+            "days_skipped": 0, "skipped_days": [],
+            "days_summarized": 0,
+            "machines": {},
+        }
+
+        for m in sorted(VALID_MACHINES):
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Syncing {m}...")
+                print(f"{'='*60}")
+
+            # Get a new session for this machine
+            machine_session = get_db_session(m)
+            try:
+                machine_stats = sync_jobs_bulk(
+                    session=machine_session,
+                    machine=m,
+                    period=period,
+                    start_date=start_date,
+                    end_date=end_date,
+                    dry_run=dry_run,
+                    batch_size=batch_size,
+                    verbose=verbose,
+                    force=force,
+                    generate_summary=generate_summary,
+                )
+
+                # Aggregate stats
+                combined_stats["fetched"] += machine_stats["fetched"]
+                combined_stats["inserted"] += machine_stats["inserted"]
+                combined_stats["errors"] += machine_stats["errors"]
+                combined_stats["days_failed"] += machine_stats["days_failed"]
+                combined_stats["failed_days"].extend(machine_stats["failed_days"])
+                combined_stats["days_skipped"] += machine_stats["days_skipped"]
+                combined_stats["skipped_days"].extend(machine_stats["skipped_days"])
+                combined_stats["days_summarized"] += machine_stats["days_summarized"]
+                combined_stats["machines"][m] = machine_stats
+
+            finally:
+                machine_session.close()
+
+        return combined_stats
 
     stats = {
         "fetched": 0, "inserted": 0, "errors": 0,

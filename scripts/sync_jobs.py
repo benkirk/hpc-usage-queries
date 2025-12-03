@@ -23,8 +23,8 @@ def parse_args():
     parser.add_argument(
         "-m", "--machine",
         required=True,
-        choices=["casper", "derecho"],
-        help="Machine to sync from"
+        choices=["casper", "derecho", "all"],
+        help="Machine to sync from (use 'all' to sync all machines)"
     )
 
     # Date options
@@ -112,13 +112,18 @@ def main():
         print("Error: Must specify --date or --start/--end", file=sys.stderr)
         sys.exit(1)
 
-    # Initialize database for this machine
-    if args.verbose:
-        db_path = get_db_path(args.machine)
-        print(f"Initializing database: {db_path}")
-
-    engine = init_db(args.machine)
-    session = get_session(args.machine, engine)
+    # Initialize database(s)
+    if args.machine == "all":
+        if args.verbose:
+            print("Initializing databases for all machines...")
+        engines = init_db(machine=None)  # Initialize all machines
+        session = None  # Will be created per-machine in sync_jobs_bulk
+    else:
+        if args.verbose:
+            db_path = get_db_path(args.machine)
+            print(f"Initializing database: {db_path}")
+        engine = init_db(args.machine)
+        session = get_session(args.machine, engine)
 
     try:
         # Determine sync parameters
@@ -131,24 +136,51 @@ def main():
             if args.verbose:
                 print(f"Regenerating summaries for {args.machine}")
 
-            if period:
-                day_date = datetime.strptime(period, "%Y-%m-%d").date()
+            if args.machine == "all":
+                # Handle all machines
+                from qhist_db.database import VALID_MACHINES
                 from qhist_db.summary import generate_daily_summary
-                result = generate_daily_summary(session, args.machine, day_date, replace=True)
-                print(f"\nSummary regenerated: {result['rows_inserted']} rows")
-            elif start_date and end_date:
-                start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
-                result = generate_summaries_for_range(
-                    session, args.machine, start_dt, end_dt,
-                    replace=True, verbose=args.verbose
-                )
-                print(f"\nSummaries regenerated:")
-                print(f"  Days processed: {result['days_processed']}")
-                print(f"  Total rows: {result['total_rows']}")
+
+                for m in sorted(VALID_MACHINES):
+                    machine_session = get_session(m)
+                    try:
+                        if args.verbose:
+                            print(f"\nRegenerating summaries for {m}...")
+
+                        if period:
+                            day_date = datetime.strptime(period, "%Y-%m-%d").date()
+                            result = generate_daily_summary(machine_session, m, day_date, replace=True)
+                            print(f"  {m}: {result['rows_inserted']} rows")
+                        elif start_date and end_date:
+                            start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+                            end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+                            result = generate_summaries_for_range(
+                                machine_session, m, start_dt, end_dt,
+                                replace=True, verbose=args.verbose
+                            )
+                            print(f"  {m}: {result['days_processed']} days, {result['total_rows']} rows")
+                    finally:
+                        machine_session.close()
             else:
-                print("Error: --summary-only requires --date or --start/--end", file=sys.stderr)
-                sys.exit(1)
+                # Single machine
+                if period:
+                    day_date = datetime.strptime(period, "%Y-%m-%d").date()
+                    from qhist_db.summary import generate_daily_summary
+                    result = generate_daily_summary(session, args.machine, day_date, replace=True)
+                    print(f"\nSummary regenerated: {result['rows_inserted']} rows")
+                elif start_date and end_date:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+                    result = generate_summaries_for_range(
+                        session, args.machine, start_dt, end_dt,
+                        replace=True, verbose=args.verbose
+                    )
+                    print(f"\nSummaries regenerated:")
+                    print(f"  Days processed: {result['days_processed']}")
+                    print(f"  Total rows: {result['total_rows']}")
+                else:
+                    print("Error: --summary-only requires --date or --start/--end", file=sys.stderr)
+                    sys.exit(1)
             return
 
         if args.verbose:
@@ -191,11 +223,21 @@ def main():
         if stats.get("days_summarized", 0) > 0:
             print(f"  Days summarized: {stats['days_summarized']}")
 
+        # Print per-machine breakdown if syncing all machines
+        if args.machine == "all" and "machines" in stats:
+            print(f"\nPer-machine breakdown:")
+            for machine, machine_stats in stats["machines"].items():
+                print(f"\n  {machine}:")
+                print(f"    Fetched:  {machine_stats['fetched']}")
+                print(f"    Inserted: {machine_stats['inserted']}")
+                print(f"    Errors:   {machine_stats['errors']}")
+
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":

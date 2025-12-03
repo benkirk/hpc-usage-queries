@@ -27,7 +27,7 @@ help:
 	@echo "  make init-db          Create database tables (both machines)"
 	@echo "  make sync-casper      Sync Casper jobs for DATE"
 	@echo "  make sync-derecho     Sync Derecho jobs for DATE"
-	@echo "  make sync-all         Sync both machines for DATE"
+	@echo "  make sync-all         Sync both machines for DATE (uses --machine all)"
 	@echo "  make clean            Remove all database files"
 	@echo ""
 	@echo "Database files:"
@@ -63,7 +63,12 @@ else
 	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m derecho -d $(DATE) -v
 endif
 
-sync-all: sync-derecho sync-casper
+sync-all:
+ifdef START
+	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m all --start $(START) $(if $(END),--end $(END)) -v
+else
+	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m all -d $(DATE) -v
+endif
 
 clean:
 	@echo "Removing databases..."
@@ -71,7 +76,7 @@ clean:
 	@echo "Done."
 
 # Development targets
-.PHONY: test-import dry-run-casper dry-run-derecho
+.PHONY: test-import dry-run-casper dry-run-derecho dry-run-all
 
 test-import:
 	@$(PYTHON) -c "from qhist_db import Job, init_db; print('Import successful')"
@@ -81,6 +86,9 @@ dry-run-casper:
 
 dry-run-derecho:
 	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m derecho -d $(DATE) --dry-run -v
+
+dry-run-all:
+	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m all -d $(DATE) --dry-run -v
 
 %: %.yaml
 	$(config_env)
