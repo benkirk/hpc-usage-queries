@@ -81,7 +81,7 @@ from .exporters import get_exporter
 @click.group(invoke_without_command=True)
 @click.option("--start-date", type=str, callback=parse_date, help="Start date for analysis (YYYY-MM-DD).")
 @click.option("--end-date", type=str, callback=parse_date, help="End date for analysis (YYYY-MM-DD).")
-@click.option("--group-by", type=click.Choice(["day", "month"]), default="day", help="Group results by day or month.")
+@click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), default="day", help="Group results by day, month, quarter, or year.")
 @click.option("-m", "--machine", type=click.Choice(["casper", "derecho"]), default="derecho", help="The machine to query.")
 @click.pass_context
 def history(ctx, start_date, end_date, group_by, machine):
@@ -102,13 +102,17 @@ from rich.console import Console
 # ... (history command group)
 
 @history.command("jobs-per-user")
+@click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), help="Group results by day, month, quarter, or year (overrides history setting).")
 @click.pass_context
-def jobs_per_user(ctx):
+def jobs_per_user(ctx, group_by):
     """Prints the number of jobs per user per account."""
     start_date = ctx.obj['start_date']
     end_date = ctx.obj['end_date']
     machine = ctx.obj['machine']
-    group_by = ctx.obj['group_by']
+    
+    # Use provided group_by or fall back to context
+    if group_by is None:
+        group_by = ctx.obj['group_by']
 
     session = get_session(machine)
     queries = JobQueries(session)
@@ -125,13 +129,17 @@ def jobs_per_user(ctx):
     session.close()
 
 @history.command("unique-projects")
+@click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), help="Group results by day, month, quarter, or year (overrides history setting).")
 @click.pass_context
-def unique_projects(ctx):
+def unique_projects(ctx, group_by):
     """Prints the number of unique projects."""
     start_date = ctx.obj['start_date']
     end_date = ctx.obj['end_date']
     machine = ctx.obj['machine']
-    group_by = ctx.obj['group_by']
+    
+    # Use provided group_by or fall back to context
+    if group_by is None:
+        group_by = ctx.obj['group_by']
 
     session = get_session(machine)
     queries = JobQueries(session)
@@ -148,13 +156,17 @@ def unique_projects(ctx):
     session.close()
 
 @history.command("unique-users")
+@click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), help="Group results by day, month, quarter, or year (overrides history setting).")
 @click.pass_context
-def unique_users(ctx):
+def unique_users(ctx, group_by):
     """Prints the number of unique users."""
     start_date = ctx.obj['start_date']
     end_date = ctx.obj['end_date']
     machine = ctx.obj['machine']
-    group_by = ctx.obj['group_by']
+    
+    # Use provided group_by or fall back to context
+    if group_by is None:
+        group_by = ctx.obj['group_by']
     
     session = get_session(machine)
     queries = JobQueries(session)
@@ -575,7 +587,7 @@ def create_resource_command(config: ReportConfig):
 @click.option("-m", "--machine", type=click.Choice(["casper", "derecho", "all"]), default="derecho", help="The machine to query (use 'all' for both).")
 @click.option("--output-dir", type=click.Path(file_okay=False, dir_okay=True, writable=True, resolve_path=True), default=".", help="Directory to save the reports.")
 @click.option("--format", "output_format", type=click.Choice(["dat", "json", "csv", "md"]), default="dat", help="Output format (dat, json, csv, md).")
-@click.option("--group-by", type=click.Choice(["day", "month"]), default="day", help="Group time-based results by day or month.")
+@click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), default="day", help="Group time-based results by day, month, quarter, or year.")
 @click.pass_context
 def resource(ctx, start_date, end_date, machine, output_dir, output_format, group_by):
     """Resource-centric view of job data."""

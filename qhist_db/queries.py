@@ -705,44 +705,44 @@ class JobQueries:
             date_filter.append(Job.end <= datetime.combine(end, datetime.max.time()))
         return date_filter
 
-    def _usage_history_total_users(self, period_format: str, date_filter: List):
+    def _usage_history_total_users(self, period_col, date_filter: List):
         """Build subquery for total unique users per period.
 
         Args:
-            period_format: strftime format string for period grouping
+            period_col: SQLAlchemy expression for period grouping
             date_filter: List of filter conditions
 
         Returns:
             SQLAlchemy subquery for total users
         """
         return self.session.query(
-            func.strftime(period_format, Job.end).label("period"),
+            period_col.label("period"),
             func.count(func.distinct(Job.user)).label("total_users")
         ).filter(*date_filter).group_by("period").subquery()
 
-    def _usage_history_total_projects(self, period_format: str, date_filter: List):
+    def _usage_history_total_projects(self, period_col, date_filter: List):
         """Build subquery for total unique projects per period.
 
         Args:
-            period_format: strftime format string for period grouping
+            period_col: SQLAlchemy expression for period grouping
             date_filter: List of filter conditions
 
         Returns:
             SQLAlchemy subquery for total projects
         """
         return self.session.query(
-            func.strftime(period_format, Job.end).label("period"),
+            period_col.label("period"),
             func.count(func.distinct(Job.account)).label("total_projects")
         ).filter(*date_filter).group_by("period").subquery()
 
     def _usage_history_resource_stats(
-        self, resource_type: str, period_format: str, date_filter: List
+        self, resource_type: str, period_col, date_filter: List
     ):
         """Build subquery for CPU or GPU stats per period.
 
         Args:
             resource_type: 'cpu' or 'gpu'
-            period_format: strftime format string for period grouping
+            period_col: SQLAlchemy expression for period grouping
             date_filter: List of filter conditions
 
         Returns:
@@ -757,7 +757,7 @@ class JobQueries:
         prefix = resource_type.lower()
 
         return self.session.query(
-            func.strftime(period_format, Job.end).label("period"),
+            period_col.label("period"),
             func.count(func.distinct(Job.user)).label(f"{prefix}_users"),
             func.count(func.distinct(Job.account)).label(f"{prefix}_projects"),
             func.count(Job.id).label(f"{prefix}_jobs"),
@@ -828,7 +828,7 @@ class JobQueries:
         """Get usage history by time period.
 
         This method coordinates 4 subqueries to gather comprehensive usage
-        statistics per period (day or month):
+        statistics per period (day, month, quarter, year):
         1. Total unique users across all queues
         2. Total unique projects across all queues
         3. CPU queue statistics (users, projects, jobs, hours)
@@ -837,32 +837,26 @@ class JobQueries:
         Args:
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
-            period: Grouping period ('day' or 'month')
+            period: Grouping period ('day', 'month', 'quarter', 'year')
 
         Returns:
             List of dicts with usage history statistics for each period.
             Each dict contains: Date, #-Users, #-Proj, #-CPU-Users, #-CPU-Proj,
             #-CPU-Jobs, #-CPU-Hrs, #-GPU-Users, #-GPU-Proj, #-GPU-Jobs, #-GPU-Hrs
-
-        Raises:
-            ValueError: If period is not 'day' or 'month'
         """
-        # Determine period format string
-        if period == "day":
-            period_format = "%Y-%m-%d"
-        elif period == "month":
-            period_format = "%Y-%m"
-        else:
-            raise ValueError("Invalid period specified. Must be 'day' or 'month'.")
+        from .query_builders import PeriodGrouper
+
+        # Get period grouping expression
+        period_col = PeriodGrouper.get_period_func(period, Job.end)
 
         # Build date filter once
         date_filter = self._build_date_filter(start, end)
 
         # Build 4 subqueries
-        total_users_sq = self._usage_history_total_users(period_format, date_filter)
-        total_projects_sq = self._usage_history_total_projects(period_format, date_filter)
-        cpu_stats_sq = self._usage_history_resource_stats('cpu', period_format, date_filter)
-        gpu_stats_sq = self._usage_history_resource_stats('gpu', period_format, date_filter)
+        total_users_sq = self._usage_history_total_users(period_col, date_filter)
+        total_projects_sq = self._usage_history_total_projects(period_col, date_filter)
+        cpu_stats_sq = self._usage_history_resource_stats('cpu', period_col, date_filter)
+        gpu_stats_sq = self._usage_history_resource_stats('gpu', period_col, date_filter)
 
         # Join and format results
         return self._join_usage_history_results(
@@ -1146,14 +1140,14 @@ class JobQueries:
         Args:
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
-            period: Grouping period ('day', 'month', 'quarter')
+            period: Grouping period ('day', 'month', 'quarter', 'year')
 
         Returns:
             A list of dicts with 'period', 'user', 'account', and 'job_count' keys.
         """
         from .query_builders import PeriodGrouper
 
-        # Get period function (returns monthly for quarter, which will be aggregated later)
+        # Get period function
         period_func = PeriodGrouper.get_period_func(period, Job.end)
 
         query = self.session.query(
@@ -1168,18 +1162,10 @@ class JobQueries:
         results = query.group_by("period", Job.user, Job.account).order_by("period", Job.user, Job.account).all()
 
         # Convert results to list of dicts
-        monthly_data = [
+        return [
             {"period": row[0], "user": row[1], "account": row[2], "job_count": row[3]}
             for row in results
         ]
-
-        # If quarter period, aggregate monthly data to quarterly
-        if period == "quarter":
-            return PeriodGrouper.aggregate_quarters(
-                monthly_data, 'job_count', grouping_fields=['user', 'account']
-            )
-
-        return monthly_data
 
     def unique_projects_by_period(
         self,
@@ -1192,28 +1178,14 @@ class JobQueries:
         Args:
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
-            period: Grouping period ('day', 'month', 'quarter')
+            period: Grouping period ('day', 'month', 'quarter', 'year')
 
         Returns:
             A list of dicts with 'period' and 'project_count' keys.
         """
         from .query_builders import PeriodGrouper
 
-        if period == "quarter":
-            # For quarters, get monthly distinct project data and aggregate
-            monthly_query = self.session.query(
-                func.strftime("%Y-%m", Job.end).label("month"),
-                Job.account
-            ).distinct()
-
-            monthly_query = self._apply_date_filter(monthly_query, start, end)
-
-            monthly_results = monthly_query.all()
-
-            # Use PeriodGrouper to aggregate quarters from monthly distinct data
-            return PeriodGrouper.aggregate_quarters_distinct(monthly_results, 'project_count')
-
-        # For day or month periods
+        # Get period function
         period_func = PeriodGrouper.get_period_func(period, Job.end)
 
         query = self.session.query(
@@ -1238,28 +1210,14 @@ class JobQueries:
         Args:
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
-            period: Grouping period ('day', 'month', 'quarter')
+            period: Grouping period ('day', 'month', 'quarter', 'year')
 
         Returns:
             A list of dicts with 'period' and 'user_count' keys.
         """
         from .query_builders import PeriodGrouper
 
-        if period == "quarter":
-            # For quarters, get monthly distinct user data and aggregate
-            monthly_query = self.session.query(
-                func.strftime("%Y-%m", Job.end).label("month"),
-                Job.user
-            ).distinct()
-
-            monthly_query = self._apply_date_filter(monthly_query, start, end)
-
-            monthly_results = monthly_query.all()
-
-            # Use PeriodGrouper to aggregate quarters from monthly distinct data
-            return PeriodGrouper.aggregate_quarters_distinct(monthly_results, 'user_count')
-
-        # For day or month periods
+        # Get period function
         period_func = PeriodGrouper.get_period_func(period, Job.end)
 
         query = self.session.query(

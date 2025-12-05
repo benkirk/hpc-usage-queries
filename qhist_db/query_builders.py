@@ -5,11 +5,11 @@ common query patterns like period-based grouping and resource type resolution.
 """
 
 from typing import Tuple, Dict, Any, List
-from sqlalchemy import func
+from sqlalchemy import func, cast, Integer, String
 
 
 class PeriodGrouper:
-    """Handles period-based grouping (day/month/quarter) for queries.
+    """Handles period-based grouping (day/month/quarter/year) for queries.
 
     This class provides utilities for:
     - Generating SQLAlchemy period grouping functions
@@ -34,6 +34,7 @@ class PeriodGrouper:
     PERIODS = {
         'day': '%Y-%m-%d',
         'month': '%Y-%m',
+        'year': '%Y',
     }
 
     @staticmethod
@@ -41,14 +42,14 @@ class PeriodGrouper:
         """Get SQLAlchemy function for period grouping.
 
         Args:
-            period: Grouping period ('day', 'month', or 'quarter')
+            period: Grouping period ('day', 'month', 'quarter', or 'year')
             date_column: SQLAlchemy column to group by (e.g., Job.end)
 
         Returns:
             SQLAlchemy function expression for grouping
 
         Raises:
-            ValueError: If period is not 'day', 'month', or 'quarter'
+            ValueError: If period is not 'day', 'month', 'quarter', or 'year'
 
         Examples:
             >>> from qhist_db.models import Job
@@ -56,17 +57,23 @@ class PeriodGrouper:
             >>> func_day = PeriodGrouper.get_period_func('day', Job.end)
             >>> # Month grouping
             >>> func_month = PeriodGrouper.get_period_func('month', Job.end)
-            >>> # Quarter returns monthly for post-processing
+            >>> # Quarter grouping (returns expression like '2025-Q1')
             >>> func_quarter = PeriodGrouper.get_period_func('quarter', Job.end)
         """
         if period in PeriodGrouper.PERIODS:
             return func.strftime(PeriodGrouper.PERIODS[period], date_column)
         elif period == 'quarter':
-            # Return monthly for post-processing with aggregate_quarters
-            return func.strftime('%Y-%m', date_column)
+            # Generate YYYY-Q# string using SQL expression
+            # Formula: year + '-Q' + ((month - 1) // 3 + 1)
+            quarter_num = (cast(func.strftime('%m', date_column), Integer) - 1) / 3 + 1
+            # Note: / operator in SQLAlchemy with Integer cast typically results in integer division in SQLite
+            # but to be safe and consistent with tests we rely on implicit or explicit behavior
+            # The test showed (cast(...) - 1) // 3 + 1 works in Python-SQLAlchemy-SQLite mapping
+            quarter_num = (cast(func.strftime('%m', date_column), Integer) - 1) // 3 + 1
+            return func.strftime('%Y', date_column) + '-Q' + cast(quarter_num, String)
         else:
             raise ValueError(
-                f"Invalid period: {period}. Must be 'day', 'month', or 'quarter'."
+                f"Invalid period: {period}. Must be 'day', 'month', 'quarter', or 'year'."
             )
 
     @staticmethod
