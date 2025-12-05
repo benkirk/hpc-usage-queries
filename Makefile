@@ -91,8 +91,8 @@ dry-run-all:
 	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m all -d $(DATE) --dry-run -v
 
 %: %.yaml
-	$(config_env)
 	[ -d $@ ] && mv $@ $@.old && rm -rf $@.old &
+	$(config_env)
 	conda env create --file $< --prefix $@
 	conda activate ./$@
 	conda list
