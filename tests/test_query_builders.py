@@ -31,12 +31,24 @@ class TestPeriodGrouper:
         assert period_func.name == 'strftime'
 
     def test_get_period_func_quarter(self):
-        """Test quarter returns monthly for post-processing."""
+        """Test quarter returns a SQL expression for YYYY-Q#."""
         from qhist_db.models import Job
 
         period_func = PeriodGrouper.get_period_func('quarter', Job.end)
 
-        # Quarter should return monthly format for post-processing (as strftime)
+        # Quarter returns a complex expression (string concatenation)
+        func_str = str(period_func)
+        assert "strftime" in func_str
+        assert "CAST" in func_str
+        # It's an expression, not a single function, so no .name attribute check
+
+    def test_get_period_func_year(self):
+        """Test year period function generation."""
+        from qhist_db.models import Job
+
+        period_func = PeriodGrouper.get_period_func('year', Job.end)
+
+        # Should return a strftime function
         assert str(period_func).startswith("strftime(")
         # Verify it's a function with the correct name
         assert period_func.name == 'strftime'
