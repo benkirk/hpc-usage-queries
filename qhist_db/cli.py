@@ -98,7 +98,7 @@ from rich.table import Table
 from rich.console import Console
 
 
-def _run_jobs_per_entity_report(ctx, group_by, primary_entity: str, table_columns: tuple):
+def _run_jobs_per_entity_report(ctx, group_by, primary_entity: str, verbose: bool):
     """Common implementation for jobs-per-user and jobs-per-project commands."""
     start_date = ctx.obj['start_date']
     end_date = ctx.obj['end_date']
@@ -118,6 +118,19 @@ def _run_jobs_per_entity_report(ctx, group_by, primary_entity: str, table_column
     )
 
     console = Console()
+
+    # Determine columns based on verbose flag
+    if primary_entity == "user":
+        if verbose:
+            table_columns = ("Period", "User", "Account", "Job Count")
+        else:
+            table_columns = ("Period", "User", "Job Count")
+    else:  # "account"
+        if verbose:
+            table_columns = ("Period", "Account", "User", "Job Count")
+        else:
+            table_columns = ("Period", "Account", "Job Count")
+
     table = Table(*table_columns)
 
     key_map = {"Period": "period", "User": "user", "Account": "account", "Job Count": "job_count"}
@@ -131,21 +144,23 @@ def _run_jobs_per_entity_report(ctx, group_by, primary_entity: str, table_column
 @history.command("jobs-per-user")
 @click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]),
               help="Group results by day, month, quarter, or year (overrides history setting).")
+@click.option("-v", "--verbose", is_flag=True, default=False,
+              help="Show account column in addition to user.")
 @click.pass_context
-def jobs_per_user(ctx, group_by):
-    """Prints the number of jobs per user per account."""
-    _run_jobs_per_entity_report(ctx, group_by, "user",
-                                ("Period", "User", "Account", "Job Count"))
+def jobs_per_user(ctx, group_by, verbose):
+    """Prints the number of jobs per user."""
+    _run_jobs_per_entity_report(ctx, group_by, "user", verbose)
 
 
 @history.command("jobs-per-project")
 @click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]),
               help="Group results by day, month, quarter, or year (overrides history setting).")
+@click.option("-v", "--verbose", is_flag=True, default=False,
+              help="Show user column in addition to account.")
 @click.pass_context
-def jobs_per_project(ctx, group_by):
-    """Prints the number of jobs per project (account) per user."""
-    _run_jobs_per_entity_report(ctx, group_by, "account",
-                                ("Period", "Account", "User", "Job Count"))
+def jobs_per_project(ctx, group_by, verbose):
+    """Prints the number of jobs per project (account)."""
+    _run_jobs_per_entity_report(ctx, group_by, "account", verbose)
 
 @history.command("unique-projects")
 @click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), help="Group results by day, month, quarter, or year (overrides history setting).")
