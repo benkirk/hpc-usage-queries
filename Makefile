@@ -96,7 +96,7 @@ dry-run-all:
 	conda env create --file $< --prefix $@
 	conda activate ./$@
 	conda list
-	pip install -e ".[dev]"
+	pip install -e ".[analysis]"
 	pipdeptree --all 2>/dev/null || true
 
 solve-%: %.yaml
