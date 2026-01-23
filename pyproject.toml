@@ -27,6 +27,8 @@ analysis = [
 [project.scripts]
 qhist-sync = "scripts.sync_jobs:main"
 qhist-report = "qhist_db.cli:cli"
+fs-scan-to-db = "fs_scans.scan_to_db:main"
+query-fs-scan-db = "fs_scans.query_db:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

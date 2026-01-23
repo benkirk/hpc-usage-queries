@@ -4,11 +4,11 @@ Tools for parsing GPFS policy scan log files and computing **directory-level met
 
 ## Tools
 
-| Tool | Purpose |
-|------|---------|
-| `parse_gpfs_scan.py` | Streaming parser - quick analysis, no persistence |
-| `scan_to_db.py` | Database importer - SQLite storage for complex queries |
-| `query_db.py` | Query interface for the SQLite database |
+| Tool | CLI Command | Purpose |
+|------|-------------|---------|
+| `parse_gpfs_scan.py` | - | Streaming parser - quick analysis, no persistence |
+| `scan_to_db.py` | `fs-scan-to-db` | Database importer - SQLite storage for complex queries |
+| `query_db.py` | `query-fs-scan-db` | Query interface for the SQLite database |
 
 ## Overview
 
@@ -24,11 +24,14 @@ Additionally, it tracks **single-owner directories** - directories where all rec
 
 ## Installation
 
-Requires Python 3.10+ with `click` and `rich`. From the project root:
+Requires Python 3.10+ with `click`, `rich`, and `sqlalchemy`. From the project root:
 
 ```bash
 source etc/config_env.sh
+pip install -e .
 ```
+
+This installs the CLI commands `fs-scan-to-db` and `query-fs-scan-db`.
 
 ## Usage
 
@@ -135,7 +138,7 @@ For persistent storage and complex queries, use the database importer to load sc
 ### Usage
 
 ```bash
-python -m fs_scans.scan_to_db <input_file> [options]
+fs-scan-to-db <input_file> [options]
 ```
 
 ### Options
@@ -154,16 +157,16 @@ python -m fs_scans.scan_to_db <input_file> [options]
 
 ```bash
 # Import a scan file (database auto-created as fs_scans/asp.db)
-python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log
+fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log
 
-# Import compressed file with custom database path
-python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log --db /tmp/asp.db
+# Import with custom database path
+fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --db /tmp/asp.db
 
 # Replace existing data
-python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log --replace
+fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --replace
 
 # Use parallel workers for faster parsing (best with uncompressed files)
-python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log --workers 4
+fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --workers 4
 ```
 
 ### Two-Pass Algorithm
@@ -222,3 +225,49 @@ The importer creates two tables:
 - `total_size_nr` / `total_size_r` - Non-recursive / recursive sizes
 - `max_atime_nr` / `max_atime_r` - Non-recursive / recursive max access times
 - `owner_uid` - Single owner UID (NULL if multiple owners)
+
+---
+
+## Database Query Tool (query_db.py)
+
+Query directory statistics from the SQLite database with filtering and sorting options.
+
+### Usage
+
+```bash
+query-fs-scan-db <filesystem> [options]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-d, --min-depth N` | Filter by minimum path depth |
+| `--max-depth N` | Filter by maximum path depth |
+| `-s, --single-owner` | Only show single-owner directories |
+| `-u, --owner-id UID` | Filter to specific owner UID |
+| `-P, --path-prefix PATH` | Filter to paths starting with prefix |
+| `-n, --limit N` | Limit results (default: 50, 0 for unlimited) |
+| `--sort-by FIELD` | Sort by: `size_r`, `size_nr`, `files_r`, `files_nr`, `atime_r`, `path`, `depth` |
+| `-o, --output FILE` | Write TSV output to file |
+| `--non-recursive` | Show non-recursive stats instead of recursive |
+| `--summary` | Show database summary only |
+
+### Examples
+
+```bash
+# Show top 50 directories by recursive size
+query-fs-scan-db asp
+
+# Filter to a specific path prefix
+query-fs-scan-db asp --path-prefix /gpfs/csfs1/asp/username
+
+# Show only single-owner directories at depth 4+
+query-fs-scan-db asp -d 4 --single-owner
+
+# Export all directories to TSV
+query-fs-scan-db asp --limit 0 -o asp_dirs.tsv
+
+# Show database summary
+query-fs-scan-db asp --summary
+```
