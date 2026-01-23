@@ -497,12 +497,17 @@ def accumulate_file_stats_nr(
 
 def flush_nr_updates(session, pending_updates: dict) -> None:
     """
-    Apply accumulated non-recursive deltas to database.
+    Apply accumulated non-recursive deltas to database using bulk execution.
 
     Args:
         session: SQLAlchemy session
         pending_updates: Dictionary of dir_id -> update data (nr_* fields only)
     """
+    if not pending_updates:
+        return
+
+    # Prepare batch parameters
+    params_batch = []
     for dir_id, upd in pending_updates.items():
         # Determine owner_uid: single uid or NULL for multiple
         first_uid = upd["first_uid"]
@@ -513,34 +518,39 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
         else:
             owner_val = first_uid
 
-        session.execute(
-            text("""
-                UPDATE directory_stats SET
-                    file_count_nr = file_count_nr + :nr_count,
-                    total_size_nr = total_size_nr + :nr_size,
-                    max_atime_nr = CASE
-                        WHEN max_atime_nr IS NULL THEN :nr_atime
-                        WHEN :nr_atime IS NULL THEN max_atime_nr
-                        WHEN :nr_atime > max_atime_nr THEN :nr_atime
-                        ELSE max_atime_nr
-                    END,
-                    owner_uid = CASE
-                        WHEN owner_uid = -1 THEN :owner
-                        WHEN :owner IS NULL THEN NULL
-                        WHEN owner_uid IS NULL THEN NULL
-                        WHEN owner_uid != :owner THEN NULL
-                        ELSE owner_uid
-                    END
-                WHERE dir_id = :dir_id
-            """),
+        params_batch.append(
             {
                 "dir_id": dir_id,
                 "nr_count": upd["nr_count"],
                 "nr_size": upd["nr_size"],
                 "nr_atime": upd["nr_atime"],
                 "owner": owner_val,
-            },
+            }
         )
+
+    # Execute bulk update
+    session.execute(
+        text("""
+            UPDATE directory_stats SET
+                file_count_nr = file_count_nr + :nr_count,
+                total_size_nr = total_size_nr + :nr_size,
+                max_atime_nr = CASE
+                    WHEN max_atime_nr IS NULL THEN :nr_atime
+                    WHEN :nr_atime IS NULL THEN max_atime_nr
+                    WHEN :nr_atime > max_atime_nr THEN :nr_atime
+                    ELSE max_atime_nr
+                END,
+                owner_uid = CASE
+                    WHEN owner_uid = -1 THEN :owner
+                    WHEN :owner IS NULL THEN NULL
+                    WHEN owner_uid IS NULL THEN NULL
+                    WHEN owner_uid != :owner THEN NULL
+                    ELSE owner_uid
+                END
+            WHERE dir_id = :dir_id
+        """),
+        params_batch,
+    )
 
     session.commit()
 
@@ -882,7 +892,7 @@ def worker_parse_lines(
 @click.option(
     "--batch-size",
     type=int,
-    default=10000,
+    default=50000,
     show_default=True,
     help="Batch size for DB updates",
 )
