@@ -570,9 +570,11 @@ def pass2a_nonrecursive_stats(
         num_workers: Number of worker processes (1 = single-threaded)
     """
     if num_workers > 1:
-        console.print(f"\n[bold]Pass 2a:[/bold] Accumulating non-recursive stats (parallel, {num_workers} workers)...")
+        console.print(f"\n[bold]Pass 2:[/bold] Accumulating statistics (parallel, {num_workers} workers)...")
     else:
-        console.print("\n[bold]Pass 2a:[/bold] Accumulating non-recursive stats...")
+        console.print("\n[bold]Pass 2:[/bold] Accumulating statistics...")
+
+    console.print("  [bold]Phase 2a:[/bold] Accumulating non-recursive stats...")
 
     pending_updates = defaultdict(make_empty_update)
     line_count = 0
@@ -726,7 +728,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
     Args:
         session: SQLAlchemy session
     """
-    console.print("\n[bold]Pass 2b:[/bold] Computing recursive statistics...")
+    console.print("  [bold]Phase 2b:[/bold] Computing recursive statistics...")
 
     # Get max depth
     max_depth = session.execute(text("SELECT MAX(depth) FROM directories")).scalar() or 0
@@ -957,6 +959,7 @@ def main(
     console.print(f"Database: {engine.url}")
     console.print()
 
+    overall_start = time.time()
     try:
         # Pass 1: Discover directories
         path_to_id, metadata = pass1_discover_directories(
@@ -977,7 +980,22 @@ def main(
         # Pass 2b: Compute recursive stats via bottom-up aggregation
         pass2b_aggregate_recursive_stats(session)
 
-        console.print("\n[green bold]Import complete![/green bold]")
+        overall_duration = time.time() - overall_start
+        
+        # Get DB file size
+        db_file = Path(f"fs_scans/{filesystem}.db")
+        size_str = "unknown"
+        if db_file.exists():
+            size_bytes = db_file.stat().st_size
+            for unit in ["B", "KB", "MB", "GB", "TB"]:
+                if size_bytes < 1024:
+                    size_str = f"{size_bytes:.2f} {unit}"
+                    break
+                size_bytes /= 1024
+
+        console.print(f"\n[green bold]Import complete![/green bold]")
+        console.print(f"[bold]Total runtime:[/bold] {overall_duration:.2f} seconds")
+        console.print(f"[bold]Database size:[/bold] {size_str}")
 
     except Exception as e:
         console.print(f"\n[red]Error during import: {e}[/red]")
