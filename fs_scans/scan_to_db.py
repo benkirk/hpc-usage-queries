@@ -38,7 +38,7 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from sqlalchemy import text
+from sqlalchemy import insert, select, text
 
 from .database import (
     drop_tables,
@@ -339,9 +339,17 @@ def pass1_discover_directories(
     console.print(f"    Inferred ~{estimated_files:,} files")
 
     # Phase 1b: Read from staging ordered by depth, insert to directories table
-    # (Must be sequential due to parent-child ordering)
-    console.print("  [bold]Phase 1b:[/bold] Inserting into database...")
+    # Optimized: Process level-by-level using bulk inserts
+    console.print("  [bold]Phase 1b:[/bold] Inserting into database (bulk optimized)...")
     path_to_id = {}
+
+    # Get distinct depths to process level-by-level
+    depths = [
+        r[0]
+        for r in session.execute(
+            text("SELECT DISTINCT depth FROM staging_dirs ORDER BY depth")
+        )
+    ]
 
     with create_progress_bar(show_rate=False) as progress:
         task = progress.add_task(
@@ -349,36 +357,73 @@ def pass1_discover_directories(
             total=dir_count,
         )
 
-        batch_size = 1000
-        batch_count = 0
+        insert_batch_size = 10000
 
-        # Stream from staging table ordered by depth
-        cursor = session.execute(
-            text("SELECT inode, fileset_id, depth, path FROM staging_dirs ORDER BY depth")
-        )
+        for depth in depths:
+            # Fetch paths for this depth
+            paths = [
+                r[0]
+                for r in session.execute(
+                    text("SELECT path FROM staging_dirs WHERE depth = :d"), {"d": depth}
+                )
+            ]
 
-        for row in cursor:
-            inode, fileset_id, depth, path = row
-            parent_path = os.path.dirname(path)
-            parent_id = path_to_id.get(parent_path)  # None for top-level
+            if not paths:
+                continue
 
-            entry = Directory(
-                parent_id=parent_id,
-                name=os.path.basename(path),
-                depth=depth,
-            )
-            session.add(entry)
-            session.flush()
-            path_to_id[path] = entry.dir_id
-            session.add(DirectoryStats(dir_id=entry.dir_id))
+            # 1. Prepare and Bulk Insert Directories
+            dir_inserts = []
+            for p in paths:
+                parent_path = os.path.dirname(p)
+                parent_id = path_to_id.get(parent_path)
+                dir_inserts.append(
+                    {
+                        "parent_id": parent_id,
+                        "name": os.path.basename(p),
+                        "depth": depth,
+                    }
+                )
 
-            batch_count += 1
-            if batch_count % batch_size == 0:
+            for i in range(0, len(dir_inserts), insert_batch_size):
+                session.execute(insert(Directory), dir_inserts[i : i + insert_batch_size])
+            session.commit()
+
+            # 2. Retrieve assigned IDs and update map
+            # Fetch (parent_id, name) -> dir_id for the current depth
+            rows = session.execute(
+                select(Directory.dir_id, Directory.parent_id, Directory.name).where(
+                    Directory.depth == depth
+                )
+            ).all()
+
+            # Create a lookup for matching (parent_id, name) -> dir_id
+            # Note: parent_id can be None for root directories
+            lookup = {(r.parent_id, r.name): r.dir_id for r in rows}
+
+            # Update path_to_id and prepare stats
+            stats_inserts = []
+            for p in paths:
+                parent_path = os.path.dirname(p)
+                parent_id = path_to_id.get(parent_path)
+                name = os.path.basename(p)
+
+                dir_id = lookup.get((parent_id, name))
+                if dir_id:
+                    path_to_id[p] = dir_id
+                    stats_inserts.append({"dir_id": dir_id})
+                else:
+                    # Should not happen given database consistency
+                    console.print(f"[red]Warning: Could not find ID for {p}[/red]")
+
+            # 3. Bulk Insert Stats
+            if stats_inserts:
+                for i in range(0, len(stats_inserts), insert_batch_size):
+                    session.execute(
+                        insert(DirectoryStats), stats_inserts[i : i + insert_batch_size]
+                    )
                 session.commit()
-                progress.update(task, advance=batch_size)
 
-        session.commit()
-        progress.update(task, completed=dir_count)
+            progress.update(task, advance=len(paths))
 
     console.print(f"    Inserted {len(path_to_id):,} directories")
 
