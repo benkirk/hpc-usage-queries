@@ -148,6 +148,7 @@ python -m fs_scans.scan_to_db <input_file> [options]
 | `--batch-size N` | Batch size for DB updates (default: 10000) |
 | `-p, --progress-interval N` | Progress reporting interval (default: 1M lines) |
 | `--replace` | Drop and recreate tables before import |
+| `-w, --workers N` | Number of worker processes for parsing (default: 1) |
 | `--echo` | Echo SQL statements (for debugging) |
 
 ### Examples
@@ -161,6 +162,9 @@ python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log.xz -
 
 # Replace existing data
 python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log --replace
+
+# Use parallel workers for faster parsing (best with uncompressed files)
+python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log --workers 4
 ```
 
 ### Two-Pass Algorithm
@@ -173,21 +177,34 @@ The importer uses a two-pass algorithm:
 
 ### Pass 1 Implementation
 
-Since GPFS scan files explicitly list all directories as separate lines, Pass 1 uses a simple two-phase approach:
+Since GPFS scan files explicitly list all directories as separate lines, Pass 1 uses a memory-optimized two-phase approach with SQLite staging:
 
 | Phase | Operation | Data Structures |
 |-------|-----------|-----------------|
-| 1a | Scan file | `dir_entries` list of (path, depth) tuples |
-| 1b | Insert to DB | `dir_entries` + `path_to_id` dict (growing) |
+| 1a | Stream to staging | SQLite `staging_dirs` table (batch inserts) |
+| 1b | Insert to DB | Read from staging ORDER BY depth, build `path_to_id` |
 
 **How it works:**
 
-1. **Phase 1a** - Scans the file and collects all directory lines as `(path, depth)` tuples
-2. **Phase 1b** - Sorts by depth (ensuring parents exist before children), inserts into database, and builds `path_to_id` directly
+1. **Phase 1a** - Streams directories to a temporary SQLite staging table with batch inserts (10K rows per batch). Extracts inode and fileset_id for unique identification.
+2. **Phase 1b** - Reads from staging table ordered by depth (ensuring parents exist before children), inserts into directories table, and builds `path_to_id` dictionary.
+3. Staging table is dropped after use to reclaim space.
 
-**Memory profile:** ~68 bytes per directory (path string + depth integer + dict entry)
+**Memory optimization:** By using SQLite staging instead of an in-memory list, peak memory is reduced from ~220 bytes/dir to ~120 bytes/dir (only `path_to_id` dict in memory). For 1M directories, this saves ~100MB of peak memory.
+
+**Progress tracking:** Phase 1 reports line count, directory count, and inferred file count. Pass 2 uses the known line count for a determinate progress bar with percentage completion.
 
 No deduplication or parent directory discovery is needed since all directories are explicitly listed in the scan output.
+
+### Parallel Processing
+
+Pass 2 supports optional parallel processing with the `--workers` flag:
+
+- Workers handle CPU-bound regex parsing of log lines
+- Main process handles database writes (SQLite single-writer constraint)
+- Queue-based communication between workers and main process
+
+**Note:** For xz-compressed files, decompression is typically the bottleneck, so parallel workers may not provide significant speedup. Best results are with uncompressed log files.
 
 ### Database Schema
 
