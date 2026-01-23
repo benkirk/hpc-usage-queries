@@ -17,7 +17,6 @@ The GPFS scan file explicitly lists all directories as separate lines,
 so no deduplication or parent directory discovery is needed.
 """
 
-import lzma
 import multiprocessing as mp
 import os
 import re
@@ -60,10 +59,36 @@ LINE_PATTERN = re.compile(
 console = Console()
 
 
+def create_progress_bar(
+    extra_columns: list[TextColumn] | None = None,
+    show_rate: bool = True,
+) -> Progress:
+    """
+    Create a standardized progress bar.
+
+    Args:
+        extra_columns: Additional TextColumn instances to display
+        show_rate: Whether to show items/sec rate column
+
+    Returns:
+        Configured Progress instance
+    """
+    columns = [
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+    ]
+    if extra_columns:
+        columns.extend(extra_columns)
+    if show_rate:
+        columns.append(TextColumn("[magenta]{task.fields[rate]} items/sec"))
+    columns.append(TimeElapsedColumn())
+    return Progress(*columns, console=console)
+
+
 def open_input_file(filepath: Path) -> TextIO:
-    """Open input file, handling xz compression if needed."""
-    if filepath.suffix == ".xz":
-        return lzma.open(filepath, "rt", encoding="utf-8", errors="replace")
+    """Open input file for reading."""
     return open(filepath, "r", encoding="utf-8", errors="replace")
 
 
@@ -119,25 +144,30 @@ def pass1_discover_directories(
     input_file: Path,
     session,
     progress_interval: int = 1_000_000,
+    num_workers: int = 1,
 ) -> tuple[dict[str, int], dict]:
     """
     First pass: identify all directories and build hierarchy.
 
     Uses SQLite staging table to avoid holding all directories in memory:
-    Phase 1a: Stream directories to SQLite staging table
+    Phase 1a: Stream directories to SQLite staging table (parallelizable)
     Phase 1b: SELECT from staging ORDER BY depth, insert to directories table
 
     Args:
         input_file: Path to the log file
         session: SQLAlchemy session
         progress_interval: Report progress every N lines
+        num_workers: Number of worker processes for parsing (Phase 1a only)
 
     Returns:
         Tuple of:
         - Dictionary mapping full paths to dir_id
         - Metadata dict with total_lines, dir_count, inferred file_count
     """
-    console.print("[bold]Pass 1:[/bold] Discovering directories...")
+    if num_workers > 1:
+        console.print(f"[bold]Pass 1:[/bold] Discovering directories (parallel, {num_workers} workers)...")
+    else:
+        console.print("[bold]Pass 1:[/bold] Discovering directories...")
 
     # Create staging table
     session.execute(
@@ -161,19 +191,12 @@ def pass1_discover_directories(
     line_count = 0
     dir_count = 0
     BATCH_SIZE = 10000
+    CHUNK_SIZE = 5000
     batch = []
-
     start_time = time.time()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("[cyan]{task.fields[dirs]} directories"),
-        TextColumn("[magenta]{task.fields[rate]} items/sec"),
-        TimeElapsedColumn(),
-        console=console,
+    with create_progress_bar(
+        extra_columns=[TextColumn("[cyan]{task.fields[dirs]} directories")]
     ) as progress:
         task = progress.add_task(
             f"[green]Scanning {input_file.name}...",
@@ -187,14 +210,10 @@ def pass1_discover_directories(
             rate = int(line_count / elapsed) if elapsed > 0 else 0
             progress.update(task, dirs=f"{dir_count:,}", rate=f"{rate:,}")
 
-        with open_input_file(input_file) as f:
-            for line in f:
-                line_count += 1
-
-                parsed = parse_line(line.rstrip("\n"))
-                if not parsed or not parsed["is_dir"]:
-                    continue
-
+        def process_parsed_dirs(parsed_list):
+            """Process a list of parsed directory entries."""
+            nonlocal dir_count
+            for parsed in parsed_list:
                 path = parsed["path"]
                 batch.append(
                     {
@@ -206,55 +225,125 @@ def pass1_discover_directories(
                 )
                 dir_count += 1
 
-                if len(batch) >= BATCH_SIZE:
-                    session.execute(
-                        text("""
-                        INSERT OR IGNORE INTO staging_dirs (inode, fileset_id, depth, path)
-                        VALUES (:inode, :fileset_id, :depth, :path)
-                    """),
-                        batch,
-                    )
-                    session.commit()
-                    batch.clear()
-                    update_progress()
+        def flush_batch():
+            """Flush batch to staging table."""
+            if batch:
+                session.execute(
+                    text("""
+                    INSERT OR IGNORE INTO staging_dirs (inode, fileset_id, depth, path)
+                    VALUES (:inode, :fileset_id, :depth, :path)
+                """),
+                    batch,
+                )
+                session.commit()
+                batch.clear()
 
-                if line_count % progress_interval == 0:
-                    update_progress()
+        if num_workers > 1:
+            # Parallel Phase 1a
+            input_queue = mp.Queue(maxsize=num_workers * 2)
+            output_queue = mp.Queue()
 
-        # Flush remaining batch
-        if batch:
-            session.execute(
-                text("""
-                INSERT OR IGNORE INTO staging_dirs (inode, fileset_id, depth, path)
-                VALUES (:inode, :fileset_id, :depth, :path)
-            """),
-                batch,
-            )
-            session.commit()
-            batch.clear()
+            workers = [
+                mp.Process(
+                    target=worker_parse_lines,
+                    args=(input_queue, output_queue, "dirs"),
+                )
+                for _ in range(num_workers)
+            ]
+            for w in workers:
+                w.start()
 
+            chunks_sent = 0
+            chunks_received = 0
+            chunk = []
+
+            with open_input_file(input_file) as f:
+                for line in f:
+                    line_count += 1
+                    chunk.append(line)
+
+                    if len(chunk) >= CHUNK_SIZE:
+                        input_queue.put(chunk)
+                        chunks_sent += 1
+                        chunk = []
+
+                        # Process available results (non-blocking)
+                        while True:
+                            try:
+                                results = output_queue.get_nowait()
+                                chunks_received += 1
+                                process_parsed_dirs(results)
+
+                                if len(batch) >= BATCH_SIZE:
+                                    flush_batch()
+                                    update_progress()
+                            except Empty:
+                                break
+
+                    if line_count % progress_interval == 0:
+                        update_progress()
+
+                # Send remaining chunk
+                if chunk:
+                    input_queue.put(chunk)
+                    chunks_sent += 1
+
+            # Send sentinel to workers
+            for _ in range(num_workers):
+                input_queue.put(None)
+
+            # Wait for remaining results
+            while chunks_received < chunks_sent:
+                try:
+                    results = output_queue.get(timeout=5)
+                    chunks_received += 1
+                    process_parsed_dirs(results)
+
+                    if len(batch) >= BATCH_SIZE:
+                        flush_batch()
+                except Empty:
+                    continue
+
+            # Wait for workers to finish
+            for w in workers:
+                w.join()
+
+        else:
+            # Single-threaded Phase 1a
+            with open_input_file(input_file) as f:
+                for line in f:
+                    line_count += 1
+
+                    parsed = parse_line(line.rstrip("\n"))
+                    if not parsed or not parsed["is_dir"]:
+                        continue
+
+                    process_parsed_dirs([parsed])
+
+                    if len(batch) >= BATCH_SIZE:
+                        flush_batch()
+                        update_progress()
+
+                    if line_count % progress_interval == 0:
+                        update_progress()
+
+        # Final flush
+        flush_batch()
         update_progress()
 
     console.print(f"    Lines scanned: {line_count:,}")
     console.print(f"    Found {dir_count:,} directories")
 
     # Estimate file count (excluding headers and directories)
-    # Headers are typically < 50 lines
     estimated_files = max(0, line_count - dir_count - 50)
     console.print(f"    Inferred ~{estimated_files:,} files")
 
     # Phase 1b: Read from staging ordered by depth, insert to directories table
+    # (Must be sequential due to parent-child ordering)
     console.print("  [bold]Phase 1b:[/bold] Inserting into database...")
     path_to_id = {}
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
+    with create_progress_bar(show_rate=False) as progress:
         task = progress.add_task(
             "[green]Inserting directories...",
             total=dir_count,
@@ -305,6 +394,67 @@ def pass1_discover_directories(
     }
 
     return path_to_id, metadata
+
+
+def make_empty_update() -> dict:
+    """Create an empty update dictionary for stats accumulation."""
+    return {
+        "nr_count": 0,
+        "nr_size": 0,
+        "nr_atime": None,
+        "r_count": 0,
+        "r_size": 0,
+        "r_atime": None,
+        "uids": set(),
+    }
+
+
+def accumulate_file_stats(
+    parsed: dict,
+    path_to_id: dict[str, int],
+    pending_updates: dict,
+) -> bool:
+    """
+    Accumulate stats for a single file into pending_updates.
+
+    Args:
+        parsed: Parsed file entry dict
+        path_to_id: Directory path to ID mapping
+        pending_updates: Accumulator dictionary (modified in place)
+
+    Returns:
+        True if file was processed, False if parent not found
+    """
+    parent = os.path.dirname(parsed["path"])
+    parent_id = path_to_id.get(parent)
+    if not parent_id:
+        return False
+
+    size = parsed["size"]
+    atime = parsed["atime"]
+    user_id = parsed["user_id"]
+
+    # Non-recursive: direct parent only
+    upd = pending_updates[parent_id]
+    upd["nr_count"] += 1
+    upd["nr_size"] += size
+    if atime:
+        upd["nr_atime"] = max(upd["nr_atime"], atime) if upd["nr_atime"] else atime
+
+    # Recursive: all ancestors
+    current = parent
+    while current and current != "/":
+        dir_id = path_to_id.get(current)
+        if dir_id:
+            upd = pending_updates[dir_id]
+            upd["r_count"] += 1
+            upd["r_size"] += size
+            if atime:
+                upd["r_atime"] = max(upd["r_atime"], atime) if upd["r_atime"] else atime
+            upd["uids"].add(user_id)
+        current = os.path.dirname(current)
+
+    return True
 
 
 def flush_updates(session, pending_updates: dict) -> None:
@@ -374,9 +524,12 @@ def pass2_accumulate_stats(
     batch_size: int = 10000,
     progress_interval: int = 1_000_000,
     total_lines: int | None = None,
+    num_workers: int = 1,
 ) -> None:
     """
     Second pass: accumulate file statistics into directory_stats.
+
+    Supports both single-threaded and parallel processing modes.
 
     Args:
         input_file: Path to the log file
@@ -385,109 +538,33 @@ def pass2_accumulate_stats(
         batch_size: Number of directories to accumulate before flushing
         progress_interval: Report progress every N lines
         total_lines: Total line count from Phase 1 (for determinate progress bar)
+        num_workers: Number of worker processes (1 = single-threaded)
     """
-    console.print("\n[bold]Pass 2:[/bold] Accumulating statistics...")
+    if num_workers > 1:
+        console.print(f"\n[bold]Pass 2:[/bold] Accumulating statistics (parallel, {num_workers} workers)...")
+    else:
+        console.print("\n[bold]Pass 2:[/bold] Accumulating statistics...")
 
-    def make_update():
-        return {
-            "nr_count": 0,
-            "nr_size": 0,
-            "nr_atime": None,
-            "r_count": 0,
-            "r_size": 0,
-            "r_atime": None,
-            "uids": set(),
-        }
-
-    pending_updates = defaultdict(make_update)
+    pending_updates = defaultdict(make_empty_update)
     line_count = 0
     file_count = 0
     flush_count = 0
     start_time = time.time()
+    CHUNK_SIZE = 5000
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("[cyan]{task.fields[files]} files"),
-        TextColumn("[yellow]{task.fields[flushes]} flushes"),
-        TextColumn("[magenta]{task.fields[rate]} items/sec"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task(
-            f"[green]Processing {input_file.name}...",
-            total=total_lines,  # Now determinate if total_lines is known
-            files="0",
-            flushes="0",
-            rate="0",
-        )
-
-        with open_input_file(input_file) as f:
-            for line in f:
-                line_count += 1
-
-                parsed = parse_line(line.rstrip("\n"))
-                if not parsed or parsed["is_dir"]:
-                    continue
-
-                file_count += 1
-                parent = os.path.dirname(parsed["path"])
-                parent_id = path_to_id.get(parent)
-                if not parent_id:
-                    continue
-
-                size = parsed["size"]
-                atime = parsed["atime"]
-                user_id = parsed["user_id"]
-
-                # Non-recursive: direct parent only
-                upd = pending_updates[parent_id]
-                upd["nr_count"] += 1
-                upd["nr_size"] += size
-                if atime:
-                    upd["nr_atime"] = (
-                        max(upd["nr_atime"], atime) if upd["nr_atime"] else atime
-                    )
-
-                # Recursive: all ancestors
-                current = parent
-                while current and current != "/":
-                    dir_id = path_to_id.get(current)
-                    if dir_id:
-                        upd = pending_updates[dir_id]
-                        upd["r_count"] += 1
-                        upd["r_size"] += size
-                        if atime:
-                            upd["r_atime"] = (
-                                max(upd["r_atime"], atime) if upd["r_atime"] else atime
-                            )
-                        upd["uids"].add(user_id)
-                    current = os.path.dirname(current)
-
-                # Flush batch periodically
-                if len(pending_updates) >= batch_size:
-                    flush_updates(session, pending_updates)
-                    flush_count += 1
-                    pending_updates.clear()
-
-                if line_count % progress_interval == 0:
-                    elapsed = time.time() - start_time
-                    rate = int(line_count / elapsed) if elapsed > 0 else 0
-                    progress.update(
-                        task,
-                        completed=line_count,
-                        files=f"{file_count:,}",
-                        flushes=f"{flush_count:,}",
-                        rate=f"{rate:,}",
-                    )
-
-        # Final flush
+    def do_flush():
+        nonlocal flush_count
         if pending_updates:
             flush_updates(session, pending_updates)
             flush_count += 1
+            pending_updates.clear()
 
+    def process_parsed_file(parsed):
+        nonlocal file_count
+        file_count += 1
+        accumulate_file_stats(parsed, path_to_id, pending_updates)
+
+    def update_progress_bar(progress, task):
         elapsed = time.time() - start_time
         rate = int(line_count / elapsed) if elapsed > 0 else 0
         progress.update(
@@ -498,17 +575,133 @@ def pass2_accumulate_stats(
             rate=f"{rate:,}",
         )
 
+    with create_progress_bar(
+        extra_columns=[
+            TextColumn("[cyan]{task.fields[files]} files"),
+            TextColumn("[yellow]{task.fields[flushes]} flushes"),
+        ]
+    ) as progress:
+        task = progress.add_task(
+            f"[green]Processing {input_file.name}...",
+            total=total_lines,
+            files="0",
+            flushes="0",
+            rate="0",
+        )
+
+        if num_workers > 1:
+            # Parallel mode
+            input_queue = mp.Queue(maxsize=num_workers * 2)
+            output_queue = mp.Queue()
+
+            workers = [
+                mp.Process(
+                    target=worker_parse_lines,
+                    args=(input_queue, output_queue, "files"),
+                )
+                for _ in range(num_workers)
+            ]
+            for w in workers:
+                w.start()
+
+            chunks_sent = 0
+            chunks_received = 0
+            chunk = []
+
+            with open_input_file(input_file) as f:
+                for line in f:
+                    line_count += 1
+                    chunk.append(line)
+
+                    if len(chunk) >= CHUNK_SIZE:
+                        input_queue.put(chunk)
+                        chunks_sent += 1
+                        chunk = []
+
+                        # Process available results (non-blocking)
+                        while True:
+                            try:
+                                results = output_queue.get_nowait()
+                                chunks_received += 1
+                                for parsed in results:
+                                    process_parsed_file(parsed)
+
+                                if len(pending_updates) >= batch_size:
+                                    do_flush()
+                            except Empty:
+                                break
+
+                    if line_count % progress_interval == 0:
+                        update_progress_bar(progress, task)
+
+                # Send remaining chunk
+                if chunk:
+                    input_queue.put(chunk)
+                    chunks_sent += 1
+
+            # Send sentinel to workers
+            for _ in range(num_workers):
+                input_queue.put(None)
+
+            # Wait for remaining results
+            while chunks_received < chunks_sent:
+                try:
+                    results = output_queue.get(timeout=5)
+                    chunks_received += 1
+                    for parsed in results:
+                        process_parsed_file(parsed)
+
+                    if len(pending_updates) >= batch_size:
+                        do_flush()
+                except Empty:
+                    continue
+
+            # Wait for workers to finish
+            for w in workers:
+                w.join()
+
+        else:
+            # Single-threaded mode
+            with open_input_file(input_file) as f:
+                for line in f:
+                    line_count += 1
+
+                    parsed = parse_line(line.rstrip("\n"))
+                    if not parsed or parsed["is_dir"]:
+                        continue
+
+                    process_parsed_file(parsed)
+
+                    if len(pending_updates) >= batch_size:
+                        do_flush()
+
+                    if line_count % progress_interval == 0:
+                        update_progress_bar(progress, task)
+
+        # Final flush
+        do_flush()
+        update_progress_bar(progress, task)
+
     console.print(f"  Lines processed: {line_count:,}")
     console.print(f"  Files counted: {file_count:,}")
     console.print(f"  Database flushes: {flush_count:,}")
 
 
-def worker_parse_lines(input_queue: mp.Queue, output_queue: mp.Queue) -> None:
+def worker_parse_lines(
+    input_queue: mp.Queue,
+    output_queue: mp.Queue,
+    filter_type: str = "files",
+) -> None:
     """
     Worker process: parse lines from input queue.
 
     Reads chunks of lines from input_queue, parses them, and sends results
     to output_queue. Exits when it receives None sentinel.
+
+    Args:
+        input_queue: Queue to receive line chunks from
+        output_queue: Queue to send parsed results to
+        filter_type: "files" (default), "dirs", or "all"
     """
     while True:
         try:
@@ -522,249 +715,15 @@ def worker_parse_lines(input_queue: mp.Queue, output_queue: mp.Queue) -> None:
         results = []
         for line in chunk:
             parsed = parse_line(line.rstrip("\n"))
-            if parsed and not parsed["is_dir"]:  # Only files
-                results.append(parsed)
+            if parsed:
+                if filter_type == "all":
+                    results.append(parsed)
+                elif filter_type == "dirs" and parsed["is_dir"]:
+                    results.append(parsed)
+                elif filter_type == "files" and not parsed["is_dir"]:
+                    results.append(parsed)
 
         output_queue.put(results)
-
-
-def pass2_accumulate_stats_parallel(
-    input_file: Path,
-    session,
-    path_to_id: dict[str, int],
-    batch_size: int = 10000,
-    progress_interval: int = 1_000_000,
-    total_lines: int | None = None,
-    num_workers: int = 1,
-) -> None:
-    """
-    Second pass with parallel parsing: accumulate file statistics into directory_stats.
-
-    Uses multiprocessing to parallelize line parsing (CPU-bound regex work).
-    Main process handles DB writes (SQLite single-writer constraint).
-
-    Args:
-        input_file: Path to the log file
-        session: SQLAlchemy session
-        path_to_id: Dictionary mapping full paths to dir_id
-        batch_size: Number of directories to accumulate before flushing
-        progress_interval: Report progress every N lines
-        total_lines: Total line count from Phase 1 (for determinate progress bar)
-        num_workers: Number of worker processes for parsing
-    """
-    if num_workers <= 1:
-        # Fall back to single-threaded implementation
-        return pass2_accumulate_stats(
-            input_file, session, path_to_id, batch_size, progress_interval, total_lines
-        )
-
-    console.print(f"\n[bold]Pass 2:[/bold] Accumulating statistics (parallel, {num_workers} workers)...")
-
-    if input_file.suffix == ".xz":
-        console.print("  [yellow]Note: xz decompression may bottleneck parallel parsing[/yellow]")
-
-    def make_update():
-        return {
-            "nr_count": 0,
-            "nr_size": 0,
-            "nr_atime": None,
-            "r_count": 0,
-            "r_size": 0,
-            "r_atime": None,
-            "uids": set(),
-        }
-
-    pending_updates = defaultdict(make_update)
-    line_count = 0
-    file_count = 0
-    flush_count = 0
-    start_time = time.time()
-
-    # Set up queues and workers
-    CHUNK_SIZE = 5000  # Lines per chunk sent to workers
-    input_queue = mp.Queue(maxsize=num_workers * 2)
-    output_queue = mp.Queue()
-
-    workers = [
-        mp.Process(target=worker_parse_lines, args=(input_queue, output_queue))
-        for _ in range(num_workers)
-    ]
-    for w in workers:
-        w.start()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("[cyan]{task.fields[files]} files"),
-        TextColumn("[yellow]{task.fields[flushes]} flushes"),
-        TextColumn("[magenta]{task.fields[rate]} items/sec"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task(
-            f"[green]Processing {input_file.name}...",
-            total=total_lines,
-            files="0",
-            flushes="0",
-            rate="0",
-        )
-
-        # Producer: read file and send chunks to workers
-        chunks_sent = 0
-        chunks_received = 0
-        chunk = []
-
-        with open_input_file(input_file) as f:
-            for line in f:
-                line_count += 1
-                chunk.append(line)
-
-                if len(chunk) >= CHUNK_SIZE:
-                    input_queue.put(chunk)
-                    chunks_sent += 1
-                    chunk = []
-
-                    # Process any available results (non-blocking)
-                    while True:
-                        try:
-                            results = output_queue.get_nowait()
-                            chunks_received += 1
-
-                            for parsed in results:
-                                file_count += 1
-                                parent = os.path.dirname(parsed["path"])
-                                parent_id = path_to_id.get(parent)
-                                if not parent_id:
-                                    continue
-
-                                size = parsed["size"]
-                                atime = parsed["atime"]
-                                user_id = parsed["user_id"]
-
-                                # Non-recursive: direct parent only
-                                upd = pending_updates[parent_id]
-                                upd["nr_count"] += 1
-                                upd["nr_size"] += size
-                                if atime:
-                                    upd["nr_atime"] = (
-                                        max(upd["nr_atime"], atime) if upd["nr_atime"] else atime
-                                    )
-
-                                # Recursive: all ancestors
-                                current = parent
-                                while current and current != "/":
-                                    dir_id = path_to_id.get(current)
-                                    if dir_id:
-                                        upd = pending_updates[dir_id]
-                                        upd["r_count"] += 1
-                                        upd["r_size"] += size
-                                        if atime:
-                                            upd["r_atime"] = (
-                                                max(upd["r_atime"], atime) if upd["r_atime"] else atime
-                                            )
-                                        upd["uids"].add(user_id)
-                                    current = os.path.dirname(current)
-
-                                # Flush batch periodically
-                                if len(pending_updates) >= batch_size:
-                                    flush_updates(session, pending_updates)
-                                    flush_count += 1
-                                    pending_updates.clear()
-
-                        except Empty:
-                            break
-
-                if line_count % progress_interval == 0:
-                    elapsed = time.time() - start_time
-                    rate = int(line_count / elapsed) if elapsed > 0 else 0
-                    progress.update(
-                        task,
-                        completed=line_count,
-                        files=f"{file_count:,}",
-                        flushes=f"{flush_count:,}",
-                        rate=f"{rate:,}",
-                    )
-
-            # Send remaining chunk
-            if chunk:
-                input_queue.put(chunk)
-                chunks_sent += 1
-
-        # Send sentinel to workers to signal completion
-        for _ in range(num_workers):
-            input_queue.put(None)
-
-        # Wait for all results
-        while chunks_received < chunks_sent:
-            try:
-                results = output_queue.get(timeout=5)
-                chunks_received += 1
-
-                for parsed in results:
-                    file_count += 1
-                    parent = os.path.dirname(parsed["path"])
-                    parent_id = path_to_id.get(parent)
-                    if not parent_id:
-                        continue
-
-                    size = parsed["size"]
-                    atime = parsed["atime"]
-                    user_id = parsed["user_id"]
-
-                    upd = pending_updates[parent_id]
-                    upd["nr_count"] += 1
-                    upd["nr_size"] += size
-                    if atime:
-                        upd["nr_atime"] = (
-                            max(upd["nr_atime"], atime) if upd["nr_atime"] else atime
-                        )
-
-                    current = parent
-                    while current and current != "/":
-                        dir_id = path_to_id.get(current)
-                        if dir_id:
-                            upd = pending_updates[dir_id]
-                            upd["r_count"] += 1
-                            upd["r_size"] += size
-                            if atime:
-                                upd["r_atime"] = (
-                                    max(upd["r_atime"], atime) if upd["r_atime"] else atime
-                                )
-                            upd["uids"].add(user_id)
-                        current = os.path.dirname(current)
-
-                    if len(pending_updates) >= batch_size:
-                        flush_updates(session, pending_updates)
-                        flush_count += 1
-                        pending_updates.clear()
-
-            except Empty:
-                continue
-
-        # Wait for workers to finish
-        for w in workers:
-            w.join()
-
-        # Final flush
-        if pending_updates:
-            flush_updates(session, pending_updates)
-            flush_count += 1
-
-        elapsed = time.time() - start_time
-        rate = int(line_count / elapsed) if elapsed > 0 else 0
-        progress.update(
-            task,
-            completed=line_count,
-            files=f"{file_count:,}",
-            flushes=f"{flush_count:,}",
-            rate=f"{rate:,}",
-        )
-
-    console.print(f"  Lines processed: {line_count:,}")
-    console.print(f"  Files counted: {file_count:,}")
-    console.print(f"  Database flushes: {flush_count:,}")
 
 
 @click.command()
@@ -831,8 +790,6 @@ def main(
       1. First pass discovers all directories and builds the hierarchy
       2. Second pass accumulates file statistics
 
-    INPUT_FILE can be a plain text log file or an xz-compressed file (.xz).
-
     Database is stored in fs_scans/<filesystem>.db by default.
     """
     console.print("[bold]GPFS Scan Database Importer[/bold]")
@@ -865,11 +822,11 @@ def main(
     try:
         # Pass 1: Discover directories
         path_to_id, metadata = pass1_discover_directories(
-            input_file, session, progress_interval
+            input_file, session, progress_interval, num_workers=workers
         )
 
         # Pass 2: Accumulate statistics (with known total for progress bar)
-        pass2_accumulate_stats_parallel(
+        pass2_accumulate_stats(
             input_file,
             session,
             path_to_id,

@@ -39,7 +39,6 @@ python fs_scans/parse_gpfs_scan.py <input_file> [options]
 ### Input Files
 
 - Plain text log files (`.log`)
-- XZ-compressed files (`.log.xz`) - automatically detected
 
 ### Options
 
@@ -66,8 +65,8 @@ python fs_scans/parse_gpfs_scan.py fs_scans/20260111_csfs1_asp.list.list_all.log
 python fs_scans/parse_gpfs_scan.py fs_scans/20260111_csfs1_asp.list.list_all.log \
     --owner-id 12345 --min-depth 4
 
-# Process compressed file, sort by file count
-python fs_scans/parse_gpfs_scan.py fs_scans/20260111_csfs1_asp.list.list_all.log.xz \
+# Sort by file count, limit results
+python fs_scans/parse_gpfs_scan.py fs_scans/20260111_csfs1_asp.list.list_all.log \
     --sort-by files_recursive --max-results 100
 ```
 
@@ -125,7 +124,7 @@ directory  file_count  total_size  max_atime  file_count_recursive  total_size_r
 | eol | 6 GB | ~20M |
 | hao | 40 GB | ~100M+ |
 
-XZ-compressed versions are also available (roughly 10x smaller).
+Data files should be decompressed before processing.
 
 ---
 
@@ -158,7 +157,7 @@ python -m fs_scans.scan_to_db <input_file> [options]
 python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log
 
 # Import compressed file with custom database path
-python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log.xz --db /tmp/asp.db
+python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log --db /tmp/asp.db
 
 # Replace existing data
 python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log --replace
@@ -198,13 +197,14 @@ No deduplication or parent directory discovery is needed since all directories a
 
 ### Parallel Processing
 
-Pass 2 supports optional parallel processing with the `--workers` flag:
+Both Phase 1a (directory discovery) and Pass 2 (stats accumulation) support parallel processing with the `--workers` flag:
 
 - Workers handle CPU-bound regex parsing of log lines
-- Main process handles database writes (SQLite single-writer constraint)
+- Main process handles file I/O and database writes (SQLite single-writer constraint)
 - Queue-based communication between workers and main process
+- Phase 1b remains sequential (parent-child ordering requirement)
 
-**Note:** For xz-compressed files, decompression is typically the bottleneck, so parallel workers may not provide significant speedup. Best results are with uncompressed log files.
+**Note:** Parallel workers are most effective when the input file is stored on fast local storage.
 
 ### Database Schema
 
