@@ -169,13 +169,17 @@ fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --replace
 fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --workers 4
 ```
 
-### Two-Pass Algorithm
+### Multi-Pass Algorithm
 
-The importer uses a two-pass algorithm:
+The importer uses a multi-pass algorithm optimized for large filesystems:
 
 **Pass 1: Directory Discovery** - Identifies all directories and builds a normalized hierarchy in the database.
 
-**Pass 2: Statistics Accumulation** - Re-scans the file to accumulate file statistics into each directory.
+**Pass 2a: Non-Recursive Stats** - Re-scans the file to accumulate statistics for each file's direct parent directory only.
+
+**Pass 2b: Recursive Aggregation** - Bottom-up SQL aggregation computes recursive stats from non-recursive stats, processing directories from deepest to shallowest.
+
+This approach is significantly faster than computing recursive stats during file scanning. Instead of walking up all ancestors for every file (O(files × depth)), Pass 2a processes each file once (O(files)), and Pass 2b aggregates in SQL (O(directories × depth_levels)).
 
 ### Pass 1 Implementation
 

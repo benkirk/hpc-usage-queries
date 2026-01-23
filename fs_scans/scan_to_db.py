@@ -2,16 +2,16 @@
 """
 GPFS Scan Database Importer - Multi-Pass Algorithm
 
-Imports GPFS policy scan log files into a SQLite database using a two-pass
+Imports GPFS policy scan log files into a SQLite database using a multi-pass
 algorithm that normalizes directory paths and accumulates statistics.
 
 Pass 1: Directory Discovery (2 phases)
     Phase 1a: Scan log file, collect directory paths
     Phase 1b: Sort by depth, insert into database, build path_to_id lookup
 
-Pass 2: Statistics Accumulation
-    - Re-scan log file to accumulate file statistics
-    - Batch updates to database for efficiency
+Pass 2: Statistics Accumulation (2 phases)
+    Phase 2a: Re-scan log file, accumulate non-recursive stats only
+    Phase 2b: Bottom-up SQL aggregation to compute recursive stats
 
 The GPFS scan file explicitly lists all directories as separate lines,
 so no deduplication or parent directory discovery is needed.
@@ -397,25 +397,25 @@ def pass1_discover_directories(
 
 
 def make_empty_update() -> dict:
-    """Create an empty update dictionary for stats accumulation."""
+    """Create an empty update dictionary for non-recursive stats accumulation."""
     return {
         "nr_count": 0,
         "nr_size": 0,
         "nr_atime": None,
-        "r_count": 0,
-        "r_size": 0,
-        "r_atime": None,
-        "uids": set(),
+        "first_uid": None,  # None = not set, -999 = multiple owners, else = single UID
     }
 
 
-def accumulate_file_stats(
+def accumulate_file_stats_nr(
     parsed: dict,
     path_to_id: dict[str, int],
     pending_updates: dict,
 ) -> bool:
     """
-    Accumulate stats for a single file into pending_updates.
+    Accumulate non-recursive stats for a single file into pending_updates.
+
+    Only updates the direct parent directory. Recursive stats are computed
+    later via bottom-up SQL aggregation in pass2b_aggregate_recursive_stats().
 
     Args:
         parsed: Parsed file entry dict
@@ -441,38 +441,32 @@ def accumulate_file_stats(
     if atime:
         upd["nr_atime"] = max(upd["nr_atime"], atime) if upd["nr_atime"] else atime
 
-    # Recursive: all ancestors
-    current = parent
-    while current and current != "/":
-        dir_id = path_to_id.get(current)
-        if dir_id:
-            upd = pending_updates[dir_id]
-            upd["r_count"] += 1
-            upd["r_size"] += size
-            if atime:
-                upd["r_atime"] = max(upd["r_atime"], atime) if upd["r_atime"] else atime
-            upd["uids"].add(user_id)
-        current = os.path.dirname(current)
+    # Simplified UID tracking: track first_uid, mark as -999 if multiple
+    if upd["first_uid"] is None:
+        upd["first_uid"] = user_id
+    elif upd["first_uid"] != user_id and upd["first_uid"] != -999:
+        upd["first_uid"] = -999  # Sentinel for "multiple owners"
 
     return True
 
 
-def flush_updates(session, pending_updates: dict) -> None:
+def flush_nr_updates(session, pending_updates: dict) -> None:
     """
-    Apply accumulated deltas to database.
+    Apply accumulated non-recursive deltas to database.
 
     Args:
         session: SQLAlchemy session
-        pending_updates: Dictionary of dir_id -> update data
+        pending_updates: Dictionary of dir_id -> update data (nr_* fields only)
     """
     for dir_id, upd in pending_updates.items():
         # Determine owner_uid: single uid or NULL for multiple
-        if len(upd["uids"]) == 0:
-            owner_val = -1  # No files
-        elif len(upd["uids"]) == 1:
-            owner_val = list(upd["uids"])[0]
-        else:
+        first_uid = upd["first_uid"]
+        if first_uid is None:
+            owner_val = -1  # No files seen
+        elif first_uid == -999:
             owner_val = None  # Multiple owners
+        else:
+            owner_val = first_uid
 
         session.execute(
             text("""
@@ -484,14 +478,6 @@ def flush_updates(session, pending_updates: dict) -> None:
                         WHEN :nr_atime IS NULL THEN max_atime_nr
                         WHEN :nr_atime > max_atime_nr THEN :nr_atime
                         ELSE max_atime_nr
-                    END,
-                    file_count_r = file_count_r + :r_count,
-                    total_size_r = total_size_r + :r_size,
-                    max_atime_r = CASE
-                        WHEN max_atime_r IS NULL THEN :r_atime
-                        WHEN :r_atime IS NULL THEN max_atime_r
-                        WHEN :r_atime > max_atime_r THEN :r_atime
-                        ELSE max_atime_r
                     END,
                     owner_uid = CASE
                         WHEN owner_uid = -1 THEN :owner
@@ -507,9 +493,6 @@ def flush_updates(session, pending_updates: dict) -> None:
                 "nr_count": upd["nr_count"],
                 "nr_size": upd["nr_size"],
                 "nr_atime": upd["nr_atime"],
-                "r_count": upd["r_count"],
-                "r_size": upd["r_size"],
-                "r_atime": upd["r_atime"],
                 "owner": owner_val,
             },
         )
@@ -517,7 +500,7 @@ def flush_updates(session, pending_updates: dict) -> None:
     session.commit()
 
 
-def pass2_accumulate_stats(
+def pass2a_nonrecursive_stats(
     input_file: Path,
     session,
     path_to_id: dict[str, int],
@@ -527,9 +510,10 @@ def pass2_accumulate_stats(
     num_workers: int = 1,
 ) -> None:
     """
-    Second pass: accumulate file statistics into directory_stats.
+    Phase 2a: accumulate non-recursive file statistics into directory_stats.
 
-    Supports both single-threaded and parallel processing modes.
+    Only updates non-recursive stats (file_count_nr, total_size_nr, max_atime_nr).
+    Recursive stats are computed in pass2b_aggregate_recursive_stats().
 
     Args:
         input_file: Path to the log file
@@ -541,9 +525,9 @@ def pass2_accumulate_stats(
         num_workers: Number of worker processes (1 = single-threaded)
     """
     if num_workers > 1:
-        console.print(f"\n[bold]Pass 2:[/bold] Accumulating statistics (parallel, {num_workers} workers)...")
+        console.print(f"\n[bold]Pass 2a:[/bold] Accumulating non-recursive stats (parallel, {num_workers} workers)...")
     else:
-        console.print("\n[bold]Pass 2:[/bold] Accumulating statistics...")
+        console.print("\n[bold]Pass 2a:[/bold] Accumulating non-recursive stats...")
 
     pending_updates = defaultdict(make_empty_update)
     line_count = 0
@@ -555,14 +539,14 @@ def pass2_accumulate_stats(
     def do_flush():
         nonlocal flush_count
         if pending_updates:
-            flush_updates(session, pending_updates)
+            flush_nr_updates(session, pending_updates)
             flush_count += 1
             pending_updates.clear()
 
     def process_parsed_file(parsed):
         nonlocal file_count
         file_count += 1
-        accumulate_file_stats(parsed, path_to_id, pending_updates)
+        accumulate_file_stats_nr(parsed, path_to_id, pending_updates)
 
     def update_progress_bar(progress, task):
         elapsed = time.time() - start_time
@@ -687,6 +671,114 @@ def pass2_accumulate_stats(
     console.print(f"  Database flushes: {flush_count:,}")
 
 
+def pass2b_aggregate_recursive_stats(session) -> None:
+    """
+    Phase 2b: compute recursive stats via bottom-up SQL aggregation.
+
+    Processes directories by depth, from deepest to shallowest.
+    Each directory's recursive stats = its non-recursive stats + sum of children's recursive stats.
+
+    Args:
+        session: SQLAlchemy session
+    """
+    console.print("\n[bold]Pass 2b:[/bold] Computing recursive statistics...")
+
+    # Get max depth
+    max_depth = session.execute(text("SELECT MAX(depth) FROM directories")).scalar() or 0
+
+    console.print(f"  Max directory depth: {max_depth}")
+
+    with create_progress_bar(show_rate=False) as progress:
+        task = progress.add_task(
+            "[green]Aggregating by depth...",
+            total=max_depth,
+        )
+
+        # Process from leaves (max_depth) down to root (depth=1)
+        for depth in range(max_depth, 0, -1):
+            session.execute(
+                text("""
+                UPDATE directory_stats
+                SET
+                    file_count_r = file_count_nr + COALESCE(
+                        (SELECT SUM(cs.file_count_r)
+                         FROM directories cd
+                         JOIN directory_stats cs ON cd.dir_id = cs.dir_id
+                         WHERE cd.parent_id = directory_stats.dir_id), 0),
+                    total_size_r = total_size_nr + COALESCE(
+                        (SELECT SUM(cs.total_size_r)
+                         FROM directories cd
+                         JOIN directory_stats cs ON cd.dir_id = cs.dir_id
+                         WHERE cd.parent_id = directory_stats.dir_id), 0),
+                    max_atime_r = (
+                        SELECT MAX(atime) FROM (
+                            SELECT max_atime_nr as atime
+                            UNION ALL
+                            SELECT cs.max_atime_r FROM directories cd
+                            JOIN directory_stats cs ON cd.dir_id = cs.dir_id
+                            WHERE cd.parent_id = directory_stats.dir_id
+                        )
+                    ),
+                    owner_uid = CASE
+                        -- Already NULL (multiple owners) -> stay NULL
+                        WHEN owner_uid IS NULL THEN NULL
+                        -- No direct files: inherit from children if they agree
+                        WHEN owner_uid = -1 THEN (
+                            SELECT CASE
+                                -- Any child has NULL -> result is NULL
+                                WHEN EXISTS (
+                                    SELECT 1 FROM directories cd
+                                    JOIN directory_stats cs ON cd.dir_id = cs.dir_id
+                                    WHERE cd.parent_id = directory_stats.dir_id
+                                      AND cs.owner_uid IS NULL
+                                ) THEN NULL
+                                -- All children agree on owner
+                                WHEN (SELECT COUNT(DISTINCT cs.owner_uid)
+                                      FROM directories cd
+                                      JOIN directory_stats cs ON cd.dir_id = cs.dir_id
+                                      WHERE cd.parent_id = directory_stats.dir_id
+                                        AND cs.owner_uid IS NOT NULL
+                                        AND cs.owner_uid != -1) <= 1
+                                THEN (SELECT cs.owner_uid
+                                      FROM directories cd
+                                      JOIN directory_stats cs ON cd.dir_id = cs.dir_id
+                                      WHERE cd.parent_id = directory_stats.dir_id
+                                        AND cs.owner_uid IS NOT NULL
+                                        AND cs.owner_uid != -1
+                                      LIMIT 1)
+                                -- Multiple owners among children
+                                ELSE NULL
+                            END
+                        )
+                        -- Has direct files: check if any child conflicts
+                        WHEN EXISTS (
+                            SELECT 1 FROM directories cd
+                            JOIN directory_stats cs ON cd.dir_id = cs.dir_id
+                            WHERE cd.parent_id = directory_stats.dir_id
+                              AND cs.owner_uid IS NOT NULL
+                              AND cs.owner_uid != -1
+                              AND cs.owner_uid != directory_stats.owner_uid
+                        ) THEN NULL
+                        -- Any child has NULL owner -> this becomes NULL too
+                        WHEN EXISTS (
+                            SELECT 1 FROM directories cd
+                            JOIN directory_stats cs ON cd.dir_id = cs.dir_id
+                            WHERE cd.parent_id = directory_stats.dir_id
+                              AND cs.owner_uid IS NULL
+                        ) THEN NULL
+                        -- No conflicts
+                        ELSE owner_uid
+                    END
+                WHERE dir_id IN (SELECT dir_id FROM directories WHERE depth = :depth)
+            """),
+                {"depth": depth},
+            )
+            session.commit()
+            progress.update(task, advance=1)
+
+    console.print(f"  Processed {max_depth} depth levels")
+
+
 def worker_parse_lines(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
@@ -786,9 +878,10 @@ def main(
     """
     Import GPFS policy scan log files into SQLite database.
 
-    Uses a two-pass algorithm:
-      1. First pass discovers all directories and builds the hierarchy
-      2. Second pass accumulates file statistics
+    Uses a multi-pass algorithm:
+      1. Pass 1: Discover directories and build the hierarchy
+      2. Pass 2a: Accumulate non-recursive file statistics
+      3. Pass 2b: Compute recursive stats via bottom-up SQL aggregation
 
     Database is stored in fs_scans/<filesystem>.db by default.
     """
@@ -825,8 +918,8 @@ def main(
             input_file, session, progress_interval, num_workers=workers
         )
 
-        # Pass 2: Accumulate statistics (with known total for progress bar)
-        pass2_accumulate_stats(
+        # Pass 2a: Accumulate non-recursive stats
+        pass2a_nonrecursive_stats(
             input_file,
             session,
             path_to_id,
@@ -835,6 +928,9 @@ def main(
             total_lines=metadata["total_lines"],
             num_workers=workers,
         )
+
+        # Pass 2b: Compute recursive stats via bottom-up aggregation
+        pass2b_aggregate_recursive_stats(session)
 
         console.print("\n[green bold]Import complete![/green bold]")
 
