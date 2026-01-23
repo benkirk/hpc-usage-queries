@@ -5,13 +5,16 @@ GPFS Scan Database Importer - Multi-Pass Algorithm
 Imports GPFS policy scan log files into a SQLite database using a two-pass
 algorithm that normalizes directory paths and accumulates statistics.
 
-Pass 1: Directory Discovery
-    - Scan log file to identify all directories
-    - Build normalized path hierarchy in database
+Pass 1: Directory Discovery (2 phases)
+    Phase 1a: Scan log file, collect directory paths
+    Phase 1b: Sort by depth, insert into database, build path_to_id lookup
 
 Pass 2: Statistics Accumulation
     - Re-scan log file to accumulate file statistics
     - Batch updates to database for efficiency
+
+The GPFS scan file explicitly lists all directories as separate lines,
+so no deduplication or parent directory discovery is needed.
 """
 
 import lzma
@@ -107,13 +110,13 @@ def pass1_discover_directories(
     """
     First pass: identify all directories and build hierarchy.
 
-    Uses hash-based discovery to reduce memory, then re-scans to build path_to_id.
-    This three-phase approach reduces peak memory by ~50% compared to storing full
-    paths during discovery.
+    Since the GPFS scan file explicitly lists all directories, we simply:
+    1. Collect directory paths during scan
+    2. Sort by depth (ensuring parents exist before children)
+    3. Insert and build path_to_id in one pass
 
-    Phase 1a: Scan file, collect unique directories using hashes only
-    Phase 1b: Insert directories into database sorted by depth
-    Phase 1c: Re-scan file to build path_to_id lookup table
+    Phase 1a: Scan file, collect directory lines as (path, depth)
+    Phase 1b: Sort by depth, insert, and build path_to_id directly
 
     Args:
         input_file: Path to the log file
@@ -125,10 +128,9 @@ def pass1_discover_directories(
     """
     console.print("[bold]Pass 1:[/bold] Discovering directories...")
 
-    # Phase 1a: Discover unique directories using hashes only
-    console.print("  [bold]Phase 1a:[/bold] Scanning for unique directories...")
-    seen_hashes = set()
-    dir_tuples = []  # (parent_hash, basename, depth, own_hash)
+    # Phase 1a: Collect directories from file
+    console.print("  [bold]Phase 1a:[/bold] Scanning for directories...")
+    dir_entries = []  # (path, depth)
     line_count = 0
 
     with Progress(
@@ -136,7 +138,7 @@ def pass1_discover_directories(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
-        TextColumn("[cyan]{task.fields[dirs]} unique dirs"),
+        TextColumn("[cyan]{task.fields[dirs]} directories"),
         TimeElapsedColumn(),
         console=console,
     ) as progress:
@@ -151,39 +153,24 @@ def pass1_discover_directories(
                 line_count += 1
 
                 parsed = parse_line(line.rstrip("\n"))
-                if not parsed:
+                if not parsed or not parsed["is_dir"]:
                     continue
 
-                # Walk up from file's parent (or dir itself) to root
-                if parsed["is_dir"]:
-                    current = parsed["path"]
-                else:
-                    current = os.path.dirname(parsed["path"])
-
-                while current and current != "/":
-                    h = hash(current)
-                    if h not in seen_hashes:
-                        seen_hashes.add(h)
-                        parent = os.path.dirname(current)
-                        ph = hash(parent) if parent and parent != "/" else None
-                        dir_tuples.append(
-                            (ph, os.path.basename(current), current.count("/"), h)
-                        )
-                    current = os.path.dirname(current)
+                path = parsed["path"]
+                dir_entries.append((path, path.count("/")))
 
                 if line_count % progress_interval == 0:
-                    progress.update(task, dirs=len(seen_hashes))
+                    progress.update(task, dirs=len(dir_entries))
 
-        progress.update(task, dirs=len(seen_hashes))
+        progress.update(task, dirs=len(dir_entries))
 
     console.print(f"    Lines scanned: {line_count:,}")
-    console.print(f"    Found {len(seen_hashes):,} unique directories")
-    del seen_hashes  # Free ~8 bytes per directory
+    console.print(f"    Found {len(dir_entries):,} directories")
 
-    # Phase 1b: Insert directories into database (sorted by depth)
+    # Phase 1b: Sort by depth and insert
     console.print("  [bold]Phase 1b:[/bold] Inserting into database...")
-    dir_tuples.sort(key=lambda x: x[2])  # sort by depth
-    hash_to_id = {None: None}  # parent_hash -> dir_id
+    dir_entries.sort(key=lambda x: x[1])  # sort by depth
+    path_to_id = {}
 
     with Progress(
         SpinnerColumn(),
@@ -195,18 +182,24 @@ def pass1_discover_directories(
     ) as progress:
         task = progress.add_task(
             "[green]Inserting directories...",
-            total=len(dir_tuples),
+            total=len(dir_entries),
         )
 
         batch_size = 1000
         batch_count = 0
 
-        for parent_hash, basename, depth, own_hash in dir_tuples:
-            parent_id = hash_to_id.get(parent_hash)
-            entry = Directory(parent_id=parent_id, name=basename, depth=depth)
+        for path, depth in dir_entries:
+            parent_path = os.path.dirname(path)
+            parent_id = path_to_id.get(parent_path)  # None for top-level
+
+            entry = Directory(
+                parent_id=parent_id,
+                name=os.path.basename(path),
+                depth=depth,
+            )
             session.add(entry)
             session.flush()
-            hash_to_id[own_hash] = entry.dir_id
+            path_to_id[path] = entry.dir_id
             session.add(DirectoryStats(dir_id=entry.dir_id))
 
             batch_count += 1
@@ -215,52 +208,10 @@ def pass1_discover_directories(
                 progress.update(task, advance=batch_size)
 
         session.commit()
-        progress.update(task, completed=len(dir_tuples))
+        progress.update(task, completed=len(dir_entries))
 
-    console.print(f"    Inserted {len(dir_tuples):,} directories")
-    del dir_tuples  # Free ~26 bytes per directory
-
-    # Phase 1c: Build path_to_id by re-scanning file (likely in OS cache)
-    console.print("  [bold]Phase 1c:[/bold] Building path lookup table...")
-    path_to_id = {}
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("[cyan]{task.fields[paths]} paths mapped"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task(
-            f"[green]Re-scanning {input_file.name}...",
-            total=None,
-            paths=0,
-        )
-
-        with open_input_file(input_file) as f:
-            for line in f:
-                parsed = parse_line(line.rstrip("\n"))
-                if not parsed:
-                    continue
-
-                if parsed["is_dir"]:
-                    current = parsed["path"]
-                else:
-                    current = os.path.dirname(parsed["path"])
-
-                while current and current != "/":
-                    if current not in path_to_id:
-                        h = hash(current)
-                        if h in hash_to_id:
-                            path_to_id[current] = hash_to_id[h]
-                    current = os.path.dirname(current)
-
-        progress.update(task, paths=len(path_to_id))
-
-    console.print(f"    Built lookup for {len(path_to_id):,} paths")
-    del hash_to_id  # Free ~16 bytes per directory
+    console.print(f"    Inserted {len(path_to_id):,} directories")
+    del dir_entries  # Free memory before Pass 2
 
     return path_to_id
 

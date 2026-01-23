@@ -171,32 +171,23 @@ The importer uses a two-pass algorithm:
 
 **Pass 2: Statistics Accumulation** - Re-scans the file to accumulate file statistics into each directory.
 
-### Memory Optimization
+### Pass 1 Implementation
 
-Pass 1 uses a three-phase approach to minimize peak memory usage:
+Since GPFS scan files explicitly list all directories as separate lines, Pass 1 uses a simple two-phase approach:
 
 | Phase | Operation | Data Structures |
 |-------|-----------|-----------------|
-| 1a | Scan file | `seen_hashes` (8 bytes/dir) + `dir_tuples` (~26 bytes/dir) |
-| 1b | Insert to DB | `dir_tuples` + `hash_to_id` (~16 bytes/dir) |
-| 1c | Build lookup | `hash_to_id` + `path_to_id` (growing) |
+| 1a | Scan file | `dir_entries` list of (path, depth) tuples |
+| 1b | Insert to DB | `dir_entries` + `path_to_id` dict (growing) |
 
-**Key optimizations:**
+**How it works:**
 
-1. **Hash-based discovery** - During Phase 1a, directories are tracked by their hash values (8 bytes) rather than full path strings (~60+ bytes). Only the minimal tuple `(parent_hash, basename, depth, own_hash)` is stored.
+1. **Phase 1a** - Scans the file and collects all directory lines as `(path, depth)` tuples
+2. **Phase 1b** - Sorts by depth (ensuring parents exist before children), inserts into database, and builds `path_to_id` directly
 
-2. **Staged memory release** - Each data structure is explicitly deleted (`del`) as soon as it's no longer needed, preventing memory peaks from overlapping allocations.
+**Memory profile:** ~68 bytes per directory (path string + depth integer + dict entry)
 
-3. **File re-scan for path mapping** - Phase 1c re-reads the input file (likely still in OS cache) to build the final `path_to_id` dictionary, avoiding the need to keep full paths in memory during discovery.
-
-**Memory comparison:**
-
-| Approach | Peak Memory per Directory |
-|----------|---------------------------|
-| Original (full paths) | ~128 bytes |
-| Optimized (hash-based) | ~42 bytes |
-
-This ~3x reduction is significant when processing filesystems with millions of directories.
+No deduplication or parent directory discovery is needed since all directories are explicitly listed in the scan output.
 
 ### Database Schema
 
