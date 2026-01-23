@@ -1,10 +1,18 @@
-# GPFS Policy Scan Log Parser
+# GPFS Policy Scan Tools
 
-A streaming parser for GPFS policy scan log files that computes **directory-level metrics** without storing file-level data. This is a prototype for future "cs-queries" database tooling.
+Tools for parsing GPFS policy scan log files and computing **directory-level metrics**. This includes both a streaming parser for quick analysis and a database importer for persistent storage and querying.
+
+## Tools
+
+| Tool | Purpose |
+|------|---------|
+| `parse_gpfs_scan.py` | Streaming parser - quick analysis, no persistence |
+| `scan_to_db.py` | Database importer - SQLite storage for complex queries |
+| `query_db.py` | Query interface for the SQLite database |
 
 ## Overview
 
-The parser processes GPFS scan logs and aggregates statistics at the directory level:
+Both tools process GPFS scan logs and aggregate statistics at the directory level:
 
 | Metric | Non-Recursive | Recursive |
 |--------|---------------|-----------|
@@ -118,3 +126,91 @@ directory  file_count  total_size  max_atime  file_count_recursive  total_size_r
 | hao | 40 GB | ~100M+ |
 
 XZ-compressed versions are also available (roughly 10x smaller).
+
+---
+
+## Database Importer (scan_to_db.py)
+
+For persistent storage and complex queries, use the database importer to load scan data into SQLite.
+
+### Usage
+
+```bash
+python -m fs_scans.scan_to_db <input_file> [options]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--db PATH` | Override database path (default: `fs_scans/<filesystem>.db`) |
+| `-f, --filesystem NAME` | Override filesystem name (default: extracted from filename) |
+| `--batch-size N` | Batch size for DB updates (default: 10000) |
+| `-p, --progress-interval N` | Progress reporting interval (default: 1M lines) |
+| `--replace` | Drop and recreate tables before import |
+| `--echo` | Echo SQL statements (for debugging) |
+
+### Examples
+
+```bash
+# Import a scan file (database auto-created as fs_scans/asp.db)
+python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log
+
+# Import compressed file with custom database path
+python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log.xz --db /tmp/asp.db
+
+# Replace existing data
+python -m fs_scans.scan_to_db fs_scans/20260111_csfs1_asp.list.list_all.log --replace
+```
+
+### Two-Pass Algorithm
+
+The importer uses a two-pass algorithm:
+
+**Pass 1: Directory Discovery** - Identifies all directories and builds a normalized hierarchy in the database.
+
+**Pass 2: Statistics Accumulation** - Re-scans the file to accumulate file statistics into each directory.
+
+### Memory Optimization
+
+Pass 1 uses a three-phase approach to minimize peak memory usage:
+
+| Phase | Operation | Data Structures |
+|-------|-----------|-----------------|
+| 1a | Scan file | `seen_hashes` (8 bytes/dir) + `dir_tuples` (~26 bytes/dir) |
+| 1b | Insert to DB | `dir_tuples` + `hash_to_id` (~16 bytes/dir) |
+| 1c | Build lookup | `hash_to_id` + `path_to_id` (growing) |
+
+**Key optimizations:**
+
+1. **Hash-based discovery** - During Phase 1a, directories are tracked by their hash values (8 bytes) rather than full path strings (~60+ bytes). Only the minimal tuple `(parent_hash, basename, depth, own_hash)` is stored.
+
+2. **Staged memory release** - Each data structure is explicitly deleted (`del`) as soon as it's no longer needed, preventing memory peaks from overlapping allocations.
+
+3. **File re-scan for path mapping** - Phase 1c re-reads the input file (likely still in OS cache) to build the final `path_to_id` dictionary, avoiding the need to keep full paths in memory during discovery.
+
+**Memory comparison:**
+
+| Approach | Peak Memory per Directory |
+|----------|---------------------------|
+| Original (full paths) | ~128 bytes |
+| Optimized (hash-based) | ~42 bytes |
+
+This ~3x reduction is significant when processing filesystems with millions of directories.
+
+### Database Schema
+
+The importer creates two tables:
+
+**directories** - Normalized directory hierarchy
+- `dir_id` - Primary key
+- `parent_id` - Foreign key to parent directory
+- `name` - Directory basename
+- `depth` - Depth in hierarchy (for efficient queries)
+
+**directory_stats** - Aggregated statistics per directory
+- `dir_id` - Foreign key to directories
+- `file_count_nr` / `file_count_r` - Non-recursive / recursive file counts
+- `total_size_nr` / `total_size_r` - Non-recursive / recursive sizes
+- `max_atime_nr` / `max_atime_r` - Non-recursive / recursive max access times
+- `owner_uid` - Single owner UID (NULL if multiple owners)
