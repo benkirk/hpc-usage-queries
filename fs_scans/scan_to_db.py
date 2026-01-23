@@ -22,6 +22,7 @@ import multiprocessing as mp
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -162,20 +163,29 @@ def pass1_discover_directories(
     BATCH_SIZE = 10000
     batch = []
 
+    start_time = time.time()
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
         TextColumn("[cyan]{task.fields[dirs]} directories"),
+        TextColumn("[magenta]{task.fields[rate]} items/sec"),
         TimeElapsedColumn(),
         console=console,
     ) as progress:
         task = progress.add_task(
             f"[green]Scanning {input_file.name}...",
             total=None,
-            dirs=0,
+            dirs="0",
+            rate="0",
         )
+
+        def update_progress():
+            elapsed = time.time() - start_time
+            rate = int(line_count / elapsed) if elapsed > 0 else 0
+            progress.update(task, dirs=f"{dir_count:,}", rate=f"{rate:,}")
 
         with open_input_file(input_file) as f:
             for line in f:
@@ -206,10 +216,10 @@ def pass1_discover_directories(
                     )
                     session.commit()
                     batch.clear()
-                    progress.update(task, dirs=dir_count)
+                    update_progress()
 
                 if line_count % progress_interval == 0:
-                    progress.update(task, dirs=dir_count)
+                    update_progress()
 
         # Flush remaining batch
         if batch:
@@ -223,7 +233,7 @@ def pass1_discover_directories(
             session.commit()
             batch.clear()
 
-        progress.update(task, dirs=dir_count)
+        update_progress()
 
     console.print(f"    Lines scanned: {line_count:,}")
     console.print(f"    Found {dir_count:,} directories")
@@ -393,6 +403,7 @@ def pass2_accumulate_stats(
     line_count = 0
     file_count = 0
     flush_count = 0
+    start_time = time.time()
 
     with Progress(
         SpinnerColumn(),
@@ -401,14 +412,16 @@ def pass2_accumulate_stats(
         TaskProgressColumn(),
         TextColumn("[cyan]{task.fields[files]} files"),
         TextColumn("[yellow]{task.fields[flushes]} flushes"),
+        TextColumn("[magenta]{task.fields[rate]} items/sec"),
         TimeElapsedColumn(),
         console=console,
     ) as progress:
         task = progress.add_task(
             f"[green]Processing {input_file.name}...",
             total=total_lines,  # Now determinate if total_lines is known
-            files=0,
-            flushes=0,
+            files="0",
+            flushes="0",
+            rate="0",
         )
 
         with open_input_file(input_file) as f:
@@ -460,11 +473,14 @@ def pass2_accumulate_stats(
                     pending_updates.clear()
 
                 if line_count % progress_interval == 0:
+                    elapsed = time.time() - start_time
+                    rate = int(line_count / elapsed) if elapsed > 0 else 0
                     progress.update(
                         task,
                         completed=line_count,
-                        files=file_count,
-                        flushes=flush_count,
+                        files=f"{file_count:,}",
+                        flushes=f"{flush_count:,}",
+                        rate=f"{rate:,}",
                     )
 
         # Final flush
@@ -472,8 +488,14 @@ def pass2_accumulate_stats(
             flush_updates(session, pending_updates)
             flush_count += 1
 
+        elapsed = time.time() - start_time
+        rate = int(line_count / elapsed) if elapsed > 0 else 0
         progress.update(
-            task, completed=line_count, files=file_count, flushes=flush_count
+            task,
+            completed=line_count,
+            files=f"{file_count:,}",
+            flushes=f"{flush_count:,}",
+            rate=f"{rate:,}",
         )
 
     console.print(f"  Lines processed: {line_count:,}")
@@ -556,6 +578,7 @@ def pass2_accumulate_stats_parallel(
     line_count = 0
     file_count = 0
     flush_count = 0
+    start_time = time.time()
 
     # Set up queues and workers
     CHUNK_SIZE = 5000  # Lines per chunk sent to workers
@@ -576,14 +599,16 @@ def pass2_accumulate_stats_parallel(
         TaskProgressColumn(),
         TextColumn("[cyan]{task.fields[files]} files"),
         TextColumn("[yellow]{task.fields[flushes]} flushes"),
+        TextColumn("[magenta]{task.fields[rate]} items/sec"),
         TimeElapsedColumn(),
         console=console,
     ) as progress:
         task = progress.add_task(
             f"[green]Processing {input_file.name}...",
             total=total_lines,
-            files=0,
-            flushes=0,
+            files="0",
+            flushes="0",
+            rate="0",
         )
 
         # Producer: read file and send chunks to workers
@@ -652,11 +677,14 @@ def pass2_accumulate_stats_parallel(
                             break
 
                 if line_count % progress_interval == 0:
+                    elapsed = time.time() - start_time
+                    rate = int(line_count / elapsed) if elapsed > 0 else 0
                     progress.update(
                         task,
                         completed=line_count,
-                        files=file_count,
-                        flushes=flush_count,
+                        files=f"{file_count:,}",
+                        flushes=f"{flush_count:,}",
+                        rate=f"{rate:,}",
                     )
 
             # Send remaining chunk
@@ -724,8 +752,14 @@ def pass2_accumulate_stats_parallel(
             flush_updates(session, pending_updates)
             flush_count += 1
 
+        elapsed = time.time() - start_time
+        rate = int(line_count / elapsed) if elapsed > 0 else 0
         progress.update(
-            task, completed=line_count, files=file_count, flushes=flush_count
+            task,
+            completed=line_count,
+            files=f"{file_count:,}",
+            flushes=f"{flush_count:,}",
+            rate=f"{rate:,}",
         )
 
     console.print(f"  Lines processed: {line_count:,}")
