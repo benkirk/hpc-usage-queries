@@ -720,9 +720,9 @@ def pass2a_nonrecursive_stats(
         do_flush()
         update_progress_bar(progress, task)
 
-    console.print(f"  Lines processed: {line_count:,}")
-    console.print(f"  Files counted: {file_count:,}")
-    console.print(f"  Database flushes: {flush_count:,}")
+    console.print(f"    Lines processed: {line_count:,}")
+    console.print(f"    Files counted: {file_count:,}")
+    console.print(f"    Database flushes: {flush_count:,}")
 
 
 def pass2b_aggregate_recursive_stats(session) -> None:
@@ -739,7 +739,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
     # Get max depth
     max_depth = session.execute(text("SELECT MAX(depth) FROM directories")).scalar() or 0
 
-    console.print(f"  Max directory depth: {max_depth}")
+    console.print(f"    Max directory depth: {max_depth}")
 
     with create_progress_bar(show_rate=False) as progress:
         task = progress.add_task(
@@ -820,7 +820,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
             session.commit()
             progress.update(task, advance=1)
 
-    console.print(f"  Processed {max_depth} depth levels")
+    console.print(f"    Processed {max_depth} depth levels")
 
 
 def worker_parse_lines(
