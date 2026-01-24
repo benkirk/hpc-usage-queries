@@ -177,6 +177,7 @@ def query_directories(
     limit: int | None = None,
     accessed_before: datetime | None = None,
     accessed_after: datetime | None = None,
+    leaves_only: bool = False,
 ) -> list[dict]:
     """
     Query directories with optional filters.
@@ -192,6 +193,7 @@ def query_directories(
         limit: Maximum results to return
         accessed_before: Filter to directories with max_atime_r before this date
         accessed_after: Filter to directories with max_atime_r after this date
+        leaves_only: Only show directories with no subdirectories
 
     Returns:
         List of directory dictionaries with stats
@@ -222,6 +224,11 @@ def query_directories(
     if accessed_after is not None:
         conditions.append("s.max_atime_r > :accessed_after")
         params["accessed_after"] = accessed_after.strftime("%Y-%m-%d %H:%M:%S")
+
+    if leaves_only:
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM directories child WHERE child.parent_id = d.dir_id)"
+        )
 
     # Handle path prefix - find ancestor and filter descendants
     if path_prefix:
@@ -301,7 +308,9 @@ def query_directories(
     return directories
 
 
-def print_results(directories: list[dict], verbose: bool = False) -> None:
+def print_results(
+    directories: list[dict], verbose: bool = False, leaves_only: bool = False
+) -> None:
     """Print directory results in a formatted table."""
     if not directories:
         console.print("[yellow]No directories found matching criteria.[/yellow]")
@@ -311,12 +320,19 @@ def print_results(directories: list[dict], verbose: bool = False) -> None:
     table.add_column("Directory", style="cyan", no_wrap=False)
     if verbose:
         table.add_column("Depth", justify="right")
-    table.add_column("Size\n(R)", justify="right")
-    table.add_column("Size\n(NR)", justify="right")
-    table.add_column("Files\n(R)", justify="right")
-    table.add_column("Files\n(NR)", justify="right")
-    table.add_column("Atime\n(R)", justify="right")
-    table.add_column("Atime\n(NR)", justify="right")
+
+    if leaves_only:
+        # Simplified columns for leaf directories (R and NR are identical)
+        table.add_column("Size", justify="right")
+        table.add_column("Files", justify="right")
+        table.add_column("Atime", justify="right")
+    else:
+        table.add_column("Size\n(R)", justify="right")
+        table.add_column("Size\n(NR)", justify="right")
+        table.add_column("Files\n(R)", justify="right")
+        table.add_column("Files\n(NR)", justify="right")
+        table.add_column("Atime\n(R)", justify="right")
+        table.add_column("Atime\n(NR)", justify="right")
     table.add_column("Owner", justify="right")
 
     for d in directories:
@@ -329,15 +345,24 @@ def print_results(directories: list[dict], verbose: bool = False) -> None:
         row = [d["path"]]
         if verbose:
             row.append(str(d["depth"]))
-        row.extend([
-            format_size(d["total_size_r"]),
-            format_size(d["total_size_nr"]),
-            f"{d['file_count_r']:,}",
-            f"{d['file_count_nr']:,}",
-            format_datetime(d["max_atime_r"]),
-            format_datetime(d["max_atime_nr"]),
-            owner_str,
-        ])
+
+        if leaves_only:
+            row.extend([
+                format_size(d["total_size_r"]),
+                f"{d['file_count_r']:,}",
+                format_datetime(d["max_atime_r"]),
+                owner_str,
+            ])
+        else:
+            row.extend([
+                format_size(d["total_size_r"]),
+                format_size(d["total_size_nr"]),
+                f"{d['file_count_r']:,}",
+                f"{d['file_count_nr']:,}",
+                format_datetime(d["max_atime_r"]),
+                format_datetime(d["max_atime_nr"]),
+                owner_str,
+            ])
         table.add_row(*row)
 
     console.print(table)
@@ -465,6 +490,11 @@ def get_summary(session) -> dict:
     help="Show additional columns (Depth)",
 )
 @click.option(
+    "--leaves-only",
+    is_flag=True,
+    help="Only show leaf directories (no subdirectories)",
+)
+@click.option(
     "--summary",
     is_flag=True,
     help="Show database summary only",
@@ -482,6 +512,7 @@ def main(
     accessed_before: str | None,
     accessed_after: str | None,
     verbose: bool,
+    leaves_only: bool,
     summary: bool,
 ):
     """
@@ -549,13 +580,14 @@ def main(
             limit=limit if limit > 0 else None,
             accessed_before=parsed_before,
             accessed_after=parsed_after,
+            leaves_only=leaves_only,
         )
 
         # Output results
         if output:
             write_tsv(directories, output)
         else:
-            print_results(directories, verbose=verbose)
+            print_results(directories, verbose=verbose, leaves_only=leaves_only)
 
     finally:
         session.close()

@@ -257,6 +257,7 @@ query-fs-scan-db <filesystem> [options]
 | `--accessed-before DATE` | Filter to max_atime_r before date (YYYY-MM-DD or Nyrs/Nmo) |
 | `--accessed-after DATE` | Filter to max_atime_r after date (YYYY-MM-DD or Nyrs/Nmo) |
 | `-v, --verbose` | Show additional columns (Depth) |
+| `--leaves-only` | Only show leaf directories (no subdirectories) |
 | `--summary` | Show database summary only |
 
 ### Examples
@@ -276,6 +277,9 @@ query-fs-scan-db asp --accessed-before 3yrs
 
 # Filter by access time range (accessed 3-5 years ago)
 query-fs-scan-db asp --accessed-after 5yrs --accessed-before 3yrs
+
+# Show only leaf directories (no subdirectories)
+query-fs-scan-db asp --leaves-only
 
 # Export all directories to TSV
 query-fs-scan-db asp --limit 0 -o asp_dirs.tsv
