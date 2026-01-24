@@ -36,9 +36,10 @@ def format_datetime(dt: datetime | str | None) -> str:
     if dt is None:
         return "N/A"
     if isinstance(dt, str):
-        # SQLite may return datetime as string
-        return dt[:19] if len(dt) >= 19 else dt
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+        # SQLite may return datetime as string - just return date portion
+        return dt[:10] if len(dt) >= 10 else dt
+    #return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%Y-%m-%d")
 
 
 def resolve_path_to_id(session, path: str) -> int | None:

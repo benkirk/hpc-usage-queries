@@ -796,7 +796,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                     owner_uid = CASE
                         -- Already conflicted -> stay conflicted
                         WHEN owner_uid IS NULL THEN NULL
-                        
+
                         -- Direct files exist (owner_uid >= 0) -> check for conflict with children
                         WHEN owner_uid >= 0 THEN
                              CASE
@@ -804,7 +804,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                                 WHEN agg.distinct_valid_owners > 0 AND agg.common_owner != owner_uid THEN NULL
                                 ELSE owner_uid
                              END
-                             
+
                         -- No direct files (-1) -> inherit from children
                         ELSE -- owner_uid == -1
                              CASE
@@ -981,7 +981,7 @@ def main(
         pass2b_aggregate_recursive_stats(session)
 
         overall_duration = time.time() - overall_start
-        
+
         # Get DB file size
         db_file = Path(f"fs_scans/{filesystem}.db")
         size_str = "unknown"

@@ -184,7 +184,8 @@ def format_datetime(dt: datetime | None) -> str:
     """Format datetime for display."""
     if dt is None:
         return "N/A"
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    #return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%Y-%m-%d")
 
 
 def get_path_depth(path: str) -> int:
