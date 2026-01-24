@@ -235,12 +235,15 @@ The importer creates two tables:
 ## Database Query Tool (query_db.py)
 
 Query directory statistics from the SQLite database with filtering and sorting options.
+Supports querying across all databases or a specific filesystem.
 
 ### Usage
 
 ```bash
-query-fs-scan-db <filesystem> [options]
+query-fs-scan-db [filesystem] [options]
 ```
+
+The `filesystem` argument is optional and defaults to `all`, which queries all available `.db` files and combines results. Specify a filesystem name (e.g., `asp`, `cisl`) to query only that database.
 
 ### Options
 
@@ -254,24 +257,39 @@ query-fs-scan-db <filesystem> [options]
 | `-n, --limit N` | Limit results (default: 50, 0 for unlimited) |
 | `--sort-by FIELD` | Sort by: `size_r`, `size_nr`, `files_r`, `files_nr`, `atime_r`, `path`, `depth` |
 | `-o, --output FILE` | Write TSV output to file |
-| `--non-recursive` | Show non-recursive stats instead of recursive |
+| `--accessed-before DATE` | Filter to max_atime_r before date (YYYY-MM-DD or Nyrs/Nmo) |
+| `--accessed-after DATE` | Filter to max_atime_r after date (YYYY-MM-DD or Nyrs/Nmo) |
+| `-v, --verbose` | Show additional columns (Depth) |
+| `--leaves-only` | Only show leaf directories (no subdirectories) |
 | `--summary` | Show database summary only |
 
 ### Examples
 
 ```bash
-# Show top 50 directories by recursive size
+# Query all filesystems (default)
+query-fs-scan-db
+
+# Query a specific filesystem
 query-fs-scan-db asp
 
 # Filter to a specific path prefix
 query-fs-scan-db asp --path-prefix /gpfs/csfs1/asp/username
 
 # Show only single-owner directories at depth 4+
-query-fs-scan-db asp -d 4 --single-owner
+query-fs-scan-db -d 4 --single-owner
+
+# Filter by access time (files not accessed in 3+ years)
+query-fs-scan-db --accessed-before 3yrs
+
+# Filter by access time range (accessed 3-5 years ago)
+query-fs-scan-db --accessed-after 5yrs --accessed-before 3yrs
+
+# Show only leaf directories (no subdirectories)
+query-fs-scan-db --leaves-only
 
 # Export all directories to TSV
-query-fs-scan-db asp --limit 0 -o asp_dirs.tsv
+query-fs-scan-db --limit 0 -o all_dirs.tsv
 
-# Show database summary
-query-fs-scan-db asp --summary
+# Show database summary for all filesystems
+query-fs-scan-db --summary
 ```

@@ -6,6 +6,7 @@ Query directory statistics from the SQLite database.
 Supports filtering by depth, owner, path prefix, and sorting.
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -14,10 +15,20 @@ from rich.console import Console
 from rich.table import Table
 from sqlalchemy import text
 
-from .database import get_db_path, get_session
+from .database import get_db_path, get_session, DATA_DIR
 from .models import Directory, DirectoryStats
 
 console = Console()
+
+
+def get_all_filesystems() -> list[str]:
+    """Discover all available filesystem databases.
+
+    Returns:
+        List of filesystem names (e.g., ['asp', 'cisl', 'eol', 'hao'])
+    """
+    db_files = DATA_DIR.glob("*.db")
+    return sorted([f.stem for f in db_files])
 
 
 def format_size(size_bytes: int) -> str:
@@ -36,9 +47,50 @@ def format_datetime(dt: datetime | str | None) -> str:
     if dt is None:
         return "N/A"
     if isinstance(dt, str):
-        # SQLite may return datetime as string
-        return dt[:19] if len(dt) >= 19 else dt
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+        # SQLite may return datetime as string - just return date portion
+        return dt[:10] if len(dt) >= 10 else dt
+    return dt.strftime("%Y-%m-%d")
+
+
+def parse_date_arg(value: str) -> datetime:
+    """
+    Parse date argument - absolute (YYYY-MM-DD) or relative (3yrs, 6mo).
+
+    Args:
+        value: Date string like "2024-01-15", "3yrs", or "18mo"
+
+    Returns:
+        datetime object
+
+    Raises:
+        click.BadParameter: If format is invalid
+    """
+    # Try absolute date first
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # Parse relative date (e.g., "3yrs", "6mo")
+    match = re.match(r"^(\d+)(yrs?|mo)$", value.lower())
+    if match:
+        num = int(match.group(1))
+        unit = match.group(2)
+        now = datetime.now()
+        if unit.startswith("yr"):
+            return now.replace(year=now.year - num)
+        elif unit == "mo":
+            # Handle month subtraction (wrap years if needed)
+            new_month = now.month - num
+            new_year = now.year
+            while new_month <= 0:
+                new_month += 12
+                new_year -= 1
+            # Handle day overflow (e.g., Jan 31 - 1 month)
+            day = min(now.day, 28)  # Safe for all months
+            return now.replace(year=new_year, month=new_month, day=day)
+
+    raise click.BadParameter(f"Invalid date format: {value}. Use YYYY-MM-DD or Nyrs/Nmo")
 
 
 def resolve_path_to_id(session, path: str) -> int | None:
@@ -133,6 +185,9 @@ def query_directories(
     path_prefix: str | None = None,
     sort_by: str = "size_r",
     limit: int | None = None,
+    accessed_before: datetime | None = None,
+    accessed_after: datetime | None = None,
+    leaves_only: bool = False,
 ) -> list[dict]:
     """
     Query directories with optional filters.
@@ -146,6 +201,9 @@ def query_directories(
         path_prefix: Filter to paths under this prefix
         sort_by: Sort field (size_r, size_nr, files_r, files_nr, atime_r, path)
         limit: Maximum results to return
+        accessed_before: Filter to directories with max_atime_r before this date
+        accessed_after: Filter to directories with max_atime_r after this date
+        leaves_only: Only show directories with no subdirectories
 
     Returns:
         List of directory dictionaries with stats
@@ -168,6 +226,19 @@ def query_directories(
     if owner_id is not None:
         conditions.append("s.owner_uid = :owner_id")
         params["owner_id"] = owner_id
+
+    if accessed_before is not None:
+        conditions.append("s.max_atime_r < :accessed_before")
+        params["accessed_before"] = accessed_before.strftime("%Y-%m-%d %H:%M:%S")
+
+    if accessed_after is not None:
+        conditions.append("s.max_atime_r > :accessed_after")
+        params["accessed_after"] = accessed_after.strftime("%Y-%m-%d %H:%M:%S")
+
+    if leaves_only:
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM directories child WHERE child.parent_id = d.dir_id)"
+        )
 
     # Handle path prefix - find ancestor and filter descendants
     if path_prefix:
@@ -247,7 +318,9 @@ def query_directories(
     return directories
 
 
-def print_results(directories: list[dict], show_recursive: bool = True) -> None:
+def print_results(
+    directories: list[dict], verbose: bool = False, leaves_only: bool = False
+) -> None:
     """Print directory results in a formatted table."""
     if not directories:
         console.print("[yellow]No directories found matching criteria.[/yellow]")
@@ -255,17 +328,21 @@ def print_results(directories: list[dict], show_recursive: bool = True) -> None:
 
     table = Table(title=f"Directory Statistics ({len(directories)} results)")
     table.add_column("Directory", style="cyan", no_wrap=False)
-    table.add_column("Depth", justify="right")
+    if verbose:
+        table.add_column("Depth", justify="right")
 
-    if show_recursive:
-        table.add_column("Files (R)", justify="right")
-        table.add_column("Size (R)", justify="right")
-        table.add_column("Max Atime (R)", justify="right")
-    else:
-        table.add_column("Files", justify="right")
+    if leaves_only:
+        # Simplified columns for leaf directories (R and NR are identical)
         table.add_column("Size", justify="right")
-        table.add_column("Max Atime", justify="right")
-
+        table.add_column("Files", justify="right")
+        table.add_column("Atime", justify="right")
+    else:
+        table.add_column("Size\n(R)", justify="right")
+        table.add_column("Size\n(NR)", justify="right")
+        table.add_column("Files\n(R)", justify="right")
+        table.add_column("Files\n(NR)", justify="right")
+        table.add_column("Atime\n(R)", justify="right")
+        table.add_column("Atime\n(NR)", justify="right")
     table.add_column("Owner", justify="right")
 
     for d in directories:
@@ -275,24 +352,28 @@ def print_results(directories: list[dict], show_recursive: bool = True) -> None:
             else "[yellow]multiple[/yellow]" if d["owner_uid"] is None else "[dim]-[/dim]"
         )
 
-        if show_recursive:
-            table.add_row(
-                d["path"],
-                str(d["depth"]),
-                f"{d['file_count_r']:,}",
+        row = [d["path"]]
+        if verbose:
+            row.append(str(d["depth"]))
+
+        if leaves_only:
+            row.extend([
                 format_size(d["total_size_r"]),
+                f"{d['file_count_r']:,}",
                 format_datetime(d["max_atime_r"]),
                 owner_str,
-            )
+            ])
         else:
-            table.add_row(
-                d["path"],
-                str(d["depth"]),
-                f"{d['file_count_nr']:,}",
+            row.extend([
+                format_size(d["total_size_r"]),
                 format_size(d["total_size_nr"]),
+                f"{d['file_count_r']:,}",
+                f"{d['file_count_nr']:,}",
+                format_datetime(d["max_atime_r"]),
                 format_datetime(d["max_atime_nr"]),
                 owner_str,
-            )
+            ])
+        table.add_row(*row)
 
     console.print(table)
 
@@ -303,18 +384,19 @@ def write_tsv(directories: list[dict], output_path: Path) -> None:
         # Header
         f.write(
             "directory\tdepth\t"
-            "file_count_nr\ttotal_size_nr\tmax_atime_nr\t"
-            "file_count_r\ttotal_size_r\tmax_atime_r\t"
+            "total_size_r\ttotal_size_nr\t"
+            "file_count_r\tfile_count_nr\t"
+            "max_atime_r\tmax_atime_nr\t"
             "owner_uid\n"
         )
 
         for d in directories:
             f.write(
                 f"{d['path']}\t{d['depth']}\t"
-                f"{d['file_count_nr']}\t{d['total_size_nr']}\t"
-                f"{format_datetime(d['max_atime_nr'])}\t"
-                f"{d['file_count_r']}\t{d['total_size_r']}\t"
+                f"{d['total_size_r']}\t{d['total_size_nr']}\t"
+                f"{d['file_count_r']}\t{d['file_count_nr']}\t"
                 f"{format_datetime(d['max_atime_r'])}\t"
+                f"{format_datetime(d['max_atime_nr'])}\t"
                 f"{d['owner_uid']}\n"
             )
 
@@ -350,7 +432,7 @@ def get_summary(session) -> dict:
 
 
 @click.command()
-@click.argument("filesystem", type=str)
+@click.argument("filesystem", type=str, default="all")
 @click.option(
     "-d",
     "--min-depth",
@@ -402,9 +484,25 @@ def get_summary(session) -> dict:
     help="Write TSV output to file",
 )
 @click.option(
-    "--non-recursive",
+    "--accessed-before",
+    type=str,
+    help="Filter to max_atime_r before date (YYYY-MM-DD or Nyrs/Nmo)",
+)
+@click.option(
+    "--accessed-after",
+    type=str,
+    help="Filter to max_atime_r after date (YYYY-MM-DD or Nyrs/Nmo)",
+)
+@click.option(
+    "-v",
+    "--verbose",
     is_flag=True,
-    help="Show non-recursive stats instead of recursive",
+    help="Show additional columns (Depth)",
+)
+@click.option(
+    "--leaves-only",
+    is_flag=True,
+    help="Only show leaf directories (no subdirectories)",
 )
 @click.option(
     "--summary",
@@ -421,72 +519,121 @@ def main(
     limit: int,
     sort_by: str,
     output: Path | None,
-    non_recursive: bool,
+    accessed_before: str | None,
+    accessed_after: str | None,
+    verbose: bool,
+    leaves_only: bool,
     summary: bool,
 ):
     """
     Query GPFS scan database for directory statistics.
 
-    FILESYSTEM is the name of the filesystem (e.g., asp, cisl, eol, hao).
+    FILESYSTEM is the name of the filesystem (e.g., asp, cisl, eol, hao),
+    or 'all' to query all available databases (default).
 
     \b
     Examples:
-        # Show top 50 directories by recursive size
-        python -m fs_scans.query_db asp
+        # Query all filesystems (default)
+        query-fs-scan-db
 
-        # Filter to a specific path prefix
-        python -m fs_scans.query_db asp --path-prefix /gpfs/csfs1/asp/username
+        # Query a specific filesystem
+        query-fs-scan-db asp
 
         # Show only single-owner directories at depth 4+
-        python -m fs_scans.query_db asp -d 4 --single-owner
+        query-fs-scan-db -d 4 --single-owner
 
-        # Export all directories to TSV
-        python -m fs_scans.query_db asp --limit 0 -o asp_dirs.tsv
+        # Filter by access time (files not accessed in 3+ years)
+        query-fs-scan-db --accessed-before 3yrs
+
+        # Show only leaf directories
+        query-fs-scan-db --leaves-only
     """
-    # Check database exists
-    db_path = get_db_path(filesystem)
-    if not db_path.exists():
-        console.print(f"[red]Database not found: {db_path}[/red]")
-        console.print("Run scan_to_db.py first to import data.")
-        raise SystemExit(1)
+    # Determine which filesystems to query
+    if filesystem.lower() == "all":
+        filesystems = get_all_filesystems()
+        if not filesystems:
+            console.print("[red]No database files found.[/red]")
+            console.print("Run fs-scan-to-db first to import data.")
+            raise SystemExit(1)
+    else:
+        db_path = get_db_path(filesystem)
+        if not db_path.exists():
+            console.print(f"[red]Database not found: {db_path}[/red]")
+            console.print("Run fs-scan-to-db first to import data.")
+            raise SystemExit(1)
+        filesystems = [filesystem]
 
     console.print(f"[bold]GPFS Scan Database Query[/bold]")
-    console.print(f"Database: {db_path}")
+    console.print(f"Databases: {', '.join(filesystems)}")
     console.print()
 
-    session = get_session(filesystem)
+    # Parse date arguments once
+    parsed_before = parse_date_arg(accessed_before) if accessed_before else None
+    parsed_after = parse_date_arg(accessed_after) if accessed_after else None
 
-    try:
-        if summary:
-            # Show summary only
-            stats = get_summary(session)
-            console.print(f"Total directories: {stats['total_directories']:,}")
-            console.print(f"Root directories: {stats['root_directories']:,}")
-            console.print(f"Total files (root): {stats['total_files']:,}")
-            console.print(f"Total size (root): {format_size(stats['total_size'])}")
-            console.print(f"Maximum depth: {stats['max_depth']}")
-            return
+    # Handle summary mode
+    if summary:
+        for fs in filesystems:
+            session = get_session(fs)
+            try:
+                stats = get_summary(session)
+                console.print(f"[cyan]{fs}:[/cyan]")
+                console.print(f"  Total directories: {stats['total_directories']:,}")
+                console.print(f"  Root directories: {stats['root_directories']:,}")
+                console.print(f"  Total files (root): {stats['total_files']:,}")
+                console.print(f"  Total size (root): {format_size(stats['total_size'])}")
+                console.print(f"  Maximum depth: {stats['max_depth']}")
+            finally:
+                session.close()
+        return
 
-        # Query directories
-        directories = query_directories(
-            session,
-            min_depth=min_depth,
-            max_depth=max_depth,
-            single_owner=single_owner,
-            owner_id=owner_id,
-            path_prefix=path_prefix,
-            sort_by=sort_by,
-            limit=limit if limit > 0 else None,
-        )
+    # Query directories
+    multi_db = len(filesystems) > 1
+    all_directories = []
 
-        # Output results
-        if output:
-            write_tsv(directories, output)
-        else:
-            print_results(directories, show_recursive=not non_recursive)
+    for fs in filesystems:
+        session = get_session(fs)
+        try:
+            dirs = query_directories(
+                session,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                single_owner=single_owner,
+                owner_id=owner_id,
+                path_prefix=path_prefix,
+                sort_by=sort_by,
+                limit=limit if limit > 0 else None,
+                accessed_before=parsed_before,
+                accessed_after=parsed_after,
+                leaves_only=leaves_only,
+            )
+            all_directories.extend(dirs)
+        finally:
+            session.close()
 
-    finally:
-        session.close()
+    # For multi-db: sort combined results and apply limit
+    if multi_db:
+        sort_key_map = {
+            "size_r": lambda d: d["total_size_r"] or 0,
+            "size_nr": lambda d: d["total_size_nr"] or 0,
+            "files_r": lambda d: d["file_count_r"] or 0,
+            "files_nr": lambda d: d["file_count_nr"] or 0,
+            "atime_r": lambda d: d["max_atime_r"] or "",
+            "path": lambda d: (d["depth"], d["path"]),
+            "depth": lambda d: d["depth"],
+        }
+        reverse = sort_by not in ("path",)  # Most sorts are descending
+        all_directories.sort(key=sort_key_map.get(sort_by, sort_key_map["size_r"]), reverse=reverse)
+
+        # Apply limit after sorting combined results
+        if limit > 0:
+            all_directories = all_directories[:limit]
+
+    # Output results
+    if output:
+        write_tsv(all_directories, output)
+    else:
+        print_results(all_directories, verbose=verbose, leaves_only=leaves_only)
 
 
 if __name__ == "__main__":

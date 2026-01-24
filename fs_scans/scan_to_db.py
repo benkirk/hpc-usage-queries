@@ -115,6 +115,7 @@ def parse_line(line: str) -> dict | None:
 
     # Extract other fields
     size_match = FIELD_PATTERNS["size"].search(fields_str)
+    alloc_match = FIELD_PATTERNS["allocated_kb"].search(fields_str)
     user_match = FIELD_PATTERNS["user_id"].search(fields_str)
     atime_match = FIELD_PATTERNS["atime"].search(fields_str)
 
@@ -129,11 +130,15 @@ def parse_line(line: str) -> dict | None:
         except ValueError:
             pass
 
+    # Allocated is in KB, convert to bytes
+    allocated = int(alloc_match.group(1)) * 1024 if alloc_match else None
+
     return {
         "inode": int(inode),
         "fileset_id": int(fileset_id),
         "path": path,
         "size": int(size_match.group(1)),
+        "allocated": allocated,
         "user_id": int(user_match.group(1)),
         "is_dir": is_dir,
         "atime": atime,
@@ -475,7 +480,9 @@ def accumulate_file_stats_nr(
     if not parent_id:
         return False
 
-    size = parsed["size"]
+    # track allocated size; not 'size'; to properly catch compression, sparse files, etc...
+    #size = parsed["size"]
+    size = parsed["allocated"]
     atime = parsed["atime"]
     user_id = parsed["user_id"]
 
@@ -612,21 +619,18 @@ def pass2a_nonrecursive_stats(
             task,
             completed=line_count,
             files=f"{file_count:,}",
-            flushes=f"{flush_count:,}",
             rate=f"{rate:,}",
         )
 
     with create_progress_bar(
         extra_columns=[
             TextColumn("[cyan]{task.fields[files]} files"),
-            TextColumn("[yellow]{task.fields[flushes]} flushes"),
         ]
     ) as progress:
         task = progress.add_task(
             f"[green]Processing {input_file.name}...",
             total=total_lines,
             files="0",
-            flushes="0",
             rate="0",
         )
 
@@ -723,9 +727,9 @@ def pass2a_nonrecursive_stats(
         do_flush()
         update_progress_bar(progress, task)
 
-    console.print(f"  Lines processed: {line_count:,}")
-    console.print(f"  Files counted: {file_count:,}")
-    console.print(f"  Database flushes: {flush_count:,}")
+    console.print(f"    Lines processed: {line_count:,}")
+    console.print(f"    Files counted: {file_count:,}")
+    console.print(f"    Database flushes: {flush_count:,}")
 
 
 def pass2b_aggregate_recursive_stats(session) -> None:
@@ -742,7 +746,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
     # Get max depth
     max_depth = session.execute(text("SELECT MAX(depth) FROM directories")).scalar() or 0
 
-    console.print(f"  Max directory depth: {max_depth}")
+    console.print(f"    Max directory depth: {max_depth}")
 
     with create_progress_bar(show_rate=False) as progress:
         task = progress.add_task(
@@ -796,7 +800,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                     owner_uid = CASE
                         -- Already conflicted -> stay conflicted
                         WHEN owner_uid IS NULL THEN NULL
-                        
+
                         -- Direct files exist (owner_uid >= 0) -> check for conflict with children
                         WHEN owner_uid >= 0 THEN
                              CASE
@@ -804,7 +808,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                                 WHEN agg.distinct_valid_owners > 0 AND agg.common_owner != owner_uid THEN NULL
                                 ELSE owner_uid
                              END
-                             
+
                         -- No direct files (-1) -> inherit from children
                         ELSE -- owner_uid == -1
                              CASE
@@ -823,7 +827,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
             session.commit()
             progress.update(task, advance=1)
 
-    console.print(f"  Processed {max_depth} depth levels")
+    console.print(f"    Processed {max_depth} depth levels")
 
 
 def worker_parse_lines(
@@ -981,7 +985,7 @@ def main(
         pass2b_aggregate_recursive_stats(session)
 
         overall_duration = time.time() - overall_start
-        
+
         # Get DB file size
         db_file = Path(f"fs_scans/{filesystem}.db")
         size_str = "unknown"

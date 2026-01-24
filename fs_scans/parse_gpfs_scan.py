@@ -57,6 +57,7 @@ LINE_PATTERN = re.compile(
 # Pattern to extract specific fields from the key=value section
 FIELD_PATTERNS = {
     "size": re.compile(r"s=(\d+)"),
+    "allocated_kb": re.compile(r"a=(\d+)"),
     "user_id": re.compile(r"u=(\d+)"),
     "permissions": re.compile(r"p=([^\s]+)"),
     "atime": re.compile(r"ac=(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"),
@@ -184,7 +185,8 @@ def format_datetime(dt: datetime | None) -> str:
     """Format datetime for display."""
     if dt is None:
         return "N/A"
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    #return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%Y-%m-%d")
 
 
 def get_path_depth(path: str) -> int:
