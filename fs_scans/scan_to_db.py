@@ -115,6 +115,7 @@ def parse_line(line: str) -> dict | None:
 
     # Extract other fields
     size_match = FIELD_PATTERNS["size"].search(fields_str)
+    alloc_match = FIELD_PATTERNS["allocated_kb"].search(fields_str)
     user_match = FIELD_PATTERNS["user_id"].search(fields_str)
     atime_match = FIELD_PATTERNS["atime"].search(fields_str)
 
@@ -129,11 +130,15 @@ def parse_line(line: str) -> dict | None:
         except ValueError:
             pass
 
+    # Allocated is in KB, convert to bytes
+    allocated = int(alloc_match.group(1)) * 1024 if alloc_match else None
+
     return {
         "inode": int(inode),
         "fileset_id": int(fileset_id),
         "path": path,
         "size": int(size_match.group(1)),
+        "allocated": allocated,
         "user_id": int(user_match.group(1)),
         "is_dir": is_dir,
         "atime": atime,
@@ -475,7 +480,9 @@ def accumulate_file_stats_nr(
     if not parent_id:
         return False
 
-    size = parsed["size"]
+    # track allocated size; not 'size'; to properly catch compression, sparse files, etc...
+    #size = parsed["size"]
+    size = parsed["allocated"]
     atime = parsed["atime"]
     user_id = parsed["user_id"]
 
