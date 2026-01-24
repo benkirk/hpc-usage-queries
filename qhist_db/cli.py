@@ -97,36 +97,70 @@ def history(ctx, start_date, end_date, group_by, machine):
 from rich.table import Table
 from rich.console import Console
 
-# ... (rest of the imports)
 
-# ... (history command group)
-
-@history.command("jobs-per-user")
-@click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), help="Group results by day, month, quarter, or year (overrides history setting).")
-@click.pass_context
-def jobs_per_user(ctx, group_by):
-    """Prints the number of jobs per user per account."""
+def _run_jobs_per_entity_report(ctx, group_by, primary_entity: str, verbose: bool):
+    """Common implementation for jobs-per-user and jobs-per-project commands."""
     start_date = ctx.obj['start_date']
     end_date = ctx.obj['end_date']
     machine = ctx.obj['machine']
-    
-    # Use provided group_by or fall back to context
+
     if group_by is None:
         group_by = ctx.obj['group_by']
 
     session = get_session(machine)
     queries = JobQueries(session)
 
-    data = queries.jobs_per_user_account_by_period(start=start_date, end=end_date, period=group_by)
-    
-    console = Console()
-    table = Table("Period", "User", "Account", "Job Count")
-    for row in data:
-        table.add_row(row['period'], row['user'], row['account'], str(row['job_count']))
-        
-    console.print(table)
+    data = queries.jobs_by_entity_period(
+        primary_entity=primary_entity,
+        start=start_date,
+        end=end_date,
+        period=group_by
+    )
 
+    console = Console()
+
+    # Determine columns based on verbose flag
+    if primary_entity == "user":
+        if verbose:
+            table_columns = ("Period", "User", "Account", "Job Count")
+        else:
+            table_columns = ("Period", "User", "Job Count")
+    else:  # "account"
+        if verbose:
+            table_columns = ("Period", "Account", "User", "Job Count")
+        else:
+            table_columns = ("Period", "Account", "Job Count")
+
+    table = Table(*table_columns)
+
+    key_map = {"Period": "period", "User": "user", "Account": "account", "Job Count": "job_count"}
+    for row in data:
+        table.add_row(*[str(row[key_map[col]]) for col in table_columns])
+
+    console.print(table)
     session.close()
+
+
+@history.command("jobs-per-user")
+@click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]),
+              help="Group results by day, month, quarter, or year (overrides history setting).")
+@click.option("-v", "--verbose", is_flag=True, default=False,
+              help="Show account column in addition to user.")
+@click.pass_context
+def jobs_per_user(ctx, group_by, verbose):
+    """Prints the number of jobs per user."""
+    _run_jobs_per_entity_report(ctx, group_by, "user", verbose)
+
+
+@history.command("jobs-per-project")
+@click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]),
+              help="Group results by day, month, quarter, or year (overrides history setting).")
+@click.option("-v", "--verbose", is_flag=True, default=False,
+              help="Show user column in addition to account.")
+@click.pass_context
+def jobs_per_project(ctx, group_by, verbose):
+    """Prints the number of jobs per project (account)."""
+    _run_jobs_per_entity_report(ctx, group_by, "account", verbose)
 
 @history.command("unique-projects")
 @click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), help="Group results by day, month, quarter, or year (overrides history setting).")

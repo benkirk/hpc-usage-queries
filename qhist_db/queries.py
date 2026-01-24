@@ -1129,26 +1129,35 @@ class JobQueries:
 
         return query.order_by(DailySummary.date).all()
 
-    def jobs_per_user_account_by_period(
+    def jobs_by_entity_period(
         self,
+        primary_entity: str = "user",
         start: Optional[date] = None,
         end: Optional[date] = None,
         period: str = "day",
     ) -> List[Dict[str, Any]]:
-        """Get the number of jobs per user per account by period in a date range.
+        """Get the number of jobs grouped by period and entity pair.
 
         Args:
+            primary_entity: Primary grouping entity ('user' or 'account').
+                           'user' gives Period > User > Account ordering.
+                           'account' gives Period > Account > User ordering.
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
             period: Grouping period ('day', 'month', 'quarter', 'year')
 
         Returns:
-            A list of dicts with 'period', 'user', 'account', and 'job_count' keys.
+            List of dicts with 'period', 'user', 'account', and 'job_count' keys,
+            ordered by period, then primary_entity, then secondary_entity.
         """
         from .query_builders import PeriodGrouper
 
-        # Get period function
         period_func = PeriodGrouper.get_period_func(period, Job.end)
+
+        if primary_entity == "user":
+            order_fields = [Job.user, Job.account]
+        else:  # "account"
+            order_fields = [Job.account, Job.user]
 
         query = self.session.query(
             period_func.label("period"),
@@ -1159,13 +1168,39 @@ class JobQueries:
 
         query = self._apply_date_filter(query, start, end)
 
-        results = query.group_by("period", Job.user, Job.account).order_by("period", Job.user, Job.account).all()
+        results = query.group_by("period", Job.user, Job.account).order_by(
+            "period", *order_fields
+        ).all()
 
-        # Convert results to list of dicts
         return [
             {"period": row[0], "user": row[1], "account": row[2], "job_count": row[3]}
             for row in results
         ]
+
+    def jobs_per_user_account_by_period(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        period: str = "day",
+    ) -> List[Dict[str, Any]]:
+        """Get the number of jobs per user per account by period in a date range.
+
+        Delegates to jobs_by_entity_period() for backward compatibility.
+
+        Args:
+            start: Optional start date (inclusive) - filters on job end time
+            end: Optional end date (inclusive) - filters on job end time
+            period: Grouping period ('day', 'month', 'quarter', 'year')
+
+        Returns:
+            A list of dicts with 'period', 'user', 'account', and 'job_count' keys.
+        """
+        return self.jobs_by_entity_period(
+            primary_entity="user",
+            start=start,
+            end=end,
+            period=period
+        )
 
     def unique_projects_by_period(
         self,

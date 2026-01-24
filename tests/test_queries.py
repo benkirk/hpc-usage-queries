@@ -407,3 +407,111 @@ class TestJobQueries:
         # Should be in descending order by end time
         for i in range(len(jobs) - 1):
             assert jobs[i].end >= jobs[i + 1].end
+
+
+class TestJobsByEntityPeriod:
+    """Test suite for jobs_by_entity_period method."""
+
+    def test_jobs_by_entity_period_user_primary(self, in_memory_session, sample_jobs):
+        """Test grouping with user as primary entity."""
+        queries = JobQueries(in_memory_session)
+        start = date(2025, 1, 15)
+        end = date(2025, 1, 20)
+
+        results = queries.jobs_by_entity_period(
+            primary_entity="user", start=start, end=end, period="day"
+        )
+
+        assert len(results) > 0
+        # Verify all required keys present
+        for row in results:
+            assert "period" in row
+            assert "user" in row
+            assert "account" in row
+            assert "job_count" in row
+
+    def test_jobs_by_entity_period_account_primary(self, in_memory_session, sample_jobs):
+        """Test grouping with account as primary entity."""
+        queries = JobQueries(in_memory_session)
+        start = date(2025, 1, 15)
+        end = date(2025, 1, 20)
+
+        results = queries.jobs_by_entity_period(
+            primary_entity="account", start=start, end=end, period="day"
+        )
+
+        assert len(results) > 0
+        for row in results:
+            assert "period" in row
+            assert "user" in row
+            assert "account" in row
+            assert "job_count" in row
+
+    def test_jobs_by_entity_period_ordering_user_primary(self, in_memory_session, sample_jobs):
+        """Test that user-primary ordering sorts by user within each period."""
+        queries = JobQueries(in_memory_session)
+        start = date(2025, 1, 15)
+        end = date(2025, 1, 20)
+
+        results = queries.jobs_by_entity_period(
+            primary_entity="user", start=start, end=end, period="day"
+        )
+
+        # Results should be sorted by period, then user, then account
+        for i in range(len(results) - 1):
+            curr, next_ = results[i], results[i + 1]
+            if curr["period"] == next_["period"]:
+                assert curr["user"] <= next_["user"] or (
+                    curr["user"] == next_["user"] and curr["account"] <= next_["account"]
+                )
+
+    def test_jobs_by_entity_period_ordering_account_primary(self, in_memory_session, sample_jobs):
+        """Test that account-primary ordering sorts by account within each period."""
+        queries = JobQueries(in_memory_session)
+        start = date(2025, 1, 15)
+        end = date(2025, 1, 20)
+
+        results = queries.jobs_by_entity_period(
+            primary_entity="account", start=start, end=end, period="day"
+        )
+
+        # Results should be sorted by period, then account, then user
+        for i in range(len(results) - 1):
+            curr, next_ = results[i], results[i + 1]
+            if curr["period"] == next_["period"]:
+                assert curr["account"] <= next_["account"] or (
+                    curr["account"] == next_["account"] and curr["user"] <= next_["user"]
+                )
+
+    def test_jobs_by_entity_period_with_month_grouping(self, in_memory_session, sample_jobs):
+        """Test grouping by month."""
+        queries = JobQueries(in_memory_session)
+        start = date(2025, 1, 1)
+        end = date(2025, 1, 31)
+
+        results = queries.jobs_by_entity_period(
+            primary_entity="user", start=start, end=end, period="month"
+        )
+
+        # All periods should be in YYYY-MM format
+        for row in results:
+            assert row["period"] == "2025-01"
+
+    def test_jobs_per_user_account_by_period_backward_compat(self, in_memory_session, sample_jobs):
+        """Test that jobs_per_user_account_by_period still works via delegation."""
+        queries = JobQueries(in_memory_session)
+        start = date(2025, 1, 15)
+        end = date(2025, 1, 20)
+
+        # Call the original method
+        results = queries.jobs_per_user_account_by_period(
+            start=start, end=end, period="day"
+        )
+
+        # Compare with direct call to new method
+        results_new = queries.jobs_by_entity_period(
+            primary_entity="user", start=start, end=end, period="day"
+        )
+
+        assert len(results) == len(results_new)
+        assert results == results_new

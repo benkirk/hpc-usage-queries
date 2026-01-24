@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "sqlalchemy>=2.0",
     "rich",
+    "click",
 ]
 
 [project.optional-dependencies]
@@ -26,13 +27,15 @@ analysis = [
 [project.scripts]
 qhist-sync = "scripts.sync_jobs:main"
 qhist-report = "qhist_db.cli:cli"
+fs-scan-to-db = "fs_scans.scan_to_db:main"
+query-fs-scan-db = "fs_scans.query_db:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["qhist_db*", "scripts*"]
+include = ["qhist_db*", "scripts*", "fs_scans*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
