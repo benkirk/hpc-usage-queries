@@ -735,8 +735,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
     Processes directories by depth, from deepest to shallowest.
     Each directory's recursive stats = its non-recursive stats + sum of children's recursive stats.
 
-    Args:
-        session: SQLAlchemy session
+    Optimized to use SQLite 'UPDATE FROM' (requires SQLite 3.33+).
     """
     console.print("  [bold]Phase 2b:[/bold] Computing recursive statistics...")
 
@@ -753,83 +752,74 @@ def pass2b_aggregate_recursive_stats(session) -> None:
 
         # Process from leaves (max_depth) down to root (depth=1)
         for depth in range(max_depth, 0, -1):
+            # 1. Initialize recursive stats with non-recursive stats for this level
+            #    (This covers leaf nodes and prepares parents for accumulation)
             session.execute(
                 text("""
                 UPDATE directory_stats
                 SET
-                    file_count_r = file_count_nr + COALESCE(
-                        (SELECT SUM(cs.file_count_r)
-                         FROM directories cd
-                         JOIN directory_stats cs ON cd.dir_id = cs.dir_id
-                         WHERE cd.parent_id = directory_stats.dir_id), 0),
-                    total_size_r = total_size_nr + COALESCE(
-                        (SELECT SUM(cs.total_size_r)
-                         FROM directories cd
-                         JOIN directory_stats cs ON cd.dir_id = cs.dir_id
-                         WHERE cd.parent_id = directory_stats.dir_id), 0),
-                    max_atime_r = (
-                        SELECT MAX(atime) FROM (
-                            SELECT max_atime_nr as atime
-                            UNION ALL
-                            SELECT cs.max_atime_r FROM directories cd
-                            JOIN directory_stats cs ON cd.dir_id = cs.dir_id
-                            WHERE cd.parent_id = directory_stats.dir_id
-                        )
-                    ),
-                    owner_uid = CASE
-                        -- Already NULL (multiple owners) -> stay NULL
-                        WHEN owner_uid IS NULL THEN NULL
-                        -- No direct files: inherit from children if they agree
-                        WHEN owner_uid = -1 THEN (
-                            SELECT CASE
-                                -- Any child has NULL -> result is NULL
-                                WHEN EXISTS (
-                                    SELECT 1 FROM directories cd
-                                    JOIN directory_stats cs ON cd.dir_id = cs.dir_id
-                                    WHERE cd.parent_id = directory_stats.dir_id
-                                      AND cs.owner_uid IS NULL
-                                ) THEN NULL
-                                -- All children agree on owner
-                                WHEN (SELECT COUNT(DISTINCT cs.owner_uid)
-                                      FROM directories cd
-                                      JOIN directory_stats cs ON cd.dir_id = cs.dir_id
-                                      WHERE cd.parent_id = directory_stats.dir_id
-                                        AND cs.owner_uid IS NOT NULL
-                                        AND cs.owner_uid != -1) <= 1
-                                THEN (SELECT cs.owner_uid
-                                      FROM directories cd
-                                      JOIN directory_stats cs ON cd.dir_id = cs.dir_id
-                                      WHERE cd.parent_id = directory_stats.dir_id
-                                        AND cs.owner_uid IS NOT NULL
-                                        AND cs.owner_uid != -1
-                                      LIMIT 1)
-                                -- Multiple owners among children
-                                ELSE NULL
-                            END
-                        )
-                        -- Has direct files: check if any child conflicts
-                        WHEN EXISTS (
-                            SELECT 1 FROM directories cd
-                            JOIN directory_stats cs ON cd.dir_id = cs.dir_id
-                            WHERE cd.parent_id = directory_stats.dir_id
-                              AND cs.owner_uid IS NOT NULL
-                              AND cs.owner_uid != -1
-                              AND cs.owner_uid != directory_stats.owner_uid
-                        ) THEN NULL
-                        -- Any child has NULL owner -> this becomes NULL too
-                        WHEN EXISTS (
-                            SELECT 1 FROM directories cd
-                            JOIN directory_stats cs ON cd.dir_id = cs.dir_id
-                            WHERE cd.parent_id = directory_stats.dir_id
-                              AND cs.owner_uid IS NULL
-                        ) THEN NULL
-                        -- No conflicts
-                        ELSE owner_uid
-                    END
+                    file_count_r = file_count_nr,
+                    total_size_r = total_size_nr,
+                    max_atime_r = max_atime_nr
                 WHERE dir_id IN (SELECT dir_id FROM directories WHERE depth = :depth)
-            """),
+                """),
                 {"depth": depth},
             )
+
+            # 2. Accumulate stats from children (depth + 1) using UPDATE FROM
+            #    (Only updates parents that actually have children)
+            session.execute(
+                text("""
+                WITH child_agg AS (
+                    SELECT
+                        d.parent_id,
+                        SUM(s.file_count_r) as sum_files,
+                        SUM(s.total_size_r) as sum_size,
+                        MAX(s.max_atime_r) as max_atime,
+                        -- Owner Aggregation:
+                        -- Check if any child has a NULL owner (conflict)
+                        MAX(CASE WHEN s.owner_uid IS NULL THEN 1 ELSE 0 END) as has_conflict,
+                        -- Count distinct valid owners (ignoring -1/no-files)
+                        COUNT(DISTINCT CASE WHEN s.owner_uid >= 0 THEN s.owner_uid END) as distinct_valid_owners,
+                        -- Get the potential common owner (if count is 1)
+                        MAX(CASE WHEN s.owner_uid >= 0 THEN s.owner_uid END) as common_owner
+                    FROM directories d
+                    JOIN directory_stats s ON d.dir_id = s.dir_id
+                    WHERE d.depth = :child_depth
+                    GROUP BY d.parent_id
+                )
+                UPDATE directory_stats
+                SET
+                    file_count_r = file_count_r + agg.sum_files,
+                    total_size_r = total_size_r + agg.sum_size,
+                    max_atime_r = MAX(COALESCE(max_atime_r, 0), COALESCE(agg.max_atime, 0)),
+                    owner_uid = CASE
+                        -- Already conflicted -> stay conflicted
+                        WHEN owner_uid IS NULL THEN NULL
+                        
+                        -- Direct files exist (owner_uid >= 0) -> check for conflict with children
+                        WHEN owner_uid >= 0 THEN
+                             CASE
+                                WHEN agg.has_conflict = 1 THEN NULL
+                                WHEN agg.distinct_valid_owners > 0 AND agg.common_owner != owner_uid THEN NULL
+                                ELSE owner_uid
+                             END
+                             
+                        -- No direct files (-1) -> inherit from children
+                        ELSE -- owner_uid == -1
+                             CASE
+                                WHEN agg.has_conflict = 1 THEN NULL
+                                WHEN agg.distinct_valid_owners > 1 THEN NULL
+                                WHEN agg.distinct_valid_owners = 1 THEN agg.common_owner
+                                ELSE -1 -- Still no owner seen
+                             END
+                    END
+                FROM child_agg AS agg
+                WHERE directory_stats.dir_id = agg.parent_id
+                """),
+                {"child_depth": depth + 1},
+            )
+
             session.commit()
             progress.update(task, advance=1)
 
