@@ -254,7 +254,9 @@ query-fs-scan-db <filesystem> [options]
 | `-n, --limit N` | Limit results (default: 50, 0 for unlimited) |
 | `--sort-by FIELD` | Sort by: `size_r`, `size_nr`, `files_r`, `files_nr`, `atime_r`, `path`, `depth` |
 | `-o, --output FILE` | Write TSV output to file |
-| `--non-recursive` | Show non-recursive stats instead of recursive |
+| `--accessed-before DATE` | Filter to max_atime_r before date (YYYY-MM-DD or Nyrs/Nmo) |
+| `--accessed-after DATE` | Filter to max_atime_r after date (YYYY-MM-DD or Nyrs/Nmo) |
+| `-v, --verbose` | Show additional columns (Depth) |
 | `--summary` | Show database summary only |
 
 ### Examples
@@ -268,6 +270,12 @@ query-fs-scan-db asp --path-prefix /gpfs/csfs1/asp/username
 
 # Show only single-owner directories at depth 4+
 query-fs-scan-db asp -d 4 --single-owner
+
+# Filter by access time (files not accessed in 3+ years)
+query-fs-scan-db asp --accessed-before 3yrs
+
+# Filter by access time range (accessed 3-5 years ago)
+query-fs-scan-db asp --accessed-after 5yrs --accessed-before 3yrs
 
 # Export all directories to TSV
 query-fs-scan-db asp --limit 0 -o asp_dirs.tsv

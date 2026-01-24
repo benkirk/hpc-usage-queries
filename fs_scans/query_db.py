@@ -6,6 +6,7 @@ Query directory statistics from the SQLite database.
 Supports filtering by depth, owner, path prefix, and sorting.
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -38,8 +39,48 @@ def format_datetime(dt: datetime | str | None) -> str:
     if isinstance(dt, str):
         # SQLite may return datetime as string - just return date portion
         return dt[:10] if len(dt) >= 10 else dt
-    #return dt.strftime("%Y-%m-%d %H:%M:%S")
     return dt.strftime("%Y-%m-%d")
+
+
+def parse_date_arg(value: str) -> datetime:
+    """
+    Parse date argument - absolute (YYYY-MM-DD) or relative (3yrs, 6mo).
+
+    Args:
+        value: Date string like "2024-01-15", "3yrs", or "18mo"
+
+    Returns:
+        datetime object
+
+    Raises:
+        click.BadParameter: If format is invalid
+    """
+    # Try absolute date first
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # Parse relative date (e.g., "3yrs", "6mo")
+    match = re.match(r"^(\d+)(yrs?|mo)$", value.lower())
+    if match:
+        num = int(match.group(1))
+        unit = match.group(2)
+        now = datetime.now()
+        if unit.startswith("yr"):
+            return now.replace(year=now.year - num)
+        elif unit == "mo":
+            # Handle month subtraction (wrap years if needed)
+            new_month = now.month - num
+            new_year = now.year
+            while new_month <= 0:
+                new_month += 12
+                new_year -= 1
+            # Handle day overflow (e.g., Jan 31 - 1 month)
+            day = min(now.day, 28)  # Safe for all months
+            return now.replace(year=new_year, month=new_month, day=day)
+
+    raise click.BadParameter(f"Invalid date format: {value}. Use YYYY-MM-DD or Nyrs/Nmo")
 
 
 def resolve_path_to_id(session, path: str) -> int | None:
@@ -134,6 +175,8 @@ def query_directories(
     path_prefix: str | None = None,
     sort_by: str = "size_r",
     limit: int | None = None,
+    accessed_before: datetime | None = None,
+    accessed_after: datetime | None = None,
 ) -> list[dict]:
     """
     Query directories with optional filters.
@@ -147,6 +190,8 @@ def query_directories(
         path_prefix: Filter to paths under this prefix
         sort_by: Sort field (size_r, size_nr, files_r, files_nr, atime_r, path)
         limit: Maximum results to return
+        accessed_before: Filter to directories with max_atime_r before this date
+        accessed_after: Filter to directories with max_atime_r after this date
 
     Returns:
         List of directory dictionaries with stats
@@ -169,6 +214,14 @@ def query_directories(
     if owner_id is not None:
         conditions.append("s.owner_uid = :owner_id")
         params["owner_id"] = owner_id
+
+    if accessed_before is not None:
+        conditions.append("s.max_atime_r < :accessed_before")
+        params["accessed_before"] = accessed_before.strftime("%Y-%m-%d %H:%M:%S")
+
+    if accessed_after is not None:
+        conditions.append("s.max_atime_r > :accessed_after")
+        params["accessed_after"] = accessed_after.strftime("%Y-%m-%d %H:%M:%S")
 
     # Handle path prefix - find ancestor and filter descendants
     if path_prefix:
@@ -248,7 +301,7 @@ def query_directories(
     return directories
 
 
-def print_results(directories: list[dict], show_recursive: bool = True) -> None:
+def print_results(directories: list[dict], verbose: bool = False) -> None:
     """Print directory results in a formatted table."""
     if not directories:
         console.print("[yellow]No directories found matching criteria.[/yellow]")
@@ -256,17 +309,14 @@ def print_results(directories: list[dict], show_recursive: bool = True) -> None:
 
     table = Table(title=f"Directory Statistics ({len(directories)} results)")
     table.add_column("Directory", style="cyan", no_wrap=False)
-    table.add_column("Depth", justify="right")
-
-    if show_recursive:
-        table.add_column("Files (R)", justify="right")
-        table.add_column("Size (R)", justify="right")
-        table.add_column("Max Atime (R)", justify="right")
-    else:
-        table.add_column("Files", justify="right")
-        table.add_column("Size", justify="right")
-        table.add_column("Max Atime", justify="right")
-
+    if verbose:
+        table.add_column("Depth", justify="right")
+    table.add_column("Size\n(R)", justify="right")
+    table.add_column("Size\n(NR)", justify="right")
+    table.add_column("Files\n(R)", justify="right")
+    table.add_column("Files\n(NR)", justify="right")
+    table.add_column("Atime\n(R)", justify="right")
+    table.add_column("Atime\n(NR)", justify="right")
     table.add_column("Owner", justify="right")
 
     for d in directories:
@@ -276,24 +326,19 @@ def print_results(directories: list[dict], show_recursive: bool = True) -> None:
             else "[yellow]multiple[/yellow]" if d["owner_uid"] is None else "[dim]-[/dim]"
         )
 
-        if show_recursive:
-            table.add_row(
-                d["path"],
-                str(d["depth"]),
-                f"{d['file_count_r']:,}",
-                format_size(d["total_size_r"]),
-                format_datetime(d["max_atime_r"]),
-                owner_str,
-            )
-        else:
-            table.add_row(
-                d["path"],
-                str(d["depth"]),
-                f"{d['file_count_nr']:,}",
-                format_size(d["total_size_nr"]),
-                format_datetime(d["max_atime_nr"]),
-                owner_str,
-            )
+        row = [d["path"]]
+        if verbose:
+            row.append(str(d["depth"]))
+        row.extend([
+            format_size(d["total_size_r"]),
+            format_size(d["total_size_nr"]),
+            f"{d['file_count_r']:,}",
+            f"{d['file_count_nr']:,}",
+            format_datetime(d["max_atime_r"]),
+            format_datetime(d["max_atime_nr"]),
+            owner_str,
+        ])
+        table.add_row(*row)
 
     console.print(table)
 
@@ -304,18 +349,19 @@ def write_tsv(directories: list[dict], output_path: Path) -> None:
         # Header
         f.write(
             "directory\tdepth\t"
-            "file_count_nr\ttotal_size_nr\tmax_atime_nr\t"
-            "file_count_r\ttotal_size_r\tmax_atime_r\t"
+            "total_size_r\ttotal_size_nr\t"
+            "file_count_r\tfile_count_nr\t"
+            "max_atime_r\tmax_atime_nr\t"
             "owner_uid\n"
         )
 
         for d in directories:
             f.write(
                 f"{d['path']}\t{d['depth']}\t"
-                f"{d['file_count_nr']}\t{d['total_size_nr']}\t"
-                f"{format_datetime(d['max_atime_nr'])}\t"
-                f"{d['file_count_r']}\t{d['total_size_r']}\t"
+                f"{d['total_size_r']}\t{d['total_size_nr']}\t"
+                f"{d['file_count_r']}\t{d['file_count_nr']}\t"
                 f"{format_datetime(d['max_atime_r'])}\t"
+                f"{format_datetime(d['max_atime_nr'])}\t"
                 f"{d['owner_uid']}\n"
             )
 
@@ -403,9 +449,20 @@ def get_summary(session) -> dict:
     help="Write TSV output to file",
 )
 @click.option(
-    "--non-recursive",
+    "--accessed-before",
+    type=str,
+    help="Filter to max_atime_r before date (YYYY-MM-DD or Nyrs/Nmo)",
+)
+@click.option(
+    "--accessed-after",
+    type=str,
+    help="Filter to max_atime_r after date (YYYY-MM-DD or Nyrs/Nmo)",
+)
+@click.option(
+    "-v",
+    "--verbose",
     is_flag=True,
-    help="Show non-recursive stats instead of recursive",
+    help="Show additional columns (Depth)",
 )
 @click.option(
     "--summary",
@@ -422,7 +479,9 @@ def main(
     limit: int,
     sort_by: str,
     output: Path | None,
-    non_recursive: bool,
+    accessed_before: str | None,
+    accessed_after: str | None,
+    verbose: bool,
     summary: bool,
 ):
     """
@@ -433,16 +492,22 @@ def main(
     \b
     Examples:
         # Show top 50 directories by recursive size
-        python -m fs_scans.query_db asp
+        query-fs-scan-db asp
 
         # Filter to a specific path prefix
-        python -m fs_scans.query_db asp --path-prefix /gpfs/csfs1/asp/username
+        query-fs-scan-db asp --path-prefix /gpfs/csfs1/asp/username
 
         # Show only single-owner directories at depth 4+
-        python -m fs_scans.query_db asp -d 4 --single-owner
+        query-fs-scan-db asp -d 4 --single-owner
+
+        # Filter by access time (files not accessed in 3+ years)
+        query-fs-scan-db asp --accessed-before 3yrs
+
+        # Filter by access time range (accessed 3-5 years ago)
+        query-fs-scan-db asp --accessed-after 5yrs --accessed-before 3yrs
 
         # Export all directories to TSV
-        python -m fs_scans.query_db asp --limit 0 -o asp_dirs.tsv
+        query-fs-scan-db asp --limit 0 -o asp_dirs.tsv
     """
     # Check database exists
     db_path = get_db_path(filesystem)
@@ -468,6 +533,10 @@ def main(
             console.print(f"Maximum depth: {stats['max_depth']}")
             return
 
+        # Parse date arguments
+        parsed_before = parse_date_arg(accessed_before) if accessed_before else None
+        parsed_after = parse_date_arg(accessed_after) if accessed_after else None
+
         # Query directories
         directories = query_directories(
             session,
@@ -478,13 +547,15 @@ def main(
             path_prefix=path_prefix,
             sort_by=sort_by,
             limit=limit if limit > 0 else None,
+            accessed_before=parsed_before,
+            accessed_after=parsed_after,
         )
 
         # Output results
         if output:
             write_tsv(directories, output)
         else:
-            print_results(directories, show_recursive=not non_recursive)
+            print_results(directories, verbose=verbose)
 
     finally:
         session.close()
