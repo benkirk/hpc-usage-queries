@@ -612,21 +612,18 @@ def pass2a_nonrecursive_stats(
             task,
             completed=line_count,
             files=f"{file_count:,}",
-            flushes=f"{flush_count:,}",
             rate=f"{rate:,}",
         )
 
     with create_progress_bar(
         extra_columns=[
             TextColumn("[cyan]{task.fields[files]} files"),
-            TextColumn("[yellow]{task.fields[flushes]} flushes"),
         ]
     ) as progress:
         task = progress.add_task(
             f"[green]Processing {input_file.name}...",
             total=total_lines,
             files="0",
-            flushes="0",
             rate="0",
         )
 
