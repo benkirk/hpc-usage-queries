@@ -15,10 +15,20 @@ from rich.console import Console
 from rich.table import Table
 from sqlalchemy import text
 
-from .database import get_db_path, get_session
+from .database import get_db_path, get_session, DATA_DIR
 from .models import Directory, DirectoryStats
 
 console = Console()
+
+
+def get_all_filesystems() -> list[str]:
+    """Discover all available filesystem databases.
+
+    Returns:
+        List of filesystem names (e.g., ['asp', 'cisl', 'eol', 'hao'])
+    """
+    db_files = DATA_DIR.glob("*.db")
+    return sorted([f.stem for f in db_files])
 
 
 def format_size(size_bytes: int) -> str:
@@ -422,7 +432,7 @@ def get_summary(session) -> dict:
 
 
 @click.command()
-@click.argument("filesystem", type=str)
+@click.argument("filesystem", type=str, default="all")
 @click.option(
     "-d",
     "--min-depth",
@@ -518,79 +528,112 @@ def main(
     """
     Query GPFS scan database for directory statistics.
 
-    FILESYSTEM is the name of the filesystem (e.g., asp, cisl, eol, hao).
+    FILESYSTEM is the name of the filesystem (e.g., asp, cisl, eol, hao),
+    or 'all' to query all available databases (default).
 
     \b
     Examples:
-        # Show top 50 directories by recursive size
+        # Query all filesystems (default)
+        query-fs-scan-db
+
+        # Query a specific filesystem
         query-fs-scan-db asp
 
-        # Filter to a specific path prefix
-        query-fs-scan-db asp --path-prefix /gpfs/csfs1/asp/username
-
         # Show only single-owner directories at depth 4+
-        query-fs-scan-db asp -d 4 --single-owner
+        query-fs-scan-db -d 4 --single-owner
 
         # Filter by access time (files not accessed in 3+ years)
-        query-fs-scan-db asp --accessed-before 3yrs
+        query-fs-scan-db --accessed-before 3yrs
 
-        # Filter by access time range (accessed 3-5 years ago)
-        query-fs-scan-db asp --accessed-after 5yrs --accessed-before 3yrs
-
-        # Export all directories to TSV
-        query-fs-scan-db asp --limit 0 -o asp_dirs.tsv
+        # Show only leaf directories
+        query-fs-scan-db --leaves-only
     """
-    # Check database exists
-    db_path = get_db_path(filesystem)
-    if not db_path.exists():
-        console.print(f"[red]Database not found: {db_path}[/red]")
-        console.print("Run scan_to_db.py first to import data.")
-        raise SystemExit(1)
+    # Determine which filesystems to query
+    if filesystem.lower() == "all":
+        filesystems = get_all_filesystems()
+        if not filesystems:
+            console.print("[red]No database files found.[/red]")
+            console.print("Run fs-scan-to-db first to import data.")
+            raise SystemExit(1)
+    else:
+        db_path = get_db_path(filesystem)
+        if not db_path.exists():
+            console.print(f"[red]Database not found: {db_path}[/red]")
+            console.print("Run fs-scan-to-db first to import data.")
+            raise SystemExit(1)
+        filesystems = [filesystem]
 
     console.print(f"[bold]GPFS Scan Database Query[/bold]")
-    console.print(f"Database: {db_path}")
+    console.print(f"Databases: {', '.join(filesystems)}")
     console.print()
 
-    session = get_session(filesystem)
+    # Parse date arguments once
+    parsed_before = parse_date_arg(accessed_before) if accessed_before else None
+    parsed_after = parse_date_arg(accessed_after) if accessed_after else None
 
-    try:
-        if summary:
-            # Show summary only
-            stats = get_summary(session)
-            console.print(f"Total directories: {stats['total_directories']:,}")
-            console.print(f"Root directories: {stats['root_directories']:,}")
-            console.print(f"Total files (root): {stats['total_files']:,}")
-            console.print(f"Total size (root): {format_size(stats['total_size'])}")
-            console.print(f"Maximum depth: {stats['max_depth']}")
-            return
+    # Handle summary mode
+    if summary:
+        for fs in filesystems:
+            session = get_session(fs)
+            try:
+                stats = get_summary(session)
+                console.print(f"[cyan]{fs}:[/cyan]")
+                console.print(f"  Total directories: {stats['total_directories']:,}")
+                console.print(f"  Root directories: {stats['root_directories']:,}")
+                console.print(f"  Total files (root): {stats['total_files']:,}")
+                console.print(f"  Total size (root): {format_size(stats['total_size'])}")
+                console.print(f"  Maximum depth: {stats['max_depth']}")
+            finally:
+                session.close()
+        return
 
-        # Parse date arguments
-        parsed_before = parse_date_arg(accessed_before) if accessed_before else None
-        parsed_after = parse_date_arg(accessed_after) if accessed_after else None
+    # Query directories
+    multi_db = len(filesystems) > 1
+    all_directories = []
 
-        # Query directories
-        directories = query_directories(
-            session,
-            min_depth=min_depth,
-            max_depth=max_depth,
-            single_owner=single_owner,
-            owner_id=owner_id,
-            path_prefix=path_prefix,
-            sort_by=sort_by,
-            limit=limit if limit > 0 else None,
-            accessed_before=parsed_before,
-            accessed_after=parsed_after,
-            leaves_only=leaves_only,
-        )
+    for fs in filesystems:
+        session = get_session(fs)
+        try:
+            dirs = query_directories(
+                session,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                single_owner=single_owner,
+                owner_id=owner_id,
+                path_prefix=path_prefix,
+                sort_by=sort_by,
+                limit=limit if limit > 0 else None,
+                accessed_before=parsed_before,
+                accessed_after=parsed_after,
+                leaves_only=leaves_only,
+            )
+            all_directories.extend(dirs)
+        finally:
+            session.close()
 
-        # Output results
-        if output:
-            write_tsv(directories, output)
-        else:
-            print_results(directories, verbose=verbose, leaves_only=leaves_only)
+    # For multi-db: sort combined results and apply limit
+    if multi_db:
+        sort_key_map = {
+            "size_r": lambda d: d["total_size_r"] or 0,
+            "size_nr": lambda d: d["total_size_nr"] or 0,
+            "files_r": lambda d: d["file_count_r"] or 0,
+            "files_nr": lambda d: d["file_count_nr"] or 0,
+            "atime_r": lambda d: d["max_atime_r"] or "",
+            "path": lambda d: (d["depth"], d["path"]),
+            "depth": lambda d: d["depth"],
+        }
+        reverse = sort_by not in ("path",)  # Most sorts are descending
+        all_directories.sort(key=sort_key_map.get(sort_by, sort_key_map["size_r"]), reverse=reverse)
 
-    finally:
-        session.close()
+        # Apply limit after sorting combined results
+        if limit > 0:
+            all_directories = all_directories[:limit]
+
+    # Output results
+    if output:
+        write_tsv(all_directories, output)
+    else:
+        print_results(all_directories, verbose=verbose, leaves_only=leaves_only)
 
 
 if __name__ == "__main__":
