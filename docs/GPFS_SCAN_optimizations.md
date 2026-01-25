@@ -251,9 +251,8 @@ def pass2_accumulate_stats_parallel(input_file, session, path_to_id, num_workers
 ---
 
 ## Files to Modify
-1. **`fs_scans/parse_gpfs_scan.py`**: Update `LINE_PATTERN` and `parse_line()` to extract inode/fileset_id
-2. **`fs_scans/scan_to_db.py`**:
-   - Modify `parse_line()` (local copy) to match
+1. **`fs_scans/scan_to_db.py`**:
+   - Update `LINE_PATTERN` and `parse_line()` to extract inode/fileset_id
    - Rewrite `pass1_discover_directories()` with staging table
    - Return line/dir/file counts from Phase 1
    - Update `pass2_accumulate_stats()` to use determinate progress bar
