@@ -1,18 +1,17 @@
 # GPFS Policy Scan Tools
 
-Tools for parsing GPFS policy scan log files and computing **directory-level metrics**. This includes both a streaming parser for quick analysis and a database importer for persistent storage and querying.
+Tools for parsing GPFS policy scan log files and computing **directory-level metrics**. Provides a database importer for persistent storage and a query interface for analysis.
 
 ## Tools
 
 | Tool | CLI Command | Purpose |
 |------|-------------|---------|
-| `parse_gpfs_scan.py` | - | Streaming parser - quick analysis, no persistence |
 | `scan_to_db.py` | `fs-scan-to-db` | Database importer - SQLite storage for complex queries |
 | `query_db.py` | `query-fs-scan-db` | Query interface for the SQLite database |
 
 ## Overview
 
-Both tools process GPFS scan logs and aggregate statistics at the directory level:
+These tools process GPFS scan logs and aggregate statistics at the directory level:
 
 | Metric | Non-Recursive | Recursive |
 |--------|---------------|-----------|
@@ -33,44 +32,31 @@ pip install -e .
 
 This installs the CLI commands `fs-scan-to-db` and `query-fs-scan-db`.
 
-## Usage
+## Configuration
 
-```bash
-python fs_scans/parse_gpfs_scan.py <input_file> [options]
-```
+Database location can be configured via environment variables or CLI options. Precedence (highest to lowest):
 
-### Input Files
-
-- Plain text log files (`.log`)
-
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `-o, --output FILE` | Write results to TSV file |
-| `-d, --min-depth N` | Only report directories at depth >= N (default: 3) |
-| `-s, --single-owner-only` | Only report single-owner directories |
-| `-u, --owner-id UID` | Filter to directories owned entirely by UID |
-| `-n, --max-results N` | Limit output to N directories |
-| `--sort-by FIELD` | Sort by: `size_recursive`, `size`, `files_recursive`, `files`, `atime_recursive`, `atime`, `path` |
-| `-p, --progress-interval N` | Progress reporting interval (default: 1M lines) |
+| Configuration | CLI Option | Environment Variable | Default |
+|---------------|------------|---------------------|---------|
+| Data directory | `--data-dir` | `FS_SCAN_DATA_DIR` | Module directory (`fs_scans/`) |
+| Database file | `--db` | `FS_SCAN_DB` | `{data_dir}/{filesystem}.db` |
 
 ### Examples
 
 ```bash
-# Basic usage - show top 50 directories by recursive size
-python fs_scans/parse_gpfs_scan.py fs_scans/20260111_csfs1_asp.list.list_all.log
+# Use environment variable for data directory
+export FS_SCAN_DATA_DIR=/data/gpfs_scans
+query-fs-scan-db --summary
 
-# Export to TSV for analysis
-python fs_scans/parse_gpfs_scan.py fs_scans/20260111_csfs1_asp.list.list_all.log -o results.tsv
+# Override via CLI (takes precedence over env var)
+query-fs-scan-db --data-dir /alt/path --summary
 
-# Find single-owner directories for a specific user
-python fs_scans/parse_gpfs_scan.py fs_scans/20260111_csfs1_asp.list.list_all.log \
-    --owner-id 12345 --min-depth 4
+# Specify exact database file
+fs-scan-to-db input.log --db /tmp/custom.db
 
-# Sort by file count, limit results
-python fs_scans/parse_gpfs_scan.py fs_scans/20260111_csfs1_asp.list.list_all.log \
-    --sort-by files_recursive --max-results 100
+# Or via environment variable
+export FS_SCAN_DB=/tmp/custom.db
+fs-scan-to-db input.log
 ```
 
 ## Log File Format
@@ -88,35 +74,6 @@ Key fields extracted:
 - `ac=` ACCESS_TIME (timestamp)
 
 Directory entries are skipped; only files contribute to statistics.
-
-## Memory Efficiency
-
-The parser uses a streaming approach with constant memory per directory:
-- ~64 bytes per directory (6 integers, 2 datetimes, 1 boolean)
-- No file-level data stored
-- Single-owner tracking uses O(1) space (one int + one bool per directory)
-
-For a filesystem with millions of files but hundreds of thousands of directories, memory usage remains manageable.
-
-## Output Formats
-
-### Table (stdout)
-
-```
-Directory Statistics (20 directories)
-┏━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┓
-┃ Directory  ┃ Files ┃ Size    ┃ Max Atime┃ Files(R)┃ Size (R) ┃Max At(R)┃ Owner ┃
-┡━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━┩
-│ /gpfs/...  │ 1,234 │ 45.6 GB │ 2024-01..│  56,789 │   1.2 TB │ 2025-12.│ 12345 │
-└────────────┴───────┴─────────┴──────────┴─────────┴──────────┴─────────┴───────┘
-```
-
-### TSV (--output)
-
-Tab-separated values with columns:
-```
-directory  file_count  total_size  max_atime  file_count_recursive  total_size_recursive  max_atime_recursive  owner_id  single_owner
-```
 
 ## Available Data Files
 
@@ -145,9 +102,10 @@ fs-scan-to-db <input_file> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--db PATH` | Override database path (default: `fs_scans/<filesystem>.db`) |
+| `--db PATH` | Override database file path (highest precedence) |
+| `--data-dir DIR` | Override directory for database files |
 | `-f, --filesystem NAME` | Override filesystem name (default: extracted from filename) |
-| --batch-size N | Batch size for DB updates (default: 50000) |
+| `--batch-size N` | Batch size for DB updates (default: 50000) |
 | `-p, --progress-interval N` | Progress reporting interval (default: 1M lines) |
 | `--replace` | Drop and recreate tables before import |
 | `-w, --workers N` | Number of worker processes for parsing (default: 1) |
@@ -249,6 +207,7 @@ The `filesystem` argument is optional and defaults to `all`, which queries all a
 
 | Option | Description |
 |--------|-------------|
+| `--data-dir DIR` | Override directory containing database files |
 | `-d, --min-depth N` | Filter by minimum path depth |
 | `--max-depth N` | Filter by maximum path depth |
 | `-s, --single-owner` | Only show single-owner directories |
@@ -292,4 +251,7 @@ query-fs-scan-db --limit 0 -o all_dirs.tsv
 
 # Show database summary for all filesystems
 query-fs-scan-db --summary
+
+# Query databases from a different directory
+query-fs-scan-db --data-dir /data/gpfs_scans --summary
 ```

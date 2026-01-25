@@ -43,11 +43,12 @@ from sqlalchemy import insert, select, text
 from .database import (
     drop_tables,
     extract_filesystem_from_filename,
+    get_db_path,
     get_session,
     init_db,
+    set_data_dir,
 )
 from .models import Directory, DirectoryStats
-from .parse_gpfs_scan import FIELD_PATTERNS
 
 # Extended LINE_PATTERN that captures inode and fileset_id for unique identification
 # Format: <thread> inode fileset_id snapshot  fields -- /path
@@ -55,6 +56,15 @@ LINE_PATTERN = re.compile(
     r"^<\d+>\s+(\d+)\s+(\d+)\s+\d+\s+"  # <thread> inode fileset_id snapshot
     r"(.+?)\s+--\s+(.+)$"  # fields -- path
 )
+
+# Pattern to extract specific fields from the key=value section of GPFS scan lines
+FIELD_PATTERNS = {
+    "size": re.compile(r"s=(\d+)"),
+    "allocated_kb": re.compile(r"a=(\d+)"),
+    "user_id": re.compile(r"u=(\d+)"),
+    "permissions": re.compile(r"p=([^\s]+)"),
+    "atime": re.compile(r"ac=(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"),
+}
 
 console = Console()
 
@@ -875,7 +885,13 @@ def worker_parse_lines(
     "--db",
     "db_path",
     type=click.Path(path_type=Path),
-    help="Override database path (default: auto from filename)",
+    help="Override database file path (highest precedence)",
+)
+@click.option(
+    "--data-dir",
+    "data_dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Override directory for database files (or set FS_SCAN_DATA_DIR env var)",
 )
 @click.option(
     "--filesystem",
@@ -919,6 +935,7 @@ def worker_parse_lines(
 def main(
     input_file: Path,
     db_path: Path | None,
+    data_dir: Path | None,
     filesystem: str | None,
     batch_size: int,
     progress_interval: int,
@@ -934,7 +951,10 @@ def main(
       2. Pass 2a: Accumulate non-recursive file statistics
       3. Pass 2b: Compute recursive stats via bottom-up SQL aggregation
 
-    Database is stored in fs_scans/<filesystem>.db by default.
+    Database location precedence:
+      1. --db option (explicit file path)
+      2. FS_SCAN_DB environment variable
+      3. --data-dir / FS_SCAN_DATA_DIR / default module directory + {filesystem}.db
     """
     console.print("[bold]GPFS Scan Database Importer[/bold]")
     console.print(f"Input: {input_file}")
@@ -952,12 +972,19 @@ def main(
 
     console.print(f"Filesystem: {filesystem}")
 
+    # Apply data directory override if provided via CLI
+    if data_dir is not None:
+        set_data_dir(data_dir)
+
+    # Resolve database path (respects CLI --db, FS_SCAN_DB env var, then default)
+    resolved_db_path = get_db_path(filesystem, db_path)
+
     # Initialize database
     if replace:
         console.print("[yellow]Dropping existing tables...[/yellow]")
-        drop_tables(filesystem, echo=echo)
+        drop_tables(filesystem, echo=echo, db_path=resolved_db_path)
 
-    engine = init_db(filesystem, echo=echo)
+    engine = init_db(filesystem, echo=echo, db_path=resolved_db_path)
     session = get_session(filesystem, engine=engine)
 
     console.print(f"Database: {engine.url}")
@@ -987,10 +1014,9 @@ def main(
         overall_duration = time.time() - overall_start
 
         # Get DB file size
-        db_file = Path(f"fs_scans/{filesystem}.db")
         size_str = "unknown"
-        if db_file.exists():
-            size_bytes = db_file.stat().st_size
+        if resolved_db_path.exists():
+            size_bytes = resolved_db_path.stat().st_size
             for unit in ["B", "KB", "MB", "GB", "TB"]:
                 if size_bytes < 1024:
                     size_str = f"{size_bytes:.2f} {unit}"

@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.table import Table
 from sqlalchemy import text
 
-from .database import get_db_path, get_session, DATA_DIR
+from .database import get_data_dir, get_db_path, get_session, set_data_dir
 from .models import Directory, DirectoryStats
 
 console = Console()
@@ -24,10 +24,13 @@ console = Console()
 def get_all_filesystems() -> list[str]:
     """Discover all available filesystem databases.
 
+    Searches in the configured data directory (via get_data_dir()).
+
     Returns:
         List of filesystem names (e.g., ['asp', 'cisl', 'eol', 'hao'])
     """
-    db_files = DATA_DIR.glob("*.db")
+    data_dir = get_data_dir()
+    db_files = data_dir.glob("*.db")
     return sorted([f.stem for f in db_files])
 
 
@@ -505,6 +508,12 @@ def get_summary(session) -> dict:
     help="Only show leaf directories (no subdirectories)",
 )
 @click.option(
+    "--data-dir",
+    "data_dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Override directory containing database files (or set FS_SCAN_DATA_DIR env var)",
+)
+@click.option(
     "--summary",
     is_flag=True,
     help="Show database summary only",
@@ -523,6 +532,7 @@ def main(
     accessed_after: str | None,
     verbose: bool,
     leaves_only: bool,
+    data_dir: Path | None,
     summary: bool,
 ):
     """
@@ -547,7 +557,14 @@ def main(
 
         # Show only leaf directories
         query-fs-scan-db --leaves-only
+
+        # Use databases from a different directory
+        query-fs-scan-db --data-dir /path/to/databases
     """
+    # Apply data directory override if provided via CLI
+    if data_dir is not None:
+        set_data_dir(data_dir)
+
     # Determine which filesystems to query
     if filesystem.lower() == "all":
         filesystems = get_all_filesystems()
