@@ -5,7 +5,7 @@
 #PBS -j oe
 #PBS -q casper
 #PBS -l walltime=10:00:00
-#PBS -l select=1:ncpus=16:mpiprocs=1:ompthreads=16:mem=120G
+#PBS -l select=1:ncpus=16:mpiprocs=1:ompthreads=16:mem=128G
 
 set -e
 
@@ -21,12 +21,13 @@ pwd
 
 echo "PBS_O_WORKDIR=${PBS_O_WORKDIR}"
 local_scratch=/local_scratch/pbs.${PBS_JOBID}
+tmpfs_scratch=/dev/shm/${USER}/pbs.${PBS_JOBID}
 work_dir=${local_scratch}/work
+
 mkdir -p ${work_dir}
 
 ls -ld ${local_scratch}
-df -h ${local_scratch}
-df -h /dev/shm
+df -h ${local_scratch} ${tmpfs_scratch}
 
 scans_logdir="/glade/u/hdig/reports/logs"
 readarray -t files < <(ls -1 ${scans_logdir}/*_csfs1_*.list_all.log)
@@ -53,10 +54,6 @@ labels=$(
 #echo "Labels:"
 #printf '  %s\n' $labels
 
-cd ${work_dir}
-pwd
-export FS_SCAN_DATA_DIR=$(pwd)
-
 export COLUMNS=256
 
 sep="------------------------------------------------------------------------------------"
@@ -64,8 +61,17 @@ for file in "${files[@]}"; do
     echo && echo ${sep}
     ls -lh ${file}
 
-    peak_memusage fs-scan-to-db --workers 12 --replace ${file}
+    rm -rf ${work_dir} && mkdir -p ${work_dir} && cd ${work_dir}
+    export FS_SCAN_DATA_DIR=$(pwd)
+    echo "Staging log file into ${work_dir}..."
+    #rsync -axv ${file} .
+    ln -sf ${file} .
+
+    peak_memusage fs-scan-to-db --workers 12 --replace ./*.log
     peak_memusage query-fs-scan-db
 
-    rsync -axv --force --delete ${FS_SCAN_DATA_DIR}/ /glade/work/benkirk/repos/qhist-queries/fs_scans/data/
+    rsync -axv ./*.db /glade/work/benkirk/repos/qhist-queries/fs_scans/data/
+
+    rm -rf ${work_dir}
+
 done
