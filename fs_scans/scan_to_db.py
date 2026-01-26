@@ -28,18 +28,11 @@ from pathlib import Path
 from typing import Any, Callable, Generator, NamedTuple, TextIO
 
 import click
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
-from sqlalchemy import insert, select, text
+from rich.progress import TextColumn
+from sqlalchemy import insert, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+from .cli_common import console, create_progress_bar
 from .database import (
     drop_tables,
     extract_filesystem_from_filename,
@@ -78,37 +71,6 @@ class ParsedEntry(NamedTuple):
     user_id: int
     is_dir: bool
     atime: datetime | None
-
-
-console = Console()
-
-
-def create_progress_bar(
-    extra_columns: list[TextColumn] | None = None,
-    show_rate: bool = True,
-) -> Progress:
-    """
-    Create a standardized progress bar.
-
-    Args:
-        extra_columns: Additional TextColumn instances to display
-        show_rate: Whether to show items/sec rate column
-
-    Returns:
-        Configured Progress instance
-    """
-    columns = [
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-    ]
-    if extra_columns:
-        columns.extend(extra_columns)
-    if show_rate:
-        columns.append(TextColumn("[magenta]{task.fields[rate]} items/sec"))
-    columns.append(TimeElapsedColumn())
-    return Progress(*columns, console=console)
 
 
 def open_input_file(filepath: Path) -> TextIO:
@@ -187,17 +149,20 @@ def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[Any, int]:
     if filter_type == "files":
         # Map-Reduce Optimization: Aggregate stats locally in worker
         # This reduces IPC traffic and main thread load by ~1000x
-        results = defaultdict(lambda: {
-            "nr_count": 0,
-            "nr_size": 0,
-            "nr_atime": None,
-            "first_uid": None
-        })
+        # Using regular dict with explicit init (faster than defaultdict in hot path)
+        results = {}
 
         for line in chunk:
             parsed = parse_line(line.rstrip("\n"))
             if parsed and not parsed.is_dir:
                 parent = os.path.dirname(parsed.path)
+                if parent not in results:
+                    results[parent] = {
+                        "nr_count": 0,
+                        "nr_size": 0,
+                        "nr_atime": None,
+                        "first_uid": None
+                    }
                 stats = results[parent]
 
                 # Accumulate count and size
@@ -316,7 +281,18 @@ def configure_sqlite_pragmas(session):
     session.execute(text("PRAGMA journal_mode = MEMORY"))
     session.execute(text("PRAGMA temp_store = MEMORY"))
     session.execute(text("PRAGMA cache_size = -64000"))  # 64MB cache
-    session.execute(text("PRAGMA mmap_size = 30000000000")) # Memory map large DBs
+    session.execute(text("PRAGMA mmap_size = 30000000000"))  # Memory map large DBs
+    session.execute(text("PRAGMA busy_timeout = 30000"))  # 30s timeout for lock contention
+    session.execute(text("PRAGMA locking_mode = EXCLUSIVE"))  # Faster single-writer mode
+
+
+def finalize_sqlite_pragmas(session):
+    """
+    Finalize SQLite after import for optimal query performance.
+    Should be called after all inserts are complete.
+    """
+    session.execute(text("PRAGMA optimize"))  # Optimize index statistics
+    session.commit()
 
 
 def pass1_discover_directories(
@@ -408,6 +384,7 @@ def pass1_discover_directories(
 
         def flush_batch():
             """Flush batch to staging table."""
+            nonlocal batch
             if batch:
                 session.execute(
                     text("""
@@ -417,7 +394,7 @@ def pass1_discover_directories(
                     batch,
                 )
                 session.commit()
-                batch.clear()
+                batch = []  # Fresh allocation to release memory
 
         if num_workers > 1:
             # Parallel Phase 1a with reader thread
@@ -463,8 +440,8 @@ def pass1_discover_directories(
     console.print(f"    Inferred ~{estimated_files:,} files")
 
     # Phase 1b: Read from staging ordered by depth, insert to directories table
-    # Optimized: Process level-by-level using bulk inserts
-    console.print("  [bold]Phase 1b:[/bold] Inserting into database (bulk optimized)...")
+    # Optimized: Single-pass insertion with sequential ID tracking (no redundant SELECT)
+    console.print("  [bold]Phase 1b:[/bold] Inserting into database (single-pass)...")
     path_to_id = {}
 
     # Get distinct depths to process level-by-level
@@ -495,79 +472,43 @@ def pass1_discover_directories(
             if not paths:
                 continue
 
-            # 1. Prepare and Bulk Insert Directories
-            # Optimized: Pre-calculate tuples to reuse (path, parent_id, name)
-            # Avoids double dictionary lookups and string splitting
-            dir_data = [] 
+            # 1. Prepare insertion data - single pass building both inserts and path list
+            # Keep paths in insertion order to match with sequential IDs later
+            ordered_paths = []
             dir_inserts = []
-            
-            for p in paths:
-                if depth == 0 or p == "/":
-                    # Handle root specially if needed, though GPFS usually starts with a root path
-                    # Just standard logic works if path_to_id has root's parent (None)
-                    parent_path, _, name = p.rpartition('/')
-                    if not name: # Root case "/gpfs" -> name="gpfs"
-                        name = p
-                    
-                    parent_id = path_to_id.get(parent_path)
-                    
-                    # Special Case: If p is absolute root like "/gpfs/csfs1", parent might be missing
-                    # but typically GPFS scan includes the root.
-                    
-                    dir_data.append((p, parent_id, name))
-                    dir_inserts.append(
-                        {
-                            "parent_id": parent_id,
-                            "name": name,
-                            "depth": depth,
-                        }
-                    )
-                else:
-                    # Faster string split
-                    parent_path, _, name = p.rpartition('/')
-                    parent_id = path_to_id.get(parent_path)
-                    
-                    dir_data.append((p, parent_id, name))
-                    dir_inserts.append(
-                        {
-                            "parent_id": parent_id,
-                            "name": name,
-                            "depth": depth,
-                        }
-                    )
 
+            for p in paths:
+                parent_path, _, name = p.rpartition('/')
+                if not name:  # Root case "/gpfs" -> name="gpfs"
+                    name = p
+
+                parent_id = path_to_id.get(parent_path)
+                ordered_paths.append(p)
+                dir_inserts.append({
+                    "parent_id": parent_id,
+                    "name": name,
+                    "depth": depth,
+                })
+
+            # 2. Get max dir_id before insert to track sequential assignment
+            max_id_before = session.execute(
+                text("SELECT COALESCE(MAX(dir_id), 0) FROM directories")
+            ).scalar()
+
+            # 3. Bulk insert directories
             for i in range(0, len(dir_inserts), insert_batch_size):
                 session.execute(insert(Directory), dir_inserts[i : i + insert_batch_size])
             session.commit()
 
-            # 2. Retrieve assigned IDs and update map
-            # Fetch (parent_id, name) -> dir_id for the current depth
-            rows = session.execute(
-                select(Directory.dir_id, Directory.parent_id, Directory.name).where(
-                    Directory.depth == depth
-                )
-            ).all()
-
-            # Create a lookup for matching (parent_id, name) -> dir_id
-            # Note: parent_id can be None for root directories
-            lookup = {(r.parent_id, r.name): r.dir_id for r in rows}
-
-            # Update path_to_id and prepare stats
+            # 4. Assign IDs sequentially (SQLite autoincrement guarantees order)
+            # IDs are max_id_before + 1, max_id_before + 2, ... max_id_before + N
             stats_inserts = []
-            
-            # Reuse dir_data to avoid re-splitting strings and looking up parent_id
-            for p, parent_id, name in dir_data:
-                dir_id = lookup.get((parent_id, name))
-                if dir_id:
-                    path_to_id[p] = dir_id
-                    stats_inserts.append({"dir_id": dir_id})
-                else:
-                    # Should not happen given database consistency
-                    console.print(f"[red]Warning: Could not find ID for {p}[/red]")
+            for idx, p in enumerate(ordered_paths):
+                dir_id = max_id_before + idx + 1
+                path_to_id[p] = dir_id
+                stats_inserts.append({"dir_id": dir_id})
 
-            # 3. Bulk Insert Stats (using on_conflict_do_nothing to handle
-            # duplicate dir_id values that can occur when orphaned directories
-            # with NULL parent_id collide in the lookup dict)
+            # 5. Bulk Insert Stats
             if stats_inserts:
                 for i in range(0, len(stats_inserts), insert_batch_size):
                     stmt = sqlite_insert(DirectoryStats).values(
@@ -703,11 +644,11 @@ def pass2a_nonrecursive_stats(
     CHUNK_BYTES = 32 * 1024 * 1024  # 32MB chunks for efficient reading
 
     def do_flush():
-        nonlocal flush_count
+        nonlocal flush_count, pending_updates
         if pending_updates:
             flush_nr_updates(session, pending_updates)
             flush_count += 1
-            pending_updates.clear()
+            pending_updates = defaultdict(make_empty_update)  # Fresh allocation
 
     def process_results_batch(results):
         """
@@ -1081,6 +1022,9 @@ def main(
 
         # Pass 2b: Compute recursive stats via bottom-up aggregation
         pass2b_aggregate_recursive_stats(session)
+
+        # Finalize database for optimal query performance
+        finalize_sqlite_pragmas(session)
 
         overall_duration = time.time() - overall_start
 
