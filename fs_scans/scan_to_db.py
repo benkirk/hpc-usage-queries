@@ -39,6 +39,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from sqlalchemy import insert, select, text
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .database import (
     drop_tables,
@@ -430,12 +431,15 @@ def pass1_discover_directories(
                     # Should not happen given database consistency
                     console.print(f"[red]Warning: Could not find ID for {p}[/red]")
 
-            # 3. Bulk Insert Stats
+            # 3. Bulk Insert Stats (using on_conflict_do_nothing to handle
+            # duplicate dir_id values that can occur when orphaned directories
+            # with NULL parent_id collide in the lookup dict)
             if stats_inserts:
                 for i in range(0, len(stats_inserts), insert_batch_size):
-                    session.execute(
-                        insert(DirectoryStats), stats_inserts[i : i + insert_batch_size]
-                    )
+                    stmt = sqlite_insert(DirectoryStats).values(
+                        stats_inserts[i : i + insert_batch_size]
+                    ).on_conflict_do_nothing(index_elements=['dir_id'])
+                    session.execute(stmt)
                 session.commit()
 
             progress.update(task, advance=len(paths))
