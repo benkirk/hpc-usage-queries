@@ -66,4 +66,6 @@ for file in "${files[@]}"; do
 
     peak_memusage fs-scan-to-db --workers 12 --replace ${file}
     peak_memusage query-fs-scan-db
+
+    rsync -axv --force --delete ${FS_SCAN_DATA_DIR}/ /glade/work/benkirk/repos/qhist-queries/fs_scans/data/
 done
