@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-With 16 workers, Phase 2a shows workers at ~10% CPU each while the main process is at 102% CPU. The main process is the bottleneck, starving workers of work.
+With 6 workers, Phase 2a shows workers at ~10% CPU each while the main process is at 102% CPU. The main process is the bottleneck, starving workers of work.
 
 ## Root Cause Analysis
 
@@ -255,11 +255,12 @@ run_parallel_file_processing(
 
 ## Verification
 
-1. **Correctness**: Run on asp file, compare output DB to baseline
+1. **Correctness**: Run on cisl file, compare output DB to baseline (which currently takes ~ 776.24 seconds)
    ```bash
-   fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --replace -w 16
-   query-fs-scan-db asp --summary
+   fs-scan-to-db ./fs_scans/20260111_csfs1_cisl.list.list_all.log --replace -w 6
+   query-fs-scan-db cisl --summary
    ```
+   Optionally, can use eol file which runs in ~90 seconds and also exibits stalling.
 
 2. **Performance**: Monitor with `top` during Phase 2a
    - Workers should show higher CPU utilization (>50% each ideally)
@@ -267,9 +268,9 @@ run_parallel_file_processing(
 
 3. **Benchmarks**: Compare before/after runtimes
    ```bash
-   time fs-scan-to-db <file> -w 16  # Before
-   time fs-scan-to-db <file> -w 16  # After quick wins
-   time fs-scan-to-db <file> -w 16  # After reader thread
+   time fs-scan-to-db <file> -w 6  # Before
+   time fs-scan-to-db <file> -w 6  # After quick wins
+   time fs-scan-to-db <file> -w 6  # After reader thread
    ```
 
 ## Rollback
