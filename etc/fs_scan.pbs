@@ -4,7 +4,7 @@
 #PBS -A SCSG0001
 #PBS -j oe
 #PBS -q casper
-#PBS -l walltime=04:00:00
+#PBS -l walltime=10:00:00
 #PBS -l select=1:ncpus=16:mpiprocs=1:ompthreads=16:mem=120G
 
 set -e
@@ -12,6 +12,8 @@ set -e
 source etc/config_env.sh
 which python3
 
+module load peak-memusage
+hostname
 w
 free -g
 
@@ -40,6 +42,7 @@ readarray -t files < <(ls -1 ${scans_logdir}/${latest_date}_csfs1_*.list_all.log
 
 #echo "${files[@]}"
 
+# determine available file systems
 labels=$(
    printf '%s\n' "${files[@]}" \
        | sed -E 's#.*/[0-9]{8}_csfs1_([^.]*)\..*#\1#' \
@@ -50,17 +53,17 @@ labels=$(
 #echo "Labels:"
 #printf '  %s\n' $labels
 
-files=("/glade/u/hdig/reports/logs/20260125_csfs1_asp.list.list_all.log")
-
 cd ${work_dir}
 pwd
 export FS_SCAN_DATA_DIR=$(pwd)
 
 export COLUMNS=256
 
+sep="------------------------------------------------------------------------------------"
 for file in "${files[@]}"; do
+    echo && echo ${sep}
     ls -lh ${file}
 
-    fs-scan-to-db --workers ${OMP_NUM_THREADS} --replace ${file}
-    query-fs-scan-db
+    peak_memusage fs-scan-to-db --workers 12 --replace ${file}
+    peak_memusage query-fs-scan-db
 done
