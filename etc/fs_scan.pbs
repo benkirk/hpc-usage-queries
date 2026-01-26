@@ -27,7 +27,7 @@ work_dir=${local_scratch}/work
 mkdir -p ${work_dir}
 
 ls -ld ${local_scratch}
-df -h ${local_scratch} ${tmpfs_scratch}
+df -h ${local_scratch}
 
 scans_logdir="/glade/u/hdig/reports/logs"
 readarray -t files < <(ls -1 ${scans_logdir}/*_csfs1_*.list_all.log)
