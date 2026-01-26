@@ -6,6 +6,7 @@ Query directory statistics from the SQLite database.
 Supports filtering by depth, owner, path prefix, and sorting.
 """
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from rich.table import Table
 from sqlalchemy import text
 
 from .cli_common import console, format_datetime, format_size, parse_date_arg
-from .database import get_data_dir, get_db_path, get_session, set_data_dir
+from .database import get_data_dir, get_data_dir_info, get_db_path, get_session, set_data_dir
 
 
 def get_all_filesystems() -> list[str]:
@@ -165,6 +166,7 @@ def query_directories(
     single_owner: bool = False,
     owner_id: int | None = None,
     path_prefix: str | None = None,
+    exclude_paths: list[str] | None = None,
     sort_by: str = "size_r",
     limit: int | None = None,
     accessed_before: datetime | None = None,
@@ -181,6 +183,7 @@ def query_directories(
         single_owner: Only show single-owner directories
         owner_id: Filter to specific owner UID
         path_prefix: Filter to paths under this prefix
+        exclude_paths: List of paths to exclude (with descendants)
         sort_by: Sort field (size_r, size_nr, files_r, files_nr, atime_r, path)
         limit: Maximum results to return
         accessed_before: Filter to directories with max_atime_r before this date
@@ -222,20 +225,37 @@ def query_directories(
             "NOT EXISTS (SELECT 1 FROM directories child WHERE child.parent_id = d.dir_id)"
         )
 
+    # Build CTEs for path filtering
+    ctes = []
+
     # Handle path prefix - find ancestor and filter descendants
     if path_prefix:
         ancestor_id = resolve_path_to_id(session, path_prefix)
         if ancestor_id is None:
             return []  # Path not found
 
-        # Use recursive CTE to find descendants
-        base_query = f"""
-            WITH RECURSIVE descendants AS (
+        ctes.append("""
+            descendants AS (
                 SELECT dir_id FROM directories WHERE dir_id = :ancestor_id
                 UNION ALL
                 SELECT d.dir_id FROM directories d
                 JOIN descendants p ON d.parent_id = p.dir_id
-            )
+            )""")
+        params["ancestor_id"] = ancestor_id
+
+    # NOTE: exclude_paths filtering is done post-query via path prefix matching
+    # This is much more efficient than building a CTE of all descendants
+    # (which would be O(excluded subtree size) vs O(results × excludes))
+
+    # Build the query with optional CTEs
+    if ctes:
+        cte_clause = "WITH RECURSIVE " + ",".join(ctes)
+    else:
+        cte_clause = ""
+
+    # Build SELECT clause - use descendants CTE if path_prefix was set
+    if path_prefix:
+        select_clause = """
             SELECT d.dir_id, d.parent_id, d.name, d.depth,
                    s.file_count_nr, s.total_size_nr, s.max_atime_nr,
                    s.file_count_r, s.total_size_r, s.max_atime_r,
@@ -244,9 +264,8 @@ def query_directories(
             JOIN directories d USING (dir_id)
             JOIN directory_stats s USING (dir_id)
         """
-        params["ancestor_id"] = ancestor_id
     else:
-        base_query = """
+        select_clause = """
             SELECT d.dir_id, d.parent_id, d.name, d.depth,
                    s.file_count_nr, s.total_size_nr, s.max_atime_nr,
                    s.file_count_r, s.total_size_r, s.max_atime_r,
@@ -254,6 +273,8 @@ def query_directories(
             FROM directories d
             JOIN directory_stats s USING (dir_id)
         """
+
+    base_query = cte_clause + select_clause
 
     # Add WHERE clause if we have conditions
     if conditions:
@@ -284,13 +305,30 @@ def query_directories(
     dir_ids = [row[0] for row in results]
     path_map = get_full_paths_batch(session, dir_ids)
 
+    # Normalize exclude paths for prefix matching
+    normalized_excludes = None
+    if exclude_paths:
+        normalized_excludes = [p.rstrip("/") for p in exclude_paths]
+
     # Convert to dictionaries with full paths
     directories = []
     for row in results:
         dir_id = row[0]
+        path = path_map.get(dir_id, f"<unknown:{dir_id}>")
+
+        # Filter out excluded paths (path prefix matching)
+        if normalized_excludes:
+            excluded = False
+            for excl in normalized_excludes:
+                if path == excl or path.startswith(excl + "/"):
+                    excluded = True
+                    break
+            if excluded:
+                continue
+
         directories.append({
             "dir_id": dir_id,
-            "path": path_map.get(dir_id, f"<unknown:{dir_id}>"),
+            "path": path,
             "depth": row[3],
             "file_count_nr": row[4] or 0,
             "total_size_nr": row[5] or 0,
@@ -417,7 +455,7 @@ def get_summary(session) -> dict:
     }
 
 
-@click.command()
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("filesystem", type=str, default="all")
 @click.option(
     "-d",
@@ -443,10 +481,23 @@ def get_summary(session) -> dict:
     help="Filter to specific owner UID",
 )
 @click.option(
+    "--mine",
+    is_flag=True,
+    help="Filter to current user's UID (shortcut for --owner-id $UID)",
+)
+@click.option(
     "--path-prefix",
     "-P",
     type=str,
     help="Filter to paths starting with prefix",
+)
+@click.option(
+    "--exclude",
+    "-E",
+    "exclude_paths",
+    multiple=True,
+    type=str,
+    help="Exclude path and descendants from results (can be repeated)",
 )
 @click.option(
     "-n",
@@ -501,13 +552,20 @@ def get_summary(session) -> dict:
     is_flag=True,
     help="Show database summary only",
 )
+@click.option(
+    "--show-config",
+    is_flag=True,
+    help="Show data directory configuration and available databases",
+)
 def main(
     filesystem: str,
     min_depth: int | None,
     max_depth: int | None,
     single_owner: bool,
     owner_id: int | None,
+    mine: bool,
     path_prefix: str | None,
+    exclude_paths: tuple[str, ...],
     limit: int,
     sort_by: str,
     output: Path | None,
@@ -517,6 +575,7 @@ def main(
     leaves_only: bool,
     data_dir: Path | None,
     summary: bool,
+    show_config: bool,
 ):
     """
     Query GPFS scan database for directory statistics.
@@ -547,6 +606,30 @@ def main(
     # Apply data directory override if provided via CLI
     if data_dir is not None:
         set_data_dir(data_dir)
+
+    # Handle --show-config
+    if show_config:
+        data_path, source = get_data_dir_info()
+        console.print("[bold]Configuration[/bold]")
+        console.print(f"  Data directory: {data_path}")
+        console.print(f"  Source: {source}")
+        console.print()
+
+        filesystems = get_all_filesystems()
+        if filesystems:
+            console.print("[bold]Available databases[/bold]")
+            for fs in filesystems:
+                db_path = get_db_path(fs)
+                size_bytes = db_path.stat().st_size if db_path.exists() else 0
+                size_str = format_size(size_bytes)
+                console.print(f"  {fs}: {db_path} ({size_str})")
+        else:
+            console.print("[yellow]No database files found.[/yellow]")
+        return
+
+    # Handle --mine flag (shortcut for --owner-id with current UID)
+    if mine:
+        owner_id = os.getuid()
 
     # Determine which filesystems to query
     if filesystem.lower() == "all":
@@ -601,6 +684,7 @@ def main(
                 single_owner=single_owner,
                 owner_id=owner_id,
                 path_prefix=path_prefix,
+                exclude_paths=list(exclude_paths) if exclude_paths else None,
                 sort_by=sort_by,
                 limit=limit if limit > 0 else None,
                 accessed_before=parsed_before,
