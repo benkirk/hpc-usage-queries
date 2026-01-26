@@ -183,7 +183,7 @@ def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[Any, int]:
         - If filter_type="dirs"/"all": results is list[ParsedEntry] (Raw)
     """
     chunk, filter_type = args
-    
+
     if filter_type == "files":
         # Map-Reduce Optimization: Aggregate stats locally in worker
         # This reduces IPC traffic and main thread load by ~1000x
@@ -193,13 +193,13 @@ def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[Any, int]:
             "nr_atime": None,
             "first_uid": None
         })
-        
+
         for line in chunk:
             parsed = parse_line(line.rstrip("\n"))
             if parsed and not parsed.is_dir:
                 parent = os.path.dirname(parsed.path)
                 stats = results[parent]
-                
+
                 # Accumulate count and size
                 stats["nr_count"] += 1
                 stats["nr_size"] += parsed.allocated
@@ -208,17 +208,17 @@ def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[Any, int]:
                 if parsed.atime:
                     cur_max = stats["nr_atime"]
                     stats["nr_atime"] = max(cur_max, parsed.atime) if cur_max else parsed.atime
-                
+
                 # Accumulate UID (Single pass logic)
                 # None = init, -999 = multiple/conflict, else = single UID
                 p_uid = parsed.user_id
                 s_uid = stats["first_uid"]
-                
+
                 if s_uid is None:
                     stats["first_uid"] = p_uid
                 elif s_uid != -999 and s_uid != p_uid:
                     stats["first_uid"] = -999
-        
+
         # Optimize IPC payload: dict of tuples
         # (nr_count, nr_size, nr_atime, first_uid)
         final_results = {
@@ -678,7 +678,7 @@ def pass2a_nonrecursive_stats(
         If results is a dict (Phase 2a aggregated), merge stats.
         """
         nonlocal file_count
-        
+
         if isinstance(results, list):
             # Fallback for single-threaded or raw ParsedEntry list
             for parsed in results:
@@ -692,12 +692,12 @@ def pass2a_nonrecursive_stats(
                     upd["nr_size"] += parsed.allocated
                     if parsed.atime:
                         upd["nr_atime"] = max(upd["nr_atime"], parsed.atime) if upd["nr_atime"] else parsed.atime
-                    
+
                     if upd["first_uid"] is None:
                         upd["first_uid"] = parsed.user_id
                     elif upd["first_uid"] != parsed.user_id and upd["first_uid"] != -999:
                         upd["first_uid"] = -999
-        
+
         elif isinstance(results, dict):
             # Optimized Aggregated Dictionary from Worker
             # Value is tuple: (nr_count, nr_size, nr_atime, first_uid)
@@ -705,25 +705,25 @@ def pass2a_nonrecursive_stats(
                 parent_id = path_to_id.get(parent_path)
                 if not parent_id:
                     continue
-                
+
                 nr_count, nr_size, nr_atime, first_uid = stats_tuple
-                
+
                 # Update file count for progress tracking
                 file_count += nr_count
-                
+
                 # Merge worker stats into pending_updates
                 upd = pending_updates[parent_id]
                 upd["nr_count"] += nr_count
                 upd["nr_size"] += nr_size
-                
+
                 # Merge max atime
                 if nr_atime:
                     upd["nr_atime"] = max(upd["nr_atime"], nr_atime) if upd["nr_atime"] else nr_atime
-                
+
                 # Merge UID logic
                 w_uid = first_uid
                 m_uid = upd["first_uid"]
-                
+
                 if m_uid == -999:
                     pass
                 elif w_uid == -999:
@@ -781,7 +781,7 @@ def pass2a_nonrecursive_stats(
                     parsed = parse_line(line.rstrip("\n"))
                     if not parsed or parsed.is_dir:
                         continue
-                    
+
                     # Single threaded logic (simplified inline)
                     file_count += 1
                     parent = os.path.dirname(parsed.path)
@@ -792,7 +792,7 @@ def pass2a_nonrecursive_stats(
                         upd["nr_size"] += parsed.allocated
                         if parsed.atime:
                             upd["nr_atime"] = max(upd["nr_atime"], parsed.atime) if upd["nr_atime"] else parsed.atime
-                        
+
                         if upd["first_uid"] is None:
                             upd["first_uid"] = parsed.user_id
                         elif upd["first_uid"] != parsed.user_id and upd["first_uid"] != -999:
