@@ -307,6 +307,18 @@ def run_parallel_file_processing(
     return total_lines
 
 
+def configure_sqlite_pragmas(session):
+    """
+    Configure SQLite for maximum insertion performance.
+    Risky if system crashes during import, but fine for a rebuildable cache.
+    """
+    session.execute(text("PRAGMA synchronous = OFF"))
+    session.execute(text("PRAGMA journal_mode = MEMORY"))
+    session.execute(text("PRAGMA temp_store = MEMORY"))
+    session.execute(text("PRAGMA cache_size = -64000"))  # 64MB cache
+    session.execute(text("PRAGMA mmap_size = 30000000000")) # Memory map large DBs
+
+
 def pass1_discover_directories(
     input_file: Path,
     session,
@@ -469,7 +481,7 @@ def pass1_discover_directories(
             total=dir_count,
         )
 
-        insert_batch_size = 10000
+        insert_batch_size = 25000
 
         for depth in depths:
             # Fetch paths for this depth
@@ -484,17 +496,45 @@ def pass1_discover_directories(
                 continue
 
             # 1. Prepare and Bulk Insert Directories
+            # Optimized: Pre-calculate tuples to reuse (path, parent_id, name)
+            # Avoids double dictionary lookups and string splitting
+            dir_data = [] 
             dir_inserts = []
+            
             for p in paths:
-                parent_path = os.path.dirname(p)
-                parent_id = path_to_id.get(parent_path)
-                dir_inserts.append(
-                    {
-                        "parent_id": parent_id,
-                        "name": os.path.basename(p),
-                        "depth": depth,
-                    }
-                )
+                if depth == 0 or p == "/":
+                    # Handle root specially if needed, though GPFS usually starts with a root path
+                    # Just standard logic works if path_to_id has root's parent (None)
+                    parent_path, _, name = p.rpartition('/')
+                    if not name: # Root case "/gpfs" -> name="gpfs"
+                        name = p
+                    
+                    parent_id = path_to_id.get(parent_path)
+                    
+                    # Special Case: If p is absolute root like "/gpfs/csfs1", parent might be missing
+                    # but typically GPFS scan includes the root.
+                    
+                    dir_data.append((p, parent_id, name))
+                    dir_inserts.append(
+                        {
+                            "parent_id": parent_id,
+                            "name": name,
+                            "depth": depth,
+                        }
+                    )
+                else:
+                    # Faster string split
+                    parent_path, _, name = p.rpartition('/')
+                    parent_id = path_to_id.get(parent_path)
+                    
+                    dir_data.append((p, parent_id, name))
+                    dir_inserts.append(
+                        {
+                            "parent_id": parent_id,
+                            "name": name,
+                            "depth": depth,
+                        }
+                    )
 
             for i in range(0, len(dir_inserts), insert_batch_size):
                 session.execute(insert(Directory), dir_inserts[i : i + insert_batch_size])
@@ -514,11 +554,9 @@ def pass1_discover_directories(
 
             # Update path_to_id and prepare stats
             stats_inserts = []
-            for p in paths:
-                parent_path = os.path.dirname(p)
-                parent_id = path_to_id.get(parent_path)
-                name = os.path.basename(p)
-
+            
+            # Reuse dir_data to avoid re-splitting strings and looking up parent_id
+            for p, parent_id, name in dir_data:
                 dir_id = lookup.get((parent_id, name))
                 if dir_id:
                     path_to_id[p] = dir_id
@@ -1018,6 +1056,7 @@ def main(
 
     engine = init_db(filesystem, echo=echo, db_path=resolved_db_path)
     session = get_session(filesystem, engine=engine)
+    configure_sqlite_pragmas(session)
 
     console.print(f"Database: {engine.url}")
     console.print()
