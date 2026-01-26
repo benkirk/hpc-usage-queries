@@ -21,14 +21,11 @@ import multiprocessing as mp
 import os
 import re
 import sys
-import threading
 import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from queue import Empty
-from queue import Queue as ThreadQueue
-from typing import Callable, NamedTuple, TextIO
+from typing import Any, Callable, Generator, NamedTuple, TextIO
 
 import click
 from rich.console import Console
@@ -119,149 +116,6 @@ def open_input_file(filepath: Path) -> TextIO:
     return open(filepath, "r", encoding="utf-8", errors="replace")
 
 
-def file_reader_thread(
-    input_file: Path,
-    chunk_queue: ThreadQueue,
-    chunk_size: int,
-    line_counter: list[int] | None = None,
-) -> None:
-    """
-    Read file and produce chunks for workers.
-
-    Reusable for both Phase 1a (directory discovery) and Phase 2a (stats).
-    Runs in a separate thread to decouple file I/O from processing.
-
-    Args:
-        input_file: Path to input file
-        chunk_queue: Thread-safe queue to put chunks into
-        chunk_size: Number of lines per chunk
-        line_counter: Optional [count] list to track total lines read
-    """
-    chunk = []
-    count = 0
-    with open_input_file(input_file) as f:
-        for line in f:
-            count += 1
-            chunk.append(line)
-            if len(chunk) >= chunk_size:
-                chunk_queue.put(chunk)
-                chunk = []
-        if chunk:
-            chunk_queue.put(chunk)
-
-    if line_counter is not None:
-        line_counter[0] = count
-    chunk_queue.put(None)  # Sentinel
-
-
-def run_parallel_file_processing(
-    input_file: Path,
-    num_workers: int,
-    chunk_size: int,
-    filter_type: str,
-    process_results_fn: Callable[[list[ParsedEntry]], None],
-    progress_callback: Callable[[int], None] | None = None,
-    flush_callback: Callable[[], None] | None = None,
-    should_flush_fn: Callable[[], bool] | None = None,
-) -> int:
-    """
-    Generic parallel file processor for Phase 1a and Phase 2a.
-
-    Uses a reader thread to decouple file I/O from queue management,
-    allowing workers to stay busy while the main thread processes results.
-
-    Args:
-        input_file: Path to the log file
-        num_workers: Number of worker processes
-        chunk_size: Lines per chunk
-        filter_type: "dirs" or "files"
-        process_results_fn: Function to process parsed results
-        progress_callback: Optional callback receiving estimated line count
-        flush_callback: Optional callback to flush accumulated data
-        should_flush_fn: Optional function that returns True if flush needed
-
-    Returns:
-        Total line count
-    """
-    chunk_queue: ThreadQueue = ThreadQueue(maxsize=num_workers * 4)
-    input_queue = mp.Queue(maxsize=num_workers * 4)
-    output_queue = mp.Queue()
-    line_counter = [0]  # Mutable container for thread communication
-
-    # Start reader thread
-    reader = threading.Thread(
-        target=file_reader_thread,
-        args=(input_file, chunk_queue, chunk_size, line_counter),
-    )
-    reader.start()
-
-    # Start worker processes
-    workers = [
-        mp.Process(target=worker_parse_lines, args=(input_queue, output_queue, filter_type))
-        for _ in range(num_workers)
-    ]
-    for w in workers:
-        w.start()
-
-    chunks_sent = 0
-    chunks_received = 0
-
-    # Main loop: dispatch chunks from reader, process results from workers
-    while True:
-        chunk = chunk_queue.get()
-        if chunk is None:
-            break
-
-        input_queue.put(chunk)
-        chunks_sent += 1
-
-        # Process available results (non-blocking)
-        while True:
-            try:
-                results = output_queue.get_nowait()
-                chunks_received += 1
-                process_results_fn(results)
-
-                # Estimate lines processed based on chunks received
-                estimated_lines = chunks_received * chunk_size
-
-                if should_flush_fn and should_flush_fn() and flush_callback:
-                    flush_callback()
-
-                if progress_callback:
-                    progress_callback(estimated_lines)
-            except Empty:
-                break
-
-    # Send sentinels to workers
-    for _ in range(num_workers):
-        input_queue.put(None)
-
-    # Drain remaining results
-    while chunks_received < chunks_sent:
-        try:
-            results = output_queue.get(timeout=5)
-            chunks_received += 1
-            process_results_fn(results)
-
-            estimated_lines = chunks_received * chunk_size
-
-            if should_flush_fn and should_flush_fn() and flush_callback:
-                flush_callback()
-
-            if progress_callback:
-                progress_callback(estimated_lines)
-        except Empty:
-            continue
-
-    # Cleanup
-    reader.join()
-    for w in workers:
-        w.join()
-
-    return line_counter[0]
-
-
 def parse_line(line: str) -> ParsedEntry | None:
     """
     Parse a single log line and extract relevant fields.
@@ -313,6 +167,97 @@ def parse_line(line: str) -> ParsedEntry | None:
         is_dir=is_dir,
         atime=atime,
     )
+
+
+def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[list[ParsedEntry], int]:
+    """
+    Worker function to parse a chunk of lines.
+
+    Args:
+        args: Tuple of (lines_chunk, filter_type)
+
+    Returns:
+        Tuple of (list of valid ParsedEntries, count of lines processed)
+    """
+    chunk, filter_type = args
+    results = []
+    for line in chunk:
+        parsed = parse_line(line.rstrip("\n"))
+        if parsed:
+            if filter_type == "all":
+                results.append(parsed)
+            elif filter_type == "dirs" and parsed.is_dir:
+                results.append(parsed)
+            elif filter_type == "files" and not parsed.is_dir:
+                results.append(parsed)
+    return results, len(chunk)
+
+
+def chunk_file_generator(filepath: Path, chunk_size: int) -> Generator[list[str], None, None]:
+    """Yield chunks of lines from the input file."""
+    with open_input_file(filepath) as f:
+        chunk = []
+        for line in f:
+            chunk.append(line)
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
+
+
+def run_parallel_file_processing(
+    input_file: Path,
+    num_workers: int,
+    chunk_size: int,
+    filter_type: str,
+    process_results_fn: Callable[[list[ParsedEntry]], None],
+    progress_callback: Callable[[int], None] | None = None,
+    flush_callback: Callable[[], None] | None = None,
+    should_flush_fn: Callable[[], bool] | None = None,
+) -> int:
+    """
+    Generic parallel file processor for Phase 1a and Phase 2a.
+
+    Uses multiprocessing.Pool to distribute parsing work.
+
+    Args:
+        input_file: Path to the log file
+        num_workers: Number of worker processes
+        chunk_size: Lines per chunk
+        filter_type: "dirs" or "files"
+        process_results_fn: Function to process parsed results
+        progress_callback: Optional callback receiving estimated line count
+        flush_callback: Optional callback to flush accumulated data
+        should_flush_fn: Optional function that returns True if flush needed
+
+    Returns:
+        Total line count
+    """
+    total_lines = 0
+
+    # Generator for pool arguments
+    def args_generator():
+        for chunk in chunk_file_generator(input_file, chunk_size):
+            yield (chunk, filter_type)
+
+    # Use a Pool to manage workers automatically
+    with mp.Pool(processes=num_workers) as pool:
+        # imap_unordered allows processing results as soon as they are ready
+        # chunksize=1 in imap because our items are already large chunks
+        for results, lines_in_chunk in pool.imap_unordered(_worker_parse_chunk, args_generator(), chunksize=1):
+            total_lines += lines_in_chunk
+
+            if results:
+                process_results_fn(results)
+
+            if should_flush_fn and should_flush_fn() and flush_callback:
+                flush_callback()
+
+            if progress_callback:
+                progress_callback(total_lines)
+
+    return total_lines
 
 
 def pass1_discover_directories(
@@ -895,42 +840,6 @@ def pass2b_aggregate_recursive_stats(session) -> None:
             progress.update(task, advance=1)
 
     console.print(f"    Processed {max_depth} depth levels")
-
-
-def worker_parse_lines(
-    input_queue: mp.Queue,
-    output_queue: mp.Queue,
-    filter_type: str = "files",
-) -> None:
-    """
-    Worker process: parse lines from input queue.
-
-    Reads chunks of lines from input_queue, parses them, and sends results
-    to output_queue as ParsedEntry tuples (faster to pickle than dicts).
-    Exits when it receives None sentinel.
-
-    Args:
-        input_queue: Queue to receive line chunks from
-        output_queue: Queue to send parsed results to
-        filter_type: "files" (default), "dirs", or "all"
-    """
-    while True:
-        try:
-            chunk = input_queue.get(timeout=1)
-        except Empty:
-            continue
-
-        if chunk is None:  # Sentinel to stop worker
-            break
-
-        results = []
-        for line in chunk:
-            parsed = parse_line(line.rstrip("\n"))
-            if parsed:
-                if filter_type == "all" or (filter_type == "dirs" and parsed.is_dir) or (filter_type == "files" and not parsed.is_dir):
-                    results.append(parsed)
-
-        output_queue.put(results)
 
 
 @click.command()
