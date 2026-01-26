@@ -112,8 +112,9 @@ def create_progress_bar(
 
 
 def open_input_file(filepath: Path) -> TextIO:
-    """Open input file for reading."""
-    return open(filepath, "r", encoding="utf-8", errors="replace")
+    """Open input file for reading with a large buffer."""
+    # Use 8MB buffer to minimize syscalls
+    return open(filepath, "r", encoding="utf-8", errors="replace", buffering=8 * 1024 * 1024)
 
 
 def parse_line(line: str) -> ParsedEntry | None:
@@ -169,7 +170,7 @@ def parse_line(line: str) -> ParsedEntry | None:
     )
 
 
-def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[list[ParsedEntry], int]:
+def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[Any, int]:
     """
     Worker function to parse a chunk of lines.
 
@@ -177,41 +178,87 @@ def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[list[ParsedEntry],
         args: Tuple of (lines_chunk, filter_type)
 
     Returns:
-        Tuple of (list of valid ParsedEntries, count of lines processed)
+        Tuple of (results, count of lines processed)
+        - If filter_type="files": results is dict[parent_path, stats] (Aggregated)
+        - If filter_type="dirs"/"all": results is list[ParsedEntry] (Raw)
     """
     chunk, filter_type = args
-    results = []
-    for line in chunk:
-        parsed = parse_line(line.rstrip("\n"))
-        if parsed:
-            if filter_type == "all":
-                results.append(parsed)
-            elif filter_type == "dirs" and parsed.is_dir:
-                results.append(parsed)
-            elif filter_type == "files" and not parsed.is_dir:
-                results.append(parsed)
-    return results, len(chunk)
+    
+    if filter_type == "files":
+        # Map-Reduce Optimization: Aggregate stats locally in worker
+        # This reduces IPC traffic and main thread load by ~1000x
+        results = defaultdict(lambda: {
+            "nr_count": 0,
+            "nr_size": 0,
+            "nr_atime": None,
+            "first_uid": None
+        })
+        
+        for line in chunk:
+            parsed = parse_line(line.rstrip("\n"))
+            if parsed and not parsed.is_dir:
+                parent = os.path.dirname(parsed.path)
+                stats = results[parent]
+                
+                # Accumulate count and size
+                stats["nr_count"] += 1
+                stats["nr_size"] += parsed.allocated
+
+                # Accumulate atime
+                if parsed.atime:
+                    cur_max = stats["nr_atime"]
+                    stats["nr_atime"] = max(cur_max, parsed.atime) if cur_max else parsed.atime
+                
+                # Accumulate UID (Single pass logic)
+                # None = init, -999 = multiple/conflict, else = single UID
+                p_uid = parsed.user_id
+                s_uid = stats["first_uid"]
+                
+                if s_uid is None:
+                    stats["first_uid"] = p_uid
+                elif s_uid != -999 and s_uid != p_uid:
+                    stats["first_uid"] = -999
+        
+        # Optimize IPC payload: dict of tuples
+        # (nr_count, nr_size, nr_atime, first_uid)
+        final_results = {
+            k: (v["nr_count"], v["nr_size"], v["nr_atime"], v["first_uid"])
+            for k, v in results.items()
+        }
+        return final_results, len(chunk)
+
+    else:
+        # Standard behavior for Pass 1 (Dirs)
+        results = []
+        for line in chunk:
+            parsed = parse_line(line.rstrip("\n"))
+            if parsed:
+                if filter_type == "all":
+                    results.append(parsed)
+                elif filter_type == "dirs" and parsed.is_dir:
+                    results.append(parsed)
+                elif filter_type == "files" and not parsed.is_dir:
+                    results.append(parsed) # Fallback if ever needed
+        return results, len(chunk)
 
 
-def chunk_file_generator(filepath: Path, chunk_size: int) -> Generator[list[str], None, None]:
-    """Yield chunks of lines from the input file."""
+def chunk_file_generator(filepath: Path, chunk_bytes: int) -> Generator[list[str], None, None]:
+    """Yield chunks of lines from the input file using byte-size hints."""
     with open_input_file(filepath) as f:
-        chunk = []
-        for line in f:
-            chunk.append(line)
-            if len(chunk) >= chunk_size:
-                yield chunk
-                chunk = []
-        if chunk:
-            yield chunk
+        while True:
+            # efficient C-implemented line splitting based on byte size
+            lines = f.readlines(chunk_bytes)
+            if not lines:
+                break
+            yield lines
 
 
 def run_parallel_file_processing(
     input_file: Path,
     num_workers: int,
-    chunk_size: int,
+    chunk_bytes: int,
     filter_type: str,
-    process_results_fn: Callable[[list[ParsedEntry]], None],
+    process_results_fn: Callable[[Any], None],
     progress_callback: Callable[[int], None] | None = None,
     flush_callback: Callable[[], None] | None = None,
     should_flush_fn: Callable[[], bool] | None = None,
@@ -224,7 +271,7 @@ def run_parallel_file_processing(
     Args:
         input_file: Path to the log file
         num_workers: Number of worker processes
-        chunk_size: Lines per chunk
+        chunk_bytes: Approx bytes per chunk (passed to readlines)
         filter_type: "dirs" or "files"
         process_results_fn: Function to process parsed results
         progress_callback: Optional callback receiving estimated line count
@@ -238,7 +285,7 @@ def run_parallel_file_processing(
 
     # Generator for pool arguments
     def args_generator():
-        for chunk in chunk_file_generator(input_file, chunk_size):
+        for chunk in chunk_file_generator(input_file, chunk_bytes):
             yield (chunk, filter_type)
 
     # Use a Pool to manage workers automatically
@@ -311,7 +358,7 @@ def pass1_discover_directories(
     line_count = 0
     dir_count = 0
     BATCH_SIZE = 10000
-    CHUNK_SIZE = 50000  # 10x larger reduces queue overhead
+    CHUNK_BYTES = 32 * 1024 * 1024  # 32MB chunks for efficient reading
     batch: list[dict] = []
     start_time = time.time()
 
@@ -365,7 +412,7 @@ def pass1_discover_directories(
             line_count = run_parallel_file_processing(
                 input_file=input_file,
                 num_workers=num_workers,
-                chunk_size=CHUNK_SIZE,
+                chunk_bytes=CHUNK_BYTES,
                 filter_type="dirs",
                 process_results_fn=process_parsed_dirs,
                 progress_callback=update_progress,
@@ -519,51 +566,6 @@ def make_empty_update() -> dict:
     }
 
 
-def accumulate_file_stats_nr(
-    parsed: ParsedEntry,
-    path_to_id: dict[str, int],
-    pending_updates: dict,
-) -> bool:
-    """
-    Accumulate non-recursive stats for a single file into pending_updates.
-
-    Only updates the direct parent directory. Recursive stats are computed
-    later via bottom-up SQL aggregation in pass2b_aggregate_recursive_stats().
-
-    Args:
-        parsed: Parsed file entry
-        path_to_id: Directory path to ID mapping
-        pending_updates: Accumulator dictionary (modified in place)
-
-    Returns:
-        True if file was processed, False if parent not found
-    """
-    parent = os.path.dirname(parsed.path)
-    parent_id = path_to_id.get(parent)
-    if not parent_id:
-        return False
-
-    # Track allocated size (not 'size') to properly catch compression, sparse files, etc.
-    size = parsed.allocated
-    atime = parsed.atime
-    user_id = parsed.user_id
-
-    # Non-recursive: direct parent only
-    upd = pending_updates[parent_id]
-    upd["nr_count"] += 1
-    upd["nr_size"] += size
-    if atime:
-        upd["nr_atime"] = max(upd["nr_atime"], atime) if upd["nr_atime"] else atime
-
-    # Simplified UID tracking: track first_uid, mark as -999 if multiple
-    if upd["first_uid"] is None:
-        upd["first_uid"] = user_id
-    elif upd["first_uid"] != user_id and upd["first_uid"] != -999:
-        upd["first_uid"] = -999  # Sentinel for "multiple owners"
-
-    return True
-
-
 def flush_nr_updates(session, pending_updates: dict) -> None:
     """
     Apply accumulated non-recursive deltas to database using bulk execution.
@@ -660,7 +662,7 @@ def pass2a_nonrecursive_stats(
     file_count = 0
     flush_count = 0
     start_time = time.time()
-    CHUNK_SIZE = 50000  # 10x larger reduces queue overhead
+    CHUNK_BYTES = 32 * 1024 * 1024  # 32MB chunks for efficient reading
 
     def do_flush():
         nonlocal flush_count
@@ -669,15 +671,68 @@ def pass2a_nonrecursive_stats(
             flush_count += 1
             pending_updates.clear()
 
-    def process_parsed_file(parsed):
-        nonlocal file_count
-        file_count += 1
-        accumulate_file_stats_nr(parsed, path_to_id, pending_updates)
-
     def process_results_batch(results):
-        """Process a batch of parsed file entries."""
-        for parsed in results:
-            process_parsed_file(parsed)
+        """
+        Process a batch of results.
+        If results is a list (single-threaded Phase 1 style logic or fallback), process individually.
+        If results is a dict (Phase 2a aggregated), merge stats.
+        """
+        nonlocal file_count
+        
+        if isinstance(results, list):
+            # Fallback for single-threaded or raw ParsedEntry list
+            for parsed in results:
+                file_count += 1
+                # Inline logic replacing accumulate_file_stats_nr
+                parent = os.path.dirname(parsed.path)
+                parent_id = path_to_id.get(parent)
+                if parent_id:
+                    upd = pending_updates[parent_id]
+                    upd["nr_count"] += 1
+                    upd["nr_size"] += parsed.allocated
+                    if parsed.atime:
+                        upd["nr_atime"] = max(upd["nr_atime"], parsed.atime) if upd["nr_atime"] else parsed.atime
+                    
+                    if upd["first_uid"] is None:
+                        upd["first_uid"] = parsed.user_id
+                    elif upd["first_uid"] != parsed.user_id and upd["first_uid"] != -999:
+                        upd["first_uid"] = -999
+        
+        elif isinstance(results, dict):
+            # Optimized Aggregated Dictionary from Worker
+            # Value is tuple: (nr_count, nr_size, nr_atime, first_uid)
+            for parent_path, stats_tuple in results.items():
+                parent_id = path_to_id.get(parent_path)
+                if not parent_id:
+                    continue
+                
+                nr_count, nr_size, nr_atime, first_uid = stats_tuple
+                
+                # Update file count for progress tracking
+                file_count += nr_count
+                
+                # Merge worker stats into pending_updates
+                upd = pending_updates[parent_id]
+                upd["nr_count"] += nr_count
+                upd["nr_size"] += nr_size
+                
+                # Merge max atime
+                if nr_atime:
+                    upd["nr_atime"] = max(upd["nr_atime"], nr_atime) if upd["nr_atime"] else nr_atime
+                
+                # Merge UID logic
+                w_uid = first_uid
+                m_uid = upd["first_uid"]
+                
+                if m_uid == -999:
+                    pass
+                elif w_uid == -999:
+                    upd["first_uid"] = -999
+                elif w_uid is not None:
+                    if m_uid is None:
+                        upd["first_uid"] = w_uid
+                    elif m_uid != w_uid:
+                        upd["first_uid"] = -999
 
     def update_progress_bar(estimated_lines: int | None = None):
         nonlocal line_count
@@ -709,7 +764,7 @@ def pass2a_nonrecursive_stats(
             line_count = run_parallel_file_processing(
                 input_file=input_file,
                 num_workers=num_workers,
-                chunk_size=CHUNK_SIZE,
+                chunk_bytes=CHUNK_BYTES,
                 filter_type="files",
                 process_results_fn=process_results_batch,
                 progress_callback=update_progress_bar,
@@ -726,8 +781,22 @@ def pass2a_nonrecursive_stats(
                     parsed = parse_line(line.rstrip("\n"))
                     if not parsed or parsed.is_dir:
                         continue
-
-                    process_parsed_file(parsed)
+                    
+                    # Single threaded logic (simplified inline)
+                    file_count += 1
+                    parent = os.path.dirname(parsed.path)
+                    parent_id = path_to_id.get(parent)
+                    if parent_id:
+                        upd = pending_updates[parent_id]
+                        upd["nr_count"] += 1
+                        upd["nr_size"] += parsed.allocated
+                        if parsed.atime:
+                            upd["nr_atime"] = max(upd["nr_atime"], parsed.atime) if upd["nr_atime"] else parsed.atime
+                        
+                        if upd["first_uid"] is None:
+                            upd["first_uid"] = parsed.user_id
+                        elif upd["first_uid"] != parsed.user_id and upd["first_uid"] != -999:
+                            upd["first_uid"] = -999
 
                     if len(pending_updates) >= batch_size:
                         do_flush()
