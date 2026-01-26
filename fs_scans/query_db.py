@@ -6,19 +6,15 @@ Query directory statistics from the SQLite database.
 Supports filtering by depth, owner, path prefix, and sorting.
 """
 
-import re
 from datetime import datetime
 from pathlib import Path
 
 import click
-from rich.console import Console
 from rich.table import Table
 from sqlalchemy import text
 
+from .cli_common import console, format_datetime, format_size, parse_date_arg
 from .database import get_data_dir, get_db_path, get_session, set_data_dir
-from .models import Directory, DirectoryStats
-
-console = Console()
 
 
 def get_all_filesystems() -> list[str]:
@@ -34,73 +30,12 @@ def get_all_filesystems() -> list[str]:
     return sorted([f.stem for f in db_files])
 
 
-def format_size(size_bytes: int) -> str:
-    """Format byte size to human-readable string."""
-    if size_bytes is None:
-        return "N/A"
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
-        if abs(size_bytes) < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f} EB"
-
-
-def format_datetime(dt: datetime | str | None) -> str:
-    """Format datetime for display."""
-    if dt is None:
-        return "N/A"
-    if isinstance(dt, str):
-        # SQLite may return datetime as string - just return date portion
-        return dt[:10] if len(dt) >= 10 else dt
-    return dt.strftime("%Y-%m-%d")
-
-
-def parse_date_arg(value: str) -> datetime:
-    """
-    Parse date argument - absolute (YYYY-MM-DD) or relative (3yrs, 6mo).
-
-    Args:
-        value: Date string like "2024-01-15", "3yrs", or "18mo"
-
-    Returns:
-        datetime object
-
-    Raises:
-        click.BadParameter: If format is invalid
-    """
-    # Try absolute date first
-    try:
-        return datetime.strptime(value, "%Y-%m-%d")
-    except ValueError:
-        pass
-
-    # Parse relative date (e.g., "3yrs", "6mo")
-    match = re.match(r"^(\d+)(yrs?|mo)$", value.lower())
-    if match:
-        num = int(match.group(1))
-        unit = match.group(2)
-        now = datetime.now()
-        if unit.startswith("yr"):
-            return now.replace(year=now.year - num)
-        elif unit == "mo":
-            # Handle month subtraction (wrap years if needed)
-            new_month = now.month - num
-            new_year = now.year
-            while new_month <= 0:
-                new_month += 12
-                new_year -= 1
-            # Handle day overflow (e.g., Jan 31 - 1 month)
-            day = min(now.day, 28)  # Safe for all months
-            return now.replace(year=new_year, month=new_month, day=day)
-
-    raise click.BadParameter(f"Invalid date format: {value}. Use YYYY-MM-DD or Nyrs/Nmo")
-
-
 def resolve_path_to_id(session, path: str) -> int | None:
     """
-    Resolve a full path to its dir_id.
+    Resolve a full path to its dir_id in a single query.
 
-    Uses a recursive CTE to find the directory matching the given path.
+    Uses dynamic N-way joins to walk the entire path in one database round-trip
+    instead of N sequential queries (one per path component).
 
     Args:
         session: SQLAlchemy session
@@ -119,33 +54,36 @@ def resolve_path_to_id(session, path: str) -> int | None:
     if not components:
         return None
 
-    # Find by walking down the tree
-    current_id = None
+    # Build single query with N-way joins (1 round-trip instead of N)
+    # SELECT dN.dir_id FROM directories d1
+    # JOIN directories d2 ON d2.parent_id = d1.dir_id AND d2.name = :c2
+    # ...
+    # WHERE d1.parent_id IS NULL AND d1.name = :c1
+    n = len(components)
+    params = {f"c{i+1}": comp for i, comp in enumerate(components)}
 
-    for component in components:
-        if current_id is None:
-            # First component - find root
-            result = session.execute(
-                text("""
-                    SELECT dir_id FROM directories
-                    WHERE parent_id IS NULL AND name = :name
-                """),
-                {"name": component},
-            ).fetchone()
-        else:
-            result = session.execute(
-                text("""
-                    SELECT dir_id FROM directories
-                    WHERE parent_id = :parent_id AND name = :name
-                """),
-                {"parent_id": current_id, "name": component},
-            ).fetchone()
+    if n == 1:
+        # Single component - simple query
+        query = """
+            SELECT dir_id FROM directories
+            WHERE parent_id IS NULL AND name = :c1
+        """
+    else:
+        # Build N-way join query
+        joins = []
+        for i in range(2, n + 1):
+            joins.append(
+                f"JOIN directories d{i} ON d{i}.parent_id = d{i-1}.dir_id AND d{i}.name = :c{i}"
+            )
 
-        if result is None:
-            return None
-        current_id = result[0]
+        query = f"""
+            SELECT d{n}.dir_id FROM directories d1
+            {' '.join(joins)}
+            WHERE d1.parent_id IS NULL AND d1.name = :c1
+        """
 
-    return current_id
+    result = session.execute(text(query), params).fetchone()
+    return result[0] if result else None
 
 
 def get_full_path(session, dir_id: int) -> str:
@@ -177,6 +115,47 @@ def get_full_path(session, dir_id: int) -> str:
     if result:
         return "/" + result[0]
     return f"<unknown:{dir_id}>"
+
+
+def get_full_paths_batch(session, dir_ids: list[int]) -> dict[int, str]:
+    """
+    Compute full paths for multiple directories in a single recursive CTE.
+
+    This is much more efficient than calling get_full_path() per directory
+    when dealing with multiple results (N queries -> 1 query).
+
+    Args:
+        session: SQLAlchemy session
+        dir_ids: List of directory IDs to resolve
+
+    Returns:
+        Dictionary mapping dir_id to full path string
+    """
+    if not dir_ids:
+        return {}
+
+    # SQLite doesn't support array parameters directly, so we build IN clause
+    # with positional parameters
+    placeholders = ", ".join(f":id_{i}" for i in range(len(dir_ids)))
+    params = {f"id_{i}": did for i, did in enumerate(dir_ids)}
+
+    result = session.execute(
+        text(f"""
+            WITH RECURSIVE path_cte AS (
+                SELECT dir_id, parent_id, name, dir_id as origin_id, name as path_segment
+                FROM directories WHERE dir_id IN ({placeholders})
+                UNION ALL
+                SELECT p.dir_id, p.parent_id, p.name, c.origin_id, p.name || '/' || c.path_segment
+                FROM directories p
+                JOIN path_cte c ON c.parent_id = p.dir_id
+            )
+            SELECT origin_id, '/' || path_segment as full_path
+            FROM path_cte WHERE parent_id IS NULL
+        """),
+        params,
+    )
+
+    return {row[0]: row[1] for row in result}
 
 
 def query_directories(
@@ -301,13 +280,17 @@ def query_directories(
     # Execute query
     results = session.execute(text(base_query), params).fetchall()
 
+    # Batch fetch all full paths in single query (N queries -> 1)
+    dir_ids = [row[0] for row in results]
+    path_map = get_full_paths_batch(session, dir_ids)
+
     # Convert to dictionaries with full paths
     directories = []
     for row in results:
         dir_id = row[0]
         directories.append({
             "dir_id": dir_id,
-            "path": get_full_path(session, dir_id),
+            "path": path_map.get(dir_id, f"<unknown:{dir_id}>"),
             "depth": row[3],
             "file_count_nr": row[4] or 0,
             "total_size_nr": row[5] or 0,
