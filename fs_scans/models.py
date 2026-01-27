@@ -97,3 +97,66 @@ class DirectoryStats(Base):
             f"<DirectoryStats(dir_id={self.dir_id}, "
             f"files_r={self.file_count_r}, size_r={self.total_size_r})>"
         )
+
+
+class ScanMetadata(Base):
+    """Track scan provenance and aggregate totals.
+
+    Records information about each imported scan file, including timestamps
+    and aggregate statistics computed from the root directories.
+    """
+
+    __tablename__ = "scan_metadata"
+
+    scan_id = Column(Integer, primary_key=True, autoincrement=True)
+    source_file = Column(Text, nullable=False)  # e.g., "20260111_csfs1_asp.list.list_all.log"
+    scan_timestamp = Column(DateTime)  # parsed from YYYYMMDD in filename
+    import_timestamp = Column(DateTime)  # when imported
+    filesystem = Column(Text, nullable=False)
+    total_directories = Column(BigInteger, default=0)
+    total_files = Column(BigInteger, default=0)
+    total_size = Column(BigInteger, default=0)
+
+    def __repr__(self):
+        return (
+            f"<ScanMetadata(scan_id={self.scan_id}, "
+            f"source_file='{self.source_file}', filesystem='{self.filesystem}')>"
+        )
+
+
+class OwnerSummary(Base):
+    """Pre-computed per-owner aggregates.
+
+    Makes `--group-by owner` queries instant by storing pre-aggregated
+    statistics for each owner UID. Populated during scan import.
+    """
+
+    __tablename__ = "owner_summary"
+
+    owner_uid = Column(Integer, primary_key=True)
+    total_size = Column(BigInteger, default=0)
+    total_files = Column(BigInteger, default=0)
+    directory_count = Column(Integer, default=0)
+
+    def __repr__(self):
+        return (
+            f"<OwnerSummary(owner_uid={self.owner_uid}, "
+            f"total_size={self.total_size}, total_files={self.total_files})>"
+        )
+
+
+class UserInfo(Base):
+    """Cache UID-to-username mappings resolved during scan.
+
+    Stores username and GECOS (full name) information for UIDs
+    encountered during scan imports, reducing repeated passwd lookups.
+    """
+
+    __tablename__ = "user_info"
+
+    uid = Column(Integer, primary_key=True)
+    username = Column(Text)
+    full_name = Column(Text)  # GECOS field
+
+    def __repr__(self):
+        return f"<UserInfo(uid={self.uid}, username='{self.username}')>"

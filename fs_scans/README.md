@@ -137,6 +137,11 @@ The importer uses a multi-pass algorithm optimized for large filesystems:
 
 **Pass 2b: Recursive Aggregation** - Bottom-up SQL aggregation computes recursive stats from non-recursive stats. Uses high-performance `UPDATE ... FROM` with CTEs to aggregate children stats in a single pass per depth level.
 
+**Pass 3: Summary Tables** - Populates auxiliary tables for fast queries:
+- **Phase 3a**: Resolves UIDs to usernames via `pwd.getpwuid()` and stores in `user_info` table
+- **Phase 3b**: Pre-aggregates per-owner statistics into `owner_summary` table
+- **Phase 3c**: Records scan metadata (source file, timestamps, totals) in `scan_metadata` table
+
 This approach is significantly faster than computing recursive stats during file scanning. Instead of walking up all ancestors for every file (O(files × depth)), Pass 2a processes each file once (O(files)), and Pass 2b aggregates in SQL (O(depth_levels)).
 
 ### Pass 1 Implementation
@@ -173,7 +178,7 @@ Both Phase 1a (directory discovery) and Pass 2 (stats accumulation) support para
 
 ### Database Schema
 
-The importer creates two tables:
+The importer creates the following tables:
 
 **directories** - Normalized directory hierarchy
 - `dir_id` - Primary key
@@ -187,6 +192,21 @@ The importer creates two tables:
 - `total_size_nr` / `total_size_r` - Non-recursive / recursive sizes
 - `max_atime_nr` / `max_atime_r` - Non-recursive / recursive max access times
 - `owner_uid` - Single owner UID (NULL if multiple owners)
+
+**scan_metadata** - Scan provenance and totals
+- `scan_id` - Primary key
+- `source_file` - Original log filename
+- `scan_timestamp` - Parsed from YYYYMMDD in filename
+- `import_timestamp` - When the import occurred
+- `filesystem`, `total_directories`, `total_files`, `total_size`
+
+**owner_summary** - Pre-computed per-owner aggregates (enables fast `--group-by owner`)
+- `owner_uid` - Primary key
+- `total_size`, `total_files`, `directory_count`
+
+**user_info** - UID-to-username cache
+- `uid` - Primary key
+- `username`, `full_name` (GECOS field)
 
 ---
 
@@ -211,8 +231,13 @@ The `filesystem` argument is optional and defaults to `all`, which queries all a
 | `-d, --min-depth N` | Filter by minimum path depth |
 | `--max-depth N` | Filter by maximum path depth |
 | `-s, --single-owner` | Only show single-owner directories |
-| `-u, --owner-id UID` | Filter to specific owner UID |
+| `-u, --owner UID` | Filter to specific owner (UID or username) |
+| `--mine` | Filter to current user's UID |
 | `-P, --path-prefix PATH` | Filter to paths starting with prefix |
+| `-E, --exclude PATH` | Exclude path and descendants (can repeat) |
+| `-N, --name-pattern PAT` | Filter by name (GLOB pattern); can repeat for OR matching |
+| `-i, --ignore-case` | Make `--name-pattern` matching case-insensitive |
+| `--group-by owner` | Show per-user summary instead of directory list |
 | `-n, --limit N` | Limit results (default: 50, 0 for unlimited) |
 | `--sort-by FIELD` | Sort by: `size_r`, `size_nr`, `files_r`, `files_nr`, `atime_r`, `path`, `depth` |
 | `-o, --output FILE` | Write TSV output to file |
@@ -245,6 +270,21 @@ query-fs-scan-db --accessed-after 5yrs --accessed-before 3yrs
 
 # Show only leaf directories (no subdirectories)
 query-fs-scan-db --leaves-only
+
+# Filter directories by name pattern
+query-fs-scan-db -N "*scratch*"
+
+# Multiple name patterns (OR matching)
+query-fs-scan-db -N "*scratch*" -N "*tmp*"
+
+# Case-insensitive name pattern
+query-fs-scan-db -N "*SCRATCH*" -i
+
+# Show per-user summary (uses pre-computed owner_summary table)
+query-fs-scan-db --group-by owner
+
+# Per-user summary with filters (computes dynamically)
+query-fs-scan-db --group-by owner -d 4 -P /gpfs/csfs1/cisl
 
 # Export all directories to TSV
 query-fs-scan-db --limit 0 -o all_dirs.tsv

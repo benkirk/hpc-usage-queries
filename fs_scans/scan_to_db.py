@@ -36,12 +36,13 @@ from .cli_common import console, create_progress_bar
 from .database import (
     drop_tables,
     extract_filesystem_from_filename,
+    extract_scan_timestamp,
     get_db_path,
     get_session,
     init_db,
     set_data_dir,
 )
-from .models import Directory, DirectoryStats
+from .models import Directory, DirectoryStats, OwnerSummary, ScanMetadata, UserInfo
 
 # Extended LINE_PATTERN that captures inode and fileset_id for unique identification
 # Format: <thread> inode fileset_id snapshot  fields -- /path
@@ -890,6 +891,143 @@ def pass2b_aggregate_recursive_stats(session) -> None:
     console.print(f"    Processed {max_depth} depth levels")
 
 
+def pass3_populate_summary_tables(
+    session,
+    input_file: Path,
+    filesystem: str,
+    metadata: dict,
+) -> None:
+    """
+    Phase 3: Populate summary tables after main processing completes.
+
+    Phase 3a: Populate UserInfo - resolve UIDs to usernames
+    Phase 3b: Compute OwnerSummary - pre-aggregate per-owner statistics
+    Phase 3c: Record ScanMetadata - store scan provenance info
+    """
+    import pwd
+    from functools import lru_cache
+
+    console.print("\n[bold]Pass 3:[/bold] Populating summary tables...")
+
+    # Phase 3a: Populate UserInfo
+    console.print("  [bold]Phase 3a:[/bold] Resolving user information...")
+
+    @lru_cache(maxsize=10000)
+    def resolve_uid(uid: int) -> tuple[str | None, str | None]:
+        """Resolve UID to username and full name (GECOS)."""
+        try:
+            pw = pwd.getpwuid(uid)
+            # GECOS field may contain comma-separated values; first is typically full name
+            gecos = pw.pw_gecos.split(",")[0] if pw.pw_gecos else None
+            return pw.pw_name, gecos
+        except (KeyError, OverflowError):
+            return None, None
+
+    # Get all distinct UIDs from directory_stats (excluding -1 and NULL)
+    uids = session.execute(
+        text("""
+            SELECT DISTINCT owner_uid FROM directory_stats
+            WHERE owner_uid IS NOT NULL AND owner_uid >= 0
+        """)
+    ).fetchall()
+
+    user_count = 0
+    if uids:
+        user_inserts = []
+        for (uid,) in uids:
+            username, full_name = resolve_uid(uid)
+            user_inserts.append({
+                "uid": uid,
+                "username": username,
+                "full_name": full_name,
+            })
+            user_count += 1
+
+        # Bulk upsert
+        for item in user_inserts:
+            session.execute(
+                text("""
+                    INSERT OR REPLACE INTO user_info (uid, username, full_name)
+                    VALUES (:uid, :username, :full_name)
+                """),
+                item,
+            )
+        session.commit()
+
+    console.print(f"    Resolved {user_count} unique UIDs")
+
+    # Phase 3b: Compute OwnerSummary
+    console.print("  [bold]Phase 3b:[/bold] Computing owner summaries...")
+
+    # Clear existing summaries and recompute
+    session.execute(text("DELETE FROM owner_summary"))
+    session.execute(
+        text("""
+            INSERT INTO owner_summary (owner_uid, total_size, total_files, directory_count)
+            SELECT
+                owner_uid,
+                SUM(total_size_r) as total_size,
+                SUM(file_count_r) as total_files,
+                COUNT(*) as directory_count
+            FROM directory_stats
+            WHERE owner_uid IS NOT NULL AND owner_uid >= 0
+            GROUP BY owner_uid
+        """)
+    )
+    session.commit()
+
+    owner_count = session.execute(
+        text("SELECT COUNT(*) FROM owner_summary")
+    ).scalar()
+    console.print(f"    Computed summaries for {owner_count} owners")
+
+    # Phase 3c: Record ScanMetadata
+    console.print("  [bold]Phase 3c:[/bold] Recording scan metadata...")
+
+    scan_timestamp = extract_scan_timestamp(input_file.name)
+    import_timestamp = datetime.now()
+
+    # Get aggregate totals from root directories
+    totals = session.execute(
+        text("""
+            SELECT
+                COUNT(*) as dir_count,
+                COALESCE(SUM(s.file_count_r), 0) as total_files,
+                COALESCE(SUM(s.total_size_r), 0) as total_size
+            FROM directories d
+            JOIN directory_stats s USING (dir_id)
+            WHERE d.parent_id IS NULL
+        """)
+    ).fetchone()
+
+    total_directories = metadata.get("dir_count", 0)
+    total_files = totals[1] if totals else 0
+    total_size = totals[2] if totals else 0
+
+    session.execute(
+        text("""
+            INSERT INTO scan_metadata
+                (source_file, scan_timestamp, import_timestamp, filesystem,
+                 total_directories, total_files, total_size)
+            VALUES
+                (:source_file, :scan_timestamp, :import_timestamp, :filesystem,
+                 :total_directories, :total_files, :total_size)
+        """),
+        {
+            "source_file": input_file.name,
+            "scan_timestamp": scan_timestamp,
+            "import_timestamp": import_timestamp,
+            "filesystem": filesystem,
+            "total_directories": total_directories,
+            "total_files": total_files,
+            "total_size": total_size,
+        },
+    )
+    session.commit()
+
+    console.print(f"    Recorded metadata for {input_file.name}")
+
+
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("input_file", type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -1022,6 +1160,9 @@ def main(
 
         # Pass 2b: Compute recursive stats via bottom-up aggregation
         pass2b_aggregate_recursive_stats(session)
+
+        # Pass 3: Populate summary tables
+        pass3_populate_summary_tables(session, input_file, filesystem, metadata)
 
         # Finalize database for optimal query performance
         finalize_sqlite_pragmas(session)
