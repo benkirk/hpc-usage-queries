@@ -584,8 +584,8 @@ def query_owner_summary(
         {cte_clause}
         SELECT
             s.owner_uid,
-            SUM(s.total_size_r) as total_size,
-            SUM(s.file_count_r) as total_files,
+            SUM(s.total_size_nr) as total_size,
+            SUM(s.file_count_nr) as total_files,
             COUNT(*) as directory_count
         FROM directories d
         JOIN directory_stats s USING (dir_id)
