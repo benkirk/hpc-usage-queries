@@ -7,6 +7,7 @@ Supports filtering by depth, owner, path prefix, and sorting.
 """
 
 import os
+import pwd
 from datetime import datetime
 from pathlib import Path
 
@@ -476,14 +477,15 @@ def get_summary(session) -> dict:
 )
 @click.option(
     "-u",
-    "--owner-id",
-    type=int,
-    help="Filter to specific owner UID",
+    "--owner",
+    "owner_id",
+    type=str,
+    help="Filter to specific owner (UID or username)",
 )
 @click.option(
     "--mine",
     is_flag=True,
-    help="Filter to current user's UID (shortcut for --owner-id $UID)",
+    help="Filter to current user's UID (shortcut for -u $UID)",
 )
 @click.option(
     "--path-prefix",
@@ -562,7 +564,7 @@ def main(
     min_depth: int | None,
     max_depth: int | None,
     single_owner: bool,
-    owner_id: int | None,
+    owner_id: str | None,
     mine: bool,
     path_prefix: str | None,
     exclude_paths: tuple[str, ...],
@@ -627,9 +629,20 @@ def main(
             console.print("[yellow]No database files found.[/yellow]")
         return
 
-    # Handle --mine flag (shortcut for --owner-id with current UID)
+    # Resolve owner_id: can be UID (int) or username (string)
+    resolved_owner_id: int | None = None
     if mine:
-        owner_id = os.getuid()
+        resolved_owner_id = os.getuid()
+    elif owner_id is not None:
+        try:
+            resolved_owner_id = int(owner_id)
+        except ValueError:
+            # Not an integer, try to resolve as username
+            try:
+                resolved_owner_id = pwd.getpwnam(owner_id).pw_uid
+            except KeyError:
+                console.print(f"[red]Unknown user: {owner_id}[/red]")
+                raise SystemExit(1)
 
     # Determine which filesystems to query
     if filesystem.lower() == "all":
@@ -682,7 +695,7 @@ def main(
                 min_depth=min_depth,
                 max_depth=max_depth,
                 single_owner=single_owner,
-                owner_id=owner_id,
+                owner_id=resolved_owner_id,
                 path_prefix=path_prefix,
                 exclude_paths=list(exclude_paths) if exclude_paths else None,
                 sort_by=sort_by,
