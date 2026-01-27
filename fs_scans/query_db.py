@@ -930,7 +930,7 @@ def main(
             raise SystemExit(1)
         filesystems = [filesystem]
 
-    console.print(f"[bold]GPFS Scan Database Query[/bold]")
+    console.print(f"[bold]Filesystem Scan Database Query[/bold]")
     console.print(f"Databases: {', '.join(filesystems)}")
 
     # Collect and display scan dates
@@ -951,6 +951,7 @@ def main(
         else:
             console.print(f"[dim]Scans from {unique_dates[0]} to {unique_dates[-1]}[/dim]")
 
+    console.print(f"Note: this information is [bold]NOT[/bold] real-time")
     console.print()
 
     # Parse date arguments once
