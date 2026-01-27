@@ -9,8 +9,8 @@ from sqlalchemy.orm import sessionmaker
 
 from .models import Base
 
-# Default database directory (same as where the module lives)
-_DEFAULT_DATA_DIR = Path(__file__).parent
+# Default database directory (module directory + /data)
+_DEFAULT_DATA_DIR = Path(__file__).parent / "data"
 
 # Module-level cache for the configured data directory (set via CLI)
 _data_dir_override: Path | None = None
@@ -22,19 +22,25 @@ def get_data_dir() -> Path:
     Precedence:
         1. Module-level override (set via set_data_dir() from CLI)
         2. FS_SCAN_DATA_DIR environment variable
-        3. Default: module directory
+        3. Default: module directory / data
 
     Returns:
-        Path to the data directory
+        Path to the data directory (created if it doesn't exist)
     """
     if _data_dir_override is not None:
-        return _data_dir_override
+        data_dir = _data_dir_override
+    elif env_dir := os.environ.get("FS_SCAN_DATA_DIR"):
+        data_dir = Path(env_dir)
+    else:
+        data_dir = _DEFAULT_DATA_DIR
 
-    env_dir = os.environ.get("FS_SCAN_DATA_DIR")
-    if env_dir:
-        return Path(env_dir)
+    # Create directory if it doesn't exist
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise OSError(f"Failed to create data directory '{data_dir}': {e}") from e
 
-    return _DEFAULT_DATA_DIR
+    return data_dir
 
 
 def set_data_dir(path: Path | None) -> None:
@@ -45,6 +51,21 @@ def set_data_dir(path: Path | None) -> None:
     """
     global _data_dir_override
     _data_dir_override = path
+
+
+def get_data_dir_info() -> tuple[Path, str]:
+    """Get the current data directory and its source.
+
+    Returns:
+        Tuple of (data_dir_path, source_description)
+        Source is one of: "CLI --data-dir", "FS_SCAN_DATA_DIR env var", "default"
+    """
+    if _data_dir_override is not None:
+        return _data_dir_override, "CLI --data-dir"
+    elif env_dir := os.environ.get("FS_SCAN_DATA_DIR"):
+        return Path(env_dir), "FS_SCAN_DATA_DIR env var"
+    else:
+        return _DEFAULT_DATA_DIR, "default"
 
 
 def extract_filesystem_from_filename(filename: str) -> str | None:

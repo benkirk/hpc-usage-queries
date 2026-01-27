@@ -30,3 +30,4 @@ samples/
 *~
 .ipynb_checkpoints/
 fs_scans/*.db
+fs_scans/data/

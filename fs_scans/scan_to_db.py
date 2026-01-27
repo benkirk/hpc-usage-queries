@@ -890,7 +890,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
     console.print(f"    Processed {max_depth} depth levels")
 
 
-@click.command()
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("input_file", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--db",
