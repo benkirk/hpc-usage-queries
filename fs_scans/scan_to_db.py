@@ -966,8 +966,8 @@ def pass3_populate_summary_tables(
             INSERT INTO owner_summary (owner_uid, total_size, total_files, directory_count)
             SELECT
                 owner_uid,
-                SUM(total_size_r) as total_size,
-                SUM(file_count_r) as total_files,
+                SUM(total_size_nr) as total_size,
+                SUM(file_count_nr) as total_files,
                 COUNT(*) as directory_count
             FROM directory_stats
             WHERE owner_uid IS NOT NULL AND owner_uid >= 0
