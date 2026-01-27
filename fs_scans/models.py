@@ -88,6 +88,8 @@ class DirectoryStats(Base):
     __table_args__ = (
         Index("ix_stats_size_r", "total_size_r"),
         Index("ix_stats_files_r", "file_count_r"),
+        Index("ix_stats_size_nr", "total_size_nr"),
+        Index("ix_stats_files_nr", "file_count_nr"),
     )
 
     def __repr__(self):
