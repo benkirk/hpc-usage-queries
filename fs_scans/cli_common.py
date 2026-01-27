@@ -68,13 +68,16 @@ def format_size(size_bytes: int | None) -> str:
     return f"{size_bytes:.1f} EB"
 
 
-def format_datetime(dt: datetime | str | None) -> str:
+def format_datetime(dt: datetime | str | int | None) -> str:
     """Format datetime for display."""
-    if dt is None:
+    if dt is None or dt == 0:
         return "N/A"
     if isinstance(dt, str):
         # SQLite may return datetime as string - just return date portion
         return dt[:10] if len(dt) >= 10 else dt
+    if isinstance(dt, int):
+        # Unexpected integer value - treat as N/A
+        return "N/A"
     return dt.strftime("%Y-%m-%d")
 
 

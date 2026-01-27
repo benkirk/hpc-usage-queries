@@ -89,6 +89,33 @@ def extract_filesystem_from_filename(filename: str) -> str | None:
     return None
 
 
+def extract_scan_timestamp(filename: str):
+    """Extract scan timestamp from a GPFS scan log filename.
+
+    Expected patterns:
+        20260111_csfs1_asp.list.list_all.log -> datetime(2026, 1, 11)
+        20260111_csfs1_cisl.list.list_all.log.xz -> datetime(2026, 1, 11)
+
+    Args:
+        filename: Name of the log file (with or without path)
+
+    Returns:
+        datetime object or None if pattern doesn't match
+    """
+    from datetime import datetime
+
+    basename = Path(filename).name
+    # Pattern: YYYYMMDD_...
+    match = re.match(r"(\d{8})_", basename)
+    if match:
+        date_str = match.group(1)
+        try:
+            return datetime.strptime(date_str, "%Y%m%d")
+        except ValueError:
+            return None
+    return None
+
+
 def get_db_path(filesystem: str, db_path: Path | None = None) -> Path:
     """Get the database path for a specific filesystem.
 

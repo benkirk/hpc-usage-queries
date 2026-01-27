@@ -173,6 +173,8 @@ def query_directories(
     accessed_before: datetime | None = None,
     accessed_after: datetime | None = None,
     leaves_only: bool = False,
+    name_patterns: list[str] | None = None,
+    name_pattern_ignorecase: bool = False,
 ) -> list[dict]:
     """
     Query directories with optional filters.
@@ -190,6 +192,8 @@ def query_directories(
         accessed_before: Filter to directories with max_atime_r before this date
         accessed_after: Filter to directories with max_atime_r after this date
         leaves_only: Only show directories with no subdirectories
+        name_patterns: List of GLOB patterns to filter directory names (OR'd together)
+        name_pattern_ignorecase: If True, name pattern matching is case-insensitive
 
     Returns:
         List of directory dictionaries with stats
@@ -225,6 +229,22 @@ def query_directories(
         conditions.append(
             "NOT EXISTS (SELECT 1 FROM directories child WHERE child.parent_id = d.dir_id)"
         )
+
+    if name_patterns:
+        # Build OR clause for multiple patterns
+        pattern_conditions = []
+        for i, pattern in enumerate(name_patterns):
+            param_name = f"name_pattern_{i}"
+            if name_pattern_ignorecase:
+                # Convert GLOB pattern to LIKE pattern (* -> %, ? -> _)
+                # LIKE is case-insensitive by default in SQLite
+                like_pattern = pattern.replace("*", "%").replace("?", "_")
+                pattern_conditions.append(f"d.name LIKE :{param_name}")
+                params[param_name] = like_pattern
+            else:
+                pattern_conditions.append(f"d.name GLOB :{param_name}")
+                params[param_name] = pattern
+        conditions.append(f"({' OR '.join(pattern_conditions)})")
 
     # Build CTEs for path filtering
     ctes = []
@@ -456,6 +476,210 @@ def get_summary(session) -> dict:
     }
 
 
+def query_owner_summary(
+    session,
+    min_depth: int | None = None,
+    max_depth: int | None = None,
+    path_prefix: str | None = None,
+    limit: int | None = None,
+    sort_by: str = "size",
+) -> list[dict]:
+    """
+    Query per-owner aggregated statistics.
+
+    Uses fast path (OwnerSummary table) when no filters are applied,
+    otherwise computes dynamically from directory_stats.
+
+    Args:
+        session: SQLAlchemy session
+        min_depth: Minimum path depth filter
+        max_depth: Maximum path depth filter
+        path_prefix: Filter to paths under this prefix
+        limit: Maximum results to return
+        sort_by: Sort field (size, files, dirs)
+
+    Returns:
+        List of owner summary dictionaries
+    """
+    has_filters = any([min_depth, max_depth, path_prefix])
+
+    if not has_filters:
+        # Fast path: use pre-computed OwnerSummary table
+        # Check if the table exists and has data
+        try:
+            count = session.execute(
+                text("SELECT COUNT(*) FROM owner_summary")
+            ).scalar()
+        except Exception:
+            count = 0
+
+        if count > 0:
+            sort_map = {
+                "size": "total_size DESC",
+                "files": "total_files DESC",
+                "dirs": "directory_count DESC",
+            }
+            order_clause = sort_map.get(sort_by, sort_map["size"])
+
+            query = f"""
+                SELECT owner_uid, total_size, total_files, directory_count
+                FROM owner_summary
+                ORDER BY {order_clause}
+            """
+            if limit:
+                query += f" LIMIT {limit}"
+
+            results = session.execute(text(query)).fetchall()
+            return [
+                {
+                    "owner_uid": row[0],
+                    "total_size": row[1] or 0,
+                    "total_files": row[2] or 0,
+                    "directory_count": row[3] or 0,
+                }
+                for row in results
+            ]
+
+    # Dynamic path: compute from directory_stats with filters
+    conditions = ["s.owner_uid IS NOT NULL AND s.owner_uid >= 0"]
+    params = {}
+
+    if min_depth is not None:
+        conditions.append("d.depth >= :min_depth")
+        params["min_depth"] = min_depth
+
+    if max_depth is not None:
+        conditions.append("d.depth <= :max_depth")
+        params["max_depth"] = max_depth
+
+    # Handle path prefix
+    cte_clause = ""
+    join_clause = ""
+    if path_prefix:
+        ancestor_id = resolve_path_to_id(session, path_prefix)
+        if ancestor_id is None:
+            return []  # Path not found
+
+        cte_clause = """
+            WITH RECURSIVE descendants AS (
+                SELECT dir_id FROM directories WHERE dir_id = :ancestor_id
+                UNION ALL
+                SELECT d.dir_id FROM directories d
+                JOIN descendants p ON d.parent_id = p.dir_id
+            )
+        """
+        join_clause = "JOIN descendants USING (dir_id)"
+        params["ancestor_id"] = ancestor_id
+
+    sort_map = {
+        "size": "total_size DESC",
+        "files": "total_files DESC",
+        "dirs": "directory_count DESC",
+    }
+    order_clause = sort_map.get(sort_by, sort_map["size"])
+
+    where_clause = " AND ".join(conditions)
+
+    query = f"""
+        {cte_clause}
+        SELECT
+            s.owner_uid,
+            SUM(s.total_size_r) as total_size,
+            SUM(s.file_count_r) as total_files,
+            COUNT(*) as directory_count
+        FROM directories d
+        JOIN directory_stats s USING (dir_id)
+        {join_clause}
+        WHERE {where_clause}
+        GROUP BY s.owner_uid
+        ORDER BY {order_clause}
+    """
+    if limit:
+        query += f" LIMIT {limit}"
+
+    results = session.execute(text(query), params).fetchall()
+    return [
+        {
+            "owner_uid": row[0],
+            "total_size": row[1] or 0,
+            "total_files": row[2] or 0,
+            "directory_count": row[3] or 0,
+        }
+        for row in results
+    ]
+
+
+def get_username_map(session, uids: list[int]) -> dict[int, str]:
+    """
+    Get username mappings for a list of UIDs from the user_info table.
+
+    Falls back to pwd.getpwuid() for UIDs not in the table.
+
+    Args:
+        session: SQLAlchemy session
+        uids: List of UIDs to resolve
+
+    Returns:
+        Dictionary mapping UID to username (or str(uid) if unknown)
+    """
+    if not uids:
+        return {}
+
+    result = {}
+
+    # Try to get from user_info table first
+    try:
+        placeholders = ", ".join(f":uid_{i}" for i in range(len(uids)))
+        params = {f"uid_{i}": uid for i, uid in enumerate(uids)}
+
+        rows = session.execute(
+            text(f"SELECT uid, username FROM user_info WHERE uid IN ({placeholders})"),
+            params,
+        ).fetchall()
+
+        for uid, username in rows:
+            result[uid] = username if username else str(uid)
+    except Exception:
+        pass
+
+    # Fall back to pwd for missing UIDs
+    for uid in uids:
+        if uid not in result:
+            try:
+                result[uid] = pwd.getpwuid(uid).pw_name
+            except (KeyError, OverflowError):
+                result[uid] = str(uid)
+
+    return result
+
+
+def print_owner_results(owners: list[dict], username_map: dict[int, str]) -> None:
+    """Print owner summary results in a formatted table."""
+    if not owners:
+        console.print("[yellow]No owner data found.[/yellow]")
+        return
+
+    table = Table(title=f"Owner Summary ({len(owners)} owners)")
+    table.add_column("Owner", style="cyan")
+    table.add_column("UID", justify="right")
+    table.add_column("Total Size", justify="right")
+    table.add_column("Total Files", justify="right")
+    table.add_column("Directories", justify="right")
+
+    for o in owners:
+        uid = o["owner_uid"]
+        username = username_map.get(uid, str(uid))
+        table.add_row(
+            username,
+            str(uid),
+            format_size(o["total_size"]),
+            f"{o['total_files']:,}",
+            f"{o['directory_count']:,}",
+        )
+
+    console.print(table)
+
+
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("filesystem", type=str, default="all")
 @click.option(
@@ -559,6 +783,26 @@ def get_summary(session) -> dict:
     is_flag=True,
     help="Show data directory configuration and available databases",
 )
+@click.option(
+    "-N",
+    "--name-pattern",
+    "name_patterns",
+    multiple=True,
+    type=str,
+    help="Filter by name pattern (GLOB); can repeat for OR matching",
+)
+@click.option(
+    "-i",
+    "--ignore-case",
+    is_flag=True,
+    help="Make --name-pattern matching case-insensitive",
+)
+@click.option(
+    "--group-by",
+    "group_by",
+    type=click.Choice(["owner"]),
+    help="Group results by field (currently: owner)",
+)
 def main(
     filesystem: str,
     min_depth: int | None,
@@ -578,6 +822,9 @@ def main(
     data_dir: Path | None,
     summary: bool,
     show_config: bool,
+    name_patterns: tuple[str, ...],
+    ignore_case: bool,
+    group_by: str | None,
 ):
     """
     Query GPFS scan database for directory statistics.
@@ -587,23 +834,16 @@ def main(
 
     \b
     Examples:
-        # Query all filesystems (default)
-        query-fs-scan-db
-
-        # Query a specific filesystem
-        query-fs-scan-db asp
-
-        # Show only single-owner directories at depth 4+
-        query-fs-scan-db -d 4 --single-owner
-
-        # Filter by access time (files not accessed in 3+ years)
-        query-fs-scan-db --accessed-before 3yrs
-
-        # Show only leaf directories
-        query-fs-scan-db --leaves-only
-
-        # Use databases from a different directory
-        query-fs-scan-db --data-dir /path/to/databases
+      query-fs-scan-db                       # all filesystems (default)
+      query-fs-scan-db asp                   # specific filesystem
+      query-fs-scan-db -d 4 --single-owner   # single-owner dirs at depth 4+
+      query-fs-scan-db --accessed-before 3yrs
+      query-fs-scan-db --leaves-only
+      query-fs-scan-db -N "*scratch*"        # filter by name pattern
+      query-fs-scan-db -N "*scratch*" -N "*tmp*"  # multiple patterns (OR)
+      query-fs-scan-db -N "*tmp*" -i         # case-insensitive name filter
+      query-fs-scan-db --group-by owner      # per-user summary
+      query-fs-scan-db --group-by owner -d 4 -P /gpfs/csfs1/cisl
     """
     # Apply data directory override if provided via CLI
     if data_dir is not None:
@@ -683,6 +923,63 @@ def main(
                 session.close()
         return
 
+    # Handle --group-by owner mode
+    if group_by == "owner":
+        all_owners = []
+        all_uids = set()
+
+        for fs in filesystems:
+            session = get_session(fs)
+            try:
+                owners = query_owner_summary(
+                    session,
+                    min_depth=min_depth,
+                    max_depth=max_depth,
+                    path_prefix=path_prefix,
+                    limit=limit if limit > 0 else None,
+                    sort_by="size",  # Default sort for owner summary
+                )
+                all_owners.extend(owners)
+                all_uids.update(o["owner_uid"] for o in owners)
+            finally:
+                session.close()
+
+        # For multi-db: aggregate by owner and re-sort
+        if len(filesystems) > 1:
+            aggregated = {}
+            for o in all_owners:
+                uid = o["owner_uid"]
+                if uid not in aggregated:
+                    aggregated[uid] = {
+                        "owner_uid": uid,
+                        "total_size": 0,
+                        "total_files": 0,
+                        "directory_count": 0,
+                    }
+                aggregated[uid]["total_size"] += o["total_size"]
+                aggregated[uid]["total_files"] += o["total_files"]
+                aggregated[uid]["directory_count"] += o["directory_count"]
+
+            all_owners = sorted(
+                aggregated.values(),
+                key=lambda x: x["total_size"],
+                reverse=True,
+            )
+            if limit > 0:
+                all_owners = all_owners[:limit]
+
+        # Get username mappings (use first available session)
+        username_map = {}
+        if all_uids and filesystems:
+            session = get_session(filesystems[0])
+            try:
+                username_map = get_username_map(session, list(all_uids))
+            finally:
+                session.close()
+
+        print_owner_results(all_owners, username_map)
+        return
+
     # Query directories
     multi_db = len(filesystems) > 1
     all_directories = []
@@ -703,6 +1000,8 @@ def main(
                 accessed_before=parsed_before,
                 accessed_after=parsed_after,
                 leaves_only=leaves_only,
+                name_patterns=list(name_patterns) if name_patterns else None,
+                name_pattern_ignorecase=ignore_case,
             )
             all_directories.extend(dirs)
         finally:
