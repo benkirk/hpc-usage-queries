@@ -68,7 +68,7 @@ class ParsedEntry(NamedTuple):
     fileset_id: int
     path: str
     size: int
-    allocated: int | None
+    allocated: int
     user_id: int
     is_dir: bool
     atime: datetime | None
@@ -118,14 +118,22 @@ def parse_line(line: str) -> ParsedEntry | None:
         except ValueError:
             pass
 
+    # Size is in bytes
+    size = int(size_match.group(1))
+
     # Allocated is in KB, convert to bytes
-    allocated = int(alloc_match.group(1)) * 1024 if alloc_match else None
+    allocated = int(alloc_match.group(1)) * 1024
+
+    # GPFS weirdness: data can be stored in the inode when the size is small.
+    if allocated == 0:
+        if size <= 4096:
+            allocated = size
 
     return ParsedEntry(
         inode=int(inode),
         fileset_id=int(fileset_id),
         path=path,
-        size=int(size_match.group(1)),
+        size=size,
         allocated=allocated,
         user_id=int(user_match.group(1)),
         is_dir=is_dir,

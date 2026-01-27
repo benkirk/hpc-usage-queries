@@ -32,6 +32,28 @@ def get_all_filesystems() -> list[str]:
     return sorted([f.stem for f in db_files])
 
 
+def get_scan_date(session) -> datetime | None:
+    """Get the scan timestamp from ScanMetadata.
+
+    Returns:
+        The scan_timestamp from the most recent scan metadata entry, or None if not found.
+    """
+    result = session.execute(
+        text("SELECT scan_timestamp FROM scan_metadata ORDER BY scan_id DESC LIMIT 1")
+    ).fetchone()
+    if not result or not result[0]:
+        return None
+    # Handle both datetime objects and string formats
+    val = result[0]
+    if isinstance(val, datetime):
+        return val
+    # Parse string format "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD"
+    try:
+        return datetime.strptime(str(val).split()[0], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 def resolve_path_to_id(session, path: str) -> int | None:
     """
     Resolve a full path to its dir_id in a single query.
@@ -364,12 +386,18 @@ def query_directories(
 
 
 def print_results(
-    directories: list[dict], verbose: bool = False, leaves_only: bool = False
+    directories: list[dict],
+    verbose: bool = False,
+    leaves_only: bool = False,
+    username_map: dict[int, str] | None = None,
 ) -> None:
     """Print directory results in a formatted table."""
     if not directories:
         console.print("[yellow]No directories found matching criteria.[/yellow]")
         return
+
+    if username_map is None:
+        username_map = {}
 
     table = Table(title=f"Directory Statistics ({len(directories)} results)")
     table.add_column("Directory", style="cyan", no_wrap=False)
@@ -391,11 +419,14 @@ def print_results(
     table.add_column("Owner", justify="right")
 
     for d in directories:
-        owner_str = (
-            f"[green]{d['owner_uid']}[/green]"
-            if d["owner_uid"] is not None and d["owner_uid"] != -1
-            else "[yellow]multiple[/yellow]" if d["owner_uid"] is None else "[dim]-[/dim]"
-        )
+        uid = d["owner_uid"]
+        if uid is not None and uid != -1:
+            owner_display = username_map.get(uid, str(uid))
+            owner_str = f"[green]{owner_display}[/green]"
+        elif uid is None:
+            owner_str = "[yellow]multiple[/yellow]"
+        else:
+            owner_str = "[dim]-[/dim]"
 
         row = [d["path"]]
         if verbose:
@@ -899,8 +930,28 @@ def main(
             raise SystemExit(1)
         filesystems = [filesystem]
 
-    console.print(f"[bold]GPFS Scan Database Query[/bold]")
+    console.print(f"[bold]Filesystem Scan Database Query[/bold]")
     console.print(f"Databases: {', '.join(filesystems)}")
+
+    # Collect and display scan dates
+    scan_dates = []
+    for fs in filesystems:
+        session = get_session(fs)
+        try:
+            scan_date = get_scan_date(session)
+            if scan_date:
+                scan_dates.append(scan_date)
+        finally:
+            session.close()
+
+    if scan_dates:
+        unique_dates = sorted(set(d.date() for d in scan_dates))
+        if len(unique_dates) == 1:
+            console.print(f"[dim]Data from scan: {unique_dates[0]}[/dim]")
+        else:
+            console.print(f"[dim]Scans from {unique_dates[0]} to {unique_dates[-1]}[/dim]")
+
+    console.print(f"Note: this information is [bold]NOT[/bold] real-time")
     console.print()
 
     # Parse date arguments once
@@ -1029,7 +1080,19 @@ def main(
     if output:
         write_tsv(all_directories, output)
     else:
-        print_results(all_directories, verbose=verbose, leaves_only=leaves_only)
+        # Resolve UIDs to usernames for display
+        unique_uids = list({
+            d["owner_uid"] for d in all_directories
+            if d["owner_uid"] is not None and d["owner_uid"] != -1
+        })
+        username_map = {}
+        if unique_uids:
+            session = get_session(filesystems[0])
+            try:
+                username_map = get_username_map(session, unique_uids)
+            finally:
+                session.close()
+        print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map)
 
 
 if __name__ == "__main__":
