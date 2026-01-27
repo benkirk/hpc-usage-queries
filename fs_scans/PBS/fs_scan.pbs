@@ -1,0 +1,58 @@
+#!/bin/bash
+
+#PBS -N fs_scan
+#PBS -A SCSG0001
+#PBS -j oe
+#PBS -q casper
+#PBS -l walltime=2:00:00
+#PBS -l select=1:ncpus=16:mpiprocs=1:ompthreads=16:mem=128G
+
+#----------------------------------------------------------------------------
+# Determine the directory containing this script, compatible with bash and zsh
+if [ -n "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION}" ]; then
+  SCRIPT_PATH="${(%):-%x}"
+else
+  echo "Unknown shell!"
+fi
+SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
+TOP_DIR=$(git rev-parse --show-toplevel)
+#----------------------------------------------------------------------------
+
+set -e
+
+source ${TOP_DIR}/etc/config_env.sh
+which python3
+
+module load peak-memusage
+hostname
+w
+free -g
+
+pwd
+
+echo "PBS_O_WORKDIR=${PBS_O_WORKDIR}"
+local_scratch=/local_scratch/pbs.${PBS_JOBID}
+tmpfs_scratch=/dev/shm/${USER}/pbs.${PBS_JOBID}
+work_dir=${local_scratch}/work
+
+mkdir -p ${work_dir}
+
+ls -ld ${local_scratch}
+df -h ${local_scratch}
+
+export COLUMNS=256
+
+echo ${sep}
+ls -lh ${SCAN_LOG_FILE}
+
+rm -rf ${work_dir} && mkdir -p ${work_dir} && cd ${work_dir}
+export FS_SCAN_DATA_DIR=$(pwd)
+
+peak_memusage fs-scan-to-db --workers 12 --replace ${SCAN_LOG_FILE}
+peak_memusage query-fs-scan-db
+
+rsync -axv ./*.db /glade/work/benkirk/repos/qhist-queries/fs_scans/data/
+
+rm -rf ${work_dir}
