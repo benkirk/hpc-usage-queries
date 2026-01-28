@@ -65,55 +65,8 @@ with ThreadPoolExecutor(max_workers=min(len(filesystems), 8)) as executor:
         all_directories.extend(future.result())
 ```
 
-### Phase 2: Path Pattern Matching
 
-#### 2.1 Add `--path-pattern` CLI Option
-**File:** `fs_scans/query_db.py`
-
-Add new option (keep `-N/--name-pattern` for SQL-level basename matching):
-```python
-@click.option(
-    "--path-pattern",
-    "path_patterns",
-    multiple=True,
-    type=str,
-    help="Filter by full path pattern (GLOB); applied post-query",
-)
-```
-
-#### 2.2 Post-Query Path Filtering with Adaptive Retry
-Apply pattern matching in Python after path reconstruction. Use adaptive over-fetching:
-
-```python
-def query_with_path_filter(session, path_patterns, limit, **query_params):
-    """Query with path pattern post-filtering and adaptive retry."""
-    import fnmatch
-
-    multipliers = [2, 5, 10, 0]  # 0 = unlimited (final attempt)
-
-    for mult in multipliers:
-        fetch_limit = limit * mult if mult > 0 else None
-        results = query_directories(session, limit=fetch_limit, **query_params)
-
-        # Apply path pattern filter
-        filtered = [
-            d for d in results
-            if any(fnmatch.fnmatch(d["path"], p) for p in path_patterns)
-        ]
-
-        if len(filtered) >= limit or mult == 0:
-            return filtered[:limit] if limit else filtered
-
-    return filtered
-```
-
-**Behavior:**
-1. First try: fetch `limit * 2`, filter, check if we have enough
-2. Second try: fetch `limit * 5` if needed
-3. Third try: fetch `limit * 10` if needed
-4. Final try: fetch unlimited (for sparse matches)
-
-### Phase 3: Query Builder Refactoring
+### Phase 2: Query Builder Refactoring
 
 **File:** `fs_scans/query_builder.py` (new)
 
@@ -137,15 +90,6 @@ class DirectoryQueryBuilder:
         if max_depth is not None:
             self.conditions.append("d.depth <= :max_depth")
             self.params["max_depth"] = max_depth
-        return self
-
-    def with_path_prefix(self, path_prefix):
-        ancestor_id = resolve_path_to_id(self.session, path_prefix)
-        if ancestor_id is None:
-            raise ValueError(f"Path not found: {path_prefix}")
-        self.ctes.append(self._descendants_cte())
-        self.params["ancestor_id"] = ancestor_id
-        self.use_descendants_cte = True
         return self
 
     def with_name_patterns(self, patterns, ignore_case=False):
@@ -187,9 +131,9 @@ class DirectoryQueryBuilder:
 | File | Changes |
 |------|---------|
 | `fs_scans/database.py` | Add engine caching |
-| `fs_scans/query_db.py` | Add parallel execution, `--path-pattern` option, integrate query builder |
+| `fs_scans/query_db.py` | Add parallel execution, integrate query builder |
 | `fs_scans/query_builder.py` | New file: `DirectoryQueryBuilder` class |
-| `fs_scans/tests/test_query_builder.py` | New file: Unit tests for query builder |
+| `tests/test_fs_scan_query_builder.py` | New file: Unit tests for query builder |
 
 ---
 
@@ -205,13 +149,7 @@ class DirectoryQueryBuilder:
    time query-fs-scan-db --sort-by files_r -N "*COLD_STORAGE*"
    ```
 
-3. **Path pattern matching (new feature):**
-   ```bash
-   query-fs-scan-db --path-pattern "*/COLD_STORAGE/*" cisl
-   query-fs-scan-db --path-pattern "/gpfs/csfs1/*/COLD_STORAGE*"
-   ```
-
-4. **Run existing tests:**
+3. **Run existing tests:**
    ```bash
    pytest fs_scans/tests/
    ```
