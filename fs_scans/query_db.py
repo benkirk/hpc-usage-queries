@@ -16,87 +16,17 @@ import click
 from rich.table import Table
 from sqlalchemy import text
 
-from .cli_common import console, format_datetime, format_size, parse_date_arg
+from .cli_common import (
+    console,
+    format_datetime,
+    format_size,
+    make_dynamic_help_command,
+    parse_date_arg,
+    parse_file_count,
+    parse_size,
+)
 from .database import get_data_dir, get_data_dir_info, get_db_path, get_session, set_data_dir
-
-import re as _re
-
-_SIZE_UNITS = {
-    "b": 1,
-    "kb": 1000,
-    "mb": 1000**2,
-    "gb": 1000**3,
-    "tb": 1000**4,
-    "pb": 1000**5,
-    "kib": 1024,
-    "mib": 1024**2,
-    "gib": 1024**3,
-    "tib": 1024**4,
-    "pib": 1024**5,
-    # Shorthand: K/M/G/T/P → binary (filesystem convention)
-    "k": 1024,
-    "m": 1024**2,
-    "g": 1024**3,
-    "t": 1024**4,
-    "p": 1024**5,
-}
-
-
-def parse_size(value: str) -> int:
-    """Parse a size string to bytes.
-
-    Accepts plain integers (bytes), SI units (KB, MB, GB, TB, PB),
-    binary units (KiB, MiB, GiB, TiB, PiB), or shorthand (K, M, G, T, P)
-    where shorthand maps to binary (1024-based).
-
-    Examples:
-        "1GiB"  -> 1073741824
-        "500MB" -> 500000000
-        "2T"    -> 2199023255552
-        "0"     -> 0
-    """
-    value = value.strip()
-    match = _re.match(r"^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$", value)
-    if not match:
-        raise click.BadParameter(f"Invalid size: {value}")
-    num_str, unit = match.groups()
-    num = float(num_str)
-    if not unit:
-        return int(num)
-    unit_lower = unit.lower()
-    if unit_lower not in _SIZE_UNITS:
-        raise click.BadParameter(f"Unknown size unit: {unit}")
-    return int(num * _SIZE_UNITS[unit_lower])
-
-
-_COUNT_UNITS = {
-    "k": 1000,
-    "m": 1000_000,
-}
-
-
-def parse_file_count(value: str) -> int:
-    """Parse a file count string to an integer.
-
-    Accepts plain integers or shorthand multipliers: K (×1000), M (×1000000).
-
-    Examples:
-        "1K"  -> 1000
-        "500" -> 500
-        "10M" -> 10000000
-    """
-    value = value.strip()
-    match = _re.match(r"^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$", value)
-    if not match:
-        raise click.BadParameter(f"Invalid file count: {value}")
-    num_str, unit = match.groups()
-    num = float(num_str)
-    if not unit:
-        return int(num)
-    unit_lower = unit.lower()
-    if unit_lower not in _COUNT_UNITS:
-        raise click.BadParameter(f"Unknown file count unit: {unit}")
-    return int(num * _COUNT_UNITS[unit_lower])
+from .query_builder import DirectoryQueryBuilder
 
 
 # Known mount point prefixes to strip from user-provided paths
@@ -338,158 +268,62 @@ def query_directories(
     Returns:
         List of directory dictionaries with stats
     """
-    # Build base query
-    conditions = []
-    params = {}
-
-    if min_depth is not None:
-        conditions.append("d.depth >= :min_depth")
-        params["min_depth"] = min_depth
-
-    if max_depth is not None:
-        conditions.append("d.depth <= :max_depth")
-        params["max_depth"] = max_depth
-
-    if single_owner:
-        conditions.append("s.owner_uid IS NOT NULL AND s.owner_uid != -1")
-
-    if owner_id is not None:
-        conditions.append("s.owner_uid = :owner_id")
-        params["owner_id"] = owner_id
-
-    if accessed_before is not None:
-        conditions.append("s.max_atime_r < :accessed_before")
-        params["accessed_before"] = accessed_before.strftime("%Y-%m-%d %H:%M:%S")
-
-    if accessed_after is not None:
-        conditions.append("s.max_atime_r > :accessed_after")
-        params["accessed_after"] = accessed_after.strftime("%Y-%m-%d %H:%M:%S")
-
-    if leaves_only:
-        conditions.append(
-            "NOT EXISTS (SELECT 1 FROM directories child WHERE child.parent_id = d.dir_id)"
-        )
-
-    if name_patterns:
-        # Build OR clause for multiple patterns
-        pattern_conditions = []
-        for i, pattern in enumerate(name_patterns):
-            param_name = f"name_pattern_{i}"
-            if name_pattern_ignorecase:
-                # Convert GLOB pattern to LIKE pattern (* -> %, ? -> _)
-                # LIKE is case-insensitive by default in SQLite
-                like_pattern = pattern.replace("*", "%").replace("?", "_")
-                pattern_conditions.append(f"d.name LIKE :{param_name}")
-                params[param_name] = like_pattern
-            else:
-                pattern_conditions.append(f"d.name GLOB :{param_name}")
-                params[param_name] = pattern
-        conditions.append(f"({' OR '.join(pattern_conditions)})")
-
-    if min_size is not None:
-        conditions.append("s.total_size_r >= :min_size")
-        params["min_size"] = min_size
-
-    if max_size is not None:
-        conditions.append("s.total_size_r <= :max_size")
-        params["max_size"] = max_size
-
-    if min_files is not None:
-        conditions.append("s.file_count_r >= :min_files")
-        params["min_files"] = min_files
-
-    if max_files is not None:
-        conditions.append("s.file_count_r <= :max_files")
-        params["max_files"] = max_files
-
-    # Build CTEs for path filtering
-    ctes = []
-    use_descendants_cte = False
-
-    # Handle path prefixes - find ancestors and filter descendants (OR'd together)
+    # Phase 1: Resolve path_prefixes to IDs (if provided)
+    ancestor_ids = []
     if path_prefixes:
-        ancestor_ids = []
         for prefix in path_prefixes:
             ancestor_id = resolve_path_to_id(session, prefix)
             if ancestor_id is not None:
-                idx = len(ancestor_ids)
                 ancestor_ids.append(ancestor_id)
-                params[f"ancestor_id_{idx}"] = ancestor_id
 
         if not ancestor_ids:
             return []  # No valid paths found
 
-        # Build IN clause for multiple ancestors
-        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
-        ctes.append(f"""
-            ancestors AS (
-                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
-            ),
-            descendants AS (
-                SELECT dir_id FROM ancestors
-                UNION ALL
-                SELECT d.dir_id FROM directories d
-                JOIN descendants p ON d.parent_id = p.dir_id
-            )""")
-        use_descendants_cte = True
+    # Phase 2: Build query using DirectoryQueryBuilder
+    builder = DirectoryQueryBuilder()
 
-    # NOTE: exclude_paths filtering is done post-query via path prefix matching
-    # This is much more efficient than building a CTE of all descendants
-    # (which would be O(excluded subtree size) vs O(results × excludes))
+    # Apply depth filters
+    if min_depth is not None or max_depth is not None:
+        builder.with_depth_range(min_depth, max_depth)
 
-    # Build the query with optional CTEs
-    if ctes:
-        cte_clause = "WITH RECURSIVE " + ",".join(ctes)
-    else:
-        cte_clause = ""
+    # Apply owner filters
+    if single_owner:
+        builder.with_single_owner()
+    if owner_id is not None:
+        builder.with_owner(owner_id)
 
-    # Build SELECT clause - use descendants CTE if path_prefixes was set
-    if use_descendants_cte:
-        select_clause = """
-            SELECT d.dir_id, d.parent_id, d.name, d.depth,
-                   s.file_count_nr, s.total_size_nr, s.max_atime_nr,
-                   s.file_count_r, s.total_size_r, s.max_atime_r,
-                   s.owner_uid
-            FROM descendants
-            JOIN directories d USING (dir_id)
-            JOIN directory_stats s USING (dir_id)
-        """
-    else:
-        select_clause = """
-            SELECT d.dir_id, d.parent_id, d.name, d.depth,
-                   s.file_count_nr, s.total_size_nr, s.max_atime_nr,
-                   s.file_count_r, s.total_size_r, s.max_atime_r,
-                   s.owner_uid
-            FROM directories d
-            JOIN directory_stats s USING (dir_id)
-        """
+    # Apply date filters
+    if accessed_before is not None:
+        builder.with_accessed_before(accessed_before)
+    if accessed_after is not None:
+        builder.with_accessed_after(accessed_after)
 
-    base_query = cte_clause + select_clause
+    # Apply structural filters
+    if leaves_only:
+        builder.with_leaves_only()
 
-    # Add WHERE clause if we have conditions
-    if conditions:
-        base_query += " WHERE " + " AND ".join(conditions)
+    # Apply name pattern filters
+    if name_patterns:
+        builder.with_name_patterns(list(name_patterns), name_pattern_ignorecase)
 
-    # Add ORDER BY
-    sort_map = {
-        "size_r": "s.total_size_r DESC",
-        "size_nr": "s.total_size_nr DESC",
-        "files_r": "s.file_count_r DESC",
-        "files_nr": "s.file_count_nr DESC",
-        "atime_r": "s.max_atime_r DESC",
-        "path": "d.depth ASC, d.name ASC",
-        "depth": "d.depth DESC",
-    }
-    order_clause = sort_map.get(sort_by, sort_map["size_r"])
-    base_query += f" ORDER BY {order_clause}"
+    # Apply size and file count filters
+    if min_size is not None or max_size is not None:
+        builder.with_size_range(min_size, max_size)
+    if min_files is not None or max_files is not None:
+        builder.with_file_count_range(min_files, max_files)
 
-    # Add LIMIT
-    if limit:
-        base_query += " LIMIT :limit"
-        params["limit"] = limit
+    # Apply path prefix filter (using resolved IDs)
+    if ancestor_ids:
+        builder.with_path_prefix_ids(ancestor_ids)
 
-    # Execute query
-    results = session.execute(text(base_query), params).fetchall()
+    # Apply sorting and limit
+    builder.with_sort(sort_by)
+    if limit is not None:
+        builder.with_limit(limit)
+
+    # Phase 3: Execute query
+    query_result = builder.build()
+    results = session.execute(text(query_result.sql), query_result.params).fetchall()
 
     # Batch fetch all full paths in single query (N queries -> 1)
     dir_ids = [row[0] for row in results]
@@ -968,20 +802,8 @@ def query_single_filesystem(
         session.close()
 
 
-class DynamicHelpCommand(click.Command):
-    """Custom Command class that replaces the command name in help text.
-
-    This allows the help examples to show the actual invoked command name,
-    which is useful when the tool is invoked via a symlink (e.g., cs-scan).
-    """
-    def get_help(self, ctx):
-        help_text = super().get_help(ctx)
-        # Get the actual invoked command name
-        prog_name = ctx.find_root().info_name
-        if prog_name and prog_name != 'query-fs-scan-db':
-            # Replace hardcoded command name with actual invoked name
-            help_text = help_text.replace('query-fs-scan-db', prog_name)
-        return help_text
+# Create DynamicHelpCommand for this tool
+DynamicHelpCommand = make_dynamic_help_command('query-fs-scan-db')
 
 
 @click.command(cls=DynamicHelpCommand, context_settings={"help_option_names": ["-h", "--help"]})

@@ -32,7 +32,7 @@ from rich.progress import TextColumn
 from sqlalchemy import insert, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from .cli_common import console, create_progress_bar, format_size
+from .cli_common import console, create_progress_bar, format_size, make_dynamic_help_command
 from .database import (
     drop_tables,
     extract_filesystem_from_filename,
@@ -1036,20 +1036,8 @@ def pass3_populate_summary_tables(
     console.print(f"    Recorded metadata for {input_file.name}")
 
 
-class DynamicHelpCommand(click.Command):
-    """Custom Command class that replaces the command name in help text.
-
-    This allows the help examples to show the actual invoked command name,
-    which is useful when the tool is invoked via a symlink.
-    """
-    def get_help(self, ctx):
-        help_text = super().get_help(ctx)
-        # Get the actual invoked command name
-        prog_name = ctx.find_root().info_name
-        if prog_name and prog_name != 'fs-scan-to-db':
-            # Replace hardcoded command name with actual invoked name
-            help_text = help_text.replace('fs-scan-to-db', prog_name)
-        return help_text
+# Create DynamicHelpCommand for this tool
+DynamicHelpCommand = make_dynamic_help_command('fs-scan-to-db')
 
 
 @click.command(cls=DynamicHelpCommand, context_settings={"help_option_names": ["-h", "--help"]})
