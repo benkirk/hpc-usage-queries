@@ -557,11 +557,11 @@ def print_results(
         table.add_column("Files", justify="right")
         table.add_column("Atime", justify="right")
     else:
-        table.add_column("Size\n(R)", justify="right")
+        table.add_column("Size\n", justify="right")
         table.add_column("Size\n(NR)", justify="right")
-        table.add_column("Files\n(R)", justify="right")
+        table.add_column("Files\n", justify="right")
         table.add_column("Files\n(NR)", justify="right")
-        table.add_column("Atime\n(R)", justify="right")
+        table.add_column("Atime\n", justify="right")
         table.add_column("Atime\n(NR)", justify="right")
     table.add_column("Owner", justify="right")
 
