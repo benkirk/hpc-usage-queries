@@ -1041,10 +1041,10 @@ class DynamicHelpCommand(click.Command):
 )
 @click.option(
     "--sort-by",
-    type=click.Choice(["size", "size_r", "size_nr", "files", "files_r", "files_nr", "atime", "atime_r", "path", "depth"]),
+    type=click.Choice(["size", "size_r", "size_nr", "files", "files_r", "files_nr", "atime", "atime_r", "path", "depth", "dirs"]),
     default="size",
     show_default=True,
-    help="Sort results by field",
+    help="Sort results by field (with --group-by owner: size, files, dirs)",
 )
 @click.option(
     "-o",
@@ -1184,6 +1184,7 @@ def main(
       query-fs-scan-db -N "*scratch*" -N "*tmp*"  # multiple patterns (OR)
       query-fs-scan-db -N "*tmp*" -i         # case-insensitive name filter
       query-fs-scan-db --group-by owner      # per-user summary
+      query-fs-scan-db --group-by owner --sort-by files  # sort by file count
       query-fs-scan-db --group-by owner -d 4 -P /gpfs/csfs1/cisl
     """
     # Apply data directory override if provided via CLI
@@ -1296,6 +1297,24 @@ def main(
 
     # Handle --group-by owner mode
     if group_by == "owner":
+        # Map sort_by to owner summary field names
+        # Accept common aliases for convenience
+        owner_sort_map = {
+            "size": "size",
+            "files": "files",
+            "dirs": "dirs",
+            "directories": "dirs",
+        }
+        owner_sort_by = owner_sort_map.get(sort_by, "size")
+
+        # Validate sort_by is compatible with --group-by owner
+        if sort_by not in owner_sort_map:
+            console.print(
+                f"[yellow]Warning: --sort-by '{sort_by}' not valid with --group-by owner. "
+                f"Using 'size' instead. Valid options: size, files, dirs[/yellow]"
+            )
+            owner_sort_by = "size"
+
         all_owners = []
         all_uids = set()
 
@@ -1308,7 +1327,7 @@ def main(
                     max_depth=max_depth,
                     path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
                     limit=limit if limit > 0 else None,
-                    sort_by="size",  # Default sort for owner summary
+                    sort_by=owner_sort_by,
                 )
                 all_owners.extend(owners)
                 all_uids.update(o["owner_uid"] for o in owners)
@@ -1331,9 +1350,17 @@ def main(
                 aggregated[uid]["total_files"] += o["total_files"]
                 aggregated[uid]["directory_count"] += o["directory_count"]
 
+            # Sort by the requested field
+            sort_key_map = {
+                "size": "total_size",
+                "files": "total_files",
+                "dirs": "directory_count",
+            }
+            sort_key = sort_key_map[owner_sort_by]
+
             all_owners = sorted(
                 aggregated.values(),
-                key=lambda x: x["total_size"],
+                key=lambda x: x[sort_key],
                 reverse=True,
             )
             if limit > 0:
