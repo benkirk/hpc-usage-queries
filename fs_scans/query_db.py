@@ -717,15 +717,36 @@ def get_username_map(session, uids: list[int]) -> dict[int, str]:
     return result
 
 
-def print_owner_results(owners: list[dict], username_map: dict[int, str]) -> None:
-    """Print owner summary results in a formatted table."""
+def print_owner_results(
+    owners: list[dict],
+    username_map: dict[int, str],
+    show_filesystem: bool = False
+) -> None:
+    """Print owner summary results in a formatted table.
+
+    Args:
+        owners: List of owner summary dictionaries
+        username_map: Mapping from UID to username
+        show_filesystem: If True, add Filesystem column (for multi-DB queries)
+    """
     if not owners:
         console.print("[yellow]No owner data found.[/yellow]")
         return
 
-    table = Table(title=f"Owner Summary ({len(owners)} owners)")
+    # Adjust title based on whether showing filesystem breakdown
+    if show_filesystem:
+        unique_combos = len(owners)  # Each row is owner+filesystem combo
+        table = Table(title=f"Owner Summary ({unique_combos} owner-filesystem combinations)")
+    else:
+        table = Table(title=f"Owner Summary ({len(owners)} owners)")
+
     table.add_column("Owner", style="cyan")
-    table.add_column("UID", justify="right")
+
+    # Add Filesystem column if showing breakdown
+    if show_filesystem:
+        table.add_column("Filesystem", style="blue")
+
+    # UID column removed (redundant with username)
     table.add_column("Total Size", justify="right")
     table.add_column("Total Files", justify="right")
     table.add_column("Directories", justify="right")
@@ -733,13 +754,20 @@ def print_owner_results(owners: list[dict], username_map: dict[int, str]) -> Non
     for o in owners:
         uid = o["owner_uid"]
         username = username_map.get(uid, str(uid))
-        table.add_row(
-            username,
-            str(uid),
+
+        row = [username]
+
+        # Add filesystem column value if needed
+        if show_filesystem:
+            row.append(o.get("filesystem", "unknown"))
+
+        row.extend([
             format_size(o["total_size"]),
             f"{o['total_files']:,}",
             f"{o['directory_count']:,}",
-        )
+        ])
+
+        table.add_row(*row)
 
     console.print(table)
 
@@ -1151,40 +1179,27 @@ def main(
                     limit=limit if limit > 0 else None,
                     sort_by=owner_sort_by,
                 )
+                # Tag each owner result with filesystem name
+                for owner in owners:
+                    owner["filesystem"] = fs
+
                 all_owners.extend(owners)
                 all_uids.update(o["owner_uid"] for o in owners)
             finally:
                 session.close()
 
-        # For multi-db: aggregate by owner and re-sort
+        # For multi-db: sort by metric, then owner, then filesystem (don't aggregate)
         if len(filesystems) > 1:
-            aggregated = {}
-            for o in all_owners:
-                uid = o["owner_uid"]
-                if uid not in aggregated:
-                    aggregated[uid] = {
-                        "owner_uid": uid,
-                        "total_size": 0,
-                        "total_files": 0,
-                        "directory_count": 0,
-                    }
-                aggregated[uid]["total_size"] += o["total_size"]
-                aggregated[uid]["total_files"] += o["total_files"]
-                aggregated[uid]["directory_count"] += o["directory_count"]
-
-            # Sort by the requested field
+            # Sort to group owners together while preserving per-filesystem breakdown
             sort_key_map = {
-                "size": "total_size",
-                "files": "total_files",
-                "dirs": "directory_count",
+                "size": lambda o: (-o["total_size"], o["owner_uid"], o["filesystem"]),
+                "files": lambda o: (-o["total_files"], o["owner_uid"], o["filesystem"]),
+                "dirs": lambda o: (-o["directory_count"], o["owner_uid"], o["filesystem"]),
             }
             sort_key = sort_key_map[owner_sort_by]
+            all_owners.sort(key=sort_key)
 
-            all_owners = sorted(
-                aggregated.values(),
-                key=lambda x: x[sort_key],
-                reverse=True,
-            )
+            # Apply limit to final sorted list
             if limit > 0:
                 all_owners = all_owners[:limit]
 
@@ -1203,7 +1218,9 @@ def main(
                 finally:
                     session.close()
 
-        print_owner_results(all_owners, username_map)
+        # Show filesystem column when querying multiple databases
+        show_filesystem = len(filesystems) > 1
+        print_owner_results(all_owners, username_map, show_filesystem=show_filesystem)
         return
 
     # Query directories
