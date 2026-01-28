@@ -1096,14 +1096,20 @@ def main(
             if limit > 0:
                 all_owners = all_owners[:limit]
 
-        # Get username mappings (use first available session)
+        # Get username mappings (aggregate across all databases)
         username_map = {}
         if all_uids and filesystems:
-            session = get_session(filesystems[0])
-            try:
-                username_map = get_username_map(session, list(all_uids))
-            finally:
-                session.close()
+            remaining_uids = set(all_uids)
+            for fs in filesystems:
+                if not remaining_uids:
+                    break
+                session = get_session(fs)
+                try:
+                    found = get_username_map(session, list(remaining_uids))
+                    username_map.update(found)
+                    remaining_uids -= found.keys()
+                finally:
+                    session.close()
 
         print_owner_results(all_owners, username_map)
         return
@@ -1188,18 +1194,24 @@ def main(
     if output:
         write_tsv(all_directories, output)
     else:
-        # Resolve UIDs to usernames for display
-        unique_uids = list({
+        # Resolve UIDs to usernames for display (aggregate across all databases)
+        unique_uids = {
             d["owner_uid"] for d in all_directories
             if d["owner_uid"] is not None and d["owner_uid"] != -1
-        })
+        }
         username_map = {}
         if unique_uids:
-            session = get_session(filesystems[0])
-            try:
-                username_map = get_username_map(session, unique_uids)
-            finally:
-                session.close()
+            remaining_uids = set(unique_uids)
+            for fs in filesystems:
+                if not remaining_uids:
+                    break
+                session = get_session(fs)
+                try:
+                    found = get_username_map(session, list(remaining_uids))
+                    username_map.update(found)
+                    remaining_uids -= found.keys()
+                finally:
+                    session.close()
         print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map)
 
 
