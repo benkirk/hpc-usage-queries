@@ -1036,7 +1036,23 @@ def pass3_populate_summary_tables(
     console.print(f"    Recorded metadata for {input_file.name}")
 
 
-@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+class DynamicHelpCommand(click.Command):
+    """Custom Command class that replaces the command name in help text.
+
+    This allows the help examples to show the actual invoked command name,
+    which is useful when the tool is invoked via a symlink.
+    """
+    def get_help(self, ctx):
+        help_text = super().get_help(ctx)
+        # Get the actual invoked command name
+        prog_name = ctx.find_root().info_name
+        if prog_name and prog_name != 'fs-scan-to-db':
+            # Replace hardcoded command name with actual invoked name
+            help_text = help_text.replace('fs-scan-to-db', prog_name)
+        return help_text
+
+
+@click.command(cls=DynamicHelpCommand, context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("input_file", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--db",

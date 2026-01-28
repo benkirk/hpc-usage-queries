@@ -927,7 +927,23 @@ def query_single_filesystem(
         session.close()
 
 
-@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+class DynamicHelpCommand(click.Command):
+    """Custom Command class that replaces the command name in help text.
+
+    This allows the help examples to show the actual invoked command name,
+    which is useful when the tool is invoked via a symlink (e.g., cs-scan).
+    """
+    def get_help(self, ctx):
+        help_text = super().get_help(ctx)
+        # Get the actual invoked command name
+        prog_name = ctx.find_root().info_name
+        if prog_name and prog_name != 'query-fs-scan-db':
+            # Replace hardcoded command name with actual invoked name
+            help_text = help_text.replace('query-fs-scan-db', prog_name)
+        return help_text
+
+
+@click.command(cls=DynamicHelpCommand, context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("filesystem", type=str, default="all")
 @click.option(
     "-d",
