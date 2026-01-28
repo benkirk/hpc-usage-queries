@@ -173,6 +173,46 @@ class DirectoryQueryBuilder:
         self._conditions.append(f"({' OR '.join(pattern_conditions)})")
         return self
 
+    def with_size_range(
+        self, min_size: int | None = None, max_size: int | None = None
+    ) -> "DirectoryQueryBuilder":
+        """Filter by recursive total size range.
+
+        Args:
+            min_size: Minimum total_size_r in bytes (inclusive)
+            max_size: Maximum total_size_r in bytes (inclusive)
+
+        Returns:
+            self for chaining
+        """
+        if min_size is not None:
+            self._conditions.append("s.total_size_r >= :min_size")
+            self._params["min_size"] = min_size
+        if max_size is not None:
+            self._conditions.append("s.total_size_r <= :max_size")
+            self._params["max_size"] = max_size
+        return self
+
+    def with_file_count_range(
+        self, min_files: int | None = None, max_files: int | None = None
+    ) -> "DirectoryQueryBuilder":
+        """Filter by recursive file count range.
+
+        Args:
+            min_files: Minimum file_count_r (inclusive)
+            max_files: Maximum file_count_r (inclusive)
+
+        Returns:
+            self for chaining
+        """
+        if min_files is not None:
+            self._conditions.append("s.file_count_r >= :min_files")
+            self._params["min_files"] = min_files
+        if max_files is not None:
+            self._conditions.append("s.file_count_r <= :max_files")
+            self._params["max_files"] = max_files
+        return self
+
     def with_path_prefix_ids(self, ancestor_ids: list[int]) -> "DirectoryQueryBuilder":
         """Filter to descendants of specific directory IDs (OR'd together).
 

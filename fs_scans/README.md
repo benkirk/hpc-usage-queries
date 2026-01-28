@@ -237,6 +237,10 @@ The `filesystem` argument is optional and defaults to `all`, which queries all a
 | `-E, --exclude PATH` | Exclude path and descendants (can repeat) |
 | `-N, --name-pattern PAT` | Filter by name (GLOB pattern); can repeat for OR matching |
 | `-i, --ignore-case` | Make `--name-pattern` matching case-insensitive |
+| `--min-size SIZE` | Min total recursive size (e.g., 500MB, 2GiB; default: 1GiB) |
+| `--max-size SIZE` | Max total recursive size |
+| `--min-files COUNT` | Min recursive file count (e.g., 500, 10K) |
+| `--max-files COUNT` | Max recursive file count |
 | `--group-by owner` | Show per-user summary instead of directory list |
 | `-n, --limit N` | Limit results (default: 50, 0 for unlimited) |
 | `--sort-by FIELD` | Sort by: `size_r`, `size_nr`, `files_r`, `files_nr`, `atime_r`, `path`, `depth` |
@@ -280,6 +284,21 @@ query-fs-scan-db -N "*scratch*" -N "*tmp*"
 # Case-insensitive name pattern
 query-fs-scan-db -N "*SCRATCH*" -i
 
+# Filter by size (default: directories >= 1GiB)
+query-fs-scan-db --min-size 100GiB
+
+# Find large directories with few files
+query-fs-scan-db --min-size 10GiB --max-files 100
+
+# Size range query
+query-fs-scan-db --min-size 1GiB --max-size 10GiB --leaves-only
+
+# Disable default size filter to see all directories
+query-fs-scan-db --min-size 0
+
+# Filter by both size and file count
+query-fs-scan-db --min-size 1GiB --min-files 1K
+
 # Show per-user summary (uses pre-computed owner_summary table)
 query-fs-scan-db --group-by owner
 
@@ -294,4 +313,13 @@ query-fs-scan-db --summary
 
 # Query databases from a different directory
 query-fs-scan-db --data-dir /data/gpfs_scans --summary
+```
+
+### Performance Notes
+
+**Size and file count filters** (`--min-size`, `--max-size`, `--min-files`, `--max-files`) leverage existing indexes on `total_size_r` and `file_count_r` to narrow the candidate set before applying unindexed name pattern GLOBs. This significantly improves query performance on large databases.
+
+**Default filter:** By default, `--min-size 1GiB` is active to focus on large directories. This can be disabled with `--min-size 0`. There is no default on `--min-files` to allow finding large directories with few files (e.g., video archives).
+
+**Name pattern filtering** uses SQLite GLOB (case-sensitive) or LIKE (case-insensitive with `-i`). Patterns with leading wildcards (e.g., `*scratch*`) cannot use indexes and require sequential scans, but size/file-count filters run first to minimize the scan set.
 ```

@@ -19,6 +19,85 @@ from sqlalchemy import text
 from .cli_common import console, format_datetime, format_size, parse_date_arg
 from .database import get_data_dir, get_data_dir_info, get_db_path, get_session, set_data_dir
 
+import re as _re
+
+_SIZE_UNITS = {
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "tb": 1000**4,
+    "pb": 1000**5,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+    "pib": 1024**5,
+    # Shorthand: K/M/G/T/P → binary (filesystem convention)
+    "k": 1024,
+    "m": 1024**2,
+    "g": 1024**3,
+    "t": 1024**4,
+    "p": 1024**5,
+}
+
+
+def parse_size(value: str) -> int:
+    """Parse a size string to bytes.
+
+    Accepts plain integers (bytes), SI units (KB, MB, GB, TB, PB),
+    binary units (KiB, MiB, GiB, TiB, PiB), or shorthand (K, M, G, T, P)
+    where shorthand maps to binary (1024-based).
+
+    Examples:
+        "1GiB"  -> 1073741824
+        "500MB" -> 500000000
+        "2T"    -> 2199023255552
+        "0"     -> 0
+    """
+    value = value.strip()
+    match = _re.match(r"^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$", value)
+    if not match:
+        raise click.BadParameter(f"Invalid size: {value}")
+    num_str, unit = match.groups()
+    num = float(num_str)
+    if not unit:
+        return int(num)
+    unit_lower = unit.lower()
+    if unit_lower not in _SIZE_UNITS:
+        raise click.BadParameter(f"Unknown size unit: {unit}")
+    return int(num * _SIZE_UNITS[unit_lower])
+
+
+_COUNT_UNITS = {
+    "k": 1000,
+    "m": 1000_000,
+}
+
+
+def parse_file_count(value: str) -> int:
+    """Parse a file count string to an integer.
+
+    Accepts plain integers or shorthand multipliers: K (×1000), M (×1000000).
+
+    Examples:
+        "1K"  -> 1000
+        "500" -> 500
+        "10M" -> 10000000
+    """
+    value = value.strip()
+    match = _re.match(r"^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$", value)
+    if not match:
+        raise click.BadParameter(f"Invalid file count: {value}")
+    num_str, unit = match.groups()
+    num = float(num_str)
+    if not unit:
+        return int(num)
+    unit_lower = unit.lower()
+    if unit_lower not in _COUNT_UNITS:
+        raise click.BadParameter(f"Unknown file count unit: {unit}")
+    return int(num * _COUNT_UNITS[unit_lower])
+
 
 def get_all_filesystems() -> list[str]:
     """Discover all available filesystem databases.
@@ -198,6 +277,10 @@ def query_directories(
     leaves_only: bool = False,
     name_patterns: list[str] | None = None,
     name_pattern_ignorecase: bool = False,
+    min_size: int | None = None,
+    max_size: int | None = None,
+    min_files: int | None = None,
+    max_files: int | None = None,
 ) -> list[dict]:
     """
     Query directories with optional filters.
@@ -217,6 +300,10 @@ def query_directories(
         leaves_only: Only show directories with no subdirectories
         name_patterns: List of GLOB patterns to filter directory names (OR'd together)
         name_pattern_ignorecase: If True, name pattern matching is case-insensitive
+        min_size: Minimum total_size_r in bytes
+        max_size: Maximum total_size_r in bytes
+        min_files: Minimum file_count_r
+        max_files: Maximum file_count_r
 
     Returns:
         List of directory dictionaries with stats
@@ -268,6 +355,22 @@ def query_directories(
                 pattern_conditions.append(f"d.name GLOB :{param_name}")
                 params[param_name] = pattern
         conditions.append(f"({' OR '.join(pattern_conditions)})")
+
+    if min_size is not None:
+        conditions.append("s.total_size_r >= :min_size")
+        params["min_size"] = min_size
+
+    if max_size is not None:
+        conditions.append("s.total_size_r <= :max_size")
+        params["max_size"] = max_size
+
+    if min_files is not None:
+        conditions.append("s.file_count_r >= :min_files")
+        params["min_files"] = min_files
+
+    if max_files is not None:
+        conditions.append("s.file_count_r <= :max_files")
+        params["max_files"] = max_files
 
     # Build CTEs for path filtering
     ctes = []
@@ -751,6 +854,10 @@ def query_single_filesystem(
     leaves_only: bool,
     name_patterns: list[str] | None,
     name_pattern_ignorecase: bool,
+    min_size: int | None = None,
+    max_size: int | None = None,
+    min_files: int | None = None,
+    max_files: int | None = None,
 ) -> list[dict]:
     """Query a single filesystem database.
 
@@ -781,6 +888,10 @@ def query_single_filesystem(
             leaves_only=leaves_only,
             name_patterns=name_patterns,
             name_pattern_ignorecase=name_pattern_ignorecase,
+            min_size=min_size,
+            max_size=max_size,
+            min_files=min_files,
+            max_files=max_files,
         )
     finally:
         session.close()
@@ -906,6 +1017,31 @@ def query_single_filesystem(
     help="Make --name-pattern matching case-insensitive",
 )
 @click.option(
+    "--min-size",
+    type=str,
+    default="1GiB",
+    show_default=True,
+    help="Min total recursive size (e.g. 500MB, 2GiB, 0 to disable)",
+)
+@click.option(
+    "--max-size",
+    type=str,
+    default=None,
+    help="Max total recursive size (e.g. 10GiB)",
+)
+@click.option(
+    "--min-files",
+    type=str,
+    default=None,
+    help="Min recursive file count (e.g. 500, 10K)",
+)
+@click.option(
+    "--max-files",
+    type=str,
+    default=None,
+    help="Max recursive file count",
+)
+@click.option(
     "--group-by",
     "group_by",
     type=click.Choice(["owner"]),
@@ -932,6 +1068,10 @@ def main(
     show_config: bool,
     name_patterns: tuple[str, ...],
     ignore_case: bool,
+    min_size: str,
+    max_size: str | None,
+    min_files: str | None,
+    max_files: str | None,
     group_by: str | None,
 ):
     """
@@ -1034,6 +1174,12 @@ def main(
     # Parse date arguments once
     parsed_before = parse_date_arg(accessed_before) if accessed_before else None
     parsed_after = parse_date_arg(accessed_after) if accessed_after else None
+
+    # Parse size/file-count filter arguments
+    parsed_min_size = parse_size(min_size) if min_size else None
+    parsed_max_size = parse_size(max_size) if max_size else None
+    parsed_min_files = parse_file_count(min_files) if min_files else None
+    parsed_max_files = parse_file_count(max_files) if max_files else None
 
     # Handle summary mode
     if summary:
@@ -1139,6 +1285,10 @@ def main(
                     leaves_only,
                     list(name_patterns) if name_patterns else None,
                     ignore_case,
+                    parsed_min_size,
+                    parsed_max_size,
+                    parsed_min_files,
+                    parsed_max_files,
                 ): fs
                 for fs in filesystems
             }
@@ -1168,6 +1318,10 @@ def main(
                 leaves_only=leaves_only,
                 name_patterns=list(name_patterns) if name_patterns else None,
                 name_pattern_ignorecase=ignore_case,
+                min_size=parsed_min_size,
+                max_size=parsed_max_size,
+                min_files=parsed_min_files,
+                max_files=parsed_max_files,
             )
         finally:
             session.close()

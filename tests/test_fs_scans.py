@@ -8,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from fs_scans.models import Base, Directory, DirectoryStats
 from fs_scans.database import get_engine, clear_engine_cache
 from fs_scans.query_builder import DirectoryQueryBuilder, QueryResult
+from fs_scans.query_db import parse_size, parse_file_count
 
 
 # ============================================================================
@@ -322,3 +323,192 @@ class TestDirectoryQueryBuilder:
         assert "d.depth >= :min_depth" in result.sql
         assert "s.owner_uid IS NOT NULL" in result.sql
         assert "s.owner_uid = :owner_id" in result.sql
+
+
+# ============================================================================
+# Parse Helper Tests
+# ============================================================================
+
+
+class TestParseSize:
+    """Tests for parse_size helper."""
+
+    def test_plain_integer(self):
+        assert parse_size("1024") == 1024
+
+    def test_zero(self):
+        assert parse_size("0") == 0
+
+    def test_bytes_unit(self):
+        assert parse_size("512B") == 512
+
+    def test_si_units(self):
+        assert parse_size("1KB") == 1000
+        assert parse_size("1MB") == 1000**2
+        assert parse_size("1GB") == 1000**3
+        assert parse_size("1TB") == 1000**4
+        assert parse_size("1PB") == 1000**5
+
+    def test_binary_units(self):
+        assert parse_size("1KiB") == 1024
+        assert parse_size("1MiB") == 1024**2
+        assert parse_size("1GiB") == 1024**3
+        assert parse_size("1TiB") == 1024**4
+        assert parse_size("1PiB") == 1024**5
+
+    def test_shorthand_binary(self):
+        assert parse_size("1K") == 1024
+        assert parse_size("1M") == 1024**2
+        assert parse_size("1G") == 1024**3
+        assert parse_size("1T") == 1024**4
+        assert parse_size("1P") == 1024**5
+
+    def test_case_insensitive(self):
+        assert parse_size("1gib") == 1024**3
+        assert parse_size("1GIB") == 1024**3
+        assert parse_size("500mb") == 500 * 1000**2
+
+    def test_fractional_values(self):
+        assert parse_size("0.5GiB") == int(0.5 * 1024**3)
+        assert parse_size("1.5MB") == int(1.5 * 1000**2)
+
+    def test_whitespace_tolerance(self):
+        assert parse_size("  100MB  ") == 100 * 1000**2
+
+    def test_invalid_unit_raises(self):
+        with pytest.raises(Exception):
+            parse_size("100XB")
+
+    def test_invalid_format_raises(self):
+        with pytest.raises(Exception):
+            parse_size("abc")
+
+
+class TestParseFileCount:
+    """Tests for parse_file_count helper."""
+
+    def test_plain_integer(self):
+        assert parse_file_count("500") == 500
+
+    def test_zero(self):
+        assert parse_file_count("0") == 0
+
+    def test_k_multiplier(self):
+        assert parse_file_count("1K") == 1000
+        assert parse_file_count("10K") == 10000
+
+    def test_m_multiplier(self):
+        assert parse_file_count("1M") == 1000000
+        assert parse_file_count("10M") == 10000000
+
+    def test_case_insensitive(self):
+        assert parse_file_count("5k") == 5000
+        assert parse_file_count("2m") == 2000000
+
+    def test_fractional_values(self):
+        assert parse_file_count("1.5K") == 1500
+
+    def test_whitespace_tolerance(self):
+        assert parse_file_count("  100K  ") == 100000
+
+    def test_invalid_unit_raises(self):
+        with pytest.raises(Exception):
+            parse_file_count("100G")
+
+    def test_invalid_format_raises(self):
+        with pytest.raises(Exception):
+            parse_file_count("abc")
+
+
+# ============================================================================
+# Size & File Count Query Builder Tests
+# ============================================================================
+
+
+class TestSizeRangeFilter:
+    """Tests for with_size_range query builder method."""
+
+    def test_min_size_only(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_size_range(min_size=1073741824).build()
+
+        assert "s.total_size_r >= :min_size" in result.sql
+        assert result.params["min_size"] == 1073741824
+        assert "max_size" not in result.params
+
+    def test_max_size_only(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_size_range(max_size=10737418240).build()
+
+        assert "s.total_size_r <= :max_size" in result.sql
+        assert result.params["max_size"] == 10737418240
+        assert "min_size" not in result.params
+
+    def test_size_range(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_size_range(min_size=1024, max_size=1048576).build()
+
+        assert "s.total_size_r >= :min_size" in result.sql
+        assert "s.total_size_r <= :max_size" in result.sql
+        assert result.params["min_size"] == 1024
+        assert result.params["max_size"] == 1048576
+
+    def test_no_args_is_noop(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_size_range().build()
+
+        assert ":min_size" not in result.sql
+        assert ":max_size" not in result.sql
+        assert "min_size" not in result.params
+        assert "max_size" not in result.params
+
+
+class TestFileCountRangeFilter:
+    """Tests for with_file_count_range query builder method."""
+
+    def test_min_files_only(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_file_count_range(min_files=1000).build()
+
+        assert "s.file_count_r >= :min_files" in result.sql
+        assert result.params["min_files"] == 1000
+        assert "max_files" not in result.params
+
+    def test_max_files_only(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_file_count_range(max_files=50000).build()
+
+        assert "s.file_count_r <= :max_files" in result.sql
+        assert result.params["max_files"] == 50000
+        assert "min_files" not in result.params
+
+    def test_file_count_range(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_file_count_range(min_files=100, max_files=5000).build()
+
+        assert "s.file_count_r >= :min_files" in result.sql
+        assert "s.file_count_r <= :max_files" in result.sql
+        assert result.params["min_files"] == 100
+        assert result.params["max_files"] == 5000
+
+    def test_no_args_is_noop(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_file_count_range().build()
+
+        assert ":min_files" not in result.sql
+        assert ":max_files" not in result.sql
+        assert "min_files" not in result.params
+        assert "max_files" not in result.params
+
+    def test_chained_with_size_range(self):
+        builder = DirectoryQueryBuilder()
+        result = (
+            builder.with_size_range(min_size=1073741824)
+            .with_file_count_range(min_files=1000)
+            .build()
+        )
+
+        assert "s.total_size_r >= :min_size" in result.sql
+        assert "s.file_count_r >= :min_files" in result.sql
+        assert result.params["min_size"] == 1073741824
+        assert result.params["min_files"] == 1000
