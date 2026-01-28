@@ -229,15 +229,28 @@ class TestDirectoryQueryBuilder:
         assert "GLOB" not in result.sql
         assert "LIKE" not in result.sql
 
-    def test_path_prefix_cte(self):
-        """Test path prefix generates descendants CTE."""
+    def test_path_prefix_cte_single(self):
+        """Test single path prefix generates descendants CTE."""
         builder = DirectoryQueryBuilder()
-        result = builder.with_path_prefix_id(ancestor_id=42).build()
+        result = builder.with_path_prefix_ids([42]).build()
 
         assert "WITH RECURSIVE" in result.sql
+        assert "ancestors AS" in result.sql
         assert "descendants AS" in result.sql
         assert "FROM descendants" in result.sql
-        assert result.params["ancestor_id"] == 42
+        assert result.params["ancestor_id_0"] == 42
+
+    def test_path_prefix_cte_multiple(self):
+        """Test multiple path prefixes generate UNION'd descendants CTE."""
+        builder = DirectoryQueryBuilder()
+        result = builder.with_path_prefix_ids([42, 99]).build()
+
+        assert "WITH RECURSIVE" in result.sql
+        assert "ancestors AS" in result.sql
+        assert "IN (:ancestor_id_0, :ancestor_id_1)" in result.sql
+        assert "descendants AS" in result.sql
+        assert result.params["ancestor_id_0"] == 42
+        assert result.params["ancestor_id_1"] == 99
 
     def test_sort_options(self):
         """Test various sort options."""

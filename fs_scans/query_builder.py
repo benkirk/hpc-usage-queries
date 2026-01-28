@@ -170,27 +170,38 @@ class DirectoryQueryBuilder:
         self._conditions.append(f"({' OR '.join(pattern_conditions)})")
         return self
 
-    def with_path_prefix_id(self, ancestor_id: int) -> "DirectoryQueryBuilder":
-        """Filter to descendants of a specific directory ID.
+    def with_path_prefix_ids(self, ancestor_ids: list[int]) -> "DirectoryQueryBuilder":
+        """Filter to descendants of specific directory IDs (OR'd together).
 
-        The ancestor_id should be resolved externally via resolve_path_to_id().
+        The ancestor_ids should be resolved externally via resolve_path_to_id().
 
         Args:
-            ancestor_id: The directory ID of the ancestor
+            ancestor_ids: List of directory IDs of the ancestors
 
         Returns:
             self for chaining
         """
+        if not ancestor_ids:
+            return self
+
+        # Add each ancestor ID as a parameter
+        for i, aid in enumerate(ancestor_ids):
+            self._params[f"ancestor_id_{i}"] = aid
+
+        # Build IN clause for multiple ancestors
+        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
         self._ctes.append(
-            """
+            f"""
+            ancestors AS (
+                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
+            ),
             descendants AS (
-                SELECT dir_id FROM directories WHERE dir_id = :ancestor_id
+                SELECT dir_id FROM ancestors
                 UNION ALL
                 SELECT d.dir_id FROM directories d
                 JOIN descendants p ON d.parent_id = p.dir_id
             )"""
         )
-        self._params["ancestor_id"] = ancestor_id
         self._use_descendants_cte = True
         return self
 

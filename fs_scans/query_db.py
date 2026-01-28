@@ -189,7 +189,7 @@ def query_directories(
     max_depth: int | None = None,
     single_owner: bool = False,
     owner_id: int | None = None,
-    path_prefix: str | None = None,
+    path_prefixes: list[str] | None = None,
     exclude_paths: list[str] | None = None,
     sort_by: str = "size_r",
     limit: int | None = None,
@@ -208,7 +208,7 @@ def query_directories(
         max_depth: Maximum path depth filter
         single_owner: Only show single-owner directories
         owner_id: Filter to specific owner UID
-        path_prefix: Filter to paths under this prefix
+        path_prefixes: Filter to paths under these prefixes (OR'd together)
         exclude_paths: List of paths to exclude (with descendants)
         sort_by: Sort field (size_r, size_nr, files_r, files_nr, atime_r, path)
         limit: Maximum results to return
@@ -271,21 +271,34 @@ def query_directories(
 
     # Build CTEs for path filtering
     ctes = []
+    use_descendants_cte = False
 
-    # Handle path prefix - find ancestor and filter descendants
-    if path_prefix:
-        ancestor_id = resolve_path_to_id(session, path_prefix)
-        if ancestor_id is None:
-            return []  # Path not found
+    # Handle path prefixes - find ancestors and filter descendants (OR'd together)
+    if path_prefixes:
+        ancestor_ids = []
+        for prefix in path_prefixes:
+            ancestor_id = resolve_path_to_id(session, prefix)
+            if ancestor_id is not None:
+                idx = len(ancestor_ids)
+                ancestor_ids.append(ancestor_id)
+                params[f"ancestor_id_{idx}"] = ancestor_id
 
-        ctes.append("""
+        if not ancestor_ids:
+            return []  # No valid paths found
+
+        # Build IN clause for multiple ancestors
+        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
+        ctes.append(f"""
+            ancestors AS (
+                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
+            ),
             descendants AS (
-                SELECT dir_id FROM directories WHERE dir_id = :ancestor_id
+                SELECT dir_id FROM ancestors
                 UNION ALL
                 SELECT d.dir_id FROM directories d
                 JOIN descendants p ON d.parent_id = p.dir_id
             )""")
-        params["ancestor_id"] = ancestor_id
+        use_descendants_cte = True
 
     # NOTE: exclude_paths filtering is done post-query via path prefix matching
     # This is much more efficient than building a CTE of all descendants
@@ -297,8 +310,8 @@ def query_directories(
     else:
         cte_clause = ""
 
-    # Build SELECT clause - use descendants CTE if path_prefix was set
-    if path_prefix:
+    # Build SELECT clause - use descendants CTE if path_prefixes was set
+    if use_descendants_cte:
         select_clause = """
             SELECT d.dir_id, d.parent_id, d.name, d.depth,
                    s.file_count_nr, s.total_size_nr, s.max_atime_nr,
@@ -512,7 +525,7 @@ def query_owner_summary(
     session,
     min_depth: int | None = None,
     max_depth: int | None = None,
-    path_prefix: str | None = None,
+    path_prefixes: list[str] | None = None,
     limit: int | None = None,
     sort_by: str = "size",
 ) -> list[dict]:
@@ -526,14 +539,14 @@ def query_owner_summary(
         session: SQLAlchemy session
         min_depth: Minimum path depth filter
         max_depth: Maximum path depth filter
-        path_prefix: Filter to paths under this prefix
+        path_prefixes: Filter to paths under these prefixes (OR'd together)
         limit: Maximum results to return
         sort_by: Sort field (size, files, dirs)
 
     Returns:
         List of owner summary dictionaries
     """
-    has_filters = any([min_depth, max_depth, path_prefix])
+    has_filters = any([min_depth, max_depth, path_prefixes])
 
     if not has_filters:
         # Fast path: use pre-computed OwnerSummary table
@@ -584,24 +597,35 @@ def query_owner_summary(
         conditions.append("d.depth <= :max_depth")
         params["max_depth"] = max_depth
 
-    # Handle path prefix
+    # Handle path prefixes
     cte_clause = ""
     join_clause = ""
-    if path_prefix:
-        ancestor_id = resolve_path_to_id(session, path_prefix)
-        if ancestor_id is None:
-            return []  # Path not found
+    if path_prefixes:
+        ancestor_ids = []
+        for prefix in path_prefixes:
+            ancestor_id = resolve_path_to_id(session, prefix)
+            if ancestor_id is not None:
+                idx = len(ancestor_ids)
+                ancestor_ids.append(ancestor_id)
+                params[f"ancestor_id_{idx}"] = ancestor_id
 
-        cte_clause = """
-            WITH RECURSIVE descendants AS (
-                SELECT dir_id FROM directories WHERE dir_id = :ancestor_id
+        if not ancestor_ids:
+            return []  # No valid paths found
+
+        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
+        cte_clause = f"""
+            WITH RECURSIVE
+            ancestors AS (
+                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
+            ),
+            descendants AS (
+                SELECT dir_id FROM ancestors
                 UNION ALL
                 SELECT d.dir_id FROM directories d
                 JOIN descendants p ON d.parent_id = p.dir_id
             )
         """
         join_clause = "JOIN descendants USING (dir_id)"
-        params["ancestor_id"] = ancestor_id
 
     sort_map = {
         "size": "total_size DESC",
@@ -718,7 +742,7 @@ def query_single_filesystem(
     max_depth: int | None,
     single_owner: bool,
     owner_id: int | None,
-    path_prefix: str | None,
+    path_prefixes: list[str] | None,
     exclude_paths: list[str] | None,
     sort_by: str,
     limit: int | None,
@@ -748,7 +772,7 @@ def query_single_filesystem(
             max_depth=max_depth,
             single_owner=single_owner,
             owner_id=owner_id,
-            path_prefix=path_prefix,
+            path_prefixes=path_prefixes,
             exclude_paths=exclude_paths,
             sort_by=sort_by,
             limit=limit,
@@ -796,8 +820,10 @@ def query_single_filesystem(
 @click.option(
     "--path-prefix",
     "-P",
+    "path_prefixes",
+    multiple=True,
     type=str,
-    help="Filter to paths starting with prefix",
+    help="Filter to paths starting with prefix (can be repeated for OR)",
 )
 @click.option(
     "--exclude",
@@ -892,7 +918,7 @@ def main(
     single_owner: bool,
     owner_id: str | None,
     mine: bool,
-    path_prefix: str | None,
+    path_prefixes: tuple[str, ...],
     exclude_paths: tuple[str, ...],
     limit: int,
     sort_by: str,
@@ -1037,7 +1063,7 @@ def main(
                     session,
                     min_depth=min_depth,
                     max_depth=max_depth,
-                    path_prefix=path_prefix,
+                    path_prefixes=list(path_prefixes) if path_prefixes else None,
                     limit=limit if limit > 0 else None,
                     sort_by="size",  # Default sort for owner summary
                 )
@@ -1098,7 +1124,7 @@ def main(
                     max_depth,
                     single_owner,
                     resolved_owner_id,
-                    path_prefix,
+                    list(path_prefixes) if path_prefixes else None,
                     list(exclude_paths) if exclude_paths else None,
                     sort_by,
                     limit if limit > 0 else None,
@@ -1127,7 +1153,7 @@ def main(
                 max_depth=max_depth,
                 single_owner=single_owner,
                 owner_id=resolved_owner_id,
-                path_prefix=path_prefix,
+                path_prefixes=list(path_prefixes) if path_prefixes else None,
                 exclude_paths=list(exclude_paths) if exclude_paths else None,
                 sort_by=sort_by,
                 limit=limit if limit > 0 else None,
