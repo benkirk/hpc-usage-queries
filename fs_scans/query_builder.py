@@ -48,10 +48,13 @@ class DirectoryQueryBuilder:
     # Sort field mapping
     SORT_MAP: dict[str, str] = field(
         default_factory=lambda: {
+            "size": "s.total_size_r DESC",
             "size_r": "s.total_size_r DESC",
             "size_nr": "s.total_size_nr DESC",
+            "files": "s.file_count_r DESC",
             "files_r": "s.file_count_r DESC",
             "files_nr": "s.file_count_nr DESC",
+            "atime": "s.max_atime_r DESC",
             "atime_r": "s.max_atime_r DESC",
             "path": "d.depth ASC, d.name ASC",
             "depth": "d.depth DESC",

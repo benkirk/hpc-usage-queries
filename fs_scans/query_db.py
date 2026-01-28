@@ -843,7 +843,7 @@ def query_single_filesystem(
 )
 @click.option(
     "--sort-by",
-    type=click.Choice(["size_r", "size_nr", "files_r", "files_nr", "atime_r", "path", "depth"]),
+    type=click.Choice(["size", "size_r", "size_nr", "files", "files_r", "files_nr", "atime", "atime_r", "path", "depth"]),
     default="size_r",
     show_default=True,
     help="Sort results by field",
