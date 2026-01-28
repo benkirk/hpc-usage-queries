@@ -537,6 +537,7 @@ def print_results(
     verbose: bool = False,
     leaves_only: bool = False,
     username_map: dict[int, str] | None = None,
+    show_total: bool = False,
 ) -> None:
     """Print directory results in a formatted table."""
     if not directories:
@@ -565,7 +566,13 @@ def print_results(
         table.add_column("Atime\n(NR)", justify="right")
     table.add_column("Owner", justify="right")
 
-    for d in directories:
+    # Track totals for summary row
+    total_size_r = 0
+    total_size_nr = 0
+    total_files_r = 0
+    total_files_nr = 0
+
+    for i, d in enumerate(directories):
         uid = d["owner_uid"]
         if uid is not None and uid != -1:
             owner_display = username_map.get(uid, str(uid))
@@ -595,6 +602,40 @@ def print_results(
                 format_datetime(d["max_atime_r"]),
                 format_datetime(d["max_atime_nr"]),
                 owner_str,
+            ])
+
+        # Add separator line before totals row
+        end_section = (i == len(directories) - 1) and len(directories) > 1 and show_total
+        table.add_row(*row, end_section=end_section)
+
+        # Accumulate totals
+        total_size_r += d["total_size_r"]
+        total_size_nr += d["total_size_nr"]
+        total_files_r += d["file_count_r"]
+        total_files_nr += d["file_count_nr"]
+
+    # Add totals row if more than one directory and --show-total is enabled
+    if len(directories) > 1 and show_total:
+        row = ["[bold]Total:[/bold]"]
+        if verbose:
+            row.append("")  # Empty depth column
+
+        if leaves_only:
+            row.extend([
+                f"[bold]{format_size(total_size_r)}[/bold]",
+                f"[bold]{total_files_r:,}[/bold]",
+                "",  # Empty atime
+                "",  # Empty owner
+            ])
+        else:
+            row.extend([
+                f"[bold]{format_size(total_size_r)}[/bold]",
+                f"[bold]{format_size(total_size_nr)}[/bold]",
+                f"[bold]{total_files_r:,}[/bold]",
+                f"[bold]{total_files_nr:,}[/bold]",
+                "",  # Empty atime (R)
+                "",  # Empty atime (NR)
+                "",  # Empty owner
             ])
         table.add_row(*row)
 
@@ -1093,6 +1134,11 @@ class DynamicHelpCommand(click.Command):
     type=click.Choice(["owner"]),
     help="Group results by field (currently: owner)",
 )
+@click.option(
+    "--show-total",
+    is_flag=True,
+    help="Show totals row at bottom of results",
+)
 def main(
     filesystem: str,
     min_depth: int | None,
@@ -1119,6 +1165,7 @@ def main(
     min_files: str | None,
     max_files: str | None,
     group_by: str | None,
+    show_total: bool,
 ):
     """
     Query GPFS scan database for directory statistics.
@@ -1416,7 +1463,7 @@ def main(
                     remaining_uids -= found.keys()
                 finally:
                     session.close()
-        print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map)
+        print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map, show_total=show_total)
 
 
 if __name__ == "__main__":
