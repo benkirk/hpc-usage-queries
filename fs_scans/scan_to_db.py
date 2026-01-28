@@ -32,7 +32,7 @@ from rich.progress import TextColumn
 from sqlalchemy import insert, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from .cli_common import console, create_progress_bar
+from .cli_common import console, create_progress_bar, format_size
 from .database import (
     drop_tables,
     extract_filesystem_from_filename,
@@ -1181,11 +1181,7 @@ def main(
         size_str = "unknown"
         if resolved_db_path.exists():
             size_bytes = resolved_db_path.stat().st_size
-            for unit in ["B", "KB", "MB", "GB", "TB"]:
-                if size_bytes < 1024:
-                    size_str = f"{size_bytes:.2f} {unit}"
-                    break
-                size_bytes /= 1024
+            size_str = format_size(size_bytes)
 
         console.print(f"\n[green bold]Import complete![/green bold]")
         console.print(f"[bold]Total runtime:[/bold] {overall_duration:.2f} seconds")
