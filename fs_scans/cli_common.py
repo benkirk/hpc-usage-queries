@@ -61,11 +61,11 @@ def format_size(size_bytes: int | None) -> str:
     """Format byte size to human-readable string."""
     if size_bytes is None:
         return "N/A"
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]:
         if abs(size_bytes) < 1024:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
-    return f"{size_bytes:.1f} EB"
+    return f"{size_bytes:.1f} EiB"
 
 
 def format_datetime(dt: datetime | str | int | None) -> str:

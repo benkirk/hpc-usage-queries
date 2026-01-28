@@ -8,6 +8,7 @@ Supports filtering by depth, owner, path prefix, and sorting.
 
 import os
 import pwd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,115 @@ from sqlalchemy import text
 
 from .cli_common import console, format_datetime, format_size, parse_date_arg
 from .database import get_data_dir, get_data_dir_info, get_db_path, get_session, set_data_dir
+
+import re as _re
+
+_SIZE_UNITS = {
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "tb": 1000**4,
+    "pb": 1000**5,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+    "pib": 1024**5,
+    # Shorthand: K/M/G/T/P → binary (filesystem convention)
+    "k": 1024,
+    "m": 1024**2,
+    "g": 1024**3,
+    "t": 1024**4,
+    "p": 1024**5,
+}
+
+
+def parse_size(value: str) -> int:
+    """Parse a size string to bytes.
+
+    Accepts plain integers (bytes), SI units (KB, MB, GB, TB, PB),
+    binary units (KiB, MiB, GiB, TiB, PiB), or shorthand (K, M, G, T, P)
+    where shorthand maps to binary (1024-based).
+
+    Examples:
+        "1GiB"  -> 1073741824
+        "500MB" -> 500000000
+        "2T"    -> 2199023255552
+        "0"     -> 0
+    """
+    value = value.strip()
+    match = _re.match(r"^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$", value)
+    if not match:
+        raise click.BadParameter(f"Invalid size: {value}")
+    num_str, unit = match.groups()
+    num = float(num_str)
+    if not unit:
+        return int(num)
+    unit_lower = unit.lower()
+    if unit_lower not in _SIZE_UNITS:
+        raise click.BadParameter(f"Unknown size unit: {unit}")
+    return int(num * _SIZE_UNITS[unit_lower])
+
+
+_COUNT_UNITS = {
+    "k": 1000,
+    "m": 1000_000,
+}
+
+
+def parse_file_count(value: str) -> int:
+    """Parse a file count string to an integer.
+
+    Accepts plain integers or shorthand multipliers: K (×1000), M (×1000000).
+
+    Examples:
+        "1K"  -> 1000
+        "500" -> 500
+        "10M" -> 10000000
+    """
+    value = value.strip()
+    match = _re.match(r"^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$", value)
+    if not match:
+        raise click.BadParameter(f"Invalid file count: {value}")
+    num_str, unit = match.groups()
+    num = float(num_str)
+    if not unit:
+        return int(num)
+    unit_lower = unit.lower()
+    if unit_lower not in _COUNT_UNITS:
+        raise click.BadParameter(f"Unknown file count unit: {unit}")
+    return int(num * _COUNT_UNITS[unit_lower])
+
+
+# Known mount point prefixes to strip from user-provided paths
+_MOUNT_POINT_PREFIXES = [
+    "/glade/campaign",
+    "/gpfs/csfs1",
+    "/glade/derecho/scratch",
+    "/lustre/desc1",
+]
+
+
+def normalize_path(path: str) -> str:
+    """Strip known mount point prefixes from a path.
+
+    Allows users to provide full filesystem paths (e.g., /glade/campaign/cisl)
+    which will be normalized to database paths (e.g., /cisl).
+
+    Args:
+        path: User-provided path (may include mount point prefix)
+
+    Returns:
+        Normalized path with mount point prefix stripped if present
+    """
+    path = path.rstrip("/")
+    for prefix in _MOUNT_POINT_PREFIXES:
+        if path.startswith(prefix):
+            # Strip prefix and ensure leading slash
+            stripped = path[len(prefix):]
+            return stripped if stripped.startswith("/") else "/" + stripped
+    return path
 
 
 def get_all_filesystems() -> list[str]:
@@ -188,7 +298,7 @@ def query_directories(
     max_depth: int | None = None,
     single_owner: bool = False,
     owner_id: int | None = None,
-    path_prefix: str | None = None,
+    path_prefixes: list[str] | None = None,
     exclude_paths: list[str] | None = None,
     sort_by: str = "size_r",
     limit: int | None = None,
@@ -197,6 +307,10 @@ def query_directories(
     leaves_only: bool = False,
     name_patterns: list[str] | None = None,
     name_pattern_ignorecase: bool = False,
+    min_size: int | None = None,
+    max_size: int | None = None,
+    min_files: int | None = None,
+    max_files: int | None = None,
 ) -> list[dict]:
     """
     Query directories with optional filters.
@@ -207,7 +321,7 @@ def query_directories(
         max_depth: Maximum path depth filter
         single_owner: Only show single-owner directories
         owner_id: Filter to specific owner UID
-        path_prefix: Filter to paths under this prefix
+        path_prefixes: Filter to paths under these prefixes (OR'd together)
         exclude_paths: List of paths to exclude (with descendants)
         sort_by: Sort field (size_r, size_nr, files_r, files_nr, atime_r, path)
         limit: Maximum results to return
@@ -216,6 +330,10 @@ def query_directories(
         leaves_only: Only show directories with no subdirectories
         name_patterns: List of GLOB patterns to filter directory names (OR'd together)
         name_pattern_ignorecase: If True, name pattern matching is case-insensitive
+        min_size: Minimum total_size_r in bytes
+        max_size: Maximum total_size_r in bytes
+        min_files: Minimum file_count_r
+        max_files: Maximum file_count_r
 
     Returns:
         List of directory dictionaries with stats
@@ -268,23 +386,52 @@ def query_directories(
                 params[param_name] = pattern
         conditions.append(f"({' OR '.join(pattern_conditions)})")
 
+    if min_size is not None:
+        conditions.append("s.total_size_r >= :min_size")
+        params["min_size"] = min_size
+
+    if max_size is not None:
+        conditions.append("s.total_size_r <= :max_size")
+        params["max_size"] = max_size
+
+    if min_files is not None:
+        conditions.append("s.file_count_r >= :min_files")
+        params["min_files"] = min_files
+
+    if max_files is not None:
+        conditions.append("s.file_count_r <= :max_files")
+        params["max_files"] = max_files
+
     # Build CTEs for path filtering
     ctes = []
+    use_descendants_cte = False
 
-    # Handle path prefix - find ancestor and filter descendants
-    if path_prefix:
-        ancestor_id = resolve_path_to_id(session, path_prefix)
-        if ancestor_id is None:
-            return []  # Path not found
+    # Handle path prefixes - find ancestors and filter descendants (OR'd together)
+    if path_prefixes:
+        ancestor_ids = []
+        for prefix in path_prefixes:
+            ancestor_id = resolve_path_to_id(session, prefix)
+            if ancestor_id is not None:
+                idx = len(ancestor_ids)
+                ancestor_ids.append(ancestor_id)
+                params[f"ancestor_id_{idx}"] = ancestor_id
 
-        ctes.append("""
+        if not ancestor_ids:
+            return []  # No valid paths found
+
+        # Build IN clause for multiple ancestors
+        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
+        ctes.append(f"""
+            ancestors AS (
+                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
+            ),
             descendants AS (
-                SELECT dir_id FROM directories WHERE dir_id = :ancestor_id
+                SELECT dir_id FROM ancestors
                 UNION ALL
                 SELECT d.dir_id FROM directories d
                 JOIN descendants p ON d.parent_id = p.dir_id
             )""")
-        params["ancestor_id"] = ancestor_id
+        use_descendants_cte = True
 
     # NOTE: exclude_paths filtering is done post-query via path prefix matching
     # This is much more efficient than building a CTE of all descendants
@@ -296,8 +443,8 @@ def query_directories(
     else:
         cte_clause = ""
 
-    # Build SELECT clause - use descendants CTE if path_prefix was set
-    if path_prefix:
+    # Build SELECT clause - use descendants CTE if path_prefixes was set
+    if use_descendants_cte:
         select_clause = """
             SELECT d.dir_id, d.parent_id, d.name, d.depth,
                    s.file_count_nr, s.total_size_nr, s.max_atime_nr,
@@ -511,7 +658,7 @@ def query_owner_summary(
     session,
     min_depth: int | None = None,
     max_depth: int | None = None,
-    path_prefix: str | None = None,
+    path_prefixes: list[str] | None = None,
     limit: int | None = None,
     sort_by: str = "size",
 ) -> list[dict]:
@@ -525,14 +672,14 @@ def query_owner_summary(
         session: SQLAlchemy session
         min_depth: Minimum path depth filter
         max_depth: Maximum path depth filter
-        path_prefix: Filter to paths under this prefix
+        path_prefixes: Filter to paths under these prefixes (OR'd together)
         limit: Maximum results to return
         sort_by: Sort field (size, files, dirs)
 
     Returns:
         List of owner summary dictionaries
     """
-    has_filters = any([min_depth, max_depth, path_prefix])
+    has_filters = any([min_depth, max_depth, path_prefixes])
 
     if not has_filters:
         # Fast path: use pre-computed OwnerSummary table
@@ -583,24 +730,35 @@ def query_owner_summary(
         conditions.append("d.depth <= :max_depth")
         params["max_depth"] = max_depth
 
-    # Handle path prefix
+    # Handle path prefixes
     cte_clause = ""
     join_clause = ""
-    if path_prefix:
-        ancestor_id = resolve_path_to_id(session, path_prefix)
-        if ancestor_id is None:
-            return []  # Path not found
+    if path_prefixes:
+        ancestor_ids = []
+        for prefix in path_prefixes:
+            ancestor_id = resolve_path_to_id(session, prefix)
+            if ancestor_id is not None:
+                idx = len(ancestor_ids)
+                ancestor_ids.append(ancestor_id)
+                params[f"ancestor_id_{idx}"] = ancestor_id
 
-        cte_clause = """
-            WITH RECURSIVE descendants AS (
-                SELECT dir_id FROM directories WHERE dir_id = :ancestor_id
+        if not ancestor_ids:
+            return []  # No valid paths found
+
+        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
+        cte_clause = f"""
+            WITH RECURSIVE
+            ancestors AS (
+                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
+            ),
+            descendants AS (
+                SELECT dir_id FROM ancestors
                 UNION ALL
                 SELECT d.dir_id FROM directories d
                 JOIN descendants p ON d.parent_id = p.dir_id
             )
         """
         join_clause = "JOIN descendants USING (dir_id)"
-        params["ancestor_id"] = ancestor_id
 
     sort_map = {
         "size": "total_size DESC",
@@ -711,7 +869,81 @@ def print_owner_results(owners: list[dict], username_map: dict[int, str]) -> Non
     console.print(table)
 
 
-@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+def query_single_filesystem(
+    filesystem: str,
+    min_depth: int | None,
+    max_depth: int | None,
+    single_owner: bool,
+    owner_id: int | None,
+    path_prefixes: list[str] | None,
+    exclude_paths: list[str] | None,
+    sort_by: str,
+    limit: int | None,
+    accessed_before: datetime | None,
+    accessed_after: datetime | None,
+    leaves_only: bool,
+    name_patterns: list[str] | None,
+    name_pattern_ignorecase: bool,
+    min_size: int | None = None,
+    max_size: int | None = None,
+    min_files: int | None = None,
+    max_files: int | None = None,
+) -> list[dict]:
+    """Query a single filesystem database.
+
+    Designed for parallel execution with ThreadPoolExecutor.
+    Creates and closes its own session.
+
+    Args:
+        filesystem: Filesystem name to query
+        Other args: Query parameters passed to query_directories()
+
+    Returns:
+        List of directory dictionaries from this filesystem
+    """
+    session = get_session(filesystem)
+    try:
+        return query_directories(
+            session,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            single_owner=single_owner,
+            owner_id=owner_id,
+            path_prefixes=path_prefixes,
+            exclude_paths=exclude_paths,
+            sort_by=sort_by,
+            limit=limit,
+            accessed_before=accessed_before,
+            accessed_after=accessed_after,
+            leaves_only=leaves_only,
+            name_patterns=name_patterns,
+            name_pattern_ignorecase=name_pattern_ignorecase,
+            min_size=min_size,
+            max_size=max_size,
+            min_files=min_files,
+            max_files=max_files,
+        )
+    finally:
+        session.close()
+
+
+class DynamicHelpCommand(click.Command):
+    """Custom Command class that replaces the command name in help text.
+
+    This allows the help examples to show the actual invoked command name,
+    which is useful when the tool is invoked via a symlink (e.g., cs-scan).
+    """
+    def get_help(self, ctx):
+        help_text = super().get_help(ctx)
+        # Get the actual invoked command name
+        prog_name = ctx.find_root().info_name
+        if prog_name and prog_name != 'query-fs-scan-db':
+            # Replace hardcoded command name with actual invoked name
+            help_text = help_text.replace('query-fs-scan-db', prog_name)
+        return help_text
+
+
+@click.command(cls=DynamicHelpCommand, context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("filesystem", type=str, default="all")
 @click.option(
     "-d",
@@ -745,8 +977,10 @@ def print_owner_results(owners: list[dict], username_map: dict[int, str]) -> Non
 @click.option(
     "--path-prefix",
     "-P",
+    "path_prefixes",
+    multiple=True,
     type=str,
-    help="Filter to paths starting with prefix",
+    help="Filter to paths starting with prefix (can be repeated for OR)",
 )
 @click.option(
     "--exclude",
@@ -766,8 +1000,8 @@ def print_owner_results(owners: list[dict], username_map: dict[int, str]) -> Non
 )
 @click.option(
     "--sort-by",
-    type=click.Choice(["size_r", "size_nr", "files_r", "files_nr", "atime_r", "path", "depth"]),
-    default="size_r",
+    type=click.Choice(["size", "size_r", "size_nr", "files", "files_r", "files_nr", "atime", "atime_r", "path", "depth"]),
+    default="size",
     show_default=True,
     help="Sort results by field",
 )
@@ -829,6 +1063,31 @@ def print_owner_results(owners: list[dict], username_map: dict[int, str]) -> Non
     help="Make --name-pattern matching case-insensitive",
 )
 @click.option(
+    "--min-size",
+    type=str,
+    default="1GiB",
+    show_default=True,
+    help="Min total recursive size (e.g. 500MB, 2GiB, 0 to disable)",
+)
+@click.option(
+    "--max-size",
+    type=str,
+    default=None,
+    help="Max total recursive size (e.g. 10GiB)",
+)
+@click.option(
+    "--min-files",
+    type=str,
+    default=None,
+    help="Min recursive file count (e.g. 500, 10K)",
+)
+@click.option(
+    "--max-files",
+    type=str,
+    default=None,
+    help="Max recursive file count",
+)
+@click.option(
     "--group-by",
     "group_by",
     type=click.Choice(["owner"]),
@@ -841,7 +1100,7 @@ def main(
     single_owner: bool,
     owner_id: str | None,
     mine: bool,
-    path_prefix: str | None,
+    path_prefixes: tuple[str, ...],
     exclude_paths: tuple[str, ...],
     limit: int,
     sort_by: str,
@@ -855,6 +1114,10 @@ def main(
     show_config: bool,
     name_patterns: tuple[str, ...],
     ignore_case: bool,
+    min_size: str,
+    max_size: str | None,
+    min_files: str | None,
+    max_files: str | None,
     group_by: str | None,
 ):
     """
@@ -958,6 +1221,16 @@ def main(
     parsed_before = parse_date_arg(accessed_before) if accessed_before else None
     parsed_after = parse_date_arg(accessed_after) if accessed_after else None
 
+    # Parse size/file-count filter arguments
+    parsed_min_size = parse_size(min_size) if min_size else None
+    parsed_max_size = parse_size(max_size) if max_size else None
+    parsed_min_files = parse_file_count(min_files) if min_files else None
+    parsed_max_files = parse_file_count(max_files) if max_files else None
+
+    # Normalize path arguments (strip mount point prefixes)
+    normalized_path_prefixes = [normalize_path(p) for p in path_prefixes] if path_prefixes else []
+    normalized_exclude_paths = [normalize_path(p) for p in exclude_paths] if exclude_paths else []
+
     # Handle summary mode
     if summary:
         for fs in filesystems:
@@ -986,7 +1259,7 @@ def main(
                     session,
                     min_depth=min_depth,
                     max_depth=max_depth,
-                    path_prefix=path_prefix,
+                    path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
                     limit=limit if limit > 0 else None,
                     sort_by="size",  # Default sort for owner summary
                 )
@@ -1019,14 +1292,20 @@ def main(
             if limit > 0:
                 all_owners = all_owners[:limit]
 
-        # Get username mappings (use first available session)
+        # Get username mappings (aggregate across all databases)
         username_map = {}
         if all_uids and filesystems:
-            session = get_session(filesystems[0])
-            try:
-                username_map = get_username_map(session, list(all_uids))
-            finally:
-                session.close()
+            remaining_uids = set(all_uids)
+            for fs in filesystems:
+                if not remaining_uids:
+                    break
+                session = get_session(fs)
+                try:
+                    found = get_username_map(session, list(remaining_uids))
+                    username_map.update(found)
+                    remaining_uids -= found.keys()
+                finally:
+                    session.close()
 
         print_owner_results(all_owners, username_map)
         return
@@ -1035,17 +1314,53 @@ def main(
     multi_db = len(filesystems) > 1
     all_directories = []
 
-    for fs in filesystems:
-        session = get_session(fs)
+    if multi_db:
+        # Parallel execution for multiple filesystems
+        max_workers = min(len(filesystems), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    query_single_filesystem,
+                    fs,
+                    min_depth,
+                    max_depth,
+                    single_owner,
+                    resolved_owner_id,
+                    normalized_path_prefixes if normalized_path_prefixes else None,
+                    normalized_exclude_paths if normalized_exclude_paths else None,
+                    sort_by,
+                    limit if limit > 0 else None,
+                    parsed_before,
+                    parsed_after,
+                    leaves_only,
+                    list(name_patterns) if name_patterns else None,
+                    ignore_case,
+                    parsed_min_size,
+                    parsed_max_size,
+                    parsed_min_files,
+                    parsed_max_files,
+                ): fs
+                for fs in filesystems
+            }
+            for future in as_completed(futures):
+                fs = futures[future]
+                try:
+                    dirs = future.result()
+                    all_directories.extend(dirs)
+                except Exception as e:
+                    console.print(f"[red]Error querying {fs}: {e}[/red]")
+    else:
+        # Single filesystem - sequential execution (no thread overhead)
+        session = get_session(filesystems[0])
         try:
-            dirs = query_directories(
+            all_directories = query_directories(
                 session,
                 min_depth=min_depth,
                 max_depth=max_depth,
                 single_owner=single_owner,
                 owner_id=resolved_owner_id,
-                path_prefix=path_prefix,
-                exclude_paths=list(exclude_paths) if exclude_paths else None,
+                path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
+                exclude_paths=normalized_exclude_paths if normalized_exclude_paths else None,
                 sort_by=sort_by,
                 limit=limit if limit > 0 else None,
                 accessed_before=parsed_before,
@@ -1053,8 +1368,11 @@ def main(
                 leaves_only=leaves_only,
                 name_patterns=list(name_patterns) if name_patterns else None,
                 name_pattern_ignorecase=ignore_case,
+                min_size=parsed_min_size,
+                max_size=parsed_max_size,
+                min_files=parsed_min_files,
+                max_files=parsed_max_files,
             )
-            all_directories.extend(dirs)
         finally:
             session.close()
 
@@ -1080,18 +1398,24 @@ def main(
     if output:
         write_tsv(all_directories, output)
     else:
-        # Resolve UIDs to usernames for display
-        unique_uids = list({
+        # Resolve UIDs to usernames for display (aggregate across all databases)
+        unique_uids = {
             d["owner_uid"] for d in all_directories
             if d["owner_uid"] is not None and d["owner_uid"] != -1
-        })
+        }
         username_map = {}
         if unique_uids:
-            session = get_session(filesystems[0])
-            try:
-                username_map = get_username_map(session, unique_uids)
-            finally:
-                session.close()
+            remaining_uids = set(unique_uids)
+            for fs in filesystems:
+                if not remaining_uids:
+                    break
+                session = get_session(fs)
+                try:
+                    found = get_username_map(session, list(remaining_uids))
+                    username_map.update(found)
+                    remaining_uids -= found.keys()
+                finally:
+                    session.close()
         print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map)
 
 
