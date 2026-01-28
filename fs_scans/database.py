@@ -2,9 +2,10 @@
 
 import os
 import re
+import threading
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, Engine
 from sqlalchemy.orm import sessionmaker
 
 from .models import Base
@@ -14,6 +15,10 @@ _DEFAULT_DATA_DIR = Path(__file__).parent / "data"
 
 # Module-level cache for the configured data directory (set via CLI)
 _data_dir_override: Path | None = None
+
+# Module-level engine cache with thread safety for parallel queries
+_engine_cache: dict[str, Engine] = {}
+_engine_cache_lock = threading.Lock()
 
 
 def get_data_dir() -> Path:
@@ -145,23 +150,43 @@ def get_db_path(filesystem: str, db_path: Path | None = None) -> Path:
     return get_data_dir() / f"{filesystem}.db"
 
 
-def get_engine(filesystem: str, echo: bool = False, db_path: Path | None = None):
-    """Create and return a SQLAlchemy engine for a specific filesystem.
+def get_engine(filesystem: str, echo: bool = False, db_path: Path | None = None) -> Engine:
+    """Create or retrieve a cached SQLAlchemy engine for a specific filesystem.
+
+    Engines are cached by resolved database path. Thread-safe for parallel queries.
 
     Args:
         filesystem: Filesystem name (e.g., 'asp', 'cisl')
-        echo: If True, log all SQL statements
+        echo: If True, log all SQL statements (only affects engine creation)
         db_path: Explicit database path override
 
     Returns:
-        SQLAlchemy Engine instance
+        SQLAlchemy Engine instance (may be cached)
     """
     resolved_path = get_db_path(filesystem, db_path)
+    cache_key = str(resolved_path)
 
-    # Ensure parent directory exists
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    with _engine_cache_lock:
+        if cache_key not in _engine_cache:
+            # Ensure parent directory exists
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            _engine_cache[cache_key] = create_engine(
+                f"sqlite:///{resolved_path}",
+                echo=echo,
+                connect_args={"check_same_thread": False},  # Thread safety for parallel queries
+            )
+        return _engine_cache[cache_key]
 
-    return create_engine(f"sqlite:///{resolved_path}", echo=echo)
+
+def clear_engine_cache() -> None:
+    """Clear the engine cache. Primarily for testing.
+
+    Disposes all cached engines before clearing to release connections.
+    """
+    with _engine_cache_lock:
+        for engine in _engine_cache.values():
+            engine.dispose()
+        _engine_cache.clear()
 
 
 def get_session(filesystem: str, engine=None, db_path: Path | None = None):

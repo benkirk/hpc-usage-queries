@@ -8,6 +8,7 @@ Supports filtering by depth, owner, path prefix, and sorting.
 
 import os
 import pwd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -711,6 +712,56 @@ def print_owner_results(owners: list[dict], username_map: dict[int, str]) -> Non
     console.print(table)
 
 
+def query_single_filesystem(
+    filesystem: str,
+    min_depth: int | None,
+    max_depth: int | None,
+    single_owner: bool,
+    owner_id: int | None,
+    path_prefix: str | None,
+    exclude_paths: list[str] | None,
+    sort_by: str,
+    limit: int | None,
+    accessed_before: datetime | None,
+    accessed_after: datetime | None,
+    leaves_only: bool,
+    name_patterns: list[str] | None,
+    name_pattern_ignorecase: bool,
+) -> list[dict]:
+    """Query a single filesystem database.
+
+    Designed for parallel execution with ThreadPoolExecutor.
+    Creates and closes its own session.
+
+    Args:
+        filesystem: Filesystem name to query
+        Other args: Query parameters passed to query_directories()
+
+    Returns:
+        List of directory dictionaries from this filesystem
+    """
+    session = get_session(filesystem)
+    try:
+        return query_directories(
+            session,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            single_owner=single_owner,
+            owner_id=owner_id,
+            path_prefix=path_prefix,
+            exclude_paths=exclude_paths,
+            sort_by=sort_by,
+            limit=limit,
+            accessed_before=accessed_before,
+            accessed_after=accessed_after,
+            leaves_only=leaves_only,
+            name_patterns=name_patterns,
+            name_pattern_ignorecase=name_pattern_ignorecase,
+        )
+    finally:
+        session.close()
+
+
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("filesystem", type=str, default="all")
 @click.option(
@@ -1035,10 +1086,42 @@ def main(
     multi_db = len(filesystems) > 1
     all_directories = []
 
-    for fs in filesystems:
-        session = get_session(fs)
+    if multi_db:
+        # Parallel execution for multiple filesystems
+        max_workers = min(len(filesystems), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    query_single_filesystem,
+                    fs,
+                    min_depth,
+                    max_depth,
+                    single_owner,
+                    resolved_owner_id,
+                    path_prefix,
+                    list(exclude_paths) if exclude_paths else None,
+                    sort_by,
+                    limit if limit > 0 else None,
+                    parsed_before,
+                    parsed_after,
+                    leaves_only,
+                    list(name_patterns) if name_patterns else None,
+                    ignore_case,
+                ): fs
+                for fs in filesystems
+            }
+            for future in as_completed(futures):
+                fs = futures[future]
+                try:
+                    dirs = future.result()
+                    all_directories.extend(dirs)
+                except Exception as e:
+                    console.print(f"[red]Error querying {fs}: {e}[/red]")
+    else:
+        # Single filesystem - sequential execution (no thread overhead)
+        session = get_session(filesystems[0])
         try:
-            dirs = query_directories(
+            all_directories = query_directories(
                 session,
                 min_depth=min_depth,
                 max_depth=max_depth,
@@ -1054,7 +1137,6 @@ def main(
                 name_patterns=list(name_patterns) if name_patterns else None,
                 name_pattern_ignorecase=ignore_case,
             )
-            all_directories.extend(dirs)
         finally:
             session.close()
 
