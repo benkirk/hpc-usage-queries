@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from fs_scans.models import Base, Directory, DirectoryStats
 from fs_scans.database import get_engine, clear_engine_cache
 from fs_scans.query_builder import DirectoryQueryBuilder, QueryResult
-from fs_scans.query_db import parse_size, parse_file_count
+from fs_scans.query_db import parse_size, parse_file_count, normalize_path
 
 
 # ============================================================================
@@ -512,3 +512,41 @@ class TestFileCountRangeFilter:
         assert "s.file_count_r >= :min_files" in result.sql
         assert result.params["min_size"] == 1073741824
         assert result.params["min_files"] == 1000
+
+
+# ============================================================================
+# Path Normalization Tests
+# ============================================================================
+
+
+class TestNormalizePath:
+    """Tests for normalize_path helper."""
+
+    def test_strip_glade_campaign(self):
+        assert normalize_path("/glade/campaign/cisl") == "/cisl"
+        assert normalize_path("/glade/campaign/cisl/users") == "/cisl/users"
+
+    def test_strip_gpfs_csfs1(self):
+        assert normalize_path("/gpfs/csfs1/cisl") == "/cisl"
+        assert normalize_path("/gpfs/csfs1/cisl/users") == "/cisl/users"
+
+    def test_strip_glade_derecho_scratch(self):
+        assert normalize_path("/glade/derecho/scratch/username") == "/username"
+        assert normalize_path("/glade/derecho/scratch/username/data") == "/username/data"
+
+    def test_strip_lustre_desc1(self):
+        assert normalize_path("/lustre/desc1/data") == "/data"
+        assert normalize_path("/lustre/desc1/data/users") == "/data/users"
+
+    def test_already_normalized(self):
+        assert normalize_path("/cisl") == "/cisl"
+        assert normalize_path("/cisl/users") == "/cisl/users"
+        assert normalize_path("/asp/data") == "/asp/data"
+
+    def test_trailing_slash_stripped(self):
+        assert normalize_path("/glade/campaign/cisl/") == "/cisl"
+        assert normalize_path("/cisl/") == "/cisl"
+
+    def test_no_match_returns_unchanged(self):
+        assert normalize_path("/some/other/path") == "/some/other/path"
+        assert normalize_path("/glade/other/path") == "/glade/other/path"

@@ -99,6 +99,36 @@ def parse_file_count(value: str) -> int:
     return int(num * _COUNT_UNITS[unit_lower])
 
 
+# Known mount point prefixes to strip from user-provided paths
+_MOUNT_POINT_PREFIXES = [
+    "/glade/campaign",
+    "/gpfs/csfs1",
+    "/glade/derecho/scratch",
+    "/lustre/desc1",
+]
+
+
+def normalize_path(path: str) -> str:
+    """Strip known mount point prefixes from a path.
+
+    Allows users to provide full filesystem paths (e.g., /glade/campaign/cisl)
+    which will be normalized to database paths (e.g., /cisl).
+
+    Args:
+        path: User-provided path (may include mount point prefix)
+
+    Returns:
+        Normalized path with mount point prefix stripped if present
+    """
+    path = path.rstrip("/")
+    for prefix in _MOUNT_POINT_PREFIXES:
+        if path.startswith(prefix):
+            # Strip prefix and ensure leading slash
+            stripped = path[len(prefix):]
+            return stripped if stripped.startswith("/") else "/" + stripped
+    return path
+
+
 def get_all_filesystems() -> list[str]:
     """Discover all available filesystem databases.
 
@@ -1181,6 +1211,10 @@ def main(
     parsed_min_files = parse_file_count(min_files) if min_files else None
     parsed_max_files = parse_file_count(max_files) if max_files else None
 
+    # Normalize path arguments (strip mount point prefixes)
+    normalized_path_prefixes = [normalize_path(p) for p in path_prefixes] if path_prefixes else []
+    normalized_exclude_paths = [normalize_path(p) for p in exclude_paths] if exclude_paths else []
+
     # Handle summary mode
     if summary:
         for fs in filesystems:
@@ -1209,7 +1243,7 @@ def main(
                     session,
                     min_depth=min_depth,
                     max_depth=max_depth,
-                    path_prefixes=list(path_prefixes) if path_prefixes else None,
+                    path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
                     limit=limit if limit > 0 else None,
                     sort_by="size",  # Default sort for owner summary
                 )
@@ -1276,8 +1310,8 @@ def main(
                     max_depth,
                     single_owner,
                     resolved_owner_id,
-                    list(path_prefixes) if path_prefixes else None,
-                    list(exclude_paths) if exclude_paths else None,
+                    normalized_path_prefixes if normalized_path_prefixes else None,
+                    normalized_exclude_paths if normalized_exclude_paths else None,
                     sort_by,
                     limit if limit > 0 else None,
                     parsed_before,
@@ -1309,8 +1343,8 @@ def main(
                 max_depth=max_depth,
                 single_owner=single_owner,
                 owner_id=resolved_owner_id,
-                path_prefixes=list(path_prefixes) if path_prefixes else None,
-                exclude_paths=list(exclude_paths) if exclude_paths else None,
+                path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
+                exclude_paths=normalized_exclude_paths if normalized_exclude_paths else None,
                 sort_by=sort_by,
                 limit=limit if limit > 0 else None,
                 accessed_before=parsed_before,
