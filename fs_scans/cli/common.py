@@ -228,8 +228,17 @@ def make_dynamic_help_command(default_command_name: str):
 
         def get_help(self, ctx):
             help_text = super().get_help(ctx)
-            # Get the actual invoked command name
-            prog_name = ctx.find_root().info_name
+            # Build full command path by walking up the context hierarchy
+            command_path = []
+            context = ctx
+            while context:
+                if context.info_name:
+                    command_path.insert(0, context.info_name)
+                context = context.parent
+
+            # Get the actual invoked command name (full path)
+            prog_name = ' '.join(command_path) if command_path else None
+
             if prog_name and prog_name != default_command_name:
                 # Replace hardcoded command name with actual invoked name
                 help_text = help_text.replace(default_command_name, prog_name)

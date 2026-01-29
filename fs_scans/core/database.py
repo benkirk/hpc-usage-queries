@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from .models import Base
 
 # Default database directory (module directory + /data)
-_DEFAULT_DATA_DIR = Path(__file__).parent / "data"
+_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
 
 # Module-level cache for the configured data directory (set via CLI)
 _data_dir_override: Path | None = None

@@ -1,77 +1,50 @@
-#!/usr/bin/env python3
-"""
-GPFS Scan Database Importer - Multi-Pass Algorithm
+"""Parser-agnostic filesystem scan importer.
 
-Imports GPFS policy scan log files into a SQLite database using a multi-pass
-algorithm that normalizes directory paths and accumulates statistics.
+This module provides the multi-pass import algorithm that works with any
+filesystem parser (GPFS, Lustre, POSIX, etc.).
 
-Pass 1: Directory Discovery (2 phases)
-    Phase 1a: Scan log file, collect directory paths
-    Phase 1b: Sort by depth, insert into database, build path_to_id lookup
+Multi-Pass Algorithm:
+    Pass 1: Directory Discovery
+        Phase 1a: Stream directories to SQLite staging table (parallelizable)
+        Phase 1b: Sort by depth, insert into database, build path_to_id lookup
 
-Pass 2: Statistics Accumulation (2 phases)
-    Phase 2a: Re-scan log file, accumulate non-recursive stats only
-    Phase 2b: Bottom-up SQL aggregation to compute recursive stats
+    Pass 2: Statistics Accumulation
+        Phase 2a: Re-scan log file, accumulate non-recursive stats only
+        Phase 2b: Bottom-up SQL aggregation to compute recursive stats
 
-The GPFS scan file explicitly lists all directories as separate lines,
-so no deduplication or parent directory discovery is needed.
+    Pass 3: Summary Tables
+        - Resolve UIDs to usernames
+        - Pre-aggregate per-owner statistics
+        - Record scan metadata
 """
 
 import multiprocessing as mp
 import os
-import re
+import pwd
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Generator, NamedTuple, TextIO
+from typing import Any, Callable, Generator, TextIO
 
-import click
 from rich.progress import TextColumn
-from sqlalchemy import insert, text
+from sqlalchemy import func, insert, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from .cli_common import console, create_progress_bar, format_size, make_dynamic_help_command
-from .database import (
-    drop_tables,
+from ..cli.common import console, create_progress_bar, format_size
+from ..core.database import (
     extract_filesystem_from_filename,
     extract_scan_timestamp,
     get_db_path,
     get_session,
     init_db,
     set_data_dir,
+    drop_tables,
 )
-from .models import Directory, DirectoryStats, OwnerSummary, ScanMetadata, UserInfo
-
-# Extended LINE_PATTERN that captures inode and fileset_id for unique identification
-# Format: <thread> inode fileset_id snapshot  fields -- /path
-LINE_PATTERN = re.compile(
-    r"^<\d+>\s+(\d+)\s+(\d+)\s+\d+\s+"  # <thread> inode fileset_id snapshot
-    r"(.+?)\s+--\s+(.+)$"  # fields -- path
-)
-
-# Pattern to extract specific fields from the key=value section of GPFS scan lines
-FIELD_PATTERNS = {
-    "size": re.compile(r"s=(\d+)"),
-    "allocated_kb": re.compile(r"a=(\d+)"),
-    "user_id": re.compile(r"u=(\d+)"),
-    "permissions": re.compile(r"p=([^\s]+)"),
-    "atime": re.compile(r"ac=(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"),
-}
-
-
-class ParsedEntry(NamedTuple):
-    """Lightweight container for parsed log entries (faster to pickle than dicts)."""
-
-    inode: int
-    fileset_id: int
-    path: str
-    size: int
-    allocated: int
-    user_id: int
-    is_dir: bool
-    atime: datetime | None
+from ..core.models import Directory, DirectoryStats, OwnerSummary, ScanMetadata, UserInfo
+from ..parsers.base import FilesystemParser
 
 
 def open_input_file(filepath: Path) -> TextIO:
@@ -80,89 +53,27 @@ def open_input_file(filepath: Path) -> TextIO:
     return open(filepath, "r", encoding="utf-8", errors="replace", buffering=8 * 1024 * 1024)
 
 
-def parse_line(line: str) -> ParsedEntry | None:
+def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser]) -> tuple[Any, int]:
     """
-    Parse a single log line and extract relevant fields.
-
-    Returns ParsedEntry with: inode, fileset_id, path, size, user_id, is_dir, atime
-    Returns None if line is not a data line.
-    """
-    match = LINE_PATTERN.match(line)
-    if not match:
-        return None
-
-    inode, fileset_id, fields_str, path = match.groups()
-
-    # Extract permissions to check if file or directory
-    perm_match = FIELD_PATTERNS["permissions"].search(fields_str)
-    if not perm_match:
-        return None
-
-    permissions = perm_match.group(1)
-    is_dir = permissions.startswith("d")
-
-    # Extract other fields
-    size_match = FIELD_PATTERNS["size"].search(fields_str)
-    alloc_match = FIELD_PATTERNS["allocated_kb"].search(fields_str)
-    user_match = FIELD_PATTERNS["user_id"].search(fields_str)
-    atime_match = FIELD_PATTERNS["atime"].search(fields_str)
-
-    if not all([size_match, user_match]):
-        return None
-
-    # Parse atime
-    atime = None
-    if atime_match:
-        try:
-            atime = datetime.strptime(atime_match.group(1), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            pass
-
-    # Size is in bytes
-    size = int(size_match.group(1))
-
-    # Allocated is in KB, convert to bytes
-    allocated = int(alloc_match.group(1)) * 1024
-
-    # GPFS weirdness: data can be stored in the inode when the size is small.
-    if allocated == 0:
-        if size <= 4096:
-            allocated = size
-
-    return ParsedEntry(
-        inode=int(inode),
-        fileset_id=int(fileset_id),
-        path=path,
-        size=size,
-        allocated=allocated,
-        user_id=int(user_match.group(1)),
-        is_dir=is_dir,
-        atime=atime,
-    )
-
-
-def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[Any, int]:
-    """
-    Worker function to parse a chunk of lines.
+    Worker function to parse a chunk of lines using the provided parser.
 
     Args:
-        args: Tuple of (lines_chunk, filter_type)
+        args: Tuple of (lines_chunk, filter_type, parser)
 
     Returns:
         Tuple of (results, count of lines processed)
         - If filter_type="files": results is dict[parent_path, stats] (Aggregated)
         - If filter_type="dirs"/"all": results is list[ParsedEntry] (Raw)
     """
-    chunk, filter_type = args
+    chunk, filter_type, parser = args
 
     if filter_type == "files":
         # Map-Reduce Optimization: Aggregate stats locally in worker
         # This reduces IPC traffic and main thread load by ~1000x
-        # Using regular dict with explicit init (faster than defaultdict in hot path)
         results = {}
 
         for line in chunk:
-            parsed = parse_line(line.rstrip("\n"))
+            parsed = parser.parse_line(line.rstrip("\n"))
             if parsed and not parsed.is_dir:
                 parent = os.path.dirname(parsed.path)
                 if parent not in results:
@@ -185,7 +96,7 @@ def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[Any, int]:
 
                 # Accumulate UID (Single pass logic)
                 # None = init, -999 = multiple/conflict, else = single UID
-                p_uid = parsed.user_id
+                p_uid = parsed.uid
                 s_uid = stats["first_uid"]
 
                 if s_uid is None:
@@ -205,14 +116,14 @@ def _worker_parse_chunk(args: tuple[list[str], str]) -> tuple[Any, int]:
         # Standard behavior for Pass 1 (Dirs)
         results = []
         for line in chunk:
-            parsed = parse_line(line.rstrip("\n"))
+            parsed = parser.parse_line(line.rstrip("\n"))
             if parsed:
                 if filter_type == "all":
                     results.append(parsed)
                 elif filter_type == "dirs" and parsed.is_dir:
                     results.append(parsed)
                 elif filter_type == "files" and not parsed.is_dir:
-                    results.append(parsed) # Fallback if ever needed
+                    results.append(parsed)  # Fallback if ever needed
         return results, len(chunk)
 
 
@@ -220,7 +131,6 @@ def chunk_file_generator(filepath: Path, chunk_bytes: int) -> Generator[list[str
     """Yield chunks of lines from the input file using byte-size hints."""
     with open_input_file(filepath) as f:
         while True:
-            # efficient C-implemented line splitting based on byte size
             lines = f.readlines(chunk_bytes)
             if not lines:
                 break
@@ -229,6 +139,7 @@ def chunk_file_generator(filepath: Path, chunk_bytes: int) -> Generator[list[str
 
 def run_parallel_file_processing(
     input_file: Path,
+    parser: FilesystemParser,
     num_workers: int,
     chunk_bytes: int,
     filter_type: str,
@@ -244,6 +155,7 @@ def run_parallel_file_processing(
 
     Args:
         input_file: Path to the log file
+        parser: Parser instance to use for parsing
         num_workers: Number of worker processes
         chunk_bytes: Approx bytes per chunk (passed to readlines)
         filter_type: "dirs" or "files"
@@ -260,12 +172,11 @@ def run_parallel_file_processing(
     # Generator for pool arguments
     def args_generator():
         for chunk in chunk_file_generator(input_file, chunk_bytes):
-            yield (chunk, filter_type)
+            yield (chunk, filter_type, parser)
 
     # Use a Pool to manage workers automatically
     with mp.Pool(processes=num_workers) as pool:
         # imap_unordered allows processing results as soon as they are ready
-        # chunksize=1 in imap because our items are already large chunks
         for results, lines_in_chunk in pool.imap_unordered(_worker_parse_chunk, args_generator(), chunksize=1):
             total_lines += lines_in_chunk
 
@@ -304,8 +215,79 @@ def finalize_sqlite_pragmas(session):
     session.commit()
 
 
+def make_empty_update() -> dict:
+    """Create an empty update dictionary for non-recursive stats accumulation."""
+    return {
+        "nr_count": 0,
+        "nr_size": 0,
+        "nr_atime": None,
+        "first_uid": None,  # None = not set, -999 = multiple owners, else = single UID
+    }
+
+
+def flush_nr_updates(session, pending_updates: dict) -> None:
+    """
+    Apply accumulated non-recursive deltas to database using bulk execution.
+
+    Args:
+        session: SQLAlchemy session
+        pending_updates: Dictionary of dir_id -> update data (nr_* fields only)
+    """
+    if not pending_updates:
+        return
+
+    # Prepare batch parameters
+    params_batch = []
+    for dir_id, upd in pending_updates.items():
+        # Determine owner_uid: single uid or NULL for multiple
+        first_uid = upd["first_uid"]
+        if first_uid is None:
+            owner_val = -1  # No files seen
+        elif first_uid == -999:
+            owner_val = None  # Multiple owners
+        else:
+            owner_val = first_uid
+
+        params_batch.append(
+            {
+                "dir_id": dir_id,
+                "nr_count": upd["nr_count"],
+                "nr_size": upd["nr_size"],
+                "nr_atime": upd["nr_atime"],
+                "owner": owner_val,
+            }
+        )
+
+    # Execute bulk update
+    session.execute(
+        text("""
+            UPDATE directory_stats SET
+                file_count_nr = file_count_nr + :nr_count,
+                total_size_nr = total_size_nr + :nr_size,
+                max_atime_nr = CASE
+                    WHEN max_atime_nr IS NULL THEN :nr_atime
+                    WHEN :nr_atime IS NULL THEN max_atime_nr
+                    WHEN :nr_atime > max_atime_nr THEN :nr_atime
+                    ELSE max_atime_nr
+                END,
+                owner_uid = CASE
+                    WHEN owner_uid = -1 THEN :owner
+                    WHEN :owner IS NULL THEN NULL
+                    WHEN owner_uid IS NULL THEN NULL
+                    WHEN owner_uid != :owner THEN NULL
+                    ELSE owner_uid
+                END
+            WHERE dir_id = :dir_id
+        """),
+        params_batch,
+    )
+
+    session.commit()
+
+
 def pass1_discover_directories(
     input_file: Path,
+    parser: FilesystemParser,
     session,
     progress_interval: int = 1_000_000,
     num_workers: int = 1,
@@ -319,6 +301,7 @@ def pass1_discover_directories(
 
     Args:
         input_file: Path to the log file
+        parser: Filesystem parser instance
         session: SQLAlchemy session
         progress_interval: Report progress every N lines
         num_workers: Number of worker processes for parsing (Phase 1a only)
@@ -333,15 +316,12 @@ def pass1_discover_directories(
     else:
         console.print("[bold]Pass 1:[/bold] Discovering directories...")
 
-    # Create staging table
+    # Create staging table (parser-agnostic version without inode/fileset_id)
     session.execute(
         text("""
         CREATE TABLE IF NOT EXISTS staging_dirs (
-            inode INTEGER NOT NULL,
-            fileset_id INTEGER NOT NULL,
             depth INTEGER NOT NULL,
-            path TEXT NOT NULL,
-            PRIMARY KEY (fileset_id, inode)
+            path TEXT NOT NULL PRIMARY KEY
         )
     """)
     )
@@ -377,14 +357,12 @@ def pass1_discover_directories(
             rate = int(line_count / elapsed) if elapsed > 0 else 0
             progress.update(task, dirs=f"{dir_count:,}", rate=f"{rate:,}")
 
-        def process_parsed_dirs(parsed_list: list[ParsedEntry]):
+        def process_parsed_dirs(parsed_list: list):
             """Process a list of parsed directory entries."""
             nonlocal dir_count
             for parsed in parsed_list:
                 batch.append(
                     {
-                        "inode": parsed.inode,
-                        "fileset_id": parsed.fileset_id,
                         "depth": parsed.path.count("/"),
                         "path": parsed.path,
                     }
@@ -397,8 +375,8 @@ def pass1_discover_directories(
             if batch:
                 session.execute(
                     text("""
-                    INSERT OR IGNORE INTO staging_dirs (inode, fileset_id, depth, path)
-                    VALUES (:inode, :fileset_id, :depth, :path)
+                    INSERT OR IGNORE INTO staging_dirs (depth, path)
+                    VALUES (:depth, :path)
                 """),
                     batch,
                 )
@@ -409,6 +387,7 @@ def pass1_discover_directories(
             # Parallel Phase 1a with reader thread
             line_count = run_parallel_file_processing(
                 input_file=input_file,
+                parser=parser,
                 num_workers=num_workers,
                 chunk_bytes=CHUNK_BYTES,
                 filter_type="dirs",
@@ -424,7 +403,7 @@ def pass1_discover_directories(
                 for line in f:
                     line_count += 1
 
-                    parsed = parse_line(line.rstrip("\n"))
+                    parsed = parser.parse_line(line.rstrip("\n"))
                     if not parsed or not parsed.is_dir:
                         continue
 
@@ -544,78 +523,9 @@ def pass1_discover_directories(
     return path_to_id, metadata
 
 
-def make_empty_update() -> dict:
-    """Create an empty update dictionary for non-recursive stats accumulation."""
-    return {
-        "nr_count": 0,
-        "nr_size": 0,
-        "nr_atime": None,
-        "first_uid": None,  # None = not set, -999 = multiple owners, else = single UID
-    }
-
-
-def flush_nr_updates(session, pending_updates: dict) -> None:
-    """
-    Apply accumulated non-recursive deltas to database using bulk execution.
-
-    Args:
-        session: SQLAlchemy session
-        pending_updates: Dictionary of dir_id -> update data (nr_* fields only)
-    """
-    if not pending_updates:
-        return
-
-    # Prepare batch parameters
-    params_batch = []
-    for dir_id, upd in pending_updates.items():
-        # Determine owner_uid: single uid or NULL for multiple
-        first_uid = upd["first_uid"]
-        if first_uid is None:
-            owner_val = -1  # No files seen
-        elif first_uid == -999:
-            owner_val = None  # Multiple owners
-        else:
-            owner_val = first_uid
-
-        params_batch.append(
-            {
-                "dir_id": dir_id,
-                "nr_count": upd["nr_count"],
-                "nr_size": upd["nr_size"],
-                "nr_atime": upd["nr_atime"],
-                "owner": owner_val,
-            }
-        )
-
-    # Execute bulk update
-    session.execute(
-        text("""
-            UPDATE directory_stats SET
-                file_count_nr = file_count_nr + :nr_count,
-                total_size_nr = total_size_nr + :nr_size,
-                max_atime_nr = CASE
-                    WHEN max_atime_nr IS NULL THEN :nr_atime
-                    WHEN :nr_atime IS NULL THEN max_atime_nr
-                    WHEN :nr_atime > max_atime_nr THEN :nr_atime
-                    ELSE max_atime_nr
-                END,
-                owner_uid = CASE
-                    WHEN owner_uid = -1 THEN :owner
-                    WHEN :owner IS NULL THEN NULL
-                    WHEN owner_uid IS NULL THEN NULL
-                    WHEN owner_uid != :owner THEN NULL
-                    ELSE owner_uid
-                END
-            WHERE dir_id = :dir_id
-        """),
-        params_batch,
-    )
-
-    session.commit()
-
-
 def pass2a_nonrecursive_stats(
     input_file: Path,
+    parser: FilesystemParser,
     session,
     path_to_id: dict[str, int],
     batch_size: int = 10000,
@@ -631,6 +541,7 @@ def pass2a_nonrecursive_stats(
 
     Args:
         input_file: Path to the log file
+        parser: Filesystem parser instance
         session: SQLAlchemy session
         path_to_id: Dictionary mapping full paths to dir_id
         batch_size: Number of directories to accumulate before flushing
@@ -681,9 +592,10 @@ def pass2a_nonrecursive_stats(
                     if parsed.atime:
                         upd["nr_atime"] = max(upd["nr_atime"], parsed.atime) if upd["nr_atime"] else parsed.atime
 
+                    # FIXED: Changed from parsed.user_id to parsed.uid
                     if upd["first_uid"] is None:
-                        upd["first_uid"] = parsed.user_id
-                    elif upd["first_uid"] != parsed.user_id and upd["first_uid"] != -999:
+                        upd["first_uid"] = parsed.uid
+                    elif upd["first_uid"] != parsed.uid and upd["first_uid"] != -999:
                         upd["first_uid"] = -999
 
         elif isinstance(results, dict):
@@ -751,6 +663,7 @@ def pass2a_nonrecursive_stats(
             # Parallel mode with reader thread
             line_count = run_parallel_file_processing(
                 input_file=input_file,
+                parser=parser,
                 num_workers=num_workers,
                 chunk_bytes=CHUNK_BYTES,
                 filter_type="files",
@@ -766,7 +679,7 @@ def pass2a_nonrecursive_stats(
                 for line in f:
                     line_count += 1
 
-                    parsed = parse_line(line.rstrip("\n"))
+                    parsed = parser.parse_line(line.rstrip("\n"))
                     if not parsed or parsed.is_dir:
                         continue
 
@@ -781,9 +694,10 @@ def pass2a_nonrecursive_stats(
                         if parsed.atime:
                             upd["nr_atime"] = max(upd["nr_atime"], parsed.atime) if upd["nr_atime"] else parsed.atime
 
+                        # FIXED: Changed from parsed.user_id to parsed.uid
                         if upd["first_uid"] is None:
-                            upd["first_uid"] = parsed.user_id
-                        elif upd["first_uid"] != parsed.user_id and upd["first_uid"] != -999:
+                            upd["first_uid"] = parsed.uid
+                        elif upd["first_uid"] != parsed.uid and upd["first_uid"] != -999:
                             upd["first_uid"] = -999
 
                     if len(pending_updates) >= batch_size:
@@ -912,9 +826,6 @@ def pass3_populate_summary_tables(
     Phase 3b: Compute OwnerSummary - pre-aggregate per-owner statistics
     Phase 3c: Record ScanMetadata - store scan provenance info
     """
-    import pwd
-    from functools import lru_cache
-
     console.print("\n[bold]Pass 3:[/bold] Populating summary tables...")
 
     # Phase 3a: Populate UserInfo
@@ -1036,88 +947,36 @@ def pass3_populate_summary_tables(
     console.print(f"    Recorded metadata for {input_file.name}")
 
 
-# Create DynamicHelpCommand for this tool
-DynamicHelpCommand = make_dynamic_help_command('fs-scan-to-db')
-
-
-@click.command(cls=DynamicHelpCommand, context_settings={"help_option_names": ["-h", "--help"]})
-@click.argument("input_file", type=click.Path(exists=True, path_type=Path))
-@click.option(
-    "--db",
-    "db_path",
-    type=click.Path(path_type=Path),
-    help="Override database file path (highest precedence)",
-)
-@click.option(
-    "--data-dir",
-    "data_dir",
-    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-    help="Override directory for database files (or set FS_SCAN_DATA_DIR env var)",
-)
-@click.option(
-    "--filesystem",
-    "-f",
-    type=str,
-    help="Override filesystem name (default: extracted from filename)",
-)
-@click.option(
-    "--batch-size",
-    type=int,
-    default=50000,
-    show_default=True,
-    help="Batch size for DB updates",
-)
-@click.option(
-    "--progress-interval",
-    "-p",
-    type=int,
-    default=1_000_000,
-    show_default=True,
-    help="Report progress every N lines",
-)
-@click.option(
-    "--replace",
-    is_flag=True,
-    help="Drop and recreate tables before import",
-)
-@click.option(
-    "--workers",
-    "-w",
-    type=int,
-    default=1,
-    show_default=True,
-    help="Number of worker processes for parsing (default: 1, single-threaded)",
-)
-@click.option(
-    "--echo",
-    is_flag=True,
-    help="Echo SQL statements (for debugging)",
-)
-def main(
+def run_import(
     input_file: Path,
-    db_path: Path | None,
-    data_dir: Path | None,
-    filesystem: str | None,
-    batch_size: int,
-    progress_interval: int,
-    replace: bool,
-    workers: int,
-    echo: bool,
-):
+    parser: FilesystemParser,
+    filesystem: str | None = None,
+    db_path: Path | None = None,
+    data_dir: Path | None = None,
+    batch_size: int = 10000,
+    progress_interval: int = 1_000_000,
+    replace: bool = False,
+    workers: int = 1,
+    echo: bool = False,
+) -> None:
     """
-    Import GPFS policy scan log files into SQLite database.
+    Run multi-pass import using the provided parser.
 
-    Uses a multi-pass algorithm:
-      1. Pass 1: Discover directories and build the hierarchy
-      2. Pass 2a: Accumulate non-recursive file statistics
-      3. Pass 2b: Compute recursive stats via bottom-up SQL aggregation
+    This is the main entry point for the import process.
 
-    Database location precedence:
-      1. --db option (explicit file path)
-      2. FS_SCAN_DB environment variable
-      3. --data-dir / FS_SCAN_DATA_DIR / default module directory + {filesystem}.db
+    Args:
+        input_file: Path to the filesystem scan log file
+        parser: Parser instance for the specific log format
+        filesystem: Filesystem name (auto-detected from filename if None)
+        db_path: Explicit database path (overrides other settings)
+        data_dir: Data directory override
+        batch_size: Batch size for database operations
+        progress_interval: Progress report interval (lines)
+        replace: If True, drop existing tables before import
+        workers: Number of parallel workers for parsing
+        echo: If True, enable SQL echo for debugging
     """
-    console.print("[bold]GPFS Scan Database Importer[/bold]")
+    console.print(f"[bold]Filesystem Scan Importer ({parser.format_name.upper()})[/bold]")
     console.print(f"Input: {input_file}")
     console.print()
 
@@ -1133,11 +992,11 @@ def main(
 
     console.print(f"Filesystem: {filesystem}")
 
-    # Apply data directory override if provided via CLI
+    # Apply data directory override if provided
     if data_dir is not None:
         set_data_dir(data_dir)
 
-    # Resolve database path (respects CLI --db, FS_SCAN_DB env var, then default)
+    # Resolve database path
     resolved_db_path = get_db_path(filesystem, db_path)
 
     # Initialize database
@@ -1154,14 +1013,15 @@ def main(
 
     overall_start = time.time()
     try:
-        # Pass 1: Discover directories
+        # Pass 1: Discover directories (now parser-agnostic)
         path_to_id, metadata = pass1_discover_directories(
-            input_file, session, progress_interval, num_workers=workers
+            input_file, parser, session, progress_interval, num_workers=workers
         )
 
-        # Pass 2a: Accumulate non-recursive stats
+        # Pass 2a: Accumulate non-recursive stats (now parser-agnostic)
         pass2a_nonrecursive_stats(
             input_file,
+            parser,
             session,
             path_to_id,
             batch_size,
@@ -1170,13 +1030,13 @@ def main(
             num_workers=workers,
         )
 
-        # Pass 2b: Compute recursive stats via bottom-up aggregation
+        # Pass 2b: Compute recursive stats via bottom-up aggregation (pure SQL)
         pass2b_aggregate_recursive_stats(session)
 
-        # Pass 3: Populate summary tables
+        # Pass 3: Populate summary tables (parser-agnostic)
         pass3_populate_summary_tables(session, input_file, filesystem, metadata)
 
-        # Finalize database for optimal query performance
+        # Finalize database
         finalize_sqlite_pragmas(session)
 
         overall_duration = time.time() - overall_start
@@ -1197,7 +1057,3 @@ def main(
         raise
     finally:
         session.close()
-
-
-if __name__ == "__main__":
-    main()
