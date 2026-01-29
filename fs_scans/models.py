@@ -90,6 +90,9 @@ class DirectoryStats(Base):
         Index("ix_stats_files_r", "file_count_r"),
         Index("ix_stats_size_nr", "total_size_nr"),
         Index("ix_stats_files_nr", "file_count_nr"),
+        # Composite indexes for optimized owner-filtered queries
+        Index("ix_stats_owner_size", "owner_uid", "total_size_r"),
+        Index("ix_stats_owner_files", "owner_uid", "file_count_r"),
     )
 
     def __repr__(self):
