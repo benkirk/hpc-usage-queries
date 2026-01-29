@@ -14,22 +14,17 @@ def fs_scans_cli():
 
     Import filesystem scan logs and query directory statistics.
 
+    \b
     Examples:
-        # Import a scan log (auto-detect format)
-        fs-scans import scan.log
+      fs-scans import scan.log                # Import with auto-detection
+      fs-scans import scan.log --format gpfs  # Import with explicit format
+      fs-scans query asp --min-size 1G -d 4   # Query a filesystem
+      fs-scans query all --single-owner       # Query all filesystems
 
-        # Import with explicit format
-        fs-scans import scan.log --format gpfs
-
-        # Query a filesystem
-        fs-scans query asp --min-size 1G -d 4
-
-        # Query all filesystems
-        fs-scans query all --single-owner
-
+    \b
     For help on a specific command:
-        fs-scans import --help
-        fs-scans query --help
+      fs-scans import --help
+      fs-scans query --help
     """
     pass
 

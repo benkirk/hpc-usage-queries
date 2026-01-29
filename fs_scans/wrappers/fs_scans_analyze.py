@@ -10,15 +10,11 @@ import sys
 
 
 def main():
-    """Inject 'analyze' subcommand and call main CLI."""
-    from fs_scans.cli.main import fs_scans_cli
+    """Convenience wrapper that calls analyze command directly."""
+    from fs_scans.cli.analyze_cmd import analyze_cmd
 
-    # Set program name for help text
-    sys.argv[0] = "fs-scans-analyze"
-    # Inject 'analyze' subcommand
-    sys.argv.insert(1, "analyze")
-    # Call main CLI
-    fs_scans_cli()
+    # Call analyze command directly (no need to inject subcommand)
+    analyze_cmd()
 
 
 if __name__ == "__main__":

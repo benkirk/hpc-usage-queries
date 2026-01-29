@@ -229,25 +229,24 @@ def query_cmd(
     show_total: bool,
     dir_counts: bool,
 ):
-    """
-    Query GPFS scan database for directory statistics.
+    """Query GPFS scan database for directory statistics.
 
     FILESYSTEM is the name of the filesystem (e.g., asp, cisl, eol, hao),
     or 'all' to query all available databases (default).
 
     \b
     Examples:
-      query-fs-scan-db                       # all filesystems (default)
-      query-fs-scan-db asp                   # specific filesystem
-      query-fs-scan-db -d 4 --single-owner   # single-owner dirs at depth 4+
-      query-fs-scan-db --accessed-before 3yrs
-      query-fs-scan-db --leaves-only
-      query-fs-scan-db -N "*scratch*"        # filter by name pattern
-      query-fs-scan-db -N "*scratch*" -N "*tmp*"  # multiple patterns (OR)
-      query-fs-scan-db -N "*tmp*" -i         # case-insensitive name filter
-      query-fs-scan-db --group-by owner      # per-user summary
-      query-fs-scan-db --group-by owner --sort-by files  # sort by file count
-      query-fs-scan-db --group-by owner -d 4 -P /gpfs/csfs1/cisl
+      fs-scans query                          # All filesystems (default)
+      fs-scans query asp                      # Specific filesystem
+      fs-scans query -d 4 --single-owner      # Single-owner dirs at depth 4+
+      fs-scans query --accessed-before 3yrs   # Old data
+      fs-scans query --leaves-only            # Leaf directories only
+      fs-scans query -N "*scratch*"           # Filter by name pattern
+      fs-scans query -N "*scratch*" -N "*tmp*"  # Multiple patterns (OR)
+      fs-scans query -N "*tmp*" -i            # Case-insensitive pattern
+      fs-scans query --group-by owner         # Per-user summary
+      fs-scans query --group-by owner --sort-by files  # Sort by file count
+      fs-scans query --group-by owner -d 4 -P /gpfs/csfs1/cisl
     """
     # Apply data directory override if provided via CLI
     if data_dir is not None:

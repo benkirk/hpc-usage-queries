@@ -10,15 +10,11 @@ import sys
 
 
 def main():
-    """Inject 'query' subcommand and call main CLI."""
-    from fs_scans.cli.main import fs_scans_cli
+    """Convenience wrapper that calls query command directly."""
+    from fs_scans.cli.query_cmd import query_cmd
 
-    # Set program name for help text
-    sys.argv[0] = "fs-scans-query"
-    # Inject 'query' subcommand
-    sys.argv.insert(1, "query")
-    # Call main CLI
-    fs_scans_cli()
+    # Call query command directly (no need to inject subcommand)
+    query_cmd()
 
 
 if __name__ == "__main__":

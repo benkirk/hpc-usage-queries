@@ -90,20 +90,14 @@ def import_cmd(
     Supports multiple scan formats: GPFS, Lustre, POSIX.
     The format is auto-detected from the filename if not specified.
 
+    \b
     Examples:
+      fs-scans import scan.log                # Import with auto-detection
+      fs-scans import scan.log --format gpfs  # Import with explicit format
+      fs-scans import scan.log --workers 4    # Import with parallel workers
+      fs-scans import scan.log --replace      # Replace existing database
 
-        # Import with auto-detection
-        fs-scans import scan.log
-
-        # Import with explicit format
-        fs-scans import scan.log --format gpfs
-
-        # Import with parallel workers
-        fs-scans import scan.log --workers 4
-
-        # Replace existing database
-        fs-scans import scan.log --replace
-
+    \b
     Database location precedence:
       1. --db option (explicit file path)
       2. FS_SCAN_DB environment variable

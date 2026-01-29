@@ -10,15 +10,11 @@ import sys
 
 
 def main():
-    """Inject 'import' subcommand and call main CLI."""
-    from fs_scans.cli.main import fs_scans_cli
+    """Convenience wrapper that calls import command directly."""
+    from fs_scans.cli.import_cmd import import_cmd
 
-    # Set program name for help text
-    sys.argv[0] = "fs-scans-import"
-    # Inject 'import' subcommand
-    sys.argv.insert(1, "import")
-    # Call main CLI
-    fs_scans_cli()
+    # Call import command directly (no need to inject subcommand)
+    import_cmd()
 
 
 if __name__ == "__main__":
