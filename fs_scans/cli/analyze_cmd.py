@@ -1,0 +1,22 @@
+"""Analyze subcommand for fs-scans CLI (placeholder)."""
+
+import click
+
+
+@click.command()
+def analyze_cmd():
+    """Analyze filesystem usage patterns (coming soon).
+
+    This command will provide advanced analytics on filesystem usage,
+    including growth trends, duplicate detection, and capacity forecasting.
+    """
+    click.echo("Analyze functionality coming soon!")
+    click.echo("")
+    click.echo("Planned features:")
+    click.echo("  - Growth trend analysis over multiple scan snapshots")
+    click.echo("  - Duplicate file detection across directories")
+    click.echo("  - Capacity forecasting based on historical growth")
+    click.echo("  - Age-based analysis (identify old unused data)")
+    click.echo("  - Owner-based chargeback calculations")
+    click.echo("")
+    click.echo("Stay tuned for future releases!")

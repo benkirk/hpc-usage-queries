@@ -32,8 +32,8 @@ from rich.progress import TextColumn
 from sqlalchemy import insert, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from .cli_common import console, create_progress_bar, format_size, make_dynamic_help_command
-from .database import (
+from .cli.common import console, create_progress_bar, format_size, make_dynamic_help_command
+from .core.database import (
     drop_tables,
     extract_filesystem_from_filename,
     extract_scan_timestamp,
@@ -42,7 +42,7 @@ from .database import (
     init_db,
     set_data_dir,
 )
-from .models import Directory, DirectoryStats, OwnerSummary, ScanMetadata, UserInfo
+from .core.models import Directory, DirectoryStats, OwnerSummary, ScanMetadata, UserInfo
 
 # Extended LINE_PATTERN that captures inode and fileset_id for unique identification
 # Format: <thread> inode fileset_id snapshot  fields -- /path

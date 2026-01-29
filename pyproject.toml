@@ -27,6 +27,16 @@ analysis = [
 [project.scripts]
 qhist-sync = "scripts.sync_jobs:main"
 qhist-report = "qhist_db.cli:cli"
+
+# New unified CLI
+fs-scans = "fs_scans.cli.main:fs_scans_cli"
+
+# Convenience wrappers (allow selective deployment)
+fs-scans-import = "fs_scans.wrappers.fs_scans_import:main"
+fs-scans-query = "fs_scans.wrappers.fs_scans_query:main"
+fs-scans-analyze = "fs_scans.wrappers.fs_scans_analyze:main"
+
+# Old CLIs (kept for backward compatibility temporarily)
 fs-scan-to-db = "fs_scans.scan_to_db:main"
 query-fs-scan-db = "fs_scans.query_db:main"
 

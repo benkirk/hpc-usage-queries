@@ -16,7 +16,7 @@ import click
 from rich.table import Table
 from sqlalchemy import text
 
-from .cli_common import (
+from .cli.common import (
     console,
     format_datetime,
     format_size,
@@ -25,8 +25,8 @@ from .cli_common import (
     parse_file_count,
     parse_size,
 )
-from .database import get_data_dir, get_data_dir_info, get_db_path, get_session, set_data_dir
-from .query_builder import DirectoryQueryBuilder
+from .core.database import get_data_dir, get_data_dir_info, get_db_path, get_session, set_data_dir
+from .core.query_builder import DirectoryQueryBuilder
 
 
 # Known mount point prefixes to strip from user-provided paths
