@@ -13,7 +13,7 @@ from ..cli.common import (
     make_dynamic_help_command,
     parse_date_arg,
 )
-from ..core.database import get_data_dir_info, set_data_dir
+from ..core.database import get_data_dir_info, set_data_dir, get_session
 from ..queries.query_engine import (
     get_all_filesystems,
     get_scan_date,
