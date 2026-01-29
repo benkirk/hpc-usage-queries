@@ -6,8 +6,8 @@ Tools for parsing GPFS policy scan log files and computing **directory-level met
 
 | Tool | CLI Command | Purpose |
 |------|-------------|---------|
-| `scan_to_db.py` | `fs-scan-to-db` | Database importer - SQLite storage for complex queries |
-| `query_db.py` | `query-fs-scan-db` | Query interface for the SQLite database |
+| `scan_to_db.py` | `fs-scans-import` | Database importer - SQLite storage for complex queries |
+| `query_db.py` | `fs-scans-query` | Query interface for the SQLite database |
 
 ## Overview
 
@@ -30,7 +30,7 @@ source etc/config_env.sh
 pip install -e .
 ```
 
-This installs the CLI commands `fs-scan-to-db` and `query-fs-scan-db`.
+This installs the CLI commands `fs-scans-import` and `fs-scans-query`.
 
 ## Configuration
 
@@ -46,17 +46,17 @@ Database location can be configured via environment variables or CLI options. Pr
 ```bash
 # Use environment variable for data directory
 export FS_SCAN_DATA_DIR=/data/gpfs_scans
-query-fs-scan-db --summary
+fs-scans-query --summary
 
 # Override via CLI (takes precedence over env var)
-query-fs-scan-db --data-dir /alt/path --summary
+fs-scans-query --data-dir /alt/path --summary
 
 # Specify exact database file
-fs-scan-to-db input.log --db /tmp/custom.db
+fs-scans-import input.log --db /tmp/custom.db
 
 # Or via environment variable
 export FS_SCAN_DB=/tmp/custom.db
-fs-scan-to-db input.log
+fs-scans-import input.log
 ```
 
 ## Log File Format
@@ -95,7 +95,7 @@ For persistent storage and complex queries, use the database importer to load sc
 ### Usage
 
 ```bash
-fs-scan-to-db <input_file> [options]
+fs-scans-import <input_file> [options]
 ```
 
 ### Options
@@ -115,16 +115,16 @@ fs-scan-to-db <input_file> [options]
 
 ```bash
 # Import a scan file (database auto-created as fs_scans/asp.db)
-fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log
+fs-scans-import fs_scans/20260111_csfs1_asp.list.list_all.log
 
 # Import with custom database path
-fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --db /tmp/asp.db
+fs-scans-import fs_scans/20260111_csfs1_asp.list.list_all.log --db /tmp/asp.db
 
 # Replace existing data
-fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --replace
+fs-scans-import fs_scans/20260111_csfs1_asp.list.list_all.log --replace
 
 # Use parallel workers for faster parsing (best with uncompressed files)
-fs-scan-to-db fs_scans/20260111_csfs1_asp.list.list_all.log --workers 4
+fs-scans-import fs_scans/20260111_csfs1_asp.list.list_all.log --workers 4
 ```
 
 ### Multi-Pass Algorithm
@@ -218,7 +218,7 @@ Supports querying across all databases or a specific filesystem.
 ### Usage
 
 ```bash
-query-fs-scan-db [filesystem] [options]
+fs-scans-query [filesystem] [options]
 ```
 
 The `filesystem` argument is optional and defaults to `all`, which queries all available `.db` files and combines results. Specify a filesystem name (e.g., `asp`, `cisl`) to query only that database.
@@ -255,66 +255,66 @@ The `filesystem` argument is optional and defaults to `all`, which queries all a
 
 ```bash
 # Query all filesystems (default)
-query-fs-scan-db
+fs-scans-query
 
 # Query a specific filesystem
-query-fs-scan-db asp
+fs-scans-query asp
 
 # Filter to a specific path prefix (mount point auto-stripped)
-query-fs-scan-db cisl --path-prefix /cisl/users
-query-fs-scan-db cisl --path-prefix /glade/campaign/cisl/users  # Same result
-query-fs-scan-db cisl --path-prefix /gpfs/csfs1/cisl/users      # Same result
+fs-scans-query cisl --path-prefix /cisl/users
+fs-scans-query cisl --path-prefix /glade/campaign/cisl/users  # Same result
+fs-scans-query cisl --path-prefix /gpfs/csfs1/cisl/users      # Same result
 
 # Show only single-owner directories at depth 4+
-query-fs-scan-db -d 4 --single-owner
+fs-scans-query -d 4 --single-owner
 
 # Filter by access time (files not accessed in 3+ years)
-query-fs-scan-db --accessed-before 3yrs
+fs-scans-query --accessed-before 3yrs
 
 # Filter by access time range (accessed 3-5 years ago)
-query-fs-scan-db --accessed-after 5yrs --accessed-before 3yrs
+fs-scans-query --accessed-after 5yrs --accessed-before 3yrs
 
 # Show only leaf directories (no subdirectories)
-query-fs-scan-db --leaves-only
+fs-scans-query --leaves-only
 
 # Filter directories by name pattern
-query-fs-scan-db -N "*scratch*"
+fs-scans-query -N "*scratch*"
 
 # Multiple name patterns (OR matching)
-query-fs-scan-db -N "*scratch*" -N "*tmp*"
+fs-scans-query -N "*scratch*" -N "*tmp*"
 
 # Case-insensitive name pattern
-query-fs-scan-db -N "*SCRATCH*" -i
+fs-scans-query -N "*SCRATCH*" -i
 
 # Filter by size (default: directories >= 1GiB)
-query-fs-scan-db --min-size 100GiB
+fs-scans-query --min-size 100GiB
 
 # Find large directories with few files
-query-fs-scan-db --min-size 10GiB --max-files 100
+fs-scans-query --min-size 10GiB --max-files 100
 
 # Size range query
-query-fs-scan-db --min-size 1GiB --max-size 10GiB --leaves-only
+fs-scans-query --min-size 1GiB --max-size 10GiB --leaves-only
 
 # Disable default size filter to see all directories
-query-fs-scan-db --min-size 0
+fs-scans-query --min-size 0
 
 # Filter by both size and file count
-query-fs-scan-db --min-size 1GiB --min-files 1K
+fs-scans-query --min-size 1GiB --min-files 1K
 
 # Show per-user summary (uses pre-computed owner_summary table)
-query-fs-scan-db --group-by owner
+fs-scans-query --group-by owner
 
 # Per-user summary with filters (computes dynamically)
-query-fs-scan-db --group-by owner -d 4 -P /gpfs/csfs1/cisl
+fs-scans-query --group-by owner -d 4 -P /gpfs/csfs1/cisl
 
 # Export all directories to TSV
-query-fs-scan-db --limit 0 -o all_dirs.tsv
+fs-scans-query --limit 0 -o all_dirs.tsv
 
 # Show database summary for all filesystems
-query-fs-scan-db --summary
+fs-scans-query --summary
 
 # Query databases from a different directory
-query-fs-scan-db --data-dir /data/gpfs_scans --summary
+fs-scans-query --data-dir /data/gpfs_scans --summary
 ```
 
 ### Performance Notes
