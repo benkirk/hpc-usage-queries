@@ -222,6 +222,57 @@ def get_full_paths_batch(session, dir_ids: list[int]) -> dict[int, str]:
     return {row[0]: row[1] for row in result}
 
 
+def get_directory_counts_batch(session, dir_ids: list[int]) -> dict[int, tuple[int, int]]:
+    """
+    Compute directory counts for multiple directories in a single query.
+
+    This is much more efficient than counting per directory when dealing
+    with multiple results (N*2 queries -> 1 query).
+
+    Args:
+        session: SQLAlchemy session
+        dir_ids: List of directory IDs to count
+
+    Returns:
+        Dictionary mapping dir_id to (ndirs_r, ndirs_nr) tuple
+        - ndirs_r: Recursive descendant directory count
+        - ndirs_nr: Direct child directory count (non-recursive)
+    """
+    if not dir_ids:
+        return {}
+
+    # SQLite doesn't support array parameters directly, so we build IN clause
+    # with positional parameters
+    placeholders = ", ".join(f":id_{i}" for i in range(len(dir_ids)))
+    params = {f"id_{i}": did for i, did in enumerate(dir_ids)}
+
+    result = session.execute(
+        text(f"""
+            WITH RECURSIVE descendant_cte AS (
+                -- Base: start from each target directory
+                SELECT dir_id, dir_id as origin_id
+                FROM directories
+                WHERE dir_id IN ({placeholders})
+                UNION ALL
+                -- Recursive: find all descendants
+                SELECT d.dir_id, cte.origin_id
+                FROM directories d
+                JOIN descendant_cte cte ON d.parent_id = cte.dir_id
+            )
+            SELECT
+                origin_id,
+                COUNT(*) - 1 as ndirs_r,
+                SUM(CASE WHEN d.parent_id = origin_id THEN 1 ELSE 0 END) as ndirs_nr
+            FROM descendant_cte cte
+            JOIN directories d ON d.dir_id = cte.dir_id
+            GROUP BY origin_id
+        """),
+        params,
+    )
+
+    return {row[0]: (row[1], row[2]) for row in result}
+
+
 def query_directories(
     session,
     min_depth: int | None = None,
@@ -241,6 +292,7 @@ def query_directories(
     max_size: int | None = None,
     min_files: int | None = None,
     max_files: int | None = None,
+    compute_dir_counts: bool = False,
 ) -> list[dict]:
     """
     Query directories with optional filters.
@@ -264,6 +316,7 @@ def query_directories(
         max_size: Maximum total_size_r in bytes
         min_files: Minimum file_count_r
         max_files: Maximum file_count_r
+        compute_dir_counts: If True, compute directory counts (ndirs_r, ndirs_nr)
 
     Returns:
         List of directory dictionaries with stats
@@ -363,6 +416,15 @@ def query_directories(
             "owner_uid": row[10],
         })
 
+    # Optionally compute directory counts in batch
+    if compute_dir_counts and directories:
+        dir_ids = [d["dir_id"] for d in directories]
+        dir_count_map = get_directory_counts_batch(session, dir_ids)
+        for d in directories:
+            ndirs_r, ndirs_nr = dir_count_map.get(d["dir_id"], (0, 0))
+            d["ndirs_r"] = ndirs_r
+            d["ndirs_nr"] = ndirs_nr
+
     return directories
 
 
@@ -372,6 +434,7 @@ def print_results(
     leaves_only: bool = False,
     username_map: dict[int, str] | None = None,
     show_total: bool = False,
+    show_dir_counts: bool = False,
 ) -> None:
     """Print directory results in a formatted table."""
     if not directories:
@@ -390,12 +453,17 @@ def print_results(
         # Simplified columns for leaf directories (R and NR are identical)
         table.add_column("Size", justify="right")
         table.add_column("Files", justify="right")
+        if show_dir_counts:
+            table.add_column("Dirs", justify="right")
         table.add_column("Atime", justify="right")
     else:
         table.add_column("Size\n", justify="right")
         table.add_column("Size\n(NR)", justify="right")
         table.add_column("Files\n", justify="right")
         table.add_column("Files\n(NR)", justify="right")
+        if show_dir_counts:
+            table.add_column("Dirs\n", justify="right")
+            table.add_column("Dirs\n(NR)", justify="right")
         table.add_column("Atime\n", justify="right")
         table.add_column("Atime\n(NR)", justify="right")
     table.add_column("Owner", justify="right")
@@ -421,22 +489,35 @@ def print_results(
             row.append(str(d["depth"]))
 
         if leaves_only:
-            row.extend([
+            row_data = [
                 format_size(d["total_size_r"]),
                 f"{d['file_count_r']:,}",
+            ]
+            if show_dir_counts:
+                row_data.append(f"{d.get('ndirs_nr', 0):,}")
+            row_data.extend([
                 format_datetime(d["max_atime_r"]),
                 owner_str,
             ])
+            row.extend(row_data)
         else:
-            row.extend([
+            row_data = [
                 format_size(d["total_size_r"]),
                 format_size(d["total_size_nr"]),
                 f"{d['file_count_r']:,}",
                 f"{d['file_count_nr']:,}",
+            ]
+            if show_dir_counts:
+                row_data.extend([
+                    f"{d.get('ndirs_r', 0):,}",
+                    f"{d.get('ndirs_nr', 0):,}",
+                ])
+            row_data.extend([
                 format_datetime(d["max_atime_r"]),
                 format_datetime(d["max_atime_nr"]),
                 owner_str,
             ])
+            row.extend(row_data)
 
         # Add separator line before totals row
         end_section = (i == len(directories) - 1) and len(directories) > 1 and show_total
@@ -455,48 +536,68 @@ def print_results(
             row.append("")  # Empty depth column
 
         if leaves_only:
-            row.extend([
+            row_data = [
                 f"[bold]{format_size(total_size_r)}[/bold]",
                 f"[bold]{total_files_r:,}[/bold]",
+            ]
+            if show_dir_counts:
+                row_data.append("")  # Empty dir count
+            row_data.extend([
                 "",  # Empty atime
                 "",  # Empty owner
             ])
+            row.extend(row_data)
         else:
-            row.extend([
+            row_data = [
                 f"[bold]{format_size(total_size_r)}[/bold]",
                 f"[bold]{format_size(total_size_nr)}[/bold]",
                 f"[bold]{total_files_r:,}[/bold]",
                 f"[bold]{total_files_nr:,}[/bold]",
+            ]
+            if show_dir_counts:
+                row_data.extend(["", ""])  # Empty dir counts (R and NR)
+            row_data.extend([
                 "",  # Empty atime (R)
                 "",  # Empty atime (NR)
                 "",  # Empty owner
             ])
+            row.extend(row_data)
         table.add_row(*row)
 
     console.print(table)
 
 
-def write_tsv(directories: list[dict], output_path: Path) -> None:
+def write_tsv(directories: list[dict], output_path: Path, include_dir_counts: bool = False) -> None:
     """Write results to TSV file."""
     with open(output_path, "w") as f:
         # Header
-        f.write(
+        header = (
             "directory\tdepth\t"
             "total_size_r\ttotal_size_nr\t"
             "file_count_r\tfile_count_nr\t"
+        )
+        if include_dir_counts:
+            header += "dir_count_r\tdir_count_nr\t"
+        header += (
             "max_atime_r\tmax_atime_nr\t"
             "owner_uid\n"
         )
+        f.write(header)
 
         for d in directories:
-            f.write(
+            line = (
                 f"{d['path']}\t{d['depth']}\t"
                 f"{d['total_size_r']}\t{d['total_size_nr']}\t"
                 f"{d['file_count_r']}\t{d['file_count_nr']}\t"
+            )
+            if include_dir_counts:
+                line += f"{d.get('ndirs_r', 0)}\t{d.get('ndirs_nr', 0)}\t"
+            line += (
                 f"{format_datetime(d['max_atime_r'])}\t"
                 f"{format_datetime(d['max_atime_nr'])}\t"
                 f"{d['owner_uid']}\n"
             )
+            f.write(line)
 
     console.print(f"[green]Results written to {output_path}[/green]")
 
@@ -791,6 +892,7 @@ def query_single_filesystem(
     max_size: int | None = None,
     min_files: int | None = None,
     max_files: int | None = None,
+    compute_dir_counts: bool = False,
 ) -> list[dict]:
     """Query a single filesystem database.
 
@@ -825,6 +927,7 @@ def query_single_filesystem(
             max_size=max_size,
             min_files=min_files,
             max_files=max_files,
+            compute_dir_counts=compute_dir_counts,
         )
     finally:
         session.close()
@@ -989,6 +1092,11 @@ DynamicHelpCommand = make_dynamic_help_command('query-fs-scan-db')
     is_flag=True,
     help="Show totals row at bottom of results",
 )
+@click.option(
+    "--dir-counts",
+    is_flag=True,
+    help="Show directory counts (Dirs and Dirs(NR) columns)",
+)
 def main(
     filesystem: str,
     min_depth: int | None,
@@ -1016,6 +1124,7 @@ def main(
     max_files: str | None,
     group_by: str | None,
     show_total: bool,
+    dir_counts: bool,
 ):
     """
     Query GPFS scan database for directory statistics.
@@ -1147,6 +1256,9 @@ def main(
 
     # Handle --group-by owner mode
     if group_by == "owner":
+        if dir_counts:
+            console.print("[yellow]Warning: --dir-counts ignored with --group-by owner[/yellow]")
+
         # Map sort_by to owner summary field names
         # Accept common aliases for convenience
         owner_sort_map = {
@@ -1252,6 +1364,7 @@ def main(
                     parsed_max_size,
                     parsed_min_files,
                     parsed_max_files,
+                    dir_counts,
                 ): fs
                 for fs in filesystems
             }
@@ -1285,6 +1398,7 @@ def main(
                 max_size=parsed_max_size,
                 min_files=parsed_min_files,
                 max_files=parsed_max_files,
+                compute_dir_counts=dir_counts,
             )
         finally:
             session.close()
@@ -1309,7 +1423,7 @@ def main(
 
     # Output results
     if output:
-        write_tsv(all_directories, output)
+        write_tsv(all_directories, output, include_dir_counts=dir_counts)
     else:
         # Resolve UIDs to usernames for display (aggregate across all databases)
         unique_uids = {
@@ -1329,7 +1443,7 @@ def main(
                     remaining_uids -= found.keys()
                 finally:
                     session.close()
-        print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map, show_total=show_total)
+        print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map, show_total=show_total, show_dir_counts=dir_counts)
 
 
 if __name__ == "__main__":
