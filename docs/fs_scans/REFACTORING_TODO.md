@@ -68,46 +68,8 @@ The refactoring is **functionally complete** and all tests pass. The unified CLI
 
 **Estimated Effort**: 6-8 hours
 
-### 3. Implement Additional Parsers
 
-**Current State**: Lustre and POSIX parsers are placeholders
-
-**Goal**: Support multiple filesystem formats
-
-#### 3a. Lustre Parser
-
-**Tasks**:
-- [ ] Define Lustre scan log format (work with ops team)
-- [ ] Implement `LustreParser.can_parse()` - detect Lustre format
-- [ ] Implement `LustreParser.parse_line()` - parse Lustre log entries
-- [ ] Add Lustre-specific fields to `ParsedEntry` if needed (stripe_count, OST info)
-- [ ] Update parser registry to register LustreParser
-- [ ] Create tests in `tests/test_fs_scans_parsers.py`
-
-**Files to Modify**:
-- `fs_scans/parsers/lustre.py`
-- `fs_scans/parsers/__init__.py` - uncomment registration
-- `tests/test_fs_scans_parsers.py` - add Lustre tests
-
-**Estimated Effort**: 8-12 hours (depends on format complexity)
-
-#### 3b. POSIX Parser
-
-**Tasks**:
-- [ ] Define POSIX scan log format (JSON? CSV? Custom?)
-- [ ] Implement `POSIXParser.can_parse()` - detect format
-- [ ] Implement `POSIXParser.parse_line()` - parse entries
-- [ ] Update parser registry
-- [ ] Create tests
-
-**Files to Modify**:
-- `fs_scans/parsers/posix.py`
-- `fs_scans/parsers/__init__.py` - uncomment registration
-- `tests/test_fs_scans_parsers.py` - add POSIX tests
-
-**Estimated Effort**: 6-10 hours
-
-### 4. Remove Legacy CLI Entry Points
+### 3. Remove Legacy CLI Entry Points
 
 **Current State**: Old CLIs kept for backward compatibility
 
@@ -130,7 +92,7 @@ The refactoring is **functionally complete** and all tests pass. The unified CLI
 
 **Estimated Effort**: 1-2 hours (plus migration time)
 
-### 5. Documentation Updates
+### 4. Documentation Updates
 
 **Current State**: README mentions old CLI commands
 
@@ -156,105 +118,3 @@ The refactoring is **functionally complete** and all tests pass. The unified CLI
 - `docs/PARSER_GUIDE.md` (create new)
 
 **Estimated Effort**: 3-4 hours
-
-### 6. Performance Optimization
-
-**Goal**: Improve import and query performance
-
-**Tasks**:
-- [ ] Profile import process to identify bottlenecks
-- [ ] Consider optimizations:
-  - Better batch sizing strategies
-  - Parallel query execution
-  - Index optimization
-  - Memory-mapped I/O tuning
-
-- [ ] Benchmark before/after changes
-
-**Files to Modify**:
-- `fs_scans/importers/importer.py`
-- `fs_scans/queries/query_engine.py`
-
-**Estimated Effort**: 8-16 hours
-
-### 7. Additional Features
-
-#### 7a. Implement `analyze` Command
-
-**Current State**: Placeholder only
-
-**Goal**: Provide advanced analytics
-
-**Tasks**:
-- [ ] Growth trend analysis (compare multiple scans)
-- [ ] Duplicate file detection
-- [ ] Capacity forecasting
-- [ ] Age-based analysis
-- [ ] Owner-based chargeback
-
-**Files to Modify**:
-- `fs_scans/cli/analyze_cmd.py`
-- Create `fs_scans/analysis/` module
-
-**Estimated Effort**: 20-40 hours (depending on features)
-
-#### 7b. Export/Import Capabilities
-
-**Tasks**:
-- [ ] Export query results to CSV, JSON, Excel
-- [ ] Generate reports in various formats
-- [ ] Schedule automated exports
-
-**Estimated Effort**: 6-10 hours
-
-#### 7c. Web Interface
-
-**Tasks**:
-- [ ] Create web UI for queries (Flask/FastAPI)
-- [ ] Interactive visualizations
-- [ ] User management
-
-**Estimated Effort**: 40-80 hours
-
-## Testing Strategy for Future Work
-
-For each enhancement:
-1. Write tests first (TDD approach)
-2. Update integration tests
-3. Run full test suite: `pytest tests/`
-4. Verify backward compatibility
-5. Performance benchmarking
-
-## Migration Path
-
-When removing legacy entry points:
-1. Add deprecation warnings (in code and docs)
-2. Email users about upcoming changes
-3. Provide migration guide
-4. Wait 1-2 months
-5. Remove old entry points
-6. Delete deprecated code
-
-## Priority Recommendations
-
-**High Priority** (do soon):
-1. Complete Importer Extraction (Enhancement #1)
-2. Documentation Updates (Enhancement #5)
-
-**Medium Priority** (do within 3-6 months):
-3. Complete Query Extraction (Enhancement #2)
-4. Implement Lustre Parser (Enhancement #3a)
-5. Remove Legacy CLI (Enhancement #4)
-
-**Low Priority** (nice to have):
-6. POSIX Parser (Enhancement #3b)
-7. Performance Optimization (Enhancement #6)
-8. Additional Features (Enhancement #7)
-
-## Notes
-
-- All current functionality is preserved
-- Tests are comprehensive (76 passing tests)
-- Code is well-structured for incremental improvements
-- Can deploy and use immediately while doing enhancements
-- Backward compatibility maintained during transition
