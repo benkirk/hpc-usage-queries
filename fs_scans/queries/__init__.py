@@ -13,6 +13,7 @@ from .query_engine import (
     query_owner_summary,
     query_single_filesystem,
     resolve_path_to_id,
+    resolve_usernames_across_databases,
 )
 from .display import (
     print_owner_results,
@@ -34,6 +35,7 @@ __all__ = [
     "query_owner_summary",
     "query_single_filesystem",
     "resolve_path_to_id",
+    "resolve_usernames_across_databases",
     # Display functions
     "print_owner_results",
     "print_results",

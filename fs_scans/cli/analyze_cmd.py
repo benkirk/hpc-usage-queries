@@ -12,8 +12,8 @@ from ..core.database import get_data_dir_info, get_db_path, get_session, set_dat
 from ..queries.query_engine import (
     get_all_filesystems,
     get_scan_date,
-    get_username_map,
     normalize_path,
+    resolve_usernames_across_databases,
 )
 from ..queries.access_history import compute_access_history
 
@@ -220,19 +220,7 @@ def analyze_cmd(
                 session.close()
 
         # Resolve usernames from all databases
-        username_map = {}
-        if all_uids:
-            remaining_uids = set(all_uids)
-            for fs in filesystems:
-                if not remaining_uids:
-                    break
-                session = get_session(fs)
-                try:
-                    found = get_username_map(session, list(remaining_uids))
-                    username_map.update(found)
-                    remaining_uids -= found.keys()
-                finally:
-                    session.close()
+        username_map = resolve_usernames_across_databases(all_uids, filesystems)
 
         # Display combined results
         output = combined_histogram.format_output(display_dir, username_map, top_n)

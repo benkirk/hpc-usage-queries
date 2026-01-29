@@ -629,6 +629,44 @@ def get_username_map(session, uids: list[int]) -> dict[int, str]:
     return result
 
 
+def resolve_usernames_across_databases(
+    uids: set[int] | list[int],
+    filesystems: list[str],
+) -> dict[int, str]:
+    """Resolve UIDs to usernames by searching across multiple databases.
+
+    Efficiently searches databases in order, stopping early once all
+    UIDs are resolved. This is useful when querying multiple databases
+    and needing to resolve usernames from any of them.
+
+    Args:
+        uids: Set or list of UIDs to resolve
+        filesystems: List of filesystem names to search
+
+    Returns:
+        Dictionary mapping UID to username (or str(uid) if unknown)
+    """
+    if not uids:
+        return {}
+
+    username_map = {}
+    remaining_uids = set(uids)
+
+    for fs in filesystems:
+        if not remaining_uids:
+            break  # All UIDs resolved, stop early
+
+        session = get_session(fs)
+        try:
+            found = get_username_map(session, list(remaining_uids))
+            username_map.update(found)
+            remaining_uids -= found.keys()
+        finally:
+            session.close()
+
+    return username_map
+
+
 def query_single_filesystem(
     filesystem: str,
     min_depth: int | None,

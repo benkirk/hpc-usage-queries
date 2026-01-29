@@ -23,11 +23,11 @@ from ..queries.query_engine import (
     get_all_filesystems,
     get_scan_date,
     get_summary,
-    get_username_map,
     normalize_path,
     query_directories,
     query_owner_summary,
     query_single_filesystem,
+    resolve_usernames_across_databases,
 )
 from ..queries.display import (
     print_owner_results,
@@ -418,19 +418,7 @@ def query_cmd(
                 all_owners = all_owners[:limit]
 
         # Get username mappings (aggregate across all databases)
-        username_map = {}
-        if all_uids and filesystems:
-            remaining_uids = set(all_uids)
-            for fs in filesystems:
-                if not remaining_uids:
-                    break
-                session = get_session(fs)
-                try:
-                    found = get_username_map(session, list(remaining_uids))
-                    username_map.update(found)
-                    remaining_uids -= found.keys()
-                finally:
-                    session.close()
+        username_map = resolve_usernames_across_databases(all_uids, filesystems)
 
         # Show filesystem column when querying multiple databases
         show_filesystem = len(filesystems) > 1
@@ -532,19 +520,7 @@ def query_cmd(
             d["owner_uid"] for d in all_directories
             if d["owner_uid"] is not None and d["owner_uid"] != -1
         }
-        username_map = {}
-        if unique_uids:
-            remaining_uids = set(unique_uids)
-            for fs in filesystems:
-                if not remaining_uids:
-                    break
-                session = get_session(fs)
-                try:
-                    found = get_username_map(session, list(remaining_uids))
-                    username_map.update(found)
-                    remaining_uids -= found.keys()
-                finally:
-                    session.close()
+        username_map = resolve_usernames_across_databases(unique_uids, filesystems)
         print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map, show_total=show_total, show_dir_counts=dir_counts)
 
 
