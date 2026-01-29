@@ -36,10 +36,6 @@ fs-scans-import = "fs_scans.wrappers.fs_scans_import:main"
 fs-scans-query = "fs_scans.wrappers.fs_scans_query:main"
 fs-scans-analyze = "fs_scans.wrappers.fs_scans_analyze:main"
 
-# Old CLIs (kept for backward compatibility temporarily)
-fs-scan-to-db = "fs_scans.scan_to_db:main"
-query-fs-scan-db = "fs_scans.query_db:main"
-
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
