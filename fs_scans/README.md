@@ -1,13 +1,27 @@
-# GPFS Policy Scan Tools
+# Filesystem Scan Tools
 
-Tools for parsing GPFS policy scan log files and computing **directory-level metrics**. Provides a database importer for persistent storage and a query interface for analysis.
+Tools for parsing filesystem scan log files (GPFS, Lustre, POSIX) and computing **directory-level metrics**. Provides a unified CLI with database import and query capabilities for large-scale filesystem analysis.
 
-## Tools
+## Quick Start
 
-| Tool | CLI Command | Purpose |
-|------|-------------|---------|
-| `scan_to_db.py` | `fs-scans-import` | Database importer - SQLite storage for complex queries |
-| `query_db.py` | `fs-scans-query` | Query interface for the SQLite database |
+```bash
+# Install
+pip install -e .
+
+# Import a scan log (auto-detect format)
+fs-scans import scan.log
+
+# Query all filesystems
+fs-scans query
+
+# Query a specific filesystem
+fs-scans query asp --min-size 10GiB -d 4
+
+# Get help
+fs-scans -h
+fs-scans import -h
+fs-scans query -h
+```
 
 ## Overview
 
@@ -21,6 +35,41 @@ These tools process GPFS scan logs and aggregate statistics at the directory lev
 
 Additionally, it tracks **single-owner directories** - directories where all recursive contents share a single owner (user_id).
 
+## Project Structure
+
+The codebase is organized into modular components:
+
+```
+fs_scans/
+├── cli/                    # Command-line interface
+│   ├── main.py            # Unified CLI entry point (fs-scans)
+│   ├── import_cmd.py      # Import subcommand
+│   ├── query_cmd.py       # Query subcommand
+│   ├── analyze_cmd.py     # Analyze subcommand (placeholder)
+│   └── common.py          # Shared CLI utilities (console, formatting, parsing)
+├── core/                   # Core business logic
+│   ├── models.py          # SQLAlchemy ORM models
+│   ├── database.py        # Database connection and session management
+│   └── query_builder.py   # SQL query construction
+├── parsers/                # Scan file parsers
+│   ├── base.py            # Base parser interface
+│   ├── gpfs.py            # GPFS-specific parser
+│   ├── lustre.py          # Lustre-specific parser
+│   └── posix.py           # POSIX-specific parser
+├── importers/              # Import pipeline
+│   └── importer.py        # Multi-pass import algorithm
+├── queries/                # Query engine
+│   ├── query_engine.py    # Query execution and filtering
+│   └── display.py         # Result formatting and display
+└── wrappers/               # Legacy wrapper scripts (deprecated)
+```
+
+**Design principles:**
+- **Separation of concerns**: CLI, business logic, and data access are cleanly separated
+- **Modularity**: Each component has a single, well-defined responsibility
+- **Testability**: Core logic is independent of CLI and can be tested in isolation
+- **Extensibility**: New parsers and query features can be added without changing existing code
+
 ## Installation
 
 Requires Python 3.10+ with `click`, `rich`, and `sqlalchemy`. From the project root:
@@ -30,7 +79,10 @@ source etc/config_env.sh
 pip install -e .
 ```
 
-This installs the CLI commands `fs-scans-import` and `fs-scans-query`.
+This installs the unified `fs-scans` CLI with three subcommands:
+- `fs-scans import` - Import scan logs into SQLite databases
+- `fs-scans query` - Query directory statistics
+- `fs-scans analyze` - Advanced analytics (coming soon)
 
 ## Configuration
 
@@ -46,17 +98,17 @@ Database location can be configured via environment variables or CLI options. Pr
 ```bash
 # Use environment variable for data directory
 export FS_SCAN_DATA_DIR=/data/gpfs_scans
-fs-scans-query --summary
+fs-scans query --summary
 
 # Override via CLI (takes precedence over env var)
-fs-scans-query --data-dir /alt/path --summary
+fs-scans query --data-dir /alt/path --summary
 
 # Specify exact database file
-fs-scans-import input.log --db /tmp/custom.db
+fs-scans import input.log --db /tmp/custom.db
 
 # Or via environment variable
 export FS_SCAN_DB=/tmp/custom.db
-fs-scans-import input.log
+fs-scans import input.log
 ```
 
 ## Log File Format
@@ -88,15 +140,19 @@ Data files should be decompressed before processing.
 
 ---
 
-## Database Importer (scan_to_db.py)
+## CLI Commands
 
-For persistent storage and complex queries, use the database importer to load scan data into SQLite.
+### Import Command
 
-### Usage
+Import filesystem scan logs into SQLite databases for persistent storage and complex queries.
+
+**Usage:**
 
 ```bash
-fs-scans-import <input_file> [options]
+fs-scans import <input_file> [options]
 ```
+
+**Supported formats:** GPFS, Lustre, POSIX (auto-detected from filename)
 
 ### Options
 
@@ -114,17 +170,20 @@ fs-scans-import <input_file> [options]
 ### Examples
 
 ```bash
-# Import a scan file (database auto-created as fs_scans/asp.db)
-fs-scans-import fs_scans/20260111_csfs1_asp.list.list_all.log
+# Import a scan file (database auto-created as fs_scans/data/{filesystem}.db)
+fs-scans import 20260111_csfs1_asp.list.list_all.log
+
+# Import with explicit format
+fs-scans import scan.log --format gpfs
 
 # Import with custom database path
-fs-scans-import fs_scans/20260111_csfs1_asp.list.list_all.log --db /tmp/asp.db
+fs-scans import 20260111_csfs1_asp.list.list_all.log --db /tmp/asp.db
 
 # Replace existing data
-fs-scans-import fs_scans/20260111_csfs1_asp.list.list_all.log --replace
+fs-scans import 20260111_csfs1_asp.list.list_all.log --replace
 
 # Use parallel workers for faster parsing (best with uncompressed files)
-fs-scans-import fs_scans/20260111_csfs1_asp.list.list_all.log --workers 4
+fs-scans import 20260111_csfs1_asp.list.list_all.log --workers 4
 ```
 
 ### Multi-Pass Algorithm
@@ -210,15 +269,15 @@ The importer creates the following tables:
 
 ---
 
-## Database Query Tool (query_db.py)
+### Query Command
 
-Query directory statistics from the SQLite database with filtering and sorting options.
+Query directory statistics from SQLite databases with powerful filtering and sorting options.
 Supports querying across all databases or a specific filesystem.
 
-### Usage
+**Usage:**
 
 ```bash
-fs-scans-query [filesystem] [options]
+fs-scans query [filesystem] [options]
 ```
 
 The `filesystem` argument is optional and defaults to `all`, which queries all available `.db` files and combines results. Specify a filesystem name (e.g., `asp`, `cisl`) to query only that database.
@@ -249,72 +308,82 @@ The `filesystem` argument is optional and defaults to `all`, which queries all a
 | `--accessed-after DATE` | Filter to max_atime_r after date (YYYY-MM-DD or Nyrs/Nmo) |
 | `-v, --verbose` | Show additional columns (Depth) |
 | `--leaves-only` | Only show leaf directories (no subdirectories) |
+| `--show-total` | Show totals row at bottom of results |
+| `--dir-counts` | Show directory counts (Dirs and Dirs(NR) columns) |
 | `--summary` | Show database summary only |
+| `--show-config` | Show data directory configuration and available databases |
 
 ### Examples
 
 ```bash
 # Query all filesystems (default)
-fs-scans-query
+fs-scans query
 
 # Query a specific filesystem
-fs-scans-query asp
+fs-scans query asp
 
 # Filter to a specific path prefix (mount point auto-stripped)
-fs-scans-query cisl --path-prefix /cisl/users
-fs-scans-query cisl --path-prefix /glade/campaign/cisl/users  # Same result
-fs-scans-query cisl --path-prefix /gpfs/csfs1/cisl/users      # Same result
+fs-scans query cisl --path-prefix /cisl/users
+fs-scans query cisl --path-prefix /glade/campaign/cisl/users  # Same result
+fs-scans query cisl --path-prefix /gpfs/csfs1/cisl/users      # Same result
 
 # Show only single-owner directories at depth 4+
-fs-scans-query -d 4 --single-owner
+fs-scans query -d 4 --single-owner
 
 # Filter by access time (files not accessed in 3+ years)
-fs-scans-query --accessed-before 3yrs
+fs-scans query --accessed-before 3yrs
 
 # Filter by access time range (accessed 3-5 years ago)
-fs-scans-query --accessed-after 5yrs --accessed-before 3yrs
+fs-scans query --accessed-after 5yrs --accessed-before 3yrs
 
 # Show only leaf directories (no subdirectories)
-fs-scans-query --leaves-only
+fs-scans query --leaves-only
 
 # Filter directories by name pattern
-fs-scans-query -N "*scratch*"
+fs-scans query -N "*scratch*"
 
 # Multiple name patterns (OR matching)
-fs-scans-query -N "*scratch*" -N "*tmp*"
+fs-scans query -N "*scratch*" -N "*tmp*"
 
 # Case-insensitive name pattern
-fs-scans-query -N "*SCRATCH*" -i
+fs-scans query -N "*SCRATCH*" -i
 
 # Filter by size (default: directories >= 1GiB)
-fs-scans-query --min-size 100GiB
+fs-scans query --min-size 100GiB
 
 # Find large directories with few files
-fs-scans-query --min-size 10GiB --max-files 100
+fs-scans query --min-size 10GiB --max-files 100
 
 # Size range query
-fs-scans-query --min-size 1GiB --max-size 10GiB --leaves-only
+fs-scans query --min-size 1GiB --max-size 10GiB --leaves-only
 
 # Disable default size filter to see all directories
-fs-scans-query --min-size 0
+fs-scans query --min-size 0
 
 # Filter by both size and file count
-fs-scans-query --min-size 1GiB --min-files 1K
+fs-scans query --min-size 1GiB --min-files 1K
 
 # Show per-user summary (uses pre-computed owner_summary table)
-fs-scans-query --group-by owner
+fs-scans query --group-by owner
 
 # Per-user summary with filters (computes dynamically)
-fs-scans-query --group-by owner -d 4 -P /gpfs/csfs1/cisl
+fs-scans query --group-by owner -d 4 -P /gpfs/csfs1/cisl
+
+# Sort by different fields
+fs-scans query --sort-by files_r --limit 20  # Top 20 by file count
+fs-scans query --sort-by atime_r             # Oldest by access time
 
 # Export all directories to TSV
-fs-scans-query --limit 0 -o all_dirs.tsv
+fs-scans query --limit 0 -o all_dirs.tsv
 
 # Show database summary for all filesystems
-fs-scans-query --summary
+fs-scans query --summary
+
+# Show configuration and available databases
+fs-scans query --show-config
 
 # Query databases from a different directory
-fs-scans-query --data-dir /data/gpfs_scans --summary
+fs-scans query --data-dir /data/gpfs_scans --summary
 ```
 
 ### Performance Notes

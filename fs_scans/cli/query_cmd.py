@@ -4,21 +4,28 @@ This module provides the query interface for the unified fs-scans CLI.
 """
 
 import os
+import pwd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
 
 from ..cli.common import (
     console,
+    format_size,
     make_dynamic_help_command,
     parse_date_arg,
+    parse_file_count,
+    parse_size,
 )
-from ..core.database import get_data_dir_info, set_data_dir, get_session
+from ..core.database import get_data_dir_info, get_db_path, get_session, set_data_dir
 from ..queries.query_engine import (
     get_all_filesystems,
     get_scan_date,
+    get_summary,
     get_username_map,
     normalize_path,
+    query_directories,
     query_owner_summary,
     query_single_filesystem,
 )
