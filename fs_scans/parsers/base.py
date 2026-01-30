@@ -28,6 +28,9 @@ class ParsedEntry:
     uid: int
     """User ID (numeric UID) of the file owner."""
 
+    gid: int
+    """Group ID (numeric GID) of the file owner."""
+
     is_dir: bool
     """True if this entry represents a directory, False for files."""
 

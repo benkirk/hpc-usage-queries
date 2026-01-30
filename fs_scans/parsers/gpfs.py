@@ -19,6 +19,7 @@ FIELD_PATTERNS = {
     "size": re.compile(r"s=(\d+)"),
     "allocated_kb": re.compile(r"a=(\d+)"),
     "user_id": re.compile(r"u=(\d+)"),
+    "group_id": re.compile(r"g=(\d+)"),
     "permissions": re.compile(r"p=([^\s]+)"),
     "atime": re.compile(r"ac=(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"),
 }
@@ -75,9 +76,10 @@ class GPFSParser(FilesystemParser):
         size_match = FIELD_PATTERNS["size"].search(fields_str)
         alloc_match = FIELD_PATTERNS["allocated_kb"].search(fields_str)
         user_match = FIELD_PATTERNS["user_id"].search(fields_str)
+        group_match = FIELD_PATTERNS["group_id"].search(fields_str)
         atime_match = FIELD_PATTERNS["atime"].search(fields_str)
 
-        if not all([size_match, user_match]):
+        if not all([size_match, user_match, group_match]):
             return None
 
         # Parse atime
@@ -105,6 +107,7 @@ class GPFSParser(FilesystemParser):
             size=size,
             allocated=allocated,
             uid=int(user_match.group(1)),
+            gid=int(group_match.group(1)),
             is_dir=is_dir,
             atime=atime,
             inode=int(inode),

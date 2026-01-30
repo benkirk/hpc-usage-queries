@@ -54,13 +54,18 @@ class Directory(Base):
 class DirectoryStats(Base):
     """Statistics for a directory, including both recursive and non-recursive metrics.
 
-    Non-recursive metrics count only direct children (files in this directory).
-    Recursive metrics count all descendants (files in this directory and all subdirectories).
+    Non-recursive metrics count only direct children (files/dirs in this directory).
+    Recursive metrics count all descendants (files/dirs in this directory and all subdirectories).
 
     Owner tracking:
         - owner_uid = -1: No files seen yet
         - owner_uid = NULL: Multiple owners detected
         - owner_uid = <uid>: Single owner (all files have this UID)
+
+    Group tracking (same logic as owner_uid):
+        - owner_gid = -1: No files seen yet
+        - owner_gid = NULL: Multiple groups detected
+        - owner_gid = <gid>: Single group (all files have this GID)
     """
 
     __tablename__ = "directory_stats"
@@ -73,14 +78,18 @@ class DirectoryStats(Base):
     file_count_nr = Column(BigInteger, default=0)
     total_size_nr = Column(BigInteger, default=0)
     max_atime_nr = Column(DateTime)
+    dir_count_nr = Column(BigInteger, default=0)
 
     # Recursive metrics (all descendants)
     file_count_r = Column(BigInteger, default=0)
     total_size_r = Column(BigInteger, default=0)
     max_atime_r = Column(DateTime)
+    dir_count_r = Column(BigInteger, default=0)
 
     # Owner tracking: -1=no files yet, NULL=multiple owners, else=single owner UID
     owner_uid = Column(Integer, default=-1, index=True)
+    # Group tracking: -1=no files yet, NULL=multiple groups, else=single group GID
+    owner_gid = Column(Integer, default=-1, index=True)
 
     # Relationship
     directory = relationship("Directory", back_populates="stats")
@@ -90,9 +99,14 @@ class DirectoryStats(Base):
         Index("ix_stats_files_r", "file_count_r"),
         Index("ix_stats_size_nr", "total_size_nr"),
         Index("ix_stats_files_nr", "file_count_nr"),
+        Index("ix_stats_dirs_r", "dir_count_r"),
+        Index("ix_stats_dirs_nr", "dir_count_nr"),
         # Composite indexes for optimized owner-filtered queries
         Index("ix_stats_owner_size", "owner_uid", "total_size_r"),
         Index("ix_stats_owner_files", "owner_uid", "file_count_r"),
+        # Composite indexes for optimized group-filtered queries
+        Index("ix_stats_group_size", "owner_gid", "total_size_r"),
+        Index("ix_stats_group_files", "owner_gid", "file_count_r"),
     )
 
     def __repr__(self):

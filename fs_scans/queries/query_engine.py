@@ -211,14 +211,11 @@ def get_full_paths_batch(session, dir_ids: list[int]) -> dict[int, str]:
 
 def get_directory_counts_batch(session, dir_ids: list[int]) -> dict[int, tuple[int, int]]:
     """
-    Compute directory counts for multiple directories in a single query.
-
-    This is much more efficient than counting per directory when dealing
-    with multiple results (N*2 queries -> 1 query).
+    Get directory counts for multiple directories from directory_stats.
 
     Args:
         session: SQLAlchemy session
-        dir_ids: List of directory IDs to count
+        dir_ids: List of directory IDs to get counts for
 
     Returns:
         Dictionary mapping dir_id to (ndirs_r, ndirs_nr) tuple
@@ -235,29 +232,14 @@ def get_directory_counts_batch(session, dir_ids: list[int]) -> dict[int, tuple[i
 
     result = session.execute(
         text(f"""
-            WITH RECURSIVE descendant_cte AS (
-                -- Base: start from each target directory
-                SELECT dir_id, dir_id as origin_id
-                FROM directories
-                WHERE dir_id IN ({placeholders})
-                UNION ALL
-                -- Recursive: find all descendants
-                SELECT d.dir_id, cte.origin_id
-                FROM directories d
-                JOIN descendant_cte cte ON d.parent_id = cte.dir_id
-            )
-            SELECT
-                origin_id,
-                COUNT(*) - 1 as ndirs_r,
-                SUM(CASE WHEN d.parent_id = origin_id THEN 1 ELSE 0 END) as ndirs_nr
-            FROM descendant_cte cte
-            JOIN directories d ON d.dir_id = cte.dir_id
-            GROUP BY origin_id
+            SELECT dir_id, dir_count_r, dir_count_nr
+            FROM directory_stats
+            WHERE dir_id IN ({placeholders})
         """),
         params,
     )
 
-    return {row[0]: (row[1], row[2]) for row in result}
+    return {row[0]: (row[1] or 0, row[2] or 0) for row in result}
 
 
 def query_directories(
@@ -397,20 +379,21 @@ def query_directories(
             "file_count_nr": row[4] or 0,
             "total_size_nr": row[5] or 0,
             "max_atime_nr": row[6],
-            "file_count_r": row[7] or 0,
-            "total_size_r": row[8] or 0,
-            "max_atime_r": row[9],
-            "owner_uid": row[10],
+            "dir_count_nr": row[7] or 0,
+            "file_count_r": row[8] or 0,
+            "total_size_r": row[9] or 0,
+            "max_atime_r": row[10],
+            "dir_count_r": row[11] or 0,
+            "owner_uid": row[12],
+            "owner_gid": row[13],
         })
 
-    # Optionally compute directory counts in batch
+    # Optionally add directory counts for backward compatibility
+    # (now they're always available, but we add separate keys if requested)
     if compute_dir_counts and directories:
-        dir_ids = [d["dir_id"] for d in directories]
-        dir_count_map = get_directory_counts_batch(session, dir_ids)
         for d in directories:
-            ndirs_r, ndirs_nr = dir_count_map.get(d["dir_id"], (0, 0))
-            d["ndirs_r"] = ndirs_r
-            d["ndirs_nr"] = ndirs_nr
+            d["ndirs_r"] = d["dir_count_r"]
+            d["ndirs_nr"] = d["dir_count_nr"]
 
     return directories
 

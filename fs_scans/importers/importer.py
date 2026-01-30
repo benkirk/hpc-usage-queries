@@ -146,7 +146,10 @@ def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime |
 
     Returns:
         Tuple of (dir_results, hist_results, count of lines processed)
-        - If filter_type="files": dir_results is dict[parent_path, stats], hist_results is dict[uid, histograms]
+        - If filter_type="files":
+            dir_results is dict[parent_path, stats_tuple]
+            where stats_tuple = (nr_count, nr_size, nr_atime, nr_dirs, first_uid, first_gid)
+            hist_results is dict[uid, histograms]
         - If filter_type="dirs"/"all": dir_results is list[ParsedEntry], hist_results is None
     """
     chunk, filter_type, parser, scan_date = args
@@ -159,61 +162,78 @@ def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime |
 
         for line in chunk:
             parsed = parser.parse_line(line.rstrip("\n"))
-            if parsed and not parsed.is_dir:
+            if parsed:
                 parent = os.path.dirname(parsed.path)
                 if parent not in results:
                     results[parent] = {
                         "nr_count": 0,
                         "nr_size": 0,
                         "nr_atime": None,
-                        "first_uid": None
+                        "nr_dirs": 0,
+                        "first_uid": None,
+                        "first_gid": None
                     }
                 stats = results[parent]
 
-                # Accumulate count and size
-                stats["nr_count"] += 1
-                stats["nr_size"] += parsed.allocated
+                if parsed.is_dir:
+                    # Track directory count for parent
+                    stats["nr_dirs"] += 1
+                else:
+                    # Track file stats
+                    # Accumulate count and size
+                    stats["nr_count"] += 1
+                    stats["nr_size"] += parsed.allocated
 
-                # Accumulate atime
-                if parsed.atime:
-                    cur_max = stats["nr_atime"]
-                    stats["nr_atime"] = max(cur_max, parsed.atime) if cur_max else parsed.atime
+                    # Accumulate atime
+                    if parsed.atime:
+                        cur_max = stats["nr_atime"]
+                        stats["nr_atime"] = max(cur_max, parsed.atime) if cur_max else parsed.atime
 
-                # Accumulate UID (Single pass logic)
-                # None = init, -999 = multiple/conflict, else = single UID
-                p_uid = parsed.uid
-                s_uid = stats["first_uid"]
+                    # Accumulate UID (Single pass logic)
+                    # None = init, -999 = multiple/conflict, else = single UID
+                    p_uid = parsed.uid
+                    s_uid = stats["first_uid"]
 
-                if s_uid is None:
-                    stats["first_uid"] = p_uid
-                elif s_uid != -999 and s_uid != p_uid:
-                    stats["first_uid"] = -999
+                    if s_uid is None:
+                        stats["first_uid"] = p_uid
+                    elif s_uid != -999 and s_uid != p_uid:
+                        stats["first_uid"] = -999
 
-                # NEW: Track histograms per UID
-                uid = parsed.uid
-                if uid not in hist_results:
-                    hist_results[uid] = {
-                        "atime_hist": [0] * 10,  # file counts per atime bucket
-                        "size_hist": [0] * 10,   # file counts per size bucket
-                        "atime_size": [0] * 10,  # total bytes per atime bucket
-                        "size_size": [0] * 10,   # total bytes per size bucket
-                    }
+                    # Accumulate GID (Single pass logic)
+                    # None = init, -999 = multiple/conflict, else = single GID
+                    p_gid = parsed.gid
+                    s_gid = stats["first_gid"]
 
-                hist = hist_results[uid]
+                    if s_gid is None:
+                        stats["first_gid"] = p_gid
+                    elif s_gid != -999 and s_gid != p_gid:
+                        stats["first_gid"] = -999
 
-                # Classify and update histograms
-                atime_bucket = classify_atime_bucket(parsed.atime, scan_date) if scan_date else 9
-                hist["atime_hist"][atime_bucket] += 1
-                hist["atime_size"][atime_bucket] += parsed.allocated
+                    # NEW: Track histograms per UID (files only)
+                    uid = parsed.uid
+                    if uid not in hist_results:
+                        hist_results[uid] = {
+                            "atime_hist": [0] * 10,  # file counts per atime bucket
+                            "size_hist": [0] * 10,   # file counts per size bucket
+                            "atime_size": [0] * 10,  # total bytes per atime bucket
+                            "size_size": [0] * 10,   # total bytes per size bucket
+                        }
 
-                size_bucket = classify_size_bucket(parsed.allocated)
-                hist["size_hist"][size_bucket] += 1
-                hist["size_size"][size_bucket] += parsed.allocated
+                    hist = hist_results[uid]
+
+                    # Classify and update histograms
+                    atime_bucket = classify_atime_bucket(parsed.atime, scan_date) if scan_date else 9
+                    hist["atime_hist"][atime_bucket] += 1
+                    hist["atime_size"][atime_bucket] += parsed.allocated
+
+                    size_bucket = classify_size_bucket(parsed.allocated)
+                    hist["size_hist"][size_bucket] += 1
+                    hist["size_size"][size_bucket] += parsed.allocated
 
         # Optimize IPC payload: convert dicts to tuples
-        # Directory stats: (nr_count, nr_size, nr_atime, first_uid)
+        # Directory stats: (nr_count, nr_size, nr_atime, nr_dirs, first_uid, first_gid)
         final_results = {
-            k: (v["nr_count"], v["nr_size"], v["nr_atime"], v["first_uid"])
+            k: (v["nr_count"], v["nr_size"], v["nr_atime"], v["nr_dirs"], v["first_uid"], v["first_gid"])
             for k, v in results.items()
         }
 
@@ -337,7 +357,9 @@ def make_empty_update() -> dict:
         "nr_count": 0,
         "nr_size": 0,
         "nr_atime": None,
+        "nr_dirs": 0,
         "first_uid": None,  # None = not set, -999 = multiple owners, else = single UID
+        "first_gid": None,  # None = not set, -999 = multiple groups, else = single GID
     }
 
 
@@ -364,13 +386,24 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
         else:
             owner_val = first_uid
 
+        # Determine owner_gid: single gid or NULL for multiple
+        first_gid = upd["first_gid"]
+        if first_gid is None:
+            group_val = -1  # No files seen
+        elif first_gid == -999:
+            group_val = None  # Multiple groups
+        else:
+            group_val = first_gid
+
         params_batch.append(
             {
                 "dir_id": dir_id,
                 "nr_count": upd["nr_count"],
                 "nr_size": upd["nr_size"],
                 "nr_atime": upd["nr_atime"],
+                "nr_dirs": upd["nr_dirs"],
                 "owner": owner_val,
+                "group": group_val,
             }
         )
 
@@ -380,6 +413,7 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
             UPDATE directory_stats SET
                 file_count_nr = file_count_nr + :nr_count,
                 total_size_nr = total_size_nr + :nr_size,
+                dir_count_nr = dir_count_nr + :nr_dirs,
                 max_atime_nr = CASE
                     WHEN max_atime_nr IS NULL THEN :nr_atime
                     WHEN :nr_atime IS NULL THEN max_atime_nr
@@ -392,6 +426,13 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
                     WHEN owner_uid IS NULL THEN NULL
                     WHEN owner_uid != :owner THEN NULL
                     ELSE owner_uid
+                END,
+                owner_gid = CASE
+                    WHEN owner_gid = -1 THEN :group
+                    WHEN :group IS NULL THEN NULL
+                    WHEN owner_gid IS NULL THEN NULL
+                    WHEN owner_gid != :group THEN NULL
+                    ELSE owner_gid
                 END
             WHERE dir_id = :dir_id
         """),
@@ -738,13 +779,13 @@ def pass2a_nonrecursive_stats(
         # Process directory results (always expect dict from worker)
         if isinstance(dir_results, dict):
             # Optimized Aggregated Dictionary from Worker
-            # Value is tuple: (nr_count, nr_size, nr_atime, first_uid)
+            # Value is tuple: (nr_count, nr_size, nr_atime, nr_dirs, first_uid, first_gid)
             for parent_path, stats_tuple in dir_results.items():
                 parent_id = path_to_id.get(parent_path)
                 if not parent_id:
                     continue
 
-                nr_count, nr_size, nr_atime, first_uid = stats_tuple
+                nr_count, nr_size, nr_atime, nr_dirs, first_uid, first_gid = stats_tuple
 
                 # Update file count for progress tracking
                 file_count += nr_count
@@ -753,6 +794,7 @@ def pass2a_nonrecursive_stats(
                 upd = pending_updates[parent_id]
                 upd["nr_count"] += nr_count
                 upd["nr_size"] += nr_size
+                upd["nr_dirs"] += nr_dirs
 
                 # Merge max atime
                 if nr_atime:
@@ -771,6 +813,20 @@ def pass2a_nonrecursive_stats(
                         upd["first_uid"] = w_uid
                     elif m_uid != w_uid:
                         upd["first_uid"] = -999
+
+                # Merge GID logic (identical to UID)
+                w_gid = first_gid
+                m_gid = upd["first_gid"]
+
+                if m_gid == -999:
+                    pass
+                elif w_gid == -999:
+                    upd["first_gid"] = -999
+                elif w_gid is not None:
+                    if m_gid is None:
+                        upd["first_gid"] = w_gid
+                    elif m_gid != w_gid:
+                        upd["first_gid"] = -999
 
         # Merge histogram results from worker
         if hist_results:
@@ -867,7 +923,8 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                 SET
                     file_count_r = file_count_nr,
                     total_size_r = total_size_nr,
-                    max_atime_r = max_atime_nr
+                    max_atime_r = max_atime_nr,
+                    dir_count_r = dir_count_nr
                 WHERE dir_id IN (SELECT dir_id FROM directories WHERE depth = :depth)
                 """),
                 {"depth": depth},
@@ -882,14 +939,22 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                         d.parent_id,
                         SUM(s.file_count_r) as sum_files,
                         SUM(s.total_size_r) as sum_size,
+                        SUM(s.dir_count_r) as sum_dirs,
                         MAX(s.max_atime_r) as max_atime,
-                        -- Owner Aggregation:
+                        -- Owner UID Aggregation:
                         -- Check if any child has a NULL owner (conflict)
-                        MAX(CASE WHEN s.owner_uid IS NULL THEN 1 ELSE 0 END) as has_conflict,
+                        MAX(CASE WHEN s.owner_uid IS NULL THEN 1 ELSE 0 END) as has_uid_conflict,
                         -- Count distinct valid owners (ignoring -1/no-files)
                         COUNT(DISTINCT CASE WHEN s.owner_uid >= 0 THEN s.owner_uid END) as distinct_valid_owners,
                         -- Get the potential common owner (if count is 1)
-                        MAX(CASE WHEN s.owner_uid >= 0 THEN s.owner_uid END) as common_owner
+                        MAX(CASE WHEN s.owner_uid >= 0 THEN s.owner_uid END) as common_owner,
+                        -- Owner GID Aggregation:
+                        -- Check if any child has a NULL group (conflict)
+                        MAX(CASE WHEN s.owner_gid IS NULL THEN 1 ELSE 0 END) as has_gid_conflict,
+                        -- Count distinct valid groups (ignoring -1/no-files)
+                        COUNT(DISTINCT CASE WHEN s.owner_gid >= 0 THEN s.owner_gid END) as distinct_valid_groups,
+                        -- Get the potential common group (if count is 1)
+                        MAX(CASE WHEN s.owner_gid >= 0 THEN s.owner_gid END) as common_group
                     FROM directories d
                     JOIN directory_stats s ON d.dir_id = s.dir_id
                     WHERE d.depth = :child_depth
@@ -899,6 +964,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                 SET
                     file_count_r = file_count_r + agg.sum_files,
                     total_size_r = total_size_r + agg.sum_size,
+                    dir_count_r = dir_count_r + agg.sum_dirs,
                     max_atime_r = MAX(COALESCE(max_atime_r, 0), COALESCE(agg.max_atime, 0)),
                     owner_uid = CASE
                         -- Already conflicted -> stay conflicted
@@ -907,7 +973,7 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                         -- Direct files exist (owner_uid >= 0) -> check for conflict with children
                         WHEN owner_uid >= 0 THEN
                              CASE
-                                WHEN agg.has_conflict = 1 THEN NULL
+                                WHEN agg.has_uid_conflict = 1 THEN NULL
                                 WHEN agg.distinct_valid_owners > 0 AND agg.common_owner != owner_uid THEN NULL
                                 ELSE owner_uid
                              END
@@ -915,10 +981,31 @@ def pass2b_aggregate_recursive_stats(session) -> None:
                         -- No direct files (-1) -> inherit from children
                         ELSE -- owner_uid == -1
                              CASE
-                                WHEN agg.has_conflict = 1 THEN NULL
+                                WHEN agg.has_uid_conflict = 1 THEN NULL
                                 WHEN agg.distinct_valid_owners > 1 THEN NULL
                                 WHEN agg.distinct_valid_owners = 1 THEN agg.common_owner
                                 ELSE -1 -- Still no owner seen
+                             END
+                    END,
+                    owner_gid = CASE
+                        -- Already conflicted -> stay conflicted
+                        WHEN owner_gid IS NULL THEN NULL
+
+                        -- Direct files exist (owner_gid >= 0) -> check for conflict with children
+                        WHEN owner_gid >= 0 THEN
+                             CASE
+                                WHEN agg.has_gid_conflict = 1 THEN NULL
+                                WHEN agg.distinct_valid_groups > 0 AND agg.common_group != owner_gid THEN NULL
+                                ELSE owner_gid
+                             END
+
+                        -- No direct files (-1) -> inherit from children
+                        ELSE -- owner_gid == -1
+                             CASE
+                                WHEN agg.has_gid_conflict = 1 THEN NULL
+                                WHEN agg.distinct_valid_groups > 1 THEN NULL
+                                WHEN agg.distinct_valid_groups = 1 THEN agg.common_group
+                                ELSE -1 -- Still no group seen
                              END
                     END
                 FROM child_agg AS agg
