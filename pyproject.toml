@@ -48,3 +48,8 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+filterwarnings = [
+    # Ignore SQLAlchemy datetime adapter deprecation warnings in Python 3.12+
+    # These are internal SQLAlchemy issues that will be fixed in future releases
+    "ignore:The default datetime adapter is deprecated:DeprecationWarning:sqlalchemy",
+]
