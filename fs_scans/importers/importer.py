@@ -478,10 +478,7 @@ def pass1_discover_directories(
         - Dictionary mapping full paths to dir_id
         - Metadata dict with total_lines, dir_count, inferred file_count
     """
-    if num_workers > 1:
-        console.print(f"[bold]Pass 1:[/bold] Discovering directories (parallel, {num_workers} workers)...")
-    else:
-        console.print("[bold]Pass 1:[/bold] Discovering directories...")
+    console.print(f"[bold]Pass 1:[/bold] Discovering directories ({num_workers} workers)...")
 
     # Create staging table (parser-agnostic version without inode/fileset_id)
     session.execute(
@@ -524,10 +521,14 @@ def pass1_discover_directories(
             rate = int(line_count / elapsed) if elapsed > 0 else 0
             progress.update(task, dirs=f"{dir_count:,}", rate=f"{rate:,}")
 
-        def process_parsed_dirs(parsed_list: list):
-            """Process a list of parsed directory entries."""
+        def process_parsed_dirs(results):
+            """Process a batch of parsed directory entries from worker."""
             nonlocal dir_count
-            for parsed in parsed_list:
+            if results is None or not results[0]:
+                return
+
+            dir_results, _ = results  # Extract dir_results from tuple
+            for parsed in dir_results:
                 batch.append(
                     {
                         "depth": parsed.path.count("/"),
@@ -550,38 +551,18 @@ def pass1_discover_directories(
                 session.commit()
                 batch = []  # Fresh allocation to release memory
 
-        if num_workers > 1:
-            # Parallel Phase 1a with reader thread
-            line_count = run_parallel_file_processing(
-                input_file=input_file,
-                parser=parser,
-                num_workers=num_workers,
-                chunk_bytes=CHUNK_BYTES,
-                filter_type="dirs",
-                process_results_fn=process_parsed_dirs,
-                progress_callback=update_progress,
-                flush_callback=flush_batch,
-                should_flush_fn=lambda: len(batch) >= BATCH_SIZE,
-            )
-
-        else:
-            # Single-threaded Phase 1a
-            with open_input_file(input_file) as f:
-                for line in f:
-                    line_count += 1
-
-                    parsed = parser.parse_line(line.rstrip("\n"))
-                    if not parsed or not parsed.is_dir:
-                        continue
-
-                    process_parsed_dirs([parsed])
-
-                    if len(batch) >= BATCH_SIZE:
-                        flush_batch()
-                        update_progress()
-
-                    if line_count % progress_interval == 0:
-                        update_progress()
+        # Parallel Phase 1a
+        line_count = run_parallel_file_processing(
+            input_file=input_file,
+            parser=parser,
+            num_workers=num_workers,
+            chunk_bytes=CHUNK_BYTES,
+            filter_type="dirs",
+            process_results_fn=process_parsed_dirs,
+            progress_callback=update_progress,
+            flush_callback=flush_batch,
+            should_flush_fn=lambda: len(batch) >= BATCH_SIZE,
+        )
 
         # Final flush
         flush_batch()
@@ -716,12 +697,9 @@ def pass2a_nonrecursive_stats(
         batch_size: Number of directories to accumulate before flushing
         progress_interval: Report progress every N lines
         total_lines: Total line count from Phase 1 (for determinate progress bar)
-        num_workers: Number of worker processes (1 = single-threaded)
+        num_workers: Number of worker processes
     """
-    if num_workers > 1:
-        console.print(f"\n[bold]Pass 2:[/bold] Accumulating statistics (parallel, {num_workers} workers)...")
-    else:
-        console.print("\n[bold]Pass 2:[/bold] Accumulating statistics...")
+    console.print(f"\n[bold]Pass 2:[/bold] Accumulating statistics ({num_workers} workers)...")
 
     console.print("  [bold]Phase 2a:[/bold] Accumulating non-recursive stats...")
 
@@ -747,7 +725,7 @@ def pass2a_nonrecursive_stats(
 
     def process_results_batch(results):
         """
-        Process a batch of results.
+        Process a batch of results from worker.
         results is a tuple of (dir_results, hist_results) from worker or None
         """
         nonlocal file_count
@@ -757,41 +735,8 @@ def pass2a_nonrecursive_stats(
 
         dir_results, hist_results = results
 
-        # Process directory results
-        if isinstance(dir_results, list):
-            # Fallback for single-threaded or raw ParsedEntry list
-            for parsed in dir_results:
-                file_count += 1
-                # Inline logic replacing accumulate_file_stats_nr
-                parent = os.path.dirname(parsed.path)
-                parent_id = path_to_id.get(parent)
-                if parent_id:
-                    upd = pending_updates[parent_id]
-                    upd["nr_count"] += 1
-                    upd["nr_size"] += parsed.allocated
-                    if parsed.atime:
-                        upd["nr_atime"] = max(upd["nr_atime"], parsed.atime) if upd["nr_atime"] else parsed.atime
-
-                    # FIXED: Changed from parsed.user_id to parsed.uid
-                    if upd["first_uid"] is None:
-                        upd["first_uid"] = parsed.uid
-                    elif upd["first_uid"] != parsed.uid and upd["first_uid"] != -999:
-                        upd["first_uid"] = -999
-
-                # Track histograms for single-threaded mode
-                if scan_date is not None:
-                    uid = parsed.uid
-                    hist = pending_histograms[uid]
-
-                    atime_bucket = classify_atime_bucket(parsed.atime, scan_date)
-                    hist["atime_hist"][atime_bucket] += 1
-                    hist["atime_size"][atime_bucket] += parsed.allocated
-
-                    size_bucket = classify_size_bucket(parsed.allocated)
-                    hist["size_hist"][size_bucket] += 1
-                    hist["size_size"][size_bucket] += parsed.allocated
-
-        elif isinstance(dir_results, dict):
+        # Process directory results (always expect dict from worker)
+        if isinstance(dir_results, dict):
             # Optimized Aggregated Dictionary from Worker
             # Value is tuple: (nr_count, nr_size, nr_atime, first_uid)
             for parent_path, stats_tuple in dir_results.items():
@@ -862,66 +807,19 @@ def pass2a_nonrecursive_stats(
             rate="0",
         )
 
-        if num_workers > 1:
-            # Parallel mode with reader thread
-            line_count = run_parallel_file_processing(
-                input_file=input_file,
-                parser=parser,
-                num_workers=num_workers,
-                chunk_bytes=CHUNK_BYTES,
-                filter_type="files",
-                process_results_fn=process_results_batch,
-                progress_callback=update_progress_bar,
-                flush_callback=do_flush,
-                should_flush_fn=lambda: len(pending_updates) >= batch_size,
-                scan_date=scan_date,
-            )
-
-        else:
-            # Single-threaded mode
-            with open_input_file(input_file) as f:
-                for line in f:
-                    line_count += 1
-
-                    parsed = parser.parse_line(line.rstrip("\n"))
-                    if not parsed or parsed.is_dir:
-                        continue
-
-                    # Single threaded logic (simplified inline)
-                    file_count += 1
-                    parent = os.path.dirname(parsed.path)
-                    parent_id = path_to_id.get(parent)
-                    if parent_id:
-                        upd = pending_updates[parent_id]
-                        upd["nr_count"] += 1
-                        upd["nr_size"] += parsed.allocated
-                        if parsed.atime:
-                            upd["nr_atime"] = max(upd["nr_atime"], parsed.atime) if upd["nr_atime"] else parsed.atime
-
-                        # FIXED: Changed from parsed.user_id to parsed.uid
-                        if upd["first_uid"] is None:
-                            upd["first_uid"] = parsed.uid
-                        elif upd["first_uid"] != parsed.uid and upd["first_uid"] != -999:
-                            upd["first_uid"] = -999
-
-                    # Track histograms
-                    if scan_date is not None:
-                        uid = parsed.uid
-                        hist = pending_histograms[uid]
-
-                        atime_bucket = classify_atime_bucket(parsed.atime, scan_date)
-                        hist["atime_hist"][atime_bucket] += 1
-                        hist["atime_size"][atime_bucket] += parsed.allocated
-
-                        size_bucket = classify_size_bucket(parsed.allocated)
-                        hist["size_hist"][size_bucket] += 1
-                        hist["size_size"][size_bucket] += parsed.allocated
-
-                    if len(pending_updates) >= batch_size:
-                        do_flush()
-
-                    if line_count % progress_interval == 0:
-                        update_progress_bar()
+        # Parallel mode with reader thread
+        line_count = run_parallel_file_processing(
+            input_file=input_file,
+            parser=parser,
+            num_workers=num_workers,
+            chunk_bytes=CHUNK_BYTES,
+            filter_type="files",
+            process_results_fn=process_results_batch,
+            progress_callback=update_progress_bar,
+            flush_callback=do_flush,
+            should_flush_fn=lambda: len(pending_updates) >= batch_size,
+            scan_date=scan_date,
+        )
 
         # Final flush for directory stats
         do_flush()
