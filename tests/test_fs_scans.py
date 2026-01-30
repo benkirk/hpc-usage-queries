@@ -201,8 +201,7 @@ class TestDirectoryQueryBuilder:
         builder = DirectoryQueryBuilder()
         result = builder.with_leaves_only().build()
 
-        assert "NOT EXISTS" in result.sql
-        assert "child.parent_id = d.dir_id" in result.sql
+        assert "s.dir_count_nr = 0" in result.sql
 
     def test_name_patterns_glob(self):
         """Test GLOB name pattern matching."""

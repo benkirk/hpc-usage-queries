@@ -43,7 +43,7 @@ class TestGPFSParser:
     def test_parse_file_line(self):
         """Test parsing a file entry."""
         parser = GPFSParser()
-        line = "<0> 123456 1 0 s=4096 a=4 u=1000 p=-rw-r--r-- ac=2024-01-15 10:30:00 -- /path/to/file.txt"
+        line = "<0> 123456 1 0 s=4096 a=4 u=1000 g=100 p=-rw-r--r-- ac=2024-01-15 10:30:00 -- /path/to/file.txt"
 
         entry = parser.parse_line(line)
 
@@ -52,6 +52,7 @@ class TestGPFSParser:
         assert entry.size == 4096
         assert entry.allocated == 4096  # 4 KB * 1024
         assert entry.uid == 1000
+        assert entry.gid == 100
         assert entry.is_dir is False
         assert entry.atime == datetime(2024, 1, 15, 10, 30, 0)
         assert entry.inode == 123456
@@ -60,7 +61,7 @@ class TestGPFSParser:
     def test_parse_directory_line(self):
         """Test parsing a directory entry."""
         parser = GPFSParser()
-        line = "<0> 789012 2 0 s=4096 a=4 u=2000 p=drwxr-xr-x ac=2024-01-15 12:00:00 -- /path/to/dir"
+        line = "<0> 789012 2 0 s=4096 a=4 u=2000 g=200 p=drwxr-xr-x ac=2024-01-15 12:00:00 -- /path/to/dir"
 
         entry = parser.parse_line(line)
 
@@ -68,12 +69,13 @@ class TestGPFSParser:
         assert entry.path == "/path/to/dir"
         assert entry.is_dir is True
         assert entry.uid == 2000
+        assert entry.gid == 200
 
     def test_parse_line_gpfs_inode_quirk(self):
         """Test GPFS quirk where small files have allocated=0."""
         parser = GPFSParser()
         # Small file with allocated=0 (stored in inode)
-        line = "<0> 123456 1 0 s=512 a=0 u=1000 p=-rw-r--r-- ac=2024-01-15 10:30:00 -- /small.txt"
+        line = "<0> 123456 1 0 s=512 a=0 u=1000 g=100 p=-rw-r--r-- ac=2024-01-15 10:30:00 -- /small.txt"
 
         entry = parser.parse_line(line)
 
@@ -84,7 +86,7 @@ class TestGPFSParser:
     def test_parse_line_no_atime(self):
         """Test parsing line without access time."""
         parser = GPFSParser()
-        line = "<0> 123456 1 0 s=1024 a=1 u=1000 p=-rw-r--r-- -- /path/to/file.txt"
+        line = "<0> 123456 1 0 s=1024 a=1 u=1000 g=100 p=-rw-r--r-- -- /path/to/file.txt"
 
         entry = parser.parse_line(line)
 
@@ -105,11 +107,15 @@ class TestGPFSParser:
         parser = GPFSParser()
 
         # Missing size field
-        line = "<0> 123456 1 0 a=4 u=1000 p=-rw-r--r-- -- /file.txt"
+        line = "<0> 123456 1 0 a=4 u=1000 g=100 p=-rw-r--r-- -- /file.txt"
         assert parser.parse_line(line) is None
 
         # Missing user field
-        line = "<0> 123456 1 0 s=4096 a=4 p=-rw-r--r-- -- /file.txt"
+        line = "<0> 123456 1 0 s=4096 a=4 g=100 p=-rw-r--r-- -- /file.txt"
+        assert parser.parse_line(line) is None
+
+        # Missing group field
+        line = "<0> 123456 1 0 s=4096 a=4 u=1000 p=-rw-r--r-- -- /file.txt"
         assert parser.parse_line(line) is None
 
 
@@ -165,6 +171,7 @@ class TestParsedEntry:
             size=1024,
             allocated=2048,
             uid=1000,
+            gid=100,
             is_dir=False,
             atime=datetime(2024, 1, 15, 10, 30, 0),
             inode=123456,
@@ -175,6 +182,7 @@ class TestParsedEntry:
         assert entry.size == 1024
         assert entry.allocated == 2048
         assert entry.uid == 1000
+        assert entry.gid == 100
         assert entry.is_dir is False
         assert entry.atime == datetime(2024, 1, 15, 10, 30, 0)
         assert entry.inode == 123456
@@ -187,6 +195,7 @@ class TestParsedEntry:
             size=1024,
             allocated=2048,
             uid=1000,
+            gid=100,
             is_dir=True,
             atime=None,
         )
