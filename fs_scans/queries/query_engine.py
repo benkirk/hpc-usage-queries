@@ -585,6 +585,38 @@ def query_owner_summary(
         for row in results
     ]
 
+def resolve_owner_filter(owner_arg: str | None, mine_flag: bool) -> int | None:
+    """Resolve owner filter argument to a UID.
+
+    Args:
+        owner_arg: Owner identifier (UID as string or username)
+        mine_flag: If True, use current user's UID
+
+    Returns:
+        Resolved UID or None if no owner filter specified
+
+    Raises:
+        SystemExit: If username cannot be resolved
+    """
+    if mine_flag:
+        return os.getuid()
+
+    if owner_arg is not None:
+        try:
+            # Try parsing as integer UID
+            return int(owner_arg)
+        except ValueError:
+            # Not an integer, try resolving as username
+            try:
+                return pwd.getpwnam(owner_arg).pw_uid
+            except KeyError:
+                from ..cli.common import console
+                console.print(f"[red]Unknown user: {owner_arg}[/red]")
+                raise SystemExit(1)
+
+    return None
+
+
 def get_username_map(session, uids: list[int]) -> dict[int, str]:
     """
     Get username mappings for a list of UIDs from the user_info table.
