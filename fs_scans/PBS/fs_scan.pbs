@@ -59,7 +59,7 @@ echo && echo ${sep}
 time peak_memusage fs-scans-query
 
 echo && echo ${sep}
-time peak_memusage fs-scans-analyze
+time peak_memusage fs-scans-analyze --access-history
 
 rsync -axv ./*.db ${TOP_DIR}/fs_scans/data/
 
