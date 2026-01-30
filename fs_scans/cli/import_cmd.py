@@ -64,9 +64,9 @@ DynamicHelpCommand = make_dynamic_help_command("fs-scans import")
     "--workers",
     "-w",
     type=int,
-    default=1,
+    default=4,
     show_default=True,
-    help="Number of parallel workers for parsing (1=single-threaded)",
+    help="Number of parallel workers for parsing (minimum 1)",
 )
 @click.option(
     "--echo",

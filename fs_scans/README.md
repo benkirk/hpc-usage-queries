@@ -17,10 +17,15 @@ fs-scans query
 # Query a specific filesystem
 fs-scans query asp --min-size 10GiB -d 4
 
+# Analyze access patterns (instant results)
+fs-scans analyze --access-history
+fs-scans analyze --file-size --owner jsmith
+
 # Get help
 fs-scans -h
 fs-scans import -h
 fs-scans query -h
+fs-scans analyze -h
 ```
 
 ## Overview
@@ -45,7 +50,7 @@ fs_scans/
 │   ├── main.py            # Unified CLI entry point (fs-scans)
 │   ├── import_cmd.py      # Import subcommand
 │   ├── query_cmd.py       # Query subcommand
-│   ├── analyze_cmd.py     # Analyze subcommand (placeholder)
+│   ├── analyze_cmd.py     # Analyze subcommand (histograms)
 │   └── common.py          # Shared CLI utilities (console, formatting, parsing)
 ├── core/                   # Core business logic
 │   ├── models.py          # SQLAlchemy ORM models
@@ -60,7 +65,10 @@ fs_scans/
 │   └── importer.py        # Multi-pass import algorithm
 ├── queries/                # Query engine
 │   ├── query_engine.py    # Query execution and filtering
-│   └── display.py         # Result formatting and display
+│   ├── display.py         # Result formatting and display
+│   ├── access_history.py  # Access time histogram queries
+│   ├── file_size.py       # File size histogram queries
+│   └── histogram_common.py # Shared histogram utilities
 └── wrappers/               # Legacy wrapper scripts (deprecated)
 ```
 
@@ -82,7 +90,7 @@ pip install -e .
 This installs the unified `fs-scans` CLI with three subcommands:
 - `fs-scans import` - Import scan logs into SQLite databases
 - `fs-scans query` - Query directory statistics
-- `fs-scans analyze` - Advanced analytics (coming soon)
+- `fs-scans analyze` - Histogram-based analytics (access patterns, size distributions)
 
 ## Configuration
 
@@ -192,7 +200,7 @@ The importer uses a multi-pass algorithm optimized for large filesystems:
 
 **Pass 1: Directory Discovery** - Identifies all directories and builds a normalized hierarchy in the database using bulk-optimized level-by-level insertion.
 
-**Pass 2a: Non-Recursive Stats** - Re-scans the file to accumulate statistics for each file's direct parent directory only. Optimized with vectorized bulk updates.
+**Pass 2a: Non-Recursive Stats & Histograms** - Re-scans the file to accumulate statistics for each file's direct parent directory only. Simultaneously builds access time and file size histograms per owner. Optimized with vectorized bulk updates.
 
 **Pass 2b: Recursive Aggregation** - Bottom-up SQL aggregation computes recursive stats from non-recursive stats. Uses high-performance `UPDATE ... FROM` with CTEs to aggregate children stats in a single pass per depth level.
 
@@ -266,6 +274,20 @@ The importer creates the following tables:
 **user_info** - UID-to-username cache
 - `uid` - Primary key
 - `username`, `full_name` (GECOS field)
+
+**access_histogram** - Pre-computed access time distribution (10 buckets)
+- `owner_uid`, `bucket_index` - Composite primary key
+- `file_count`, `total_size` - Files and bytes per bucket per owner
+- Enables instant access-age queries without scanning directory_stats
+
+**size_histogram** - Pre-computed file size distribution (10 buckets)
+- `owner_uid`, `bucket_index` - Composite primary key
+- `file_count`, `total_size` - Files and bytes per bucket per owner
+- Enables instant size distribution queries without scanning directory_stats
+
+**Histogram Buckets:**
+- **Access Time** (10 buckets): < 1 Month, 1-3 Months, 3-6 Months, 6-12 Months, 1-2 Years, 2-3 Years, 3-4 Years, 5-6 Years, 6-7 Years, 7+ Years
+- **File Size** (10 buckets): 0-1 KiB, 1-10 KiB, 10-100 KiB, 100 KiB-1 MiB, 1-10 MiB, 10-100 MiB, 100 MiB-1 GiB, 1-10 GiB, 10-100 GiB, 100 GiB+
 
 ---
 
@@ -395,4 +417,174 @@ fs-scans query --data-dir /data/gpfs_scans --summary
 **Name pattern filtering** uses SQLite GLOB (case-sensitive) or LIKE (case-insensitive with `-i`). Patterns with leading wildcards (e.g., `*scratch*`) cannot use indexes and require sequential scans, but size/file-count filters run first to minimize the scan set.
 
 **Mount point normalization:** Path arguments (`-P`/`--path-prefix` and `-E`/`--exclude`) automatically strip known mount point prefixes (`/glade/campaign`, `/gpfs/csfs1`, `/glade/derecho/scratch`, `/lustre/desc1`). This allows users to provide full filesystem paths as they appear on the system, which are then normalized to match the database's stripped paths.
+
+---
+
+### Analyze Command
+
+Generate histogram-based analytics for filesystem usage patterns. The analyze command provides instant insights into file access patterns and size distributions using pre-computed histogram tables.
+
+**Usage:**
+
+```bash
+fs-scans analyze [filesystem] [options]
 ```
+
+The `filesystem` argument is optional and defaults to `all`. Supports two types of analysis:
+- `--access-history` - File distribution by last access time
+- `--file-size` - File distribution by size
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--access-history` | Generate access time distribution histogram |
+| `--file-size` | Generate file size distribution histogram |
+| `-u, --owner TEXT` | Filter to specific owner (UID or username) |
+| `--mine` | Filter to current user's UID |
+| `-P, --path-prefix PATH` | Filter to paths (uses slower fallback computation) |
+| `-d, --min-depth N` | Filter by minimum path depth (uses slower fallback) |
+| `--max-depth N` | Filter by maximum path depth (uses slower fallback) |
+| `--top-n N` | Number of top users to show per bucket (default: 10) |
+| `--data-dir DIR` | Override directory containing database files |
+
+### Performance Characteristics
+
+The analyze command uses **two execution paths** depending on query filters:
+
+**Fast Path (ORM-based, <100ms):**
+- No path or depth filters
+- Uses pre-computed `access_histogram` and `size_histogram` tables
+- Instant results even for 100M+ file filesystems
+
+**Slow Path (On-the-fly computation, 5-30 seconds):**
+- With path filters (`-P`), depth filters (`-d`, `--max-depth`)
+- Computes from `directory_stats` table
+- Shows warning message: `"Note: Path filtering requires on-the-fly computation (slower)"`
+- For `--file-size`: Uses approximate distribution based on directory-level averages
+
+### Examples
+
+```bash
+# Access time distribution (all filesystems, fast path)
+fs-scans analyze --access-history
+
+# Access time for specific filesystem
+fs-scans analyze asp --access-history
+
+# Filter to specific user (fast path)
+fs-scans analyze asp --access-history --owner jsmith
+fs-scans analyze asp --access-history --owner 32455  # By UID
+
+# Current user's data only (fast path)
+fs-scans analyze --access-history --mine
+
+# File size distribution (fast path)
+fs-scans analyze all --file-size
+fs-scans analyze cisl --file-size --owner jdoe
+
+# With path filter (slow path - shows warning)
+fs-scans analyze asp --access-history -P /asp/users
+fs-scans analyze asp --file-size -P /asp/scratch
+
+# Show more users per bucket
+fs-scans analyze --access-history --top-n 20
+```
+
+### Output Format
+
+Both histogram types display:
+1. **Summary table** - Total files and data per bucket with percentages
+2. **Per-user breakdown** - Top-N users for each bucket with their contribution
+
+**Access Time Buckets (10):**
+```
+< 1 Month       - 0-30 days old
+1-3 Months      - 30-90 days old
+3-6 Months      - 90-180 days old
+6-12 Months     - 180-365 days old
+1-2 Years       - 1-2 years old
+2-3 Years       - 2-3 years old
+3-4 Years       - 3-4 years old
+5-6 Years       - 5-6 years old
+6-7 Years       - 6-7 years old
+7+ Years        - 7+ years old
+```
+
+**File Size Buckets (10):**
+```
+0 - 1 KiB       - Tiny files
+1 KiB - 10 KiB
+10 KiB - 100 KiB
+100 KiB - 1 MiB
+1 MiB - 10 MiB
+10 MiB - 100 MiB
+100 MiB - 1 GiB
+1 GiB - 10 GiB
+10 GiB - 100 GiB
+100 GiB+        - Huge files
+```
+
+### Example Output
+
+```
+================================================================================
+Access Time Distribution
+Scan date: 2026-01-11
+Directory: /asp
+Total Files: 10.2 M
+Total Data: 234.4 TiB
+
+Bucket                             Data                         # Files
+================================================================================
+< 1 Month                    1.2 TiB ( 0.50%)           3.9 K ( 0.04%)
+1-3 Months                   2.5 TiB ( 1.05%)          12.5 K ( 0.12%)
+3-6 Months                  25.9 TiB (11.07%)         500.9 K ( 4.93%)
+...
+
+User Data per Bucket               Data                         # Files
+================================================================================
+< 1 Month:                   1.2 TiB                             3.9 K
+   1. jsmith                 1.1 TiB (90.40%)           1.7 K (43.41%)
+   2. jdoe                 114.4 GiB ( 9.60%)           2.2 K (56.15%)
+...
+```
+
+### Use Cases
+
+**Access History Analysis:**
+- Identify cold data for archival or deletion
+- Find data retention policy violations
+- Track data lifecycle patterns
+- Prioritize cleanup efforts by age and size
+
+**File Size Distribution:**
+- Optimize storage tiering strategies
+- Identify storage inefficiencies (many tiny files vs. few huge files)
+- Plan compression strategies (small text files vs. binary blobs)
+- Understand I/O patterns (many small files = metadata-heavy)
+
+### Technical Notes
+
+**Histogram Generation:**
+- Histograms are pre-computed during `fs-scans import` (no performance penalty)
+- Stored in `access_histogram` and `size_histogram` tables
+- Bucket boundaries are fixed and consistent across all scans
+- Per-owner tracking allows user-filtered queries without re-scanning
+
+**Approximation for Path Filters:**
+- File size histograms with path filters use directory-level average file sizes
+- Assumes uniform file sizes within each directory
+- Accurate for homogeneous data (e.g., simulation outputs, image collections)
+- Less accurate for mixed directories (e.g., home directories)
+- Warning displayed: `"Note: Size distribution is approximate for path-filtered queries"`
+
+---
+
+## Development Branch Status
+
+This implementation is on the `histogram` branch. Key commits:
+- `8715c61` - Add histogram collection during filesystem scan import
+- `a1459f1` - Remove single-threaded fallback code from import pipeline
+
+To merge into main, ensure all databases are re-imported to populate histogram tables.

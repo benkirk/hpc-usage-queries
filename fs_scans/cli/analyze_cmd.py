@@ -13,9 +13,11 @@ from ..queries.query_engine import (
     get_all_filesystems,
     get_scan_date,
     normalize_path,
+    resolve_owner_filter,
     resolve_usernames_across_databases,
 )
-from ..queries.access_history import compute_access_history
+from ..queries.access_history import compute_access_history, query_access_histogram_fast
+from ..queries.histogram_common import aggregate_histograms_across_databases
 
 
 # Create DynamicHelpCommand for this tool
@@ -28,6 +30,23 @@ DynamicHelpCommand = make_dynamic_help_command('fs-scans analyze')
     "--access-history",
     is_flag=True,
     help="Generate access history histogram showing data by age",
+)
+@click.option(
+    "--file-size",
+    is_flag=True,
+    help="Generate file size distribution histogram",
+)
+@click.option(
+    "--owner",
+    "-u",
+    "owner_id",
+    type=str,
+    help="Filter to specific owner (UID or username)",
+)
+@click.option(
+    "--mine",
+    is_flag=True,
+    help="Filter to current user's UID",
 )
 @click.option(
     "--path-prefix",
@@ -69,6 +88,9 @@ DynamicHelpCommand = make_dynamic_help_command('fs-scans analyze')
 def analyze_cmd(
     filesystem: str,
     access_history: bool,
+    file_size: bool,
+    owner_id: str | None,
+    mine: bool,
     path_prefixes: tuple[str, ...],
     min_depth: int | None,
     max_depth: int | None,
@@ -85,8 +107,11 @@ def analyze_cmd(
     Examples:
       fs-scans analyze --access-history                 # All filesystems
       fs-scans analyze asp --access-history             # Specific filesystem
-      fs-scans analyze --access-history -P /cisl        # Filter to path
-      fs-scans analyze --access-history -d 4            # Filter by depth
+      fs-scans analyze --access-history --owner jsmith  # Filter to user
+      fs-scans analyze --access-history --mine          # Current user only
+      fs-scans analyze --access-history -P /cisl        # Filter to path (slower)
+      fs-scans analyze --file-size                      # File size distribution
+      fs-scans analyze --file-size --owner jdoe         # Size by user
     """
     # Apply data directory override if provided via CLI
     if data_dir is not None:
@@ -114,9 +139,10 @@ def analyze_cmd(
         return
 
     # Check that at least one analysis option is specified
-    if not access_history:
+    if not access_history and not file_size:
         console.print("[yellow]No analysis option specified.[/yellow]")
         console.print("Try: fs-scans analyze --access-history")
+        console.print("     fs-scans analyze --file-size")
         console.print("Use --help for more options")
         return
 
@@ -135,8 +161,18 @@ def analyze_cmd(
             raise SystemExit(1)
         filesystems = [filesystem]
 
+    # Resolve owner filter
+    resolved_owner_uid = resolve_owner_filter(owner_id, mine)
+
     # Normalize path arguments (strip mount point prefixes)
     normalized_path_prefixes = [normalize_path(p) for p in path_prefixes] if path_prefixes else None
+
+    # Determine if we can use ORM fast path (no path/depth filters)
+    use_orm_histogram = (
+        not normalized_path_prefixes and
+        not min_depth and
+        not max_depth
+    )
 
     # Process access history - combine all filesystems into single histogram
     if access_history:
@@ -175,54 +211,190 @@ def analyze_cmd(
                 console.print(f"[dim]Scan dates range from {unique_dates[0]} to {unique_dates[-1]}[/dim]")
                 console.print(f"[dim]Using {reference_scan_date.date()} as reference for age calculations[/dim]")
 
-        # Create a single combined histogram
-        from ..queries.access_history import AccessHistogram
-        combined_histogram = AccessHistogram(reference_scan_date)
+        if use_orm_histogram:
+            # Fast path: Use pre-computed histogram ORM tables
+            combined_histogram, username_map = aggregate_histograms_across_databases(
+                filesystems=filesystems,
+                histogram_type="access",
+                owner_uid=resolved_owner_uid,
+            )
 
-        # Process each filesystem and merge into combined histogram
-        all_uids = set()
+            # Display results using HistogramData format_output
+            output = combined_histogram.format_output(
+                title="Access Time Distribution",
+                directory=display_dir,
+                username_map=username_map,
+                top_n=top_n,
+            )
+            console.print(output)
+            console.print()
+
+        else:
+            # Slow path: Compute from directory_stats (needed for path filters)
+            console.print("[yellow]Note: Path filtering requires on-the-fly computation (slower)[/yellow]")
+            console.print()
+
+            # Create a single combined histogram
+            from ..queries.access_history import AccessHistogram
+            combined_histogram = AccessHistogram(reference_scan_date)
+
+            # Process each filesystem and merge into combined histogram
+            all_uids = set()
+            for fs in filesystems:
+                session = get_session(fs)
+                try:
+                    # Get scan date for this filesystem
+                    scan_date = get_scan_date(session)
+                    if not scan_date:
+                        console.print(f"[yellow]Warning: No scan date found for {fs}, skipping[/yellow]")
+                        continue
+
+                    # Compute access history for this filesystem
+                    fs_histogram = compute_access_history(
+                        session,
+                        scan_date,
+                        path_prefixes=normalized_path_prefixes,
+                        min_depth=min_depth,
+                        max_depth=max_depth,
+                    )
+
+                    # Merge into combined histogram
+                    combined_histogram.total_data += fs_histogram.total_data
+                    combined_histogram.total_files += fs_histogram.total_files
+
+                    for bucket_label in combined_histogram.buckets.keys():
+                        fs_bucket = fs_histogram.buckets[bucket_label]
+                        combined_bucket = combined_histogram.buckets[bucket_label]
+
+                        combined_bucket["data"] += fs_bucket["data"]
+                        combined_bucket["files"] += fs_bucket["files"]
+
+                        # Merge owner stats
+                        for uid, stats in fs_bucket["owners"].items():
+                            combined_bucket["owners"][uid]["data"] += stats["data"]
+                            combined_bucket["owners"][uid]["files"] += stats["files"]
+                            all_uids.add(uid)
+
+                finally:
+                    session.close()
+
+            # Resolve usernames from all databases
+            username_map = resolve_usernames_across_databases(all_uids, filesystems)
+
+            # Display combined results
+            output = combined_histogram.format_output(display_dir, username_map, top_n)
+            console.print(output)
+            console.print()
+
+    # Process file size histogram
+    if file_size:
+        # Determine directory for display
+        if normalized_path_prefixes:
+            display_dir = normalized_path_prefixes[0] if len(normalized_path_prefixes) == 1 else "Multiple paths"
+        elif len(filesystems) == 1:
+            display_dir = f"/{filesystems[0]}"
+        else:
+            display_dir = "All filesystems"
+
+        # Collect scan dates
+        scan_dates = []
         for fs in filesystems:
             session = get_session(fs)
             try:
-                # Get scan date for this filesystem
                 scan_date = get_scan_date(session)
-                if not scan_date:
-                    console.print(f"[yellow]Warning: No scan date found for {fs}, skipping[/yellow]")
-                    continue
-
-                # Compute access history for this filesystem
-                fs_histogram = compute_access_history(
-                    session,
-                    scan_date,
-                    path_prefixes=normalized_path_prefixes,
-                    min_depth=min_depth,
-                    max_depth=max_depth,
-                )
-
-                # Merge into combined histogram
-                combined_histogram.total_data += fs_histogram.total_data
-                combined_histogram.total_files += fs_histogram.total_files
-
-                for bucket_label in combined_histogram.buckets.keys():
-                    fs_bucket = fs_histogram.buckets[bucket_label]
-                    combined_bucket = combined_histogram.buckets[bucket_label]
-
-                    combined_bucket["data"] += fs_bucket["data"]
-                    combined_bucket["files"] += fs_bucket["files"]
-
-                    # Merge owner stats
-                    for uid, stats in fs_bucket["owners"].items():
-                        combined_bucket["owners"][uid]["data"] += stats["data"]
-                        combined_bucket["owners"][uid]["files"] += stats["files"]
-                        all_uids.add(uid)
-
+                if scan_date:
+                    scan_dates.append(scan_date)
             finally:
                 session.close()
 
-        # Resolve usernames from all databases
-        username_map = resolve_usernames_across_databases(all_uids, filesystems)
+        if not scan_dates:
+            console.print("[yellow]Warning: No scan dates found in any database[/yellow]")
+            return
 
-        # Display combined results
-        output = combined_histogram.format_output(display_dir, username_map, top_n)
-        console.print(output)
-        console.print()
+        # Use the most recent scan date for reference
+        reference_scan_date = max(scan_dates)
+
+        # Show scan date info
+        if len(filesystems) > 1:
+            unique_dates = sorted(set(d.date() for d in scan_dates))
+            if len(unique_dates) == 1:
+                console.print(f"[dim]Scan date: {unique_dates[0]}[/dim]")
+            else:
+                console.print(f"[dim]Scan dates range from {unique_dates[0]} to {unique_dates[-1]}[/dim]")
+
+        if use_orm_histogram:
+            # Fast path: Use pre-computed histogram ORM tables
+            combined_histogram, username_map = aggregate_histograms_across_databases(
+                filesystems=filesystems,
+                histogram_type="size",
+                owner_uid=resolved_owner_uid,
+            )
+
+            # Display results using HistogramData format_output
+            output = combined_histogram.format_output(
+                title="File Size Distribution",
+                directory=display_dir,
+                username_map=username_map,
+                top_n=top_n,
+            )
+            console.print(output)
+            console.print()
+
+        else:
+            # Slow path: Approximate from directory_stats (needed for path filters)
+            console.print("[yellow]Note: Size distribution is approximate for path-filtered queries[/yellow]")
+            console.print()
+
+            from ..importers.importer import SIZE_BUCKETS
+            from ..queries.histogram_common import HistogramData
+            from ..queries.file_size import compute_size_histogram_from_directory_stats
+
+            # Get bucket labels
+            bucket_labels = [label for label, _, _ in SIZE_BUCKETS]
+
+            # Create combined histogram
+            combined_histogram = HistogramData(bucket_labels, reference_scan_date)
+
+            # Process each filesystem and merge
+            all_uids = set()
+            for fs in filesystems:
+                session = get_session(fs)
+                try:
+                    # Get scan date for this filesystem
+                    scan_date = get_scan_date(session)
+                    if not scan_date:
+                        console.print(f"[yellow]Warning: No scan date found for {fs}, skipping[/yellow]")
+                        continue
+
+                    # Compute size histogram for this filesystem
+                    fs_histogram = compute_size_histogram_from_directory_stats(
+                        session,
+                        scan_date,
+                        path_prefixes=normalized_path_prefixes,
+                        min_depth=min_depth,
+                        max_depth=max_depth,
+                        owner_uid=resolved_owner_uid,
+                    )
+
+                    # Merge into combined histogram
+                    for bucket_label, owner_data in fs_histogram.items():
+                        for uid, (file_count, total_size) in owner_data.items():
+                            combined_histogram.add_bucket_data(bucket_label, uid, file_count, total_size)
+                            if uid is not None and uid >= 0:
+                                all_uids.add(uid)
+
+                finally:
+                    session.close()
+
+            # Resolve usernames from all databases
+            username_map = resolve_usernames_across_databases(all_uids, filesystems)
+
+            # Display combined results
+            output = combined_histogram.format_output(
+                title="File Size Distribution (Approximate)",
+                directory=display_dir,
+                username_map=username_map,
+                top_n=top_n,
+            )
+            console.print(output)
+            console.print()

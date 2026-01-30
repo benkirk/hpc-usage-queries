@@ -9,20 +9,14 @@ from collections import defaultdict
 from typing import Any
 
 from ..cli.common import format_size
+from ..importers.importer import ATIME_BUCKETS
 
 
 class AccessHistogram:
     """Builds and formats access history histogram data."""
 
-    # Time bucket definitions (in days from scan date)
-    BUCKETS = [
-        ("< 1 Month", 30),
-        ("1 Month", 30 * 6),  # 1-6 months
-        ("6 Months", 365),    # 6-12 months
-        ("1 Year", 365 * 3),  # 1-3 years
-        ("3 Years", 365 * 5), # 3-5 years
-        ("5+ Years", None),   # 5+ years
-    ]
+    # Time bucket definitions (in days from scan date) - now uses 10 buckets from importer
+    BUCKETS = ATIME_BUCKETS
 
     def __init__(self, scan_date: datetime):
         """Initialize histogram with scan date.
@@ -302,5 +296,71 @@ def compute_access_history(
                     atime_nr = None
 
             histogram.add_directory(size_nr, files_nr, atime_nr, owner_uid)
+
+    return histogram
+
+
+def query_access_histogram_fast(
+    session,
+    owner_uid: int | None = None,
+) -> AccessHistogram:
+    """Query pre-computed access histogram from ORM tables (fast path).
+
+    This function uses the AccessHistogram ORM table populated during import
+    for instant query performance.
+
+    Args:
+        session: SQLAlchemy database session
+        owner_uid: Optional owner UID filter
+
+    Returns:
+        AccessHistogram with data from ORM tables
+    """
+    from sqlalchemy import text
+    from ..queries.query_engine import get_scan_date
+
+    # Get scan date for histogram initialization
+    scan_date = get_scan_date(session)
+    if not scan_date:
+        # Fallback to current date if scan date not found
+        scan_date = datetime.now()
+
+    histogram = AccessHistogram(scan_date)
+
+    # Build query with optional owner filter
+    owner_filter = ""
+    params = {}
+    if owner_uid is not None:
+        owner_filter = "WHERE owner_uid = :owner_uid"
+        params["owner_uid"] = owner_uid
+
+    query = f"""
+        SELECT bucket_index, owner_uid, file_count, total_size
+        FROM access_histogram
+        {owner_filter}
+        ORDER BY bucket_index, owner_uid
+    """
+
+    results = session.execute(text(query), params).fetchall()
+
+    # Populate histogram from ORM data
+    for bucket_idx, uid, file_count, total_size in results:
+        # Map bucket index to label
+        if 0 <= bucket_idx < len(ATIME_BUCKETS):
+            bucket_label = ATIME_BUCKETS[bucket_idx][0]
+
+            # Add to appropriate bucket
+            bucket = histogram.buckets[bucket_label]
+            bucket["data"] += total_size
+            bucket["files"] += file_count
+
+            # Track by owner
+            if uid is not None and uid >= 0:
+                bucket["owners"][uid]["data"] += total_size
+                bucket["owners"][uid]["files"] += file_count
+
+            # Update totals
+            histogram.total_data += total_size
+            histogram.total_files += file_count
 
     return histogram

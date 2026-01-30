@@ -3,8 +3,6 @@
 This module provides the query interface for the unified fs-scans CLI.
 """
 
-import os
-import pwd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -27,6 +25,7 @@ from ..queries.query_engine import (
     query_directories,
     query_owner_summary,
     query_single_filesystem,
+    resolve_owner_filter,
     resolve_usernames_across_databases,
 )
 from ..queries.display import (
@@ -273,19 +272,7 @@ def query_cmd(
         return
 
     # Resolve owner_id: can be UID (int) or username (string)
-    resolved_owner_id: int | None = None
-    if mine:
-        resolved_owner_id = os.getuid()
-    elif owner_id is not None:
-        try:
-            resolved_owner_id = int(owner_id)
-        except ValueError:
-            # Not an integer, try to resolve as username
-            try:
-                resolved_owner_id = pwd.getpwnam(owner_id).pw_uid
-            except KeyError:
-                console.print(f"[red]Unknown user: {owner_id}[/red]")
-                raise SystemExit(1)
+    resolved_owner_id = resolve_owner_filter(owner_id, mine)
 
     # Determine which filesystems to query
     if filesystem.lower() == "all":
