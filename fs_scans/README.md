@@ -35,10 +35,11 @@ These tools process GPFS scan logs and aggregate statistics at the directory lev
 | Metric | Non-Recursive | Recursive |
 |--------|---------------|-----------|
 | File count | Direct children only | All descendants |
+| Directory count | Direct children only | All descendants |
 | Total size | Direct children only | All descendants |
 | Max access time | Direct children only | All descendants |
 
-Additionally, it tracks **single-owner directories** - directories where all recursive contents share a single owner (user_id).
+Additionally, it tracks **single-owner directories** - directories where all recursive contents share a single owner (UID) and **single-group directories** - directories where all recursive contents share a single group (GID).
 
 ## Project Structure
 
@@ -130,10 +131,11 @@ The parser expects GPFS policy scan output with lines in this format:
 Key fields extracted:
 - `s=` FILE_SIZE (bytes)
 - `u=` USER_ID (numeric)
+- `g=` GROUP_ID (numeric)
 - `p=` permissions (first char: `-`=file, `d`=directory)
 - `ac=` ACCESS_TIME (timestamp)
 
-Directory entries are skipped; only files contribute to statistics.
+Files contribute to file count, size, and access time statistics. Directories contribute to directory count statistics.
 
 ## Available Data Files
 
@@ -200,9 +202,9 @@ The importer uses a multi-pass algorithm optimized for large filesystems:
 
 **Pass 1: Directory Discovery** - Identifies all directories and builds a normalized hierarchy in the database using bulk-optimized level-by-level insertion.
 
-**Pass 2a: Non-Recursive Stats & Histograms** - Re-scans the file to accumulate statistics for each file's direct parent directory only. Simultaneously builds access time and file size histograms per owner. Optimized with vectorized bulk updates.
+**Pass 2a: Non-Recursive Stats & Histograms** - Re-scans the file to accumulate statistics for each entry's direct parent directory. Files contribute to file counts, sizes, and histograms; directories contribute to directory counts. Simultaneously builds access time and file size histograms per owner (files only). Optimized with vectorized bulk updates.
 
-**Pass 2b: Recursive Aggregation** - Bottom-up SQL aggregation computes recursive stats from non-recursive stats. Uses high-performance `UPDATE ... FROM` with CTEs to aggregate children stats in a single pass per depth level.
+**Pass 2b: Recursive Aggregation** - Bottom-up SQL aggregation computes recursive stats (file counts, directory counts, sizes, access times, owner UID/GID) from non-recursive stats. Uses high-performance `UPDATE ... FROM` with CTEs to aggregate children stats in a single pass per depth level.
 
 **Pass 3: Summary Tables** - Populates auxiliary tables for fast queries:
 - **Phase 3a**: Resolves UIDs to usernames via `pwd.getpwuid()` and stores in `user_info` table
@@ -256,9 +258,11 @@ The importer creates the following tables:
 **directory_stats** - Aggregated statistics per directory
 - `dir_id` - Foreign key to directories
 - `file_count_nr` / `file_count_r` - Non-recursive / recursive file counts
+- `dir_count_nr` / `dir_count_r` - Non-recursive / recursive directory counts
 - `total_size_nr` / `total_size_r` - Non-recursive / recursive sizes
 - `max_atime_nr` / `max_atime_r` - Non-recursive / recursive max access times
-- `owner_uid` - Single owner UID (NULL if multiple owners)
+- `owner_uid` - Single owner UID (NULL if multiple owners, -1 if no files)
+- `owner_gid` - Single group GID (NULL if multiple groups, -1 if no files)
 
 **scan_metadata** - Scan provenance and totals
 - `scan_id` - Primary key
@@ -329,7 +333,7 @@ The `filesystem` argument is optional and defaults to `all`, which queries all a
 | `--accessed-before DATE` | Filter to max_atime_r before date (YYYY-MM-DD or Nyrs/Nmo) |
 | `--accessed-after DATE` | Filter to max_atime_r after date (YYYY-MM-DD or Nyrs/Nmo) |
 | `-v, --verbose` | Show additional columns (Depth) |
-| `--leaves-only` | Only show leaf directories (no subdirectories) |
+| `--leaves-only` | Only show leaf directories (dir_count_nr = 0) |
 | `--show-total` | Show totals row at bottom of results |
 | `--dir-counts` | Show directory counts (Dirs and Dirs(NR) columns) |
 | `--summary` | Show database summary only |

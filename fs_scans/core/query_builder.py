@@ -54,6 +54,9 @@ class DirectoryQueryBuilder:
             "files": "s.file_count_r DESC",
             "files_r": "s.file_count_r DESC",
             "files_nr": "s.file_count_nr DESC",
+            "dirs": "s.dir_count_r DESC",
+            "dirs_r": "s.dir_count_r DESC",
+            "dirs_nr": "s.dir_count_nr DESC",
             "atime": "s.max_atime_r DESC",
             "atime_r": "s.max_atime_r DESC",
             "path": "d.depth ASC, d.name ASC",
@@ -105,6 +108,30 @@ class DirectoryQueryBuilder:
         self._params["owner_id"] = owner_id
         return self
 
+    def with_single_group(self) -> "DirectoryQueryBuilder":
+        """Filter to single-group directories only.
+
+        Excludes directories with NULL or -1 owner_gid.
+
+        Returns:
+            self for chaining
+        """
+        self._conditions.append("s.owner_gid IS NOT NULL AND s.owner_gid != -1")
+        return self
+
+    def with_group(self, group_id: int) -> "DirectoryQueryBuilder":
+        """Filter to specific group GID.
+
+        Args:
+            group_id: The group GID to filter by
+
+        Returns:
+            self for chaining
+        """
+        self._conditions.append("s.owner_gid = :group_id")
+        self._params["group_id"] = group_id
+        return self
+
     def with_accessed_before(self, dt: datetime) -> "DirectoryQueryBuilder":
         """Filter to directories with max_atime_r before date.
 
@@ -137,9 +164,7 @@ class DirectoryQueryBuilder:
         Returns:
             self for chaining
         """
-        self._conditions.append(
-            "NOT EXISTS (SELECT 1 FROM directories child WHERE child.parent_id = d.dir_id)"
-        )
+        self._conditions.append("s.dir_count_nr = 0")
         return self
 
     def with_name_patterns(
@@ -211,6 +236,26 @@ class DirectoryQueryBuilder:
         if max_files is not None:
             self._conditions.append("s.file_count_r <= :max_files")
             self._params["max_files"] = max_files
+        return self
+
+    def with_dir_count_range(
+        self, min_dirs: int | None = None, max_dirs: int | None = None
+    ) -> "DirectoryQueryBuilder":
+        """Filter by recursive directory count range.
+
+        Args:
+            min_dirs: Minimum dir_count_r (inclusive)
+            max_dirs: Maximum dir_count_r (inclusive)
+
+        Returns:
+            self for chaining
+        """
+        if min_dirs is not None:
+            self._conditions.append("s.dir_count_r >= :min_dirs")
+            self._params["min_dirs"] = min_dirs
+        if max_dirs is not None:
+            self._conditions.append("s.dir_count_r <= :max_dirs")
+            self._params["max_dirs"] = max_dirs
         return self
 
     def with_path_prefix_ids(self, ancestor_ids: list[int]) -> "DirectoryQueryBuilder":
@@ -287,9 +332,9 @@ class DirectoryQueryBuilder:
         if self._use_descendants_cte:
             select_clause = """
                 SELECT d.dir_id, d.parent_id, d.name, d.depth,
-                       s.file_count_nr, s.total_size_nr, s.max_atime_nr,
-                       s.file_count_r, s.total_size_r, s.max_atime_r,
-                       s.owner_uid
+                       s.file_count_nr, s.total_size_nr, s.max_atime_nr, s.dir_count_nr,
+                       s.file_count_r, s.total_size_r, s.max_atime_r, s.dir_count_r,
+                       s.owner_uid, s.owner_gid
                 FROM descendants
                 JOIN directories d USING (dir_id)
                 JOIN directory_stats s USING (dir_id)
@@ -297,9 +342,9 @@ class DirectoryQueryBuilder:
         else:
             select_clause = """
                 SELECT d.dir_id, d.parent_id, d.name, d.depth,
-                       s.file_count_nr, s.total_size_nr, s.max_atime_nr,
-                       s.file_count_r, s.total_size_r, s.max_atime_r,
-                       s.owner_uid
+                       s.file_count_nr, s.total_size_nr, s.max_atime_nr, s.dir_count_nr,
+                       s.file_count_r, s.total_size_r, s.max_atime_r, s.dir_count_r,
+                       s.owner_uid, s.owner_gid
                 FROM directories d
                 JOIN directory_stats s USING (dir_id)
             """
