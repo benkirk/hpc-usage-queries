@@ -163,3 +163,57 @@ class UserInfo(Base):
 
     def __repr__(self):
         return f"<UserInfo(uid={self.uid}, username='{self.username}')>"
+
+
+class AccessHistogram(Base):
+    """Pre-computed access time histogram per user.
+
+    Stores file count and total allocated size for each atime bucket per UID.
+    Enables instant access history queries without scanning directory_stats.
+    """
+
+    __tablename__ = "access_histogram"
+
+    owner_uid = Column(Integer, primary_key=True)
+    bucket_index = Column(Integer, primary_key=True)  # 0-9 (maps to ATIME_BUCKETS)
+
+    file_count = Column(BigInteger, default=0)
+    total_size = Column(BigInteger, default=0)  # allocated bytes
+
+    __table_args__ = (
+        Index("ix_access_hist_uid", "owner_uid"),
+        Index("ix_access_hist_bucket", "bucket_index"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<AccessHistogram(owner_uid={self.owner_uid}, "
+            f"bucket_index={self.bucket_index}, file_count={self.file_count})>"
+        )
+
+
+class SizeHistogram(Base):
+    """Pre-computed file size histogram per user.
+
+    Stores file count and total allocated size for each size bucket per UID.
+    Enables analysis of file size distributions per user.
+    """
+
+    __tablename__ = "size_histogram"
+
+    owner_uid = Column(Integer, primary_key=True)
+    bucket_index = Column(Integer, primary_key=True)  # 0-9 (maps to SIZE_BUCKETS)
+
+    file_count = Column(BigInteger, default=0)
+    total_size = Column(BigInteger, default=0)  # allocated bytes
+
+    __table_args__ = (
+        Index("ix_size_hist_uid", "owner_uid"),
+        Index("ix_size_hist_bucket", "bucket_index"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<SizeHistogram(owner_uid={self.owner_uid}, "
+            f"bucket_index={self.bucket_index}, file_count={self.file_count})>"
+        )

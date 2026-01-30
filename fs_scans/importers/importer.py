@@ -43,8 +43,92 @@ from ..core.database import (
     set_data_dir,
     drop_tables,
 )
-from ..core.models import Directory, DirectoryStats, OwnerSummary, ScanMetadata, UserInfo
+from ..core.models import (
+    AccessHistogram,
+    Directory,
+    DirectoryStats,
+    OwnerSummary,
+    ScanMetadata,
+    SizeHistogram,
+    UserInfo,
+)
 from ..parsers.base import FilesystemParser
+
+
+# Histogram Bucket Definitions
+
+# Access Time Histogram (10 buckets)
+# Tracks file distribution by last access time relative to scan date
+ATIME_BUCKETS = [
+    ("< 1 Month", 30),           # 0-30 days
+    ("1-3 Months", 90),          # 30-90 days
+    ("3-6 Months", 180),         # 90-180 days
+    ("6-12 Months", 365),        # 180-365 days
+    ("1-2 Years", 730),          # 1-2 years
+    ("2-3 Years", 1095),         # 2-3 years
+    ("3-4 Years", 1460),         # 3-4 years
+    ("5-6 Years", 2190),         # 5-6 years
+    ("6-7 Years", 2555),         # 6-7 years
+    ("7+ Years", None),          # 7+ years
+]
+
+# Size Histogram (10 buckets)
+# Logarithmic scale covering practical file size ranges
+SIZE_BUCKETS = [
+    ("0 - 1 KiB", 0, 1024),
+    ("1 KiB - 10 KiB", 1024, 10 * 1024),
+    ("10 KiB - 100 KiB", 10 * 1024, 100 * 1024),
+    ("100 KiB - 1 MiB", 100 * 1024, 1024 * 1024),
+    ("1 MiB - 10 MiB", 1024 * 1024, 10 * 1024 * 1024),
+    ("10 MiB - 100 MiB", 10 * 1024 * 1024, 100 * 1024 * 1024),
+    ("100 MiB - 1 GiB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
+    ("1 GiB - 10 GiB", 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    ("10 GiB - 100 GiB", 10 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024),
+    ("100 GiB+", 100 * 1024 * 1024 * 1024, None),
+]
+
+
+def classify_atime_bucket(atime: datetime | None, scan_date: datetime) -> int:
+    """Classify file's access time into histogram bucket.
+
+    Args:
+        atime: File's last access time
+        scan_date: Scan timestamp (extracted from filename)
+
+    Returns:
+        Bucket index (0-9)
+    """
+    if atime is None:
+        return len(ATIME_BUCKETS) - 1  # Default to oldest bucket
+
+    days_old = (scan_date - atime).days
+
+    for idx, (_, max_days) in enumerate(ATIME_BUCKETS):
+        if max_days is None:  # Last bucket (7+ years)
+            return idx
+        if days_old < max_days:
+            return idx
+
+    return len(ATIME_BUCKETS) - 1  # Fallback to oldest bucket
+
+
+def classify_size_bucket(size_bytes: int) -> int:
+    """Classify file size into histogram bucket.
+
+    Args:
+        size_bytes: File size in bytes (allocated size)
+
+    Returns:
+        Bucket index (0-9)
+    """
+    for idx, (_, min_size, max_size) in enumerate(SIZE_BUCKETS):
+        if max_size is None:  # Last bucket (100 GiB+)
+            if size_bytes >= min_size:
+                return idx
+        elif min_size <= size_bytes < max_size:
+            return idx
+
+    return len(SIZE_BUCKETS) - 1  # Fallback to largest bucket
 
 
 def open_input_file(filepath: Path) -> TextIO:
@@ -53,24 +137,25 @@ def open_input_file(filepath: Path) -> TextIO:
     return open(filepath, "r", encoding="utf-8", errors="replace", buffering=8 * 1024 * 1024)
 
 
-def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser]) -> tuple[Any, int]:
+def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime | None]) -> tuple[Any, Any, int]:
     """
     Worker function to parse a chunk of lines using the provided parser.
 
     Args:
-        args: Tuple of (lines_chunk, filter_type, parser)
+        args: Tuple of (lines_chunk, filter_type, parser, scan_date)
 
     Returns:
-        Tuple of (results, count of lines processed)
-        - If filter_type="files": results is dict[parent_path, stats] (Aggregated)
-        - If filter_type="dirs"/"all": results is list[ParsedEntry] (Raw)
+        Tuple of (dir_results, hist_results, count of lines processed)
+        - If filter_type="files": dir_results is dict[parent_path, stats], hist_results is dict[uid, histograms]
+        - If filter_type="dirs"/"all": dir_results is list[ParsedEntry], hist_results is None
     """
-    chunk, filter_type, parser = args
+    chunk, filter_type, parser, scan_date = args
 
     if filter_type == "files":
         # Map-Reduce Optimization: Aggregate stats locally in worker
         # This reduces IPC traffic and main thread load by ~1000x
         results = {}
+        hist_results = {}
 
         for line in chunk:
             parsed = parser.parse_line(line.rstrip("\n"))
@@ -104,13 +189,42 @@ def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser]) -> tuple[
                 elif s_uid != -999 and s_uid != p_uid:
                     stats["first_uid"] = -999
 
-        # Optimize IPC payload: dict of tuples
-        # (nr_count, nr_size, nr_atime, first_uid)
+                # NEW: Track histograms per UID
+                uid = parsed.uid
+                if uid not in hist_results:
+                    hist_results[uid] = {
+                        "atime_hist": [0] * 10,  # file counts per atime bucket
+                        "size_hist": [0] * 10,   # file counts per size bucket
+                        "atime_size": [0] * 10,  # total bytes per atime bucket
+                        "size_size": [0] * 10,   # total bytes per size bucket
+                    }
+
+                hist = hist_results[uid]
+
+                # Classify and update histograms
+                atime_bucket = classify_atime_bucket(parsed.atime, scan_date) if scan_date else 9
+                hist["atime_hist"][atime_bucket] += 1
+                hist["atime_size"][atime_bucket] += parsed.allocated
+
+                size_bucket = classify_size_bucket(parsed.allocated)
+                hist["size_hist"][size_bucket] += 1
+                hist["size_size"][size_bucket] += parsed.allocated
+
+        # Optimize IPC payload: convert dicts to tuples
+        # Directory stats: (nr_count, nr_size, nr_atime, first_uid)
         final_results = {
             k: (v["nr_count"], v["nr_size"], v["nr_atime"], v["first_uid"])
             for k, v in results.items()
         }
-        return final_results, len(chunk)
+
+        # Histogram stats: (atime_hist, size_hist, atime_size, size_size)
+        final_hist_results = {
+            uid: (hist["atime_hist"], hist["size_hist"],
+                  hist["atime_size"], hist["size_size"])
+            for uid, hist in hist_results.items()
+        }
+
+        return final_results, final_hist_results, len(chunk)
 
     else:
         # Standard behavior for Pass 1 (Dirs)
@@ -124,7 +238,7 @@ def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser]) -> tuple[
                     results.append(parsed)
                 elif filter_type == "files" and not parsed.is_dir:
                     results.append(parsed)  # Fallback if ever needed
-        return results, len(chunk)
+        return results, None, len(chunk)
 
 
 def chunk_file_generator(filepath: Path, chunk_bytes: int) -> Generator[list[str], None, None]:
@@ -147,6 +261,7 @@ def run_parallel_file_processing(
     progress_callback: Callable[[int], None] | None = None,
     flush_callback: Callable[[], None] | None = None,
     should_flush_fn: Callable[[], bool] | None = None,
+    scan_date: datetime | None = None,
 ) -> int:
     """
     Generic parallel file processor for Phase 1a and Phase 2a.
@@ -163,6 +278,7 @@ def run_parallel_file_processing(
         progress_callback: Optional callback receiving estimated line count
         flush_callback: Optional callback to flush accumulated data
         should_flush_fn: Optional function that returns True if flush needed
+        scan_date: Scan timestamp (needed for histogram classification in filter_type="files")
 
     Returns:
         Total line count
@@ -172,16 +288,16 @@ def run_parallel_file_processing(
     # Generator for pool arguments
     def args_generator():
         for chunk in chunk_file_generator(input_file, chunk_bytes):
-            yield (chunk, filter_type, parser)
+            yield (chunk, filter_type, parser, scan_date)
 
     # Use a Pool to manage workers automatically
     with mp.Pool(processes=num_workers) as pool:
         # imap_unordered allows processing results as soon as they are ready
-        for results, lines_in_chunk in pool.imap_unordered(_worker_parse_chunk, args_generator(), chunksize=1):
+        for dir_results, hist_results, lines_in_chunk in pool.imap_unordered(_worker_parse_chunk, args_generator(), chunksize=1):
             total_lines += lines_in_chunk
 
-            if results:
-                process_results_fn(results)
+            if dir_results or hist_results:
+                process_results_fn((dir_results, hist_results))
 
             if should_flush_fn and should_flush_fn() and flush_callback:
                 flush_callback()
@@ -281,6 +397,57 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
         """),
         params_batch,
     )
+
+    session.commit()
+
+
+def flush_histograms(session, pending_histograms: dict) -> None:
+    """
+    Bulk insert accumulated histograms to database.
+
+    Args:
+        session: SQLAlchemy session
+        pending_histograms: Dictionary of uid -> histogram data
+    """
+    if not pending_histograms:
+        return
+
+    atime_inserts = []
+    size_inserts = []
+
+    for uid, hist in pending_histograms.items():
+        # Access time histogram (10 rows per UID)
+        for bucket_idx in range(10):
+            if hist["atime_hist"][bucket_idx] > 0:  # skip empty buckets
+                atime_inserts.append({
+                    "owner_uid": uid,
+                    "bucket_index": bucket_idx,
+                    "file_count": hist["atime_hist"][bucket_idx],
+                    "total_size": hist["atime_size"][bucket_idx],
+                })
+
+        # Size histogram (10 rows per UID)
+        for bucket_idx in range(10):
+            if hist["size_hist"][bucket_idx] > 0:  # skip empty buckets
+                size_inserts.append({
+                    "owner_uid": uid,
+                    "bucket_index": bucket_idx,
+                    "file_count": hist["size_hist"][bucket_idx],
+                    "total_size": hist["size_size"][bucket_idx],
+                })
+
+    # Bulk insert using executemany for performance
+    if atime_inserts:
+        session.execute(
+            AccessHistogram.__table__.insert(),
+            atime_inserts
+        )
+
+    if size_inserts:
+        session.execute(
+            SizeHistogram.__table__.insert(),
+            size_inserts
+        )
 
     session.commit()
 
@@ -528,6 +695,7 @@ def pass2a_nonrecursive_stats(
     parser: FilesystemParser,
     session,
     path_to_id: dict[str, int],
+    scan_date: datetime | None = None,
     batch_size: int = 10000,
     progress_interval: int = 1_000_000,
     total_lines: int | None = None,
@@ -544,6 +712,7 @@ def pass2a_nonrecursive_stats(
         parser: Filesystem parser instance
         session: SQLAlchemy session
         path_to_id: Dictionary mapping full paths to dir_id
+        scan_date: Scan timestamp (for histogram classification)
         batch_size: Number of directories to accumulate before flushing
         progress_interval: Report progress every N lines
         total_lines: Total line count from Phase 1 (for determinate progress bar)
@@ -557,6 +726,12 @@ def pass2a_nonrecursive_stats(
     console.print("  [bold]Phase 2a:[/bold] Accumulating non-recursive stats...")
 
     pending_updates = defaultdict(make_empty_update)
+    pending_histograms = defaultdict(lambda: {
+        "atime_hist": [0] * 10,
+        "size_hist": [0] * 10,
+        "atime_size": [0] * 10,
+        "size_size": [0] * 10,
+    })
     line_count = 0
     file_count = 0
     flush_count = 0
@@ -573,14 +748,19 @@ def pass2a_nonrecursive_stats(
     def process_results_batch(results):
         """
         Process a batch of results.
-        If results is a list (single-threaded Phase 1 style logic or fallback), process individually.
-        If results is a dict (Phase 2a aggregated), merge stats.
+        results is a tuple of (dir_results, hist_results) from worker or None
         """
         nonlocal file_count
 
-        if isinstance(results, list):
+        if results is None or (not results[0] and not results[1]):
+            return
+
+        dir_results, hist_results = results
+
+        # Process directory results
+        if isinstance(dir_results, list):
             # Fallback for single-threaded or raw ParsedEntry list
-            for parsed in results:
+            for parsed in dir_results:
                 file_count += 1
                 # Inline logic replacing accumulate_file_stats_nr
                 parent = os.path.dirname(parsed.path)
@@ -598,10 +778,23 @@ def pass2a_nonrecursive_stats(
                     elif upd["first_uid"] != parsed.uid and upd["first_uid"] != -999:
                         upd["first_uid"] = -999
 
-        elif isinstance(results, dict):
+                # Track histograms for single-threaded mode
+                if scan_date is not None:
+                    uid = parsed.uid
+                    hist = pending_histograms[uid]
+
+                    atime_bucket = classify_atime_bucket(parsed.atime, scan_date)
+                    hist["atime_hist"][atime_bucket] += 1
+                    hist["atime_size"][atime_bucket] += parsed.allocated
+
+                    size_bucket = classify_size_bucket(parsed.allocated)
+                    hist["size_hist"][size_bucket] += 1
+                    hist["size_size"][size_bucket] += parsed.allocated
+
+        elif isinstance(dir_results, dict):
             # Optimized Aggregated Dictionary from Worker
             # Value is tuple: (nr_count, nr_size, nr_atime, first_uid)
-            for parent_path, stats_tuple in results.items():
+            for parent_path, stats_tuple in dir_results.items():
                 parent_id = path_to_id.get(parent_path)
                 if not parent_id:
                     continue
@@ -633,6 +826,16 @@ def pass2a_nonrecursive_stats(
                         upd["first_uid"] = w_uid
                     elif m_uid != w_uid:
                         upd["first_uid"] = -999
+
+        # Merge histogram results from worker
+        if hist_results:
+            for uid, (atime_hist, size_hist, atime_size, size_size) in hist_results.items():
+                main_hist = pending_histograms[uid]
+                for i in range(10):
+                    main_hist["atime_hist"][i] += atime_hist[i]
+                    main_hist["atime_size"][i] += atime_size[i]
+                    main_hist["size_hist"][i] += size_hist[i]
+                    main_hist["size_size"][i] += size_size[i]
 
     def update_progress_bar(estimated_lines: int | None = None):
         nonlocal line_count
@@ -671,6 +874,7 @@ def pass2a_nonrecursive_stats(
                 progress_callback=update_progress_bar,
                 flush_callback=do_flush,
                 should_flush_fn=lambda: len(pending_updates) >= batch_size,
+                scan_date=scan_date,
             )
 
         else:
@@ -700,15 +904,33 @@ def pass2a_nonrecursive_stats(
                         elif upd["first_uid"] != parsed.uid and upd["first_uid"] != -999:
                             upd["first_uid"] = -999
 
+                    # Track histograms
+                    if scan_date is not None:
+                        uid = parsed.uid
+                        hist = pending_histograms[uid]
+
+                        atime_bucket = classify_atime_bucket(parsed.atime, scan_date)
+                        hist["atime_hist"][atime_bucket] += 1
+                        hist["atime_size"][atime_bucket] += parsed.allocated
+
+                        size_bucket = classify_size_bucket(parsed.allocated)
+                        hist["size_hist"][size_bucket] += 1
+                        hist["size_size"][size_bucket] += parsed.allocated
+
                     if len(pending_updates) >= batch_size:
                         do_flush()
 
                     if line_count % progress_interval == 0:
                         update_progress_bar()
 
-        # Final flush
+        # Final flush for directory stats
         do_flush()
         update_progress_bar()
+
+    # Flush histograms to database
+    console.print("  [bold]Flushing histograms to database...[/bold]")
+    flush_histograms(session, pending_histograms)
+    console.print(f"    Stored histograms for {len(pending_histograms):,} users")
 
     console.print(f"    Lines processed: {line_count:,}")
     console.print(f"    Files counted: {file_count:,}")
@@ -1012,6 +1234,15 @@ def run_import(
     console.print()
 
     overall_start = time.time()
+
+    # Extract scan date for histogram classification
+    scan_date = extract_scan_timestamp(input_file.name)
+    if scan_date:
+        console.print(f"Scan date: {scan_date.strftime('%Y-%m-%d')}")
+    else:
+        console.print("[yellow]Warning: Could not extract scan date from filename, histogram classification may be inaccurate[/yellow]")
+    console.print()
+
     try:
         # Pass 1: Discover directories (now parser-agnostic)
         path_to_id, metadata = pass1_discover_directories(
@@ -1024,8 +1255,9 @@ def run_import(
             parser,
             session,
             path_to_id,
-            batch_size,
-            progress_interval,
+            scan_date=scan_date,
+            batch_size=batch_size,
+            progress_interval=progress_interval,
             total_lines=metadata["total_lines"],
             num_workers=workers,
         )
