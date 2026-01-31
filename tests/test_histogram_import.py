@@ -12,13 +12,13 @@ from fs_scans.core.models import (
     Directory,
     DirectoryStats,
     SizeHistogram,
-)
-from fs_scans.core.database import clear_engine_cache
-from fs_scans.importers.importer import (
     ATIME_BUCKETS,
     SIZE_BUCKETS,
     classify_atime_bucket,
     classify_size_bucket,
+)
+from fs_scans.core.database import clear_engine_cache
+from fs_scans.importers.importer import (
     run_import,
 )
 from fs_scans.parsers.gpfs import GPFSParser

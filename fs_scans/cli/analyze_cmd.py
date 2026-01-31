@@ -345,7 +345,7 @@ def analyze_cmd(
             console.print("[yellow]Note: Size distribution is approximate for path-filtered queries[/yellow]")
             console.print()
 
-            from ..importers.importer import SIZE_BUCKETS
+            from ..core.models import SIZE_BUCKETS
             from ..queries.histogram_common import HistogramData
             from ..queries.file_size import compute_size_histogram_from_directory_stats
 
