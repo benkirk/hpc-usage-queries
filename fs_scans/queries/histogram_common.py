@@ -11,7 +11,7 @@ from sqlalchemy import text
 
 from ..cli.common import format_size
 from ..core.database import get_session
-from ..importers.importer import ATIME_BUCKETS, SIZE_BUCKETS
+from ..core.models import ATIME_BUCKETS, SIZE_BUCKETS
 from .query_engine import (
     get_scan_date,
     resolve_usernames_across_databases,

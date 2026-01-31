@@ -348,6 +348,8 @@ The `filesystem` argument is optional and defaults to `all`, which queries all a
 | `--summary` | Show database summary only |
 | `--show-config` | Show data directory configuration and available databases |
 
+**Note on `--group-by` with multiple filesystems:** When querying multiple filesystems with `--group-by owner` or `--group-by group`, results are aggregated across all filesystems by default (summing sizes, files, and directory counts for each owner/group). Use `--verbose` to show per-filesystem breakdown instead of aggregated totals.
+
 ### Examples
 
 ```bash
@@ -398,14 +400,20 @@ fs-scans query --min-size 0
 # Filter by both size and file count
 fs-scans query --min-size 1GiB --min-files 1K
 
-# Show per-user summary (uses pre-computed owner_summary table)
+# Show per-user summary (aggregated across all filesystems by default)
 fs-scans query --group-by owner
+
+# Show per-user summary with per-filesystem breakdown (use --verbose)
+fs-scans query --group-by owner --verbose
 
 # Per-user summary with filters (computes dynamically)
 fs-scans query --group-by owner -d 4 -P /gpfs/csfs1/cisl
 
-# Show per-group summary (uses pre-computed group_summary table)
+# Show per-group summary (aggregated across all filesystems by default)
 fs-scans query --group-by group
+
+# Show per-group summary with per-filesystem breakdown (use --verbose)
+fs-scans query --group-by group --verbose
 
 # Per-group summary with filters (computes dynamically)
 fs-scans query --group-by group -d 4 -P /gpfs/csfs1/cisl

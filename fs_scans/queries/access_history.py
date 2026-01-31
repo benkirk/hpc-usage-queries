@@ -9,7 +9,7 @@ from collections import defaultdict
 from typing import Any
 
 from ..cli.common import format_size
-from ..importers.importer import ATIME_BUCKETS
+from ..core.models import ATIME_BUCKETS
 
 
 class AccessHistogram:

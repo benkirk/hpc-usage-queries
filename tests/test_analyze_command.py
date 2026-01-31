@@ -24,7 +24,7 @@ from fs_scans.queries.file_size import (
     compute_size_histogram_from_directory_stats,
 )
 from fs_scans.queries.query_engine import resolve_owner_filter
-from fs_scans.importers.importer import ATIME_BUCKETS, SIZE_BUCKETS
+from fs_scans.core.models import ATIME_BUCKETS, SIZE_BUCKETS
 
 
 # ============================================================================

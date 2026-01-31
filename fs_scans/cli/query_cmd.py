@@ -39,6 +39,134 @@ from ..queries.display import (
 )
 
 
+# Entity-specific configuration for owner/group summary queries
+_ENTITY_CONFIG = {
+    "owner": {
+        "id_field": "owner_uid",
+        "query_func": query_owner_summary,
+        "resolve_func": resolve_usernames_across_databases,
+        "print_func": print_owner_results,
+    },
+    "group": {
+        "id_field": "owner_gid",
+        "query_func": query_group_summary,
+        "resolve_func": resolve_groupnames_across_databases,
+        "print_func": print_group_results,
+    },
+}
+
+
+def _process_entity_summary(
+    entity_type: str,
+    filesystems: list[str],
+    sort_by: str,
+    min_depth: int | None,
+    max_depth: int | None,
+    normalized_path_prefixes: list[str],
+    limit: int,
+    verbose: bool,
+) -> None:
+    """Process and display owner or group summary results.
+
+    Unified handler for both --group-by owner and --group-by group modes.
+
+    Args:
+        entity_type: "owner" or "group"
+        filesystems: List of filesystem names to query
+        sort_by: Sort field (size, files, dirs)
+        min_depth: Minimum path depth filter
+        max_depth: Maximum path depth filter
+        normalized_path_prefixes: Path prefix filters
+        limit: Result limit (0 for unlimited)
+        verbose: Show per-filesystem breakdown for multi-DB queries
+    """
+    config = _ENTITY_CONFIG[entity_type]
+
+    # Stage 1: Validate and map sort_by
+    sort_map = {
+        "size": "size",
+        "files": "files",
+        "dirs": "dirs",
+        "directories": "dirs",
+    }
+    entity_sort_by = sort_map.get(sort_by, "size")
+
+    if sort_by not in sort_map:
+        console.print(
+            f"[yellow]Warning: --sort-by '{sort_by}' not valid with --group-by {entity_type}. "
+            f"Using 'size' instead. Valid options: size, files, dirs[/yellow]"
+        )
+        entity_sort_by = "size"
+
+    # Stage 2: Query each filesystem
+    all_results = []
+    all_ids = set()
+
+    for fs in filesystems:
+        session = get_session(fs)
+        try:
+            results = config["query_func"](
+                session,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
+                limit=limit if limit > 0 else None,
+                sort_by=entity_sort_by,
+            )
+            # Tag each result with filesystem name
+            for result in results:
+                result["filesystem"] = fs
+
+            all_results.extend(results)
+            all_ids.update(r[config["id_field"]] for r in results)
+        finally:
+            session.close()
+
+    # Stage 3: Multi-DB post-processing
+    if len(filesystems) > 1:
+        if verbose:
+            # Show per-filesystem breakdown
+            sort_key_map = {
+                "size": lambda r: (-r["total_size"], r[config["id_field"]], r["filesystem"]),
+                "files": lambda r: (-r["total_files"], r[config["id_field"]], r["filesystem"]),
+                "dirs": lambda r: (-r["directory_count"], r[config["id_field"]], r["filesystem"]),
+            }
+            sort_key = sort_key_map[entity_sort_by]
+            all_results.sort(key=sort_key)
+
+            if limit > 0:
+                all_results = all_results[:limit]
+        else:
+            # Aggregate across filesystems by ID
+            from collections import defaultdict
+            aggregated = defaultdict(lambda: {"total_size": 0, "total_files": 0, "directory_count": 0})
+
+            for result in all_results:
+                entity_id = result[config["id_field"]]
+                aggregated[entity_id][config["id_field"]] = entity_id
+                aggregated[entity_id]["total_size"] += result["total_size"]
+                aggregated[entity_id]["total_files"] += result["total_files"]
+                aggregated[entity_id]["directory_count"] += result["directory_count"]
+
+            all_results = list(aggregated.values())
+
+            # Sort aggregated results
+            sort_key_map = {
+                "size": lambda r: -r["total_size"],
+                "files": lambda r: -r["total_files"],
+                "dirs": lambda r: -r["directory_count"],
+            }
+            all_results.sort(key=sort_key_map[entity_sort_by])
+
+            if limit > 0:
+                all_results = all_results[:limit]
+
+    # Stage 4: Name resolution and display
+    name_map = config["resolve_func"](all_ids, filesystems)
+
+    show_filesystem = len(filesystems) > 1 and verbose
+    config["print_func"](all_results, name_map, show_filesystem=show_filesystem)
+
 
 # Create DynamicHelpCommand for this tool
 DynamicHelpCommand = make_dynamic_help_command('fs-scans query')
@@ -247,11 +375,12 @@ def query_cmd(
       fs-scans query -N "*scratch*"           # Filter by name pattern
       fs-scans query -N "*scratch*" -N "*tmp*"  # Multiple patterns (OR)
       fs-scans query -N "*tmp*" -i            # Case-insensitive pattern
-      fs-scans query --group-by owner         # Per-user summary
+      fs-scans query --group-by owner         # Per-user summary (aggregated)
+      fs-scans query --group-by owner -v     # Per-user per-filesystem breakdown
       fs-scans query --group-by owner --sort-by files  # Sort by file count
       fs-scans query --group-by owner -d 4 -P /gpfs/csfs1/cisl
-      fs-scans query --group-by group         # Per-group summary
-      fs-scans query --group-by group --sort-by size  # Sort by size
+      fs-scans query --group-by group         # Per-group summary (aggregated)
+      fs-scans query --group-by group -v     # Per-group per-filesystem breakdown
     """
     # Apply data directory override if provided via CLI
     if data_dir is not None:
@@ -354,68 +483,16 @@ def query_cmd(
         if dir_counts:
             console.print("[yellow]Warning: --dir-counts ignored with --group-by owner[/yellow]")
 
-        # Map sort_by to owner summary field names
-        # Accept common aliases for convenience
-        owner_sort_map = {
-            "size": "size",
-            "files": "files",
-            "dirs": "dirs",
-            "directories": "dirs",
-        }
-        owner_sort_by = owner_sort_map.get(sort_by, "size")
-
-        # Validate sort_by is compatible with --group-by owner
-        if sort_by not in owner_sort_map:
-            console.print(
-                f"[yellow]Warning: --sort-by '{sort_by}' not valid with --group-by owner. "
-                f"Using 'size' instead. Valid options: size, files, dirs[/yellow]"
-            )
-            owner_sort_by = "size"
-
-        all_owners = []
-        all_uids = set()
-
-        for fs in filesystems:
-            session = get_session(fs)
-            try:
-                owners = query_owner_summary(
-                    session,
-                    min_depth=min_depth,
-                    max_depth=max_depth,
-                    path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
-                    limit=limit if limit > 0 else None,
-                    sort_by=owner_sort_by,
-                )
-                # Tag each owner result with filesystem name
-                for owner in owners:
-                    owner["filesystem"] = fs
-
-                all_owners.extend(owners)
-                all_uids.update(o["owner_uid"] for o in owners)
-            finally:
-                session.close()
-
-        # For multi-db: sort by metric, then owner, then filesystem (don't aggregate)
-        if len(filesystems) > 1:
-            # Sort to group owners together while preserving per-filesystem breakdown
-            sort_key_map = {
-                "size": lambda o: (-o["total_size"], o["owner_uid"], o["filesystem"]),
-                "files": lambda o: (-o["total_files"], o["owner_uid"], o["filesystem"]),
-                "dirs": lambda o: (-o["directory_count"], o["owner_uid"], o["filesystem"]),
-            }
-            sort_key = sort_key_map[owner_sort_by]
-            all_owners.sort(key=sort_key)
-
-            # Apply limit to final sorted list
-            if limit > 0:
-                all_owners = all_owners[:limit]
-
-        # Get username mappings (aggregate across all databases)
-        username_map = resolve_usernames_across_databases(all_uids, filesystems)
-
-        # Show filesystem column when querying multiple databases
-        show_filesystem = len(filesystems) > 1
-        print_owner_results(all_owners, username_map, show_filesystem=show_filesystem)
+        _process_entity_summary(
+            entity_type="owner",
+            filesystems=filesystems,
+            sort_by=sort_by,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            normalized_path_prefixes=normalized_path_prefixes,
+            limit=limit,
+            verbose=verbose,
+        )
         return
 
     # Handle --group-by group mode
@@ -423,68 +500,16 @@ def query_cmd(
         if dir_counts:
             console.print("[yellow]Warning: --dir-counts ignored with --group-by group[/yellow]")
 
-        # Map sort_by to group summary field names
-        # Accept common aliases for convenience
-        group_sort_map = {
-            "size": "size",
-            "files": "files",
-            "dirs": "dirs",
-            "directories": "dirs",
-        }
-        group_sort_by = group_sort_map.get(sort_by, "size")
-
-        # Validate sort_by is compatible with --group-by group
-        if sort_by not in group_sort_map:
-            console.print(
-                f"[yellow]Warning: --sort-by '{sort_by}' not valid with --group-by group. "
-                f"Using 'size' instead. Valid options: size, files, dirs[/yellow]"
-            )
-            group_sort_by = "size"
-
-        all_groups = []
-        all_gids = set()
-
-        for fs in filesystems:
-            session = get_session(fs)
-            try:
-                groups = query_group_summary(
-                    session,
-                    min_depth=min_depth,
-                    max_depth=max_depth,
-                    path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
-                    limit=limit if limit > 0 else None,
-                    sort_by=group_sort_by,
-                )
-                # Tag each group result with filesystem name
-                for group in groups:
-                    group["filesystem"] = fs
-
-                all_groups.extend(groups)
-                all_gids.update(g["owner_gid"] for g in groups)
-            finally:
-                session.close()
-
-        # For multi-db: sort by metric, then group, then filesystem (don't aggregate)
-        if len(filesystems) > 1:
-            # Sort to group GIDs together while preserving per-filesystem breakdown
-            sort_key_map = {
-                "size": lambda g: (-g["total_size"], g["owner_gid"], g["filesystem"]),
-                "files": lambda g: (-g["total_files"], g["owner_gid"], g["filesystem"]),
-                "dirs": lambda g: (-g["directory_count"], g["owner_gid"], g["filesystem"]),
-            }
-            sort_key = sort_key_map[group_sort_by]
-            all_groups.sort(key=sort_key)
-
-            # Apply limit to final sorted list
-            if limit > 0:
-                all_groups = all_groups[:limit]
-
-        # Get groupname mappings (aggregate across all databases)
-        groupname_map = resolve_groupnames_across_databases(all_gids, filesystems)
-
-        # Show filesystem column when querying multiple databases
-        show_filesystem = len(filesystems) > 1
-        print_group_results(all_groups, groupname_map, show_filesystem=show_filesystem)
+        _process_entity_summary(
+            entity_type="group",
+            filesystems=filesystems,
+            sort_by=sort_by,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            normalized_path_prefixes=normalized_path_prefixes,
+            limit=limit,
+            verbose=verbose,
+        )
         return
 
     # Query directories

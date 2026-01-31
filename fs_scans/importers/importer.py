@@ -54,90 +54,43 @@ from ..core.models import (
     ScanMetadata,
     SizeHistogram,
     UserInfo,
+    classify_atime_bucket,
+    classify_size_bucket,
 )
 from ..parsers.base import FilesystemParser
 
 
-# Histogram Bucket Definitions
 
-# Access Time Histogram (10 buckets)
-# Tracks file distribution by last access time relative to scan date
-ATIME_BUCKETS = [
-    ("< 1 Month", 30),           # 0-30 days
-    ("1-3 Months", 90),          # 30-90 days
-    ("3-6 Months", 180),         # 90-180 days
-    ("6-12 Months", 365),        # 180-365 days
-    ("1-2 Years", 730),          # 1-2 years
-    ("2-3 Years", 1095),         # 2-3 years
-    ("3-4 Years", 1460),         # 3-4 years
-    ("5-6 Years", 2190),         # 5-6 years
-    ("6-7 Years", 2555),         # 6-7 years
-    ("7+ Years", None),          # 7+ years
-]
-
-# Size Histogram (10 buckets)
-# Logarithmic scale covering practical file size ranges
-SIZE_BUCKETS = [
-    ("0 - 1 KiB", 0, 1024),
-    ("1 KiB - 10 KiB", 1024, 10 * 1024),
-    ("10 KiB - 100 KiB", 10 * 1024, 100 * 1024),
-    ("100 KiB - 1 MiB", 100 * 1024, 1024 * 1024),
-    ("1 MiB - 10 MiB", 1024 * 1024, 10 * 1024 * 1024),
-    ("10 MiB - 100 MiB", 10 * 1024 * 1024, 100 * 1024 * 1024),
-    ("100 MiB - 1 GiB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
-    ("1 GiB - 10 GiB", 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
-    ("10 GiB - 100 GiB", 10 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024),
-    ("100 GiB+", 100 * 1024 * 1024 * 1024, None),
-]
-
-
-def classify_atime_bucket(atime: datetime | None, scan_date: datetime) -> int:
-    """Classify file's access time into histogram bucket.
-
-    Args:
-        atime: File's last access time
-        scan_date: Scan timestamp (extracted from filename)
-
-    Returns:
-        Bucket index (0-9)
-    """
-    if atime is None:
-        return len(ATIME_BUCKETS) - 1  # Default to oldest bucket
-
-    days_old = (scan_date - atime).days
-
-    for idx, (_, max_days) in enumerate(ATIME_BUCKETS):
-        if max_days is None:  # Last bucket (7+ years)
-            return idx
-        if days_old < max_days:
-            return idx
-
-    return len(ATIME_BUCKETS) - 1  # Fallback to oldest bucket
-
-
-def classify_size_bucket(size_bytes: int) -> int:
-    """Classify file size into histogram bucket.
-
-    Args:
-        size_bytes: File size in bytes (allocated size)
-
-    Returns:
-        Bucket index (0-9)
-    """
-    for idx, (_, min_size, max_size) in enumerate(SIZE_BUCKETS):
-        if max_size is None:  # Last bucket (100 GiB+)
-            if size_bytes >= min_size:
-                return idx
-        elif min_size <= size_bytes < max_size:
-            return idx
-
-    return len(SIZE_BUCKETS) - 1  # Fallback to largest bucket
 
 
 def open_input_file(filepath: Path) -> TextIO:
     """Open input file for reading with a large buffer."""
     # Use 8MB buffer to minimize syscalls
     return open(filepath, "r", encoding="utf-8", errors="replace", buffering=8 * 1024 * 1024)
+
+
+class DirStatsAccumulator:
+    """Memory-efficient accumulator for directory statistics using __slots__."""
+    __slots__ = ('nr_count', 'nr_size', 'nr_atime', 'nr_dirs', 'first_uid', 'first_gid')
+
+    def __init__(self):
+        self.nr_count = 0
+        self.nr_size = 0
+        self.nr_atime = None
+        self.nr_dirs = 0
+        self.first_uid = None
+        self.first_gid = None
+
+
+class HistAccumulator:
+    """Memory-efficient accumulator for histogram statistics using __slots__."""
+    __slots__ = ('atime_hist', 'size_hist', 'atime_size', 'size_size')
+
+    def __init__(self):
+        self.atime_hist = [0] * 10
+        self.size_hist = [0] * 10
+        self.atime_size = [0] * 10
+        self.size_size = [0] * 10
 
 
 def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime | None]) -> tuple[Any, Any, int]:
@@ -150,9 +103,8 @@ def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime |
     Returns:
         Tuple of (dir_results, hist_results, count of lines processed)
         - If filter_type="files":
-            dir_results is dict[parent_path, stats_tuple]
-            where stats_tuple = (nr_count, nr_size, nr_atime, nr_dirs, first_uid, first_gid)
-            hist_results is dict[uid, histograms]
+            dir_results is dict[parent_path, DirStatsAccumulator]
+            hist_results is dict[uid, HistAccumulator]
         - If filter_type="dirs"/"all": dir_results is list[ParsedEntry], hist_results is None
     """
     chunk, filter_type, parser, scan_date = args
@@ -168,89 +120,64 @@ def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime |
             if parsed:
                 parent = os.path.dirname(parsed.path)
                 if parent not in results:
-                    results[parent] = {
-                        "nr_count": 0,
-                        "nr_size": 0,
-                        "nr_atime": None,
-                        "nr_dirs": 0,
-                        "first_uid": None,
-                        "first_gid": None
-                    }
+                    results[parent] = DirStatsAccumulator()
                 stats = results[parent]
 
                 if parsed.is_dir:
                     # Track directory count for parent
-                    stats["nr_dirs"] += 1
+                    stats.nr_dirs += 1
                 else:
                     # Track file stats
                     # Accumulate count and size
-                    stats["nr_count"] += 1
-                    stats["nr_size"] += parsed.allocated
+                    stats.nr_count += 1
+                    stats.nr_size += parsed.allocated
 
                     # Accumulate atime
                     if parsed.atime:
-                        cur_max = stats["nr_atime"]
-                        stats["nr_atime"] = max(cur_max, parsed.atime) if cur_max else parsed.atime
+                        cur_max = stats.nr_atime
+                        stats.nr_atime = max(cur_max, parsed.atime) if cur_max else parsed.atime
 
                     # Accumulate UID (Single pass logic)
                     # None = init, -999 = multiple/conflict, else = single UID
                     p_uid = parsed.uid
-                    s_uid = stats["first_uid"]
+                    s_uid = stats.first_uid
 
                     if s_uid is None:
-                        stats["first_uid"] = p_uid
+                        stats.first_uid = p_uid
                     elif s_uid != -999 and s_uid != p_uid:
-                        stats["first_uid"] = -999
+                        stats.first_uid = -999
 
                     # Accumulate GID (Single pass logic)
                     # None = init, -999 = multiple/conflict, else = single GID
                     p_gid = parsed.gid
-                    s_gid = stats["first_gid"]
+                    s_gid = stats.first_gid
 
                     if s_gid is None:
-                        stats["first_gid"] = p_gid
+                        stats.first_gid = p_gid
                     elif s_gid != -999 and s_gid != p_gid:
-                        stats["first_gid"] = -999
+                        stats.first_gid = -999
 
                     # NEW: Track histograms per UID (files only)
                     uid = parsed.uid
                     if uid not in hist_results:
-                        hist_results[uid] = {
-                            "atime_hist": [0] * 10,  # file counts per atime bucket
-                            "size_hist": [0] * 10,   # file counts per size bucket
-                            "atime_size": [0] * 10,  # total bytes per atime bucket
-                            "size_size": [0] * 10,   # total bytes per size bucket
-                        }
+                        hist_results[uid] = HistAccumulator()
 
                     hist = hist_results[uid]
 
                     # Classify and update histograms
                     atime_bucket = classify_atime_bucket(parsed.atime, scan_date) if scan_date else 9
-                    hist["atime_hist"][atime_bucket] += 1
-                    hist["atime_size"][atime_bucket] += parsed.allocated
+                    hist.atime_hist[atime_bucket] += 1
+                    hist.atime_size[atime_bucket] += parsed.allocated
 
                     size_bucket = classify_size_bucket(parsed.allocated)
-                    hist["size_hist"][size_bucket] += 1
-                    hist["size_size"][size_bucket] += parsed.allocated
+                    hist.size_hist[size_bucket] += 1
+                    hist.size_size[size_bucket] += parsed.allocated
 
-        # Optimize IPC payload: convert dicts to tuples
-        # Directory stats: (nr_count, nr_size, nr_atime, nr_dirs, first_uid, first_gid)
-        final_results = {
-            k: (v["nr_count"], v["nr_size"], v["nr_atime"], v["nr_dirs"], v["first_uid"], v["first_gid"])
-            for k, v in results.items()
-        }
-
-        # Histogram stats: (atime_hist, size_hist, atime_size, size_size)
-        final_hist_results = {
-            uid: (hist["atime_hist"], hist["size_hist"],
-                  hist["atime_size"], hist["size_size"])
-            for uid, hist in hist_results.items()
-        }
-
-        return final_results, final_hist_results, len(chunk)
+        return results, hist_results, len(chunk)
 
     else:
         # Standard behavior for Pass 1 (Dirs)
+
         results = []
         for line in chunk:
             parsed = parser.parse_line(line.rstrip("\n"))
@@ -354,16 +281,7 @@ def finalize_sqlite_pragmas(session):
     session.commit()
 
 
-def make_empty_update() -> dict:
-    """Create an empty update dictionary for non-recursive stats accumulation."""
-    return {
-        "nr_count": 0,
-        "nr_size": 0,
-        "nr_atime": None,
-        "nr_dirs": 0,
-        "first_uid": None,  # None = not set, -999 = multiple owners, else = single UID
-        "first_gid": None,  # None = not set, -999 = multiple groups, else = single GID
-    }
+
 
 
 def flush_nr_updates(session, pending_updates: dict) -> None:
@@ -372,7 +290,7 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
 
     Args:
         session: SQLAlchemy session
-        pending_updates: Dictionary of dir_id -> update data (nr_* fields only)
+        pending_updates: Dictionary of dir_id -> DirStatsAccumulator object
     """
     if not pending_updates:
         return
@@ -381,7 +299,7 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
     params_batch = []
     for dir_id, upd in pending_updates.items():
         # Determine owner_uid: single uid or NULL for multiple
-        first_uid = upd["first_uid"]
+        first_uid = upd.first_uid
         if first_uid is None:
             owner_val = -1  # No files seen
         elif first_uid == -999:
@@ -390,7 +308,7 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
             owner_val = first_uid
 
         # Determine owner_gid: single gid or NULL for multiple
-        first_gid = upd["first_gid"]
+        first_gid = upd.first_gid
         if first_gid is None:
             group_val = -1  # No files seen
         elif first_gid == -999:
@@ -401,10 +319,10 @@ def flush_nr_updates(session, pending_updates: dict) -> None:
         params_batch.append(
             {
                 "dir_id": dir_id,
-                "nr_count": upd["nr_count"],
-                "nr_size": upd["nr_size"],
-                "nr_atime": upd["nr_atime"],
-                "nr_dirs": upd["nr_dirs"],
+                "nr_count": upd.nr_count,
+                "nr_size": upd.nr_size,
+                "nr_atime": upd.nr_atime,
+                "nr_dirs": upd.nr_dirs,
                 "owner": owner_val,
                 "group": group_val,
             }
@@ -451,7 +369,7 @@ def flush_histograms(session, pending_histograms: dict) -> None:
 
     Args:
         session: SQLAlchemy session
-        pending_histograms: Dictionary of uid -> histogram data
+        pending_histograms: Dictionary of uid -> HistAccumulator object
     """
     if not pending_histograms:
         return
@@ -462,22 +380,22 @@ def flush_histograms(session, pending_histograms: dict) -> None:
     for uid, hist in pending_histograms.items():
         # Access time histogram (10 rows per UID)
         for bucket_idx in range(10):
-            if hist["atime_hist"][bucket_idx] > 0:  # skip empty buckets
+            if hist.atime_hist[bucket_idx] > 0:  # skip empty buckets
                 atime_inserts.append({
                     "owner_uid": uid,
                     "bucket_index": bucket_idx,
-                    "file_count": hist["atime_hist"][bucket_idx],
-                    "total_size": hist["atime_size"][bucket_idx],
+                    "file_count": hist.atime_hist[bucket_idx],
+                    "total_size": hist.atime_size[bucket_idx],
                 })
 
         # Size histogram (10 rows per UID)
         for bucket_idx in range(10):
-            if hist["size_hist"][bucket_idx] > 0:  # skip empty buckets
+            if hist.size_hist[bucket_idx] > 0:  # skip empty buckets
                 size_inserts.append({
                     "owner_uid": uid,
                     "bucket_index": bucket_idx,
-                    "file_count": hist["size_hist"][bucket_idx],
-                    "total_size": hist["size_size"][bucket_idx],
+                    "file_count": hist.size_hist[bucket_idx],
+                    "total_size": hist.size_size[bucket_idx],
                 })
 
     # Bulk insert using executemany for performance
@@ -525,16 +443,19 @@ def pass1_discover_directories(
     console.print(f"[bold]Pass 1:[/bold] Discovering directories ({num_workers} workers)...")
 
     # Create staging table (parser-agnostic version without inode/fileset_id)
+    # Drop existing staging_dirs from previous run (if any) before Phase 1a starts
+    # This way any cleanup delay happens upfront rather than after Phase 1b
+    session.execute(text("DROP TABLE IF EXISTS staging_dirs"))
     session.execute(
         text("""
-        CREATE TABLE IF NOT EXISTS staging_dirs (
+        CREATE TABLE staging_dirs (
             depth INTEGER NOT NULL,
             path TEXT NOT NULL PRIMARY KEY
         )
     """)
     )
     session.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_staging_depth ON staging_dirs(depth)")
+        text("CREATE INDEX idx_staging_depth ON staging_dirs(depth)")
     )
     session.commit()
 
@@ -701,9 +622,8 @@ def pass1_discover_directories(
 
     console.print(f"    Inserted {len(path_to_id):,} directories")
 
-    # Cleanup staging table
-    session.execute(text("DROP TABLE IF EXISTS staging_dirs"))
-    session.commit()
+    # Note: staging_dirs table is preserved and reused on next import
+    # (cleared at start of Phase 1a instead of dropped here)
 
     # Return path_to_id and metadata for Phase 2
     metadata = {
@@ -747,13 +667,8 @@ def pass2a_nonrecursive_stats(
 
     console.print("  [bold]Phase 2a:[/bold] Accumulating non-recursive stats...")
 
-    pending_updates = defaultdict(make_empty_update)
-    pending_histograms = defaultdict(lambda: {
-        "atime_hist": [0] * 10,
-        "size_hist": [0] * 10,
-        "atime_size": [0] * 10,
-        "size_size": [0] * 10,
-    })
+    pending_updates = defaultdict(DirStatsAccumulator)
+    pending_histograms = defaultdict(HistAccumulator)
     line_count = 0
     file_count = 0
     flush_count = 0
@@ -765,7 +680,7 @@ def pass2a_nonrecursive_stats(
         if pending_updates:
             flush_nr_updates(session, pending_updates)
             flush_count += 1
-            pending_updates = defaultdict(make_empty_update)  # Fresh allocation
+            pending_updates = defaultdict(DirStatsAccumulator)  # Fresh allocation
 
     def process_results_batch(results):
         """
@@ -781,65 +696,69 @@ def pass2a_nonrecursive_stats(
 
         # Process directory results (always expect dict from worker)
         if isinstance(dir_results, dict):
-            # Optimized Aggregated Dictionary from Worker
-            # Value is tuple: (nr_count, nr_size, nr_atime, nr_dirs, first_uid, first_gid)
-            for parent_path, stats_tuple in dir_results.items():
-                parent_id = path_to_id.get(parent_path)
+            # Performance Optimization: Alias for speed in tight loop
+            # Avoids repeated LOAD_DEREF of closure variables
+            local_path_to_id = path_to_id
+            local_updates = pending_updates
+
+            # Optimized Aggregated Dictionary from Worker (DirStatsAccumulator objects)
+            for parent_path, w_stats in dir_results.items():
+                parent_id = local_path_to_id.get(parent_path)
                 if not parent_id:
                     continue
 
-                nr_count, nr_size, nr_atime, nr_dirs, first_uid, first_gid = stats_tuple
-
+                # Merge into main accumulator
+                upd = local_updates[parent_id]
+                
                 # Update file count for progress tracking
-                file_count += nr_count
+                file_count += w_stats.nr_count
 
-                # Merge worker stats into pending_updates
-                upd = pending_updates[parent_id]
-                upd["nr_count"] += nr_count
-                upd["nr_size"] += nr_size
-                upd["nr_dirs"] += nr_dirs
+                upd.nr_count += w_stats.nr_count
+                upd.nr_size += w_stats.nr_size
+                upd.nr_dirs += w_stats.nr_dirs
 
                 # Merge max atime
-                if nr_atime:
-                    upd["nr_atime"] = max(upd["nr_atime"], nr_atime) if upd["nr_atime"] else nr_atime
+                if w_stats.nr_atime:
+                    upd.nr_atime = max(upd.nr_atime, w_stats.nr_atime) if upd.nr_atime else w_stats.nr_atime
 
                 # Merge UID logic
-                w_uid = first_uid
-                m_uid = upd["first_uid"]
+                w_uid = w_stats.first_uid
+                m_uid = upd.first_uid
 
                 if m_uid == -999:
                     pass
                 elif w_uid == -999:
-                    upd["first_uid"] = -999
+                    upd.first_uid = -999
                 elif w_uid is not None:
                     if m_uid is None:
-                        upd["first_uid"] = w_uid
+                        upd.first_uid = w_uid
                     elif m_uid != w_uid:
-                        upd["first_uid"] = -999
+                        upd.first_uid = -999
 
                 # Merge GID logic (identical to UID)
-                w_gid = first_gid
-                m_gid = upd["first_gid"]
+                w_gid = w_stats.first_gid
+                m_gid = upd.first_gid
 
                 if m_gid == -999:
                     pass
                 elif w_gid == -999:
-                    upd["first_gid"] = -999
+                    upd.first_gid = -999
                 elif w_gid is not None:
                     if m_gid is None:
-                        upd["first_gid"] = w_gid
+                        upd.first_gid = w_gid
                     elif m_gid != w_gid:
-                        upd["first_gid"] = -999
+                        upd.first_gid = -999
 
         # Merge histogram results from worker
         if hist_results:
-            for uid, (atime_hist, size_hist, atime_size, size_size) in hist_results.items():
-                main_hist = pending_histograms[uid]
+            local_histograms = pending_histograms
+            for uid, w_hist in hist_results.items():
+                main_hist = local_histograms[uid]
                 for i in range(10):
-                    main_hist["atime_hist"][i] += atime_hist[i]
-                    main_hist["atime_size"][i] += atime_size[i]
-                    main_hist["size_hist"][i] += size_hist[i]
-                    main_hist["size_size"][i] += size_size[i]
+                    main_hist.atime_hist[i] += w_hist.atime_hist[i]
+                    main_hist.atime_size[i] += w_hist.atime_size[i]
+                    main_hist.size_hist[i] += w_hist.size_hist[i]
+                    main_hist.size_size[i] += w_hist.size_size[i]
 
     def update_progress_bar(estimated_lines: int | None = None):
         nonlocal line_count

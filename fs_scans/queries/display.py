@@ -202,8 +202,7 @@ def print_owner_results(
 
     # Adjust title based on whether showing filesystem breakdown
     if show_filesystem:
-        unique_combos = len(owners)  # Each row is owner+filesystem combo
-        table = Table(title=f"Owner Summary ({unique_combos} owner-filesystem combinations)")
+        table = Table(title=f"Owner Summary ({len(owners)} owner-filesystem combinations)")
     else:
         table = Table(title=f"Owner Summary ({len(owners)} owners)")
 
@@ -257,8 +256,7 @@ def print_group_results(
 
     # Adjust title based on whether showing filesystem breakdown
     if show_filesystem:
-        unique_combos = len(groups)  # Each row is group+filesystem combo
-        table = Table(title=f"Group Summary ({unique_combos} group-filesystem combinations)")
+        table = Table(title=f"Group Summary ({len(groups)} group-filesystem combinations)")
     else:
         table = Table(title=f"Group Summary ({len(groups)} groups)")
 

@@ -10,7 +10,7 @@ from datetime import datetime
 from sqlalchemy import text
 
 from ..cli.common import format_size
-from ..importers.importer import SIZE_BUCKETS, classify_size_bucket
+from ..core.models import SIZE_BUCKETS, classify_size_bucket
 from ..queries.query_engine import get_scan_date, resolve_path_to_id
 
 
