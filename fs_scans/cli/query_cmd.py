@@ -247,11 +247,12 @@ def query_cmd(
       fs-scans query -N "*scratch*"           # Filter by name pattern
       fs-scans query -N "*scratch*" -N "*tmp*"  # Multiple patterns (OR)
       fs-scans query -N "*tmp*" -i            # Case-insensitive pattern
-      fs-scans query --group-by owner         # Per-user summary
+      fs-scans query --group-by owner         # Per-user summary (aggregated)
+      fs-scans query --group-by owner -v     # Per-user per-filesystem breakdown
       fs-scans query --group-by owner --sort-by files  # Sort by file count
       fs-scans query --group-by owner -d 4 -P /gpfs/csfs1/cisl
-      fs-scans query --group-by group         # Per-group summary
-      fs-scans query --group-by group --sort-by size  # Sort by size
+      fs-scans query --group-by group         # Per-group summary (aggregated)
+      fs-scans query --group-by group -v     # Per-group per-filesystem breakdown
     """
     # Apply data directory override if provided via CLI
     if data_dir is not None:
@@ -395,26 +396,50 @@ def query_cmd(
             finally:
                 session.close()
 
-        # For multi-db: sort by metric, then owner, then filesystem (don't aggregate)
+        # For multi-db: aggregate or show per-filesystem breakdown based on --verbose
         if len(filesystems) > 1:
-            # Sort to group owners together while preserving per-filesystem breakdown
-            sort_key_map = {
-                "size": lambda o: (-o["total_size"], o["owner_uid"], o["filesystem"]),
-                "files": lambda o: (-o["total_files"], o["owner_uid"], o["filesystem"]),
-                "dirs": lambda o: (-o["directory_count"], o["owner_uid"], o["filesystem"]),
-            }
-            sort_key = sort_key_map[owner_sort_by]
-            all_owners.sort(key=sort_key)
+            if verbose:
+                # Show per-filesystem breakdown
+                sort_key_map = {
+                    "size": lambda o: (-o["total_size"], o["owner_uid"], o["filesystem"]),
+                    "files": lambda o: (-o["total_files"], o["owner_uid"], o["filesystem"]),
+                    "dirs": lambda o: (-o["directory_count"], o["owner_uid"], o["filesystem"]),
+                }
+                sort_key = sort_key_map[owner_sort_by]
+                all_owners.sort(key=sort_key)
 
-            # Apply limit to final sorted list
-            if limit > 0:
-                all_owners = all_owners[:limit]
+                if limit > 0:
+                    all_owners = all_owners[:limit]
+            else:
+                # Aggregate across filesystems by owner_uid
+                from collections import defaultdict
+                aggregated = defaultdict(lambda: {"total_size": 0, "total_files": 0, "directory_count": 0})
+
+                for owner in all_owners:
+                    uid = owner["owner_uid"]
+                    aggregated[uid]["owner_uid"] = uid
+                    aggregated[uid]["total_size"] += owner["total_size"]
+                    aggregated[uid]["total_files"] += owner["total_files"]
+                    aggregated[uid]["directory_count"] += owner["directory_count"]
+
+                all_owners = list(aggregated.values())
+
+                # Sort aggregated results
+                sort_key_map = {
+                    "size": lambda o: -o["total_size"],
+                    "files": lambda o: -o["total_files"],
+                    "dirs": lambda o: -o["directory_count"],
+                }
+                all_owners.sort(key=sort_key_map[owner_sort_by])
+
+                if limit > 0:
+                    all_owners = all_owners[:limit]
 
         # Get username mappings (aggregate across all databases)
         username_map = resolve_usernames_across_databases(all_uids, filesystems)
 
-        # Show filesystem column when querying multiple databases
-        show_filesystem = len(filesystems) > 1
+        # Show filesystem column only when verbose and multiple databases
+        show_filesystem = len(filesystems) > 1 and verbose
         print_owner_results(all_owners, username_map, show_filesystem=show_filesystem)
         return
 
@@ -464,26 +489,50 @@ def query_cmd(
             finally:
                 session.close()
 
-        # For multi-db: sort by metric, then group, then filesystem (don't aggregate)
+        # For multi-db: aggregate or show per-filesystem breakdown based on --verbose
         if len(filesystems) > 1:
-            # Sort to group GIDs together while preserving per-filesystem breakdown
-            sort_key_map = {
-                "size": lambda g: (-g["total_size"], g["owner_gid"], g["filesystem"]),
-                "files": lambda g: (-g["total_files"], g["owner_gid"], g["filesystem"]),
-                "dirs": lambda g: (-g["directory_count"], g["owner_gid"], g["filesystem"]),
-            }
-            sort_key = sort_key_map[group_sort_by]
-            all_groups.sort(key=sort_key)
+            if verbose:
+                # Show per-filesystem breakdown
+                sort_key_map = {
+                    "size": lambda g: (-g["total_size"], g["owner_gid"], g["filesystem"]),
+                    "files": lambda g: (-g["total_files"], g["owner_gid"], g["filesystem"]),
+                    "dirs": lambda g: (-g["directory_count"], g["owner_gid"], g["filesystem"]),
+                }
+                sort_key = sort_key_map[group_sort_by]
+                all_groups.sort(key=sort_key)
 
-            # Apply limit to final sorted list
-            if limit > 0:
-                all_groups = all_groups[:limit]
+                if limit > 0:
+                    all_groups = all_groups[:limit]
+            else:
+                # Aggregate across filesystems by owner_gid
+                from collections import defaultdict
+                aggregated = defaultdict(lambda: {"total_size": 0, "total_files": 0, "directory_count": 0})
+
+                for group in all_groups:
+                    gid = group["owner_gid"]
+                    aggregated[gid]["owner_gid"] = gid
+                    aggregated[gid]["total_size"] += group["total_size"]
+                    aggregated[gid]["total_files"] += group["total_files"]
+                    aggregated[gid]["directory_count"] += group["directory_count"]
+
+                all_groups = list(aggregated.values())
+
+                # Sort aggregated results
+                sort_key_map = {
+                    "size": lambda g: -g["total_size"],
+                    "files": lambda g: -g["total_files"],
+                    "dirs": lambda g: -g["directory_count"],
+                }
+                all_groups.sort(key=sort_key_map[group_sort_by])
+
+                if limit > 0:
+                    all_groups = all_groups[:limit]
 
         # Get groupname mappings (aggregate across all databases)
         groupname_map = resolve_groupnames_across_databases(all_gids, filesystems)
 
-        # Show filesystem column when querying multiple databases
-        show_filesystem = len(filesystems) > 1
+        # Show filesystem column only when verbose and multiple databases
+        show_filesystem = len(filesystems) > 1 and verbose
         print_group_results(all_groups, groupname_map, show_filesystem=show_filesystem)
         return
 
