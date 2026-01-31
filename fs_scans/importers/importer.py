@@ -13,11 +13,12 @@ Multi-Pass Algorithm:
         Phase 2b: Bottom-up SQL aggregation to compute recursive stats
 
     Pass 3: Summary Tables
-        - Resolve UIDs to usernames
-        - Pre-aggregate per-owner statistics
+        - Resolve UIDs to usernames and GIDs to groupnames
+        - Pre-aggregate per-owner and per-group statistics
         - Record scan metadata
 """
 
+import grp
 import multiprocessing as mp
 import os
 import pwd
@@ -47,6 +48,8 @@ from ..core.models import (
     AccessHistogram,
     Directory,
     DirectoryStats,
+    GroupInfo,
+    GroupSummary,
     OwnerSummary,
     ScanMetadata,
     SizeHistogram,
@@ -1029,14 +1032,14 @@ def pass3_populate_summary_tables(
     """
     Phase 3: Populate summary tables after main processing completes.
 
-    Phase 3a: Populate UserInfo - resolve UIDs to usernames
-    Phase 3b: Compute OwnerSummary - pre-aggregate per-owner statistics
+    Phase 3a: Populate UserInfo and GroupInfo - resolve UIDs to usernames and GIDs to groupnames
+    Phase 3b: Compute OwnerSummary and GroupSummary - pre-aggregate per-owner and per-group statistics
     Phase 3c: Record ScanMetadata - store scan provenance info
     """
     console.print("\n[bold]Pass 3:[/bold] Populating summary tables...")
 
-    # Phase 3a: Populate UserInfo
-    console.print("  [bold]Phase 3a:[/bold] Resolving user information...")
+    # Phase 3a: Populate UserInfo and GroupInfo
+    console.print("  [bold]Phase 3a:[/bold] Resolving user and group information...")
 
     @lru_cache(maxsize=10000)
     def resolve_uid(uid: int) -> tuple[str | None, str | None]:
@@ -1048,6 +1051,14 @@ def pass3_populate_summary_tables(
             return pw.pw_name, gecos
         except (KeyError, OverflowError):
             return None, None
+
+    @lru_cache(maxsize=10000)
+    def resolve_gid(gid: int) -> str | None:
+        """Resolve GID to groupname."""
+        try:
+            return grp.getgrgid(gid).gr_name
+        except (KeyError, OverflowError):
+            return None
 
     # Get all distinct UIDs from directory_stats (excluding -1 and NULL)
     uids = session.execute(
@@ -1082,8 +1093,40 @@ def pass3_populate_summary_tables(
 
     console.print(f"    Resolved {user_count} unique UIDs")
 
-    # Phase 3b: Compute OwnerSummary
-    console.print("  [bold]Phase 3b:[/bold] Computing owner summaries...")
+    # Get all distinct GIDs from directory_stats (excluding -1 and NULL)
+    gids = session.execute(
+        text("""
+            SELECT DISTINCT owner_gid FROM directory_stats
+            WHERE owner_gid IS NOT NULL AND owner_gid >= 0
+        """)
+    ).fetchall()
+
+    group_count = 0
+    if gids:
+        group_inserts = []
+        for (gid,) in gids:
+            groupname = resolve_gid(gid)
+            group_inserts.append({
+                "gid": gid,
+                "groupname": groupname,
+            })
+            group_count += 1
+
+        # Bulk upsert
+        for item in group_inserts:
+            session.execute(
+                text("""
+                    INSERT OR REPLACE INTO group_info (gid, groupname)
+                    VALUES (:gid, :groupname)
+                """),
+                item,
+            )
+        session.commit()
+
+    console.print(f"    Resolved {group_count} unique GIDs")
+
+    # Phase 3b: Compute OwnerSummary and GroupSummary
+    console.print("  [bold]Phase 3b:[/bold] Computing owner and group summaries...")
 
     # Clear existing summaries and recompute
     session.execute(text("DELETE FROM owner_summary"))
@@ -1106,6 +1149,27 @@ def pass3_populate_summary_tables(
         text("SELECT COUNT(*) FROM owner_summary")
     ).scalar()
     console.print(f"    Computed summaries for {owner_count} owners")
+
+    session.execute(text("DELETE FROM group_summary"))
+    session.execute(
+        text("""
+            INSERT INTO group_summary (owner_gid, total_size, total_files, directory_count)
+            SELECT
+                owner_gid,
+                SUM(total_size_nr) as total_size,
+                SUM(file_count_nr) as total_files,
+                COUNT(*) as directory_count
+            FROM directory_stats
+            WHERE owner_gid IS NOT NULL AND owner_gid >= 0
+            GROUP BY owner_gid
+        """)
+    )
+    session.commit()
+
+    group_summary_count = session.execute(
+        text("SELECT COUNT(*) FROM group_summary")
+    ).scalar()
+    console.print(f"    Computed summaries for {group_summary_count} groups")
 
     # Phase 3c: Record ScanMetadata
     console.print("  [bold]Phase 3c:[/bold] Recording scan metadata...")

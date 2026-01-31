@@ -179,6 +179,43 @@ class UserInfo(Base):
         return f"<UserInfo(uid={self.uid}, username='{self.username}')>"
 
 
+class GroupInfo(Base):
+    """Cache GID-to-groupname mappings resolved during scan.
+
+    Stores group name information for GIDs encountered during scan
+    imports, reducing repeated group lookups.
+    """
+
+    __tablename__ = "group_info"
+
+    gid = Column(Integer, primary_key=True)
+    groupname = Column(Text)
+
+    def __repr__(self):
+        return f"<GroupInfo(gid={self.gid}, groupname='{self.groupname}')>"
+
+
+class GroupSummary(Base):
+    """Pre-computed per-group aggregates.
+
+    Makes `--group-by group` queries instant by storing pre-aggregated
+    statistics for each group GID. Populated during scan import.
+    """
+
+    __tablename__ = "group_summary"
+
+    owner_gid = Column(Integer, primary_key=True)
+    total_size = Column(BigInteger, default=0)
+    total_files = Column(BigInteger, default=0)
+    directory_count = Column(Integer, default=0)
+
+    def __repr__(self):
+        return (
+            f"<GroupSummary(owner_gid={self.owner_gid}, "
+            f"total_size={self.total_size}, total_files={self.total_files})>"
+        )
+
+
 class AccessHistogram(Base):
     """Pre-computed access time histogram per user.
 
