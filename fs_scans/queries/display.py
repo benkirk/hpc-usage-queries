@@ -238,3 +238,58 @@ def print_owner_results(
 
     console.print(table)
 
+
+def print_group_results(
+    groups: list[dict],
+    groupname_map: dict[int, str],
+    show_filesystem: bool = False
+) -> None:
+    """Print group summary results in a formatted table.
+
+    Args:
+        groups: List of group summary dictionaries
+        groupname_map: Mapping from GID to groupname
+        show_filesystem: If True, add Filesystem column (for multi-DB queries)
+    """
+    if not groups:
+        console.print("[yellow]No group data found.[/yellow]")
+        return
+
+    # Adjust title based on whether showing filesystem breakdown
+    if show_filesystem:
+        unique_combos = len(groups)  # Each row is group+filesystem combo
+        table = Table(title=f"Group Summary ({unique_combos} group-filesystem combinations)")
+    else:
+        table = Table(title=f"Group Summary ({len(groups)} groups)")
+
+    table.add_column("Group", style="cyan")
+
+    # Add Filesystem column if showing breakdown
+    if show_filesystem:
+        table.add_column("Filesystem", style="blue")
+
+    # GID column removed (redundant with groupname)
+    table.add_column("Total Size", justify="right")
+    table.add_column("Total Files", justify="right")
+    table.add_column("Directories", justify="right")
+
+    for g in groups:
+        gid = g["owner_gid"]
+        groupname = groupname_map.get(gid, str(gid))
+
+        row = [groupname]
+
+        # Add filesystem column value if needed
+        if show_filesystem:
+            row.append(g.get("filesystem", "unknown"))
+
+        row.extend([
+            format_size(g["total_size"]),
+            f"{g['total_files']:,}",
+            f"{g['directory_count']:,}",
+        ])
+
+        table.add_row(*row)
+
+    console.print(table)
+

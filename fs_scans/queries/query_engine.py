@@ -4,6 +4,7 @@ This module provides the core business logic for querying filesystem scan databa
 Separated from CLI concerns for modularity and testability.
 """
 
+import grp
 import os
 import pwd
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -680,6 +681,264 @@ def resolve_usernames_across_databases(
             session.close()
 
     return username_map
+
+
+def resolve_group_filter(group_arg: str | None, mine_flag: bool) -> int | None:
+    """Resolve group filter argument to a GID.
+
+    Args:
+        group_arg: Group identifier (GID as string or groupname)
+        mine_flag: If True, use current user's primary GID
+
+    Returns:
+        Resolved GID or None if no group filter specified
+
+    Raises:
+        SystemExit: If groupname cannot be resolved
+    """
+    if mine_flag:
+        return os.getgid()
+
+    if group_arg is not None:
+        try:
+            # Try parsing as integer GID
+            return int(group_arg)
+        except ValueError:
+            # Not an integer, try resolving as groupname
+            try:
+                return grp.getgrnam(group_arg).gr_gid
+            except KeyError:
+                from ..cli.common import console
+                console.print(f"[red]Unknown group: {group_arg}[/red]")
+                raise SystemExit(1)
+
+    return None
+
+
+def get_groupname_map(session, gids: list[int]) -> dict[int, str]:
+    """
+    Get groupname mappings for a list of GIDs from the group_info table.
+
+    Falls back to grp.getgrgid() for GIDs not in the table.
+
+    Args:
+        session: SQLAlchemy session
+        gids: List of GIDs to resolve
+
+    Returns:
+        Dictionary mapping GID to groupname (or str(gid) if unknown)
+    """
+    if not gids:
+        return {}
+
+    result = {}
+
+    # Try to get from group_info table first
+    try:
+        placeholders = ", ".join(f":gid_{i}" for i in range(len(gids)))
+        params = {f"gid_{i}": gid for i, gid in enumerate(gids)}
+
+        rows = session.execute(
+            text(f"SELECT gid, groupname FROM group_info WHERE gid IN ({placeholders})"),
+            params,
+        ).fetchall()
+
+        for gid, groupname in rows:
+            result[gid] = groupname if groupname else str(gid)
+    except Exception:
+        pass
+
+    # Fall back to grp for missing GIDs
+    for gid in gids:
+        if gid not in result:
+            try:
+                result[gid] = grp.getgrgid(gid).gr_name
+            except (KeyError, OverflowError):
+                result[gid] = str(gid)
+
+    return result
+
+
+def resolve_groupnames_across_databases(
+    gids: set[int] | list[int],
+    filesystems: list[str],
+) -> dict[int, str]:
+    """Resolve GIDs to groupnames by searching across multiple databases.
+
+    Efficiently searches databases in order, stopping early once all
+    GIDs are resolved. This is useful when querying multiple databases
+    and needing to resolve groupnames from any of them.
+
+    Args:
+        gids: Set or list of GIDs to resolve
+        filesystems: List of filesystem names to search
+
+    Returns:
+        Dictionary mapping GID to groupname (or str(gid) if unknown)
+    """
+    if not gids:
+        return {}
+
+    groupname_map = {}
+    remaining_gids = set(gids)
+
+    for fs in filesystems:
+        if not remaining_gids:
+            break  # All GIDs resolved, stop early
+
+        session = get_session(fs)
+        try:
+            found = get_groupname_map(session, list(remaining_gids))
+            groupname_map.update(found)
+            remaining_gids -= found.keys()
+        finally:
+            session.close()
+
+    return groupname_map
+
+
+def query_group_summary(
+    session,
+    min_depth: int | None = None,
+    max_depth: int | None = None,
+    path_prefixes: list[str] | None = None,
+    limit: int | None = None,
+    sort_by: str = "size",
+) -> list[dict]:
+    """
+    Query per-group aggregated statistics.
+
+    Uses fast path (GroupSummary table) when no filters are applied,
+    otherwise computes dynamically from directory_stats.
+
+    Args:
+        session: SQLAlchemy session
+        min_depth: Minimum path depth filter
+        max_depth: Maximum path depth filter
+        path_prefixes: Filter to paths under these prefixes (OR'd together)
+        limit: Maximum results to return
+        sort_by: Sort field (size, files, dirs)
+
+    Returns:
+        List of group summary dictionaries
+    """
+    has_filters = any([min_depth, max_depth, path_prefixes])
+
+    if not has_filters:
+        # Fast path: use pre-computed GroupSummary table
+        # Check if the table exists and has data
+        try:
+            count = session.execute(
+                text("SELECT COUNT(*) FROM group_summary")
+            ).scalar()
+        except Exception:
+            count = 0
+
+        if count > 0:
+            sort_map = {
+                "size": "total_size DESC",
+                "files": "total_files DESC",
+                "dirs": "directory_count DESC",
+            }
+            order_clause = sort_map.get(sort_by, sort_map["size"])
+
+            query = f"""
+                SELECT owner_gid, total_size, total_files, directory_count
+                FROM group_summary
+                ORDER BY {order_clause}
+            """
+            if limit:
+                query += f" LIMIT {limit}"
+
+            results = session.execute(text(query)).fetchall()
+            return [
+                {
+                    "owner_gid": row[0],
+                    "total_size": row[1] or 0,
+                    "total_files": row[2] or 0,
+                    "directory_count": row[3] or 0,
+                }
+                for row in results
+            ]
+
+    # Dynamic path: compute from directory_stats with filters
+    conditions = ["s.owner_gid IS NOT NULL AND s.owner_gid >= 0"]
+    params = {}
+
+    if min_depth is not None:
+        conditions.append("d.depth >= :min_depth")
+        params["min_depth"] = min_depth
+
+    if max_depth is not None:
+        conditions.append("d.depth <= :max_depth")
+        params["max_depth"] = max_depth
+
+    # Handle path prefixes
+    cte_clause = ""
+    join_clause = ""
+    if path_prefixes:
+        ancestor_ids = []
+        for prefix in path_prefixes:
+            ancestor_id = resolve_path_to_id(session, prefix)
+            if ancestor_id is not None:
+                idx = len(ancestor_ids)
+                ancestor_ids.append(ancestor_id)
+                params[f"ancestor_id_{idx}"] = ancestor_id
+
+        if not ancestor_ids:
+            return []  # No valid paths found
+
+        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
+        cte_clause = f"""
+            WITH RECURSIVE
+            ancestors AS (
+                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
+            ),
+            descendants AS (
+                SELECT dir_id FROM ancestors
+                UNION ALL
+                SELECT d.dir_id FROM directories d
+                JOIN descendants p ON d.parent_id = p.dir_id
+            )
+        """
+        join_clause = "JOIN descendants USING (dir_id)"
+
+    sort_map = {
+        "size": "total_size DESC",
+        "files": "total_files DESC",
+        "dirs": "directory_count DESC",
+    }
+    order_clause = sort_map.get(sort_by, sort_map["size"])
+
+    where_clause = " AND ".join(conditions)
+
+    query = f"""
+        {cte_clause}
+        SELECT
+            s.owner_gid,
+            SUM(s.total_size_nr) as total_size,
+            SUM(s.file_count_nr) as total_files,
+            COUNT(*) as directory_count
+        FROM directories d
+        JOIN directory_stats s USING (dir_id)
+        {join_clause}
+        WHERE {where_clause}
+        GROUP BY s.owner_gid
+        ORDER BY {order_clause}
+    """
+    if limit:
+        query += f" LIMIT {limit}"
+
+    results = session.execute(text(query), params).fetchall()
+    return [
+        {
+            "owner_gid": row[0],
+            "total_size": row[1] or 0,
+            "total_files": row[2] or 0,
+            "directory_count": row[3] or 0,
+        }
+        for row in results
+    ]
 
 
 def query_single_filesystem(

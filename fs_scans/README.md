@@ -207,8 +207,8 @@ The importer uses a multi-pass algorithm optimized for large filesystems:
 **Pass 2b: Recursive Aggregation** - Bottom-up SQL aggregation computes recursive stats (file counts, directory counts, sizes, access times, owner UID/GID) from non-recursive stats. Uses high-performance `UPDATE ... FROM` with CTEs to aggregate children stats in a single pass per depth level.
 
 **Pass 3: Summary Tables** - Populates auxiliary tables for fast queries:
-- **Phase 3a**: Resolves UIDs to usernames via `pwd.getpwuid()` and stores in `user_info` table
-- **Phase 3b**: Pre-aggregates per-owner statistics into `owner_summary` table
+- **Phase 3a**: Resolves UIDs to usernames via `pwd.getpwuid()` and GIDs to groupnames via `grp.getgrgid()`, stores in `user_info` and `group_info` tables
+- **Phase 3b**: Pre-aggregates per-owner statistics into `owner_summary` table and per-group statistics into `group_summary` table
 - **Phase 3c**: Records scan metadata (source file, timestamps, totals) in `scan_metadata` table
 
 This approach is significantly faster than computing recursive stats during file scanning. Instead of walking up all ancestors for every file (O(files × depth)), Pass 2a processes each file once (O(files)), and Pass 2b aggregates in SQL (O(depth_levels)).
@@ -279,6 +279,14 @@ The importer creates the following tables:
 - `uid` - Primary key
 - `username`, `full_name` (GECOS field)
 
+**group_summary** - Pre-computed per-group aggregates (enables fast `--group-by group`)
+- `owner_gid` - Primary key
+- `total_size`, `total_files`, `directory_count`
+
+**group_info** - GID-to-groupname cache
+- `gid` - Primary key
+- `groupname`
+
 **access_histogram** - Pre-computed access time distribution (10 buckets)
 - `owner_uid`, `bucket_index` - Composite primary key
 - `file_count`, `total_size` - Files and bytes per bucket per owner
@@ -327,6 +335,7 @@ The `filesystem` argument is optional and defaults to `all`, which queries all a
 | `--min-files COUNT` | Min recursive file count (e.g., 500, 10K) |
 | `--max-files COUNT` | Max recursive file count |
 | `--group-by owner` | Show per-user summary instead of directory list |
+| `--group-by group` | Show per-group summary instead of directory list |
 | `-n, --limit N` | Limit results (default: 50, 0 for unlimited) |
 | `--sort-by FIELD` | Sort by: `size_r`, `size_nr`, `files_r`, `files_nr`, `atime_r`, `path`, `depth` |
 | `-o, --output FILE` | Write TSV output to file |
@@ -394,6 +403,12 @@ fs-scans query --group-by owner
 
 # Per-user summary with filters (computes dynamically)
 fs-scans query --group-by owner -d 4 -P /gpfs/csfs1/cisl
+
+# Show per-group summary (uses pre-computed group_summary table)
+fs-scans query --group-by group
+
+# Per-group summary with filters (computes dynamically)
+fs-scans query --group-by group -d 4 -P /gpfs/csfs1/cisl
 
 # Sort by different fields
 fs-scans query --sort-by files_r --limit 20  # Top 20 by file count
