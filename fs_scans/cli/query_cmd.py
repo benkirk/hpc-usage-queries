@@ -96,7 +96,7 @@ DynamicHelpCommand = make_dynamic_help_command('fs-scans query')
 )
 @click.option(
     "--sort-by",
-    type=click.Choice(["size", "size_r", "size_nr", "files", "files_r", "files_nr", "atime", "atime_r", "path", "depth", "dirs"]),
+    type=click.Choice(["size", "size_r", "size_nr", "files", "files_r", "files_nr", "dirs", "dirs_r", "dirs_nr", "atime", "atime_r", "path", "depth"]),
     default="size",
     show_default=True,
     help="Sort results by field (with --group-by owner: size, files, dirs)",
@@ -483,10 +483,15 @@ def query_cmd(
     # For multi-db: sort combined results and apply limit
     if multi_db:
         sort_key_map = {
+            "size": lambda d: d["total_size_r"] or 0,
             "size_r": lambda d: d["total_size_r"] or 0,
             "size_nr": lambda d: d["total_size_nr"] or 0,
+            "files": lambda d: d["file_count_r"] or 0,
             "files_r": lambda d: d["file_count_r"] or 0,
             "files_nr": lambda d: d["file_count_nr"] or 0,
+            "dirs": lambda d: d["dir_count_r"] or 0,
+            "dirs_r": lambda d: d["dir_count_r"] or 0,
+            "dirs_nr": lambda d: d["dir_count_nr"] or 0,
             "atime_r": lambda d: d["max_atime_r"] or "",
             "path": lambda d: (d["depth"], d["path"]),
             "depth": lambda d: d["depth"],
