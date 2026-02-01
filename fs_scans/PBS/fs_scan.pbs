@@ -4,8 +4,8 @@
 #PBS -A SCSG0001
 #PBS -j oe
 #PBS -q casper
-#PBS -l walltime=3:00:00
-#PBS -l select=1:ncpus=16:mpiprocs=1:ompthreads=16:mem=128G
+#PBS -l walltime=4:00:00
+#PBS -l select=1:ncpus=16:mpiprocs=1:ompthreads=16:mem=192G
 
 #----------------------------------------------------------------------------
 # Determine the directory containing this script, compatible with bash and zsh
@@ -19,6 +19,8 @@ fi
 SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
 TOP_DIR=$(git rev-parse --show-toplevel)
 #----------------------------------------------------------------------------
+
+sep="#----------------------------------------------------------------------------"
 
 set -e
 
@@ -50,9 +52,15 @@ ls -lh ${SCAN_LOG_FILE}
 rm -rf ${work_dir} && mkdir -p ${work_dir} && cd ${work_dir}
 export FS_SCAN_DATA_DIR=$(pwd)
 
-peak_memusage fs-scan-to-db --workers 12 --replace ${SCAN_LOG_FILE}
-peak_memusage query-fs-scan-db
+echo && echo ${sep}
+time peak_memusage fs-scans-import --workers 12 --replace ${SCAN_LOG_FILE}
 
-rsync -axv ./*.db /glade/work/benkirk/repos/qhist-queries/fs_scans/data/
+echo && echo ${sep}
+time peak_memusage fs-scans-query
+
+echo && echo ${sep}
+time peak_memusage fs-scans-analyze --access-history
+
+rsync -axv ./*.db ${TOP_DIR}/fs_scans/data/
 
 rm -rf ${work_dir}
