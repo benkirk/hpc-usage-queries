@@ -41,7 +41,6 @@ def run_import(
     data_dir: Path | None = None,
     batch_size: int = 10000,
     progress_interval: int = 1_000_000,
-    replace: bool = False,
     workers: int = 1,
     echo: bool = False,
 ) -> None:
@@ -58,7 +57,6 @@ def run_import(
         data_dir: Data directory override
         batch_size: Batch size for database operations
         progress_interval: Progress report interval (lines)
-        replace: If True, drop existing tables before import
         workers: Number of parallel workers for parsing
         echo: If True, enable SQL echo for debugging
     """
@@ -86,9 +84,8 @@ def run_import(
     resolved_db_path = get_db_path(filesystem, db_path)
 
     # Initialize database
-    if replace:
-        console.print("[yellow]Dropping existing tables...[/yellow]")
-        drop_tables(filesystem, echo=echo, db_path=resolved_db_path)
+    console.print("[yellow]Dropping existing tables...[/yellow]")
+    drop_tables(filesystem, echo=echo, db_path=resolved_db_path)
 
     engine = init_db(filesystem, echo=echo, db_path=resolved_db_path)
     session = get_session(filesystem, engine=engine)

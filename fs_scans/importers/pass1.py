@@ -128,7 +128,7 @@ def pass1_discover_directories(
             total=len(path_to_depth),
         )
 
-        insert_batch_size = 25000
+        insert_batch_size = 25_000
 
         # Group by depth using groupby (requires sorted input)
         for depth, paths_iter in groupby(sorted_paths, key=lambda p: path_to_depth[p]):

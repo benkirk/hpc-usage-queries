@@ -4,8 +4,8 @@ from ..parsers.base import FilesystemParser
 
 def open_input_file(filepath: Path) -> TextIO:
     """Open input file for reading with a large buffer."""
-    # Use 8MB buffer to minimize syscalls
-    return open(filepath, "r", encoding="utf-8", errors="replace", buffering=8 * 1024 * 1024)
+    # Use big buffer to minimize syscalls
+    return open(filepath, "r", encoding="utf-8", errors="replace", buffering=64 * 1024 * 1024)
 
 
 def chunk_file_generator(filepath: Path, chunk_bytes: int) -> Generator[list[str], None, None]:
