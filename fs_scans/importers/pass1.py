@@ -122,10 +122,12 @@ def pass1_discover_directories(
     sorted_paths = sorted(path_to_depth.keys(), key=lambda p: path_to_depth[p])
 
     # Determine starting ID (0 if empty, else max+1)
+    # FIXME - should be empty, confirm later.
     max_id = session.execute(
         text("SELECT COALESCE(MAX(dir_id), -1) FROM directories")
     ).scalar()
     current_dir_id = max_id + 1
+    assert 0 == current_dir_id
 
     with create_progress_bar(show_rate=False) as progress:
         task = progress.add_task(
@@ -163,10 +165,8 @@ def pass1_discover_directories(
             # Flush batch
             if len(dir_inserts) >= insert_batch_size:
                 session.execute(insert(Directory), dir_inserts)
-                stmt = sqlite_insert(DirectoryStats).values(stats_inserts).on_conflict_do_nothing(index_elements=['dir_id'])
-                session.execute(stmt)
+                session.execute(insert(DirectoryStats), stats_inserts)
                 session.commit()
-
                 progress.update(task, advance=len(dir_inserts))
                 dir_inserts = []
                 stats_inserts = []
@@ -174,8 +174,7 @@ def pass1_discover_directories(
         # Flush remaining
         if dir_inserts:
             session.execute(insert(Directory), dir_inserts)
-            stmt = sqlite_insert(DirectoryStats).values(stats_inserts).on_conflict_do_nothing(index_elements=['dir_id'])
-            session.execute(stmt)
+            session.execute(insert(DirectoryStats), stats_inserts)
             session.commit()
             progress.update(task, advance=len(dir_inserts))
 
