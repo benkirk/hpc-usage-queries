@@ -31,6 +31,7 @@ from .pass1 import *
 from .pass2a import *
 from .pass2b import *
 from .pass3 import *
+from .add_table_indexing import *
 
 
 def run_import(
@@ -122,6 +123,9 @@ def run_import(
             total_lines=metadata["total_lines"],
             num_workers=workers,
         )
+
+        add_directories_indexing(session)
+        add_directory_stats_indexing(session)
 
         # Pass 2b: Compute recursive stats via bottom-up aggregation (pure SQL)
         pass2b_aggregate_recursive_stats(session)
