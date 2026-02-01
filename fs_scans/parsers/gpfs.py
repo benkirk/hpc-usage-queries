@@ -79,22 +79,17 @@ class GPFSParser(FilesystemParser):
         group_match = FIELD_PATTERNS["group_id"].search(fields_str)
         atime_match = FIELD_PATTERNS["atime"].search(fields_str)
 
-        if not all([size_match, user_match, group_match]):
+        if not all([size_match, user_match, group_match, atime_match]):
             return None
 
         # Parse atime
-        atime = None
-        if atime_match:
-            try:
-                atime = datetime.strptime(atime_match.group(1), "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                pass
+        atime = datetime.strptime(atime_match.group(1), "%Y-%m-%d %H:%M:%S")
 
         # Size is in bytes
         size = int(size_match.group(1))
 
         # Allocated is in KB, convert to bytes
-        allocated = int(alloc_match.group(1)) * 1024 if alloc_match else 0
+        allocated = int(alloc_match.group(1)) * 1024
 
         # GPFS weirdness: data can be stored in the inode when the size is small.
         # If allocated is 0 but file size is small, assume it's stored in the inode.

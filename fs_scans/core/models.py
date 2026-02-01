@@ -13,82 +13,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship
 
-# Histogram Bucket Definitions
-
-# Access Time Histogram (10 buckets)
-# Tracks file distribution by last access time relative to scan date
-ATIME_BUCKETS = [
-    ("< 1 Month", 30),           # 0-30 days
-    ("1-3 Months", 90),          # 30-90 days
-    ("3-6 Months", 180),         # 90-180 days
-    ("6-12 Months", 365),        # 180-365 days
-    ("1-2 Years", 730),          # 1-2 years
-    ("2-3 Years", 1095),         # 2-3 years
-    ("3-4 Years", 1460),         # 3-4 years
-    ("5-6 Years", 2190),         # 5-6 years
-    ("6-7 Years", 2555),         # 6-7 years
-    ("7+ Years", None),          # 7+ years
-]
-
-# Size Histogram (10 buckets)
-# Logarithmic scale covering practical file size ranges
-SIZE_BUCKETS = [
-    ("0 - 1 KiB", 0, 1024),
-    ("1 KiB - 10 KiB", 1024, 10 * 1024),
-    ("10 KiB - 100 KiB", 10 * 1024, 100 * 1024),
-    ("100 KiB - 1 MiB", 100 * 1024, 1024 * 1024),
-    ("1 MiB - 10 MiB", 1024 * 1024, 10 * 1024 * 1024),
-    ("10 MiB - 100 MiB", 10 * 1024 * 1024, 100 * 1024 * 1024),
-    ("100 MiB - 1 GiB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
-    ("1 GiB - 10 GiB", 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
-    ("10 GiB - 100 GiB", 10 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024),
-    ("100 GiB+", 100 * 1024 * 1024 * 1024, None),
-]
-
-
-def classify_atime_bucket(atime: datetime | None, scan_date: datetime) -> int:
-    """Classify file's access time into histogram bucket.
-
-    Args:
-        atime: File's last access time
-        scan_date: Scan timestamp (extracted from filename)
-
-    Returns:
-        Bucket index (0-9)
-    """
-    if atime is None:
-        return len(ATIME_BUCKETS) - 1  # Default to oldest bucket
-
-    days_old = (scan_date - atime).days
-
-    for idx, (_, max_days) in enumerate(ATIME_BUCKETS):
-        if max_days is None:  # Last bucket (7+ years)
-            return idx
-        if days_old < max_days:
-            return idx
-
-    return len(ATIME_BUCKETS) - 1  # Fallback to oldest bucket
-
-
-def classify_size_bucket(size_bytes: int) -> int:
-    """Classify file size into histogram bucket.
-
-    Args:
-        size_bytes: File size in bytes (allocated size)
-
-    Returns:
-        Bucket index (0-9)
-    """
-    for idx, (_, min_size, max_size) in enumerate(SIZE_BUCKETS):
-        if max_size is None:  # Last bucket (100 GiB+)
-            if size_bytes >= min_size:
-                return idx
-        elif min_size <= size_bytes < max_size:
-            return idx
-
-    return len(SIZE_BUCKETS) - 1  # Fallback to largest bucket
-
-
 Base = declarative_base()
 
 
@@ -152,32 +76,25 @@ class DirectoryStats(Base):
     )
 
     # Non-recursive metrics (direct children only)
-    file_count_nr = Column(BigInteger, default=0)
-    total_size_nr = Column(BigInteger, default=0)
+    file_count_nr = Column(BigInteger, nullable=False, default=0, index=True)
+    total_size_nr = Column(BigInteger, nullable=False, default=0, index=True)
+    dir_count_nr = Column(BigInteger, nullable=False, default=0, index=True)
     max_atime_nr = Column(DateTime)
-    dir_count_nr = Column(BigInteger, default=0)
 
     # Recursive metrics (all descendants)
-    file_count_r = Column(BigInteger, default=0)
-    total_size_r = Column(BigInteger, default=0)
-    max_atime_r = Column(DateTime)
-    dir_count_r = Column(BigInteger, default=0)
+    file_count_r = Column(BigInteger, nullable=False, default=0, index=True)
+    total_size_r = Column(BigInteger, nullable=False, default=0, index=True)
+    dir_count_r = Column(BigInteger, nullable=False, default=0, index=True)
+    max_atime_r = Column(DateTime, nullable=True)
 
-    # Owner tracking: -1=no files yet, NULL=multiple owners, else=single owner UID
-    owner_uid = Column(Integer, default=-1, index=True)
-    # Group tracking: -1=no files yet, NULL=multiple groups, else=single group GID
-    owner_gid = Column(Integer, default=-1, index=True)
+    # Owner/group tracking: -1=no files yet, NULL=multiple, else=single UID/GID
+    owner_uid = Column(Integer, nullable=True, default=-1, index=True)
+    owner_gid = Column(Integer, nullable=True, default=-1, index=True)
 
     # Relationship
     directory = relationship("Directory", back_populates="stats")
 
     __table_args__ = (
-        Index("ix_stats_size_r", "total_size_r"),
-        Index("ix_stats_files_r", "file_count_r"),
-        Index("ix_stats_size_nr", "total_size_nr"),
-        Index("ix_stats_files_nr", "file_count_nr"),
-        Index("ix_stats_dirs_r", "dir_count_r"),
-        Index("ix_stats_dirs_nr", "dir_count_nr"),
         # Composite indexes for optimized owner-filtered queries
         Index("ix_stats_owner_size", "owner_uid", "total_size_r"),
         Index("ix_stats_owner_files", "owner_uid", "file_count_r"),
@@ -191,6 +108,19 @@ class DirectoryStats(Base):
             f"<DirectoryStats(dir_id={self.dir_id}, "
             f"files_r={self.file_count_r}, size_r={self.total_size_r})>"
         )
+
+
+class DirStatsAccumulator:
+    """Memory-efficient accumulator for directory statistics using __slots__."""
+    __slots__ = ('nr_count', 'nr_size', 'nr_atime', 'nr_dirs', 'first_uid', 'first_gid')
+
+    def __init__(self):
+        self.nr_count = 0
+        self.nr_size = 0
+        self.nr_atime = None
+        self.nr_dirs = 0
+        self.first_uid = None
+        self.first_gid = None
 
 
 class ScanMetadata(Base):
@@ -318,6 +248,43 @@ class AccessHistogram(Base):
             f"<AccessHistogram(owner_uid={self.owner_uid}, "
             f"bucket_index={self.bucket_index}, file_count={self.file_count})>"
         )
+# Access Time Histogram (10 buckets)
+# Tracks file distribution by last access time relative to scan date
+ATIME_BUCKETS = [
+    ("< 1 Month", 30),           # 0-30 days
+    ("1-3 Months", 90),          # 30-90 days
+    ("3-6 Months", 180),         # 90-180 days
+    ("6-12 Months", 365),        # 180-365 days
+    ("1-2 Years", 730),          # 1-2 years
+    ("2-3 Years", 1095),         # 2-3 years
+    ("3-4 Years", 1460),         # 3-4 years
+    ("5-6 Years", 2190),         # 5-6 years
+    ("6-7 Years", 2555),         # 6-7 years
+    ("7+ Years", None),          # 7+ years
+]
+
+def classify_atime_bucket(atime: datetime | None, scan_date: datetime) -> int:
+    """Classify file's access time into histogram bucket.
+
+    Args:
+        atime: File's last access time
+        scan_date: Scan timestamp (extracted from filename)
+
+    Returns:
+        Bucket index (0-9)
+    """
+    if atime is None:
+        return len(ATIME_BUCKETS) - 1  # Default to oldest bucket
+
+    days_old = (scan_date - atime).days
+
+    for idx, (_, max_days) in enumerate(ATIME_BUCKETS):
+        if max_days is None:  # Last bucket (7+ years)
+            return idx
+        if days_old < max_days:
+            return idx
+
+    return len(ATIME_BUCKETS) - 1  # Fallback to oldest bucket
 
 
 class SizeHistogram(Base):
@@ -345,3 +312,49 @@ class SizeHistogram(Base):
             f"<SizeHistogram(owner_uid={self.owner_uid}, "
             f"bucket_index={self.bucket_index}, file_count={self.file_count})>"
         )
+
+
+# Size Histogram (10 buckets)
+# Logarithmic scale covering practical file size ranges
+SIZE_BUCKETS = [
+    ("0 - 1 KiB", 0, 1024),
+    ("1 KiB - 10 KiB", 1024, 10 * 1024),
+    ("10 KiB - 100 KiB", 10 * 1024, 100 * 1024),
+    ("100 KiB - 1 MiB", 100 * 1024, 1024 * 1024),
+    ("1 MiB - 10 MiB", 1024 * 1024, 10 * 1024 * 1024),
+    ("10 MiB - 100 MiB", 10 * 1024 * 1024, 100 * 1024 * 1024),
+    ("100 MiB - 1 GiB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
+    ("1 GiB - 10 GiB", 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    ("10 GiB - 100 GiB", 10 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024),
+    ("100 GiB+", 100 * 1024 * 1024 * 1024, None),
+]
+
+
+def classify_size_bucket(size_bytes: int) -> int:
+    """Classify file size into histogram bucket.
+
+    Args:
+        size_bytes: File size in bytes (allocated size)
+
+    Returns:
+        Bucket index (0-9)
+    """
+    for idx, (_, min_size, max_size) in enumerate(SIZE_BUCKETS):
+        if max_size is None:  # Last bucket (100 GiB+)
+            if size_bytes >= min_size:
+                return idx
+        elif min_size <= size_bytes < max_size:
+            return idx
+
+    return len(SIZE_BUCKETS) - 1  # Fallback to largest bucket
+
+
+class HistAccumulator:
+    """Memory-efficient accumulator for histogram statistics using __slots__."""
+    __slots__ = ('atime_hist', 'size_hist', 'atime_size', 'size_size')
+
+    def __init__(self):
+        self.atime_hist = [0] * 10
+        self.size_hist = [0] * 10
+        self.atime_size = [0] * 10
+        self.size_size = [0] * 10

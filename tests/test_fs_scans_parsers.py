@@ -83,16 +83,6 @@ class TestGPFSParser:
         assert entry.size == 512
         assert entry.allocated == 512  # Should be set to size for small files
 
-    def test_parse_line_no_atime(self):
-        """Test parsing line without access time."""
-        parser = GPFSParser()
-        line = "<0> 123456 1 0 s=1024 a=1 u=1000 g=100 p=-rw-r--r-- -- /path/to/file.txt"
-
-        entry = parser.parse_line(line)
-
-        assert entry is not None
-        assert entry.atime is None
-
     def test_parse_line_invalid(self):
         """Test parsing invalid line returns None."""
         parser = GPFSParser()
