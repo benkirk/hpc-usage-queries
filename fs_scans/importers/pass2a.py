@@ -282,7 +282,7 @@ def pass2a_nonrecursive_stats(
             # Optimized Aggregated Dictionary from Worker (DirStatsAccumulator objects)
             for parent_path, w_stats in dir_results.items():
                 parent_id = local_path_to_id.get(parent_path)
-                if not parent_id:
+                if parent_id is None:
                     continue
 
                 # Merge into main accumulator
