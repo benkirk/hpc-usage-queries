@@ -76,32 +76,25 @@ class DirectoryStats(Base):
     )
 
     # Non-recursive metrics (direct children only)
-    file_count_nr = Column(BigInteger, default=0)
-    total_size_nr = Column(BigInteger, default=0)
+    file_count_nr = Column(BigInteger, nullable=False, default=0, index=True)
+    total_size_nr = Column(BigInteger, nullable=False, default=0, index=True)
+    dir_count_nr = Column(BigInteger, nullable=False, default=0, index=True)
     max_atime_nr = Column(DateTime)
-    dir_count_nr = Column(BigInteger, default=0)
 
     # Recursive metrics (all descendants)
-    file_count_r = Column(BigInteger, default=0)
-    total_size_r = Column(BigInteger, default=0)
-    max_atime_r = Column(DateTime)
-    dir_count_r = Column(BigInteger, default=0)
+    file_count_r = Column(BigInteger, nullable=False, default=0, index=True)
+    total_size_r = Column(BigInteger, nullable=False, default=0, index=True)
+    dir_count_r = Column(BigInteger, nullable=False, default=0, index=True)
+    max_atime_r = Column(DateTime, nullable=True)
 
-    # Owner tracking: -1=no files yet, NULL=multiple owners, else=single owner UID
-    owner_uid = Column(Integer, default=-1, index=True)
-    # Group tracking: -1=no files yet, NULL=multiple groups, else=single group GID
-    owner_gid = Column(Integer, default=-1, index=True)
+    # Owner/group tracking: -1=no files yet, NULL=multiple, else=single UID/GID
+    owner_uid = Column(Integer, nullable=True, default=-1, index=True)
+    owner_gid = Column(Integer, nullable=True, default=-1, index=True)
 
     # Relationship
     directory = relationship("Directory", back_populates="stats")
 
     __table_args__ = (
-        Index("ix_stats_size_r", "total_size_r"),
-        Index("ix_stats_files_r", "file_count_r"),
-        Index("ix_stats_size_nr", "total_size_nr"),
-        Index("ix_stats_files_nr", "file_count_nr"),
-        Index("ix_stats_dirs_r", "dir_count_r"),
-        Index("ix_stats_dirs_nr", "dir_count_nr"),
         # Composite indexes for optimized owner-filtered queries
         Index("ix_stats_owner_size", "owner_uid", "total_size_r"),
         Index("ix_stats_owner_files", "owner_uid", "file_count_r"),

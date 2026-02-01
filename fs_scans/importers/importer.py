@@ -28,7 +28,8 @@ Multi-Pass Algorithm:
 from .common_imports import *
 from .file_handling import *
 from .pass1 import *
-from .pass2 import *
+from .pass2a import *
+from .pass2b import *
 from .pass3 import *
 
 
