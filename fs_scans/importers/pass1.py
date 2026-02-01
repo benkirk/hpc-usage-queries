@@ -3,6 +3,30 @@ from ..parsers.base import FilesystemParser
 from .file_handling import *
 
 
+def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime | None]) -> tuple[Any, Any, int]:
+    """
+    Worker function to parse a chunk of lines using the provided parser.
+
+    Args:
+        args: Tuple of (lines_chunk, parser, scan_date)
+
+    Returns:
+        Tuple of (dir_results, None, count of lines processed)
+        - dir_results is list[ParsedEntry], hist_results is None
+    """
+    chunk, parser, scan_date = args
+
+    results = []
+    for line in chunk:
+        parsed = parser.parse_line(line.rstrip("\n"))
+        if parsed and parsed.is_dir:
+            results.append(parsed)
+
+    return results, None, len(chunk)
+
+
+
+
 def pass1_discover_directories(
     input_file: Path,
     parser: FilesystemParser,
@@ -113,7 +137,7 @@ def pass1_discover_directories(
             parser=parser,
             num_workers=num_workers,
             chunk_bytes=CHUNK_BYTES,
-            filter_type="dirs",
+            worker_parse_chunk=_worker_parse_chunk,
             process_results_fn=process_parsed_dirs,
             progress_callback=update_progress,
             flush_callback=flush_batch,

@@ -2,129 +2,6 @@ from .common_imports import *
 from ..parsers.base import FilesystemParser
 
 
-
-class DirStatsAccumulator:
-    """Memory-efficient accumulator for directory statistics using __slots__."""
-    __slots__ = ('nr_count', 'nr_size', 'nr_atime', 'nr_dirs', 'first_uid', 'first_gid')
-
-    def __init__(self):
-        self.nr_count = 0
-        self.nr_size = 0
-        self.nr_atime = None
-        self.nr_dirs = 0
-        self.first_uid = None
-        self.first_gid = None
-
-
-class HistAccumulator:
-    """Memory-efficient accumulator for histogram statistics using __slots__."""
-    __slots__ = ('atime_hist', 'size_hist', 'atime_size', 'size_size')
-
-    def __init__(self):
-        self.atime_hist = [0] * 10
-        self.size_hist = [0] * 10
-        self.atime_size = [0] * 10
-        self.size_size = [0] * 10
-
-
-def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime | None]) -> tuple[Any, Any, int]:
-    """
-    Worker function to parse a chunk of lines using the provided parser.
-
-    Args:
-        args: Tuple of (lines_chunk, filter_type, parser, scan_date)
-
-    Returns:
-        Tuple of (dir_results, hist_results, count of lines processed)
-        - If filter_type="files":
-            dir_results is dict[parent_path, DirStatsAccumulator]
-            hist_results is dict[uid, HistAccumulator]
-        - If filter_type="dirs"/"all": dir_results is list[ParsedEntry], hist_results is None
-    """
-    chunk, filter_type, parser, scan_date = args
-
-    if filter_type == "files":
-        # Map-Reduce Optimization: Aggregate stats locally in worker
-        # This reduces IPC traffic and main thread load by ~1000x
-        results = {}
-        hist_results = {}
-
-        for line in chunk:
-            parsed = parser.parse_line(line.rstrip("\n"))
-            if parsed:
-                parent = os.path.dirname(parsed.path)
-                if parent not in results:
-                    results[parent] = DirStatsAccumulator()
-                stats = results[parent]
-
-                if parsed.is_dir:
-                    # Track directory count for parent
-                    stats.nr_dirs += 1
-                else:
-                    # Track file stats
-                    # Accumulate count and size
-                    stats.nr_count += 1
-                    stats.nr_size += parsed.allocated
-
-                    # Accumulate atime
-                    if parsed.atime:
-                        cur_max = stats.nr_atime
-                        stats.nr_atime = max(cur_max, parsed.atime) if cur_max else parsed.atime
-
-                    # Accumulate UID (Single pass logic)
-                    # None = init, -999 = multiple/conflict, else = single UID
-                    p_uid = parsed.uid
-                    s_uid = stats.first_uid
-
-                    if s_uid is None:
-                        stats.first_uid = p_uid
-                    elif s_uid != -999 and s_uid != p_uid:
-                        stats.first_uid = -999
-
-                    # Accumulate GID (Single pass logic)
-                    # None = init, -999 = multiple/conflict, else = single GID
-                    p_gid = parsed.gid
-                    s_gid = stats.first_gid
-
-                    if s_gid is None:
-                        stats.first_gid = p_gid
-                    elif s_gid != -999 and s_gid != p_gid:
-                        stats.first_gid = -999
-
-                    # NEW: Track histograms per UID (files only)
-                    uid = parsed.uid
-                    if uid not in hist_results:
-                        hist_results[uid] = HistAccumulator()
-
-                    hist = hist_results[uid]
-
-                    # Classify and update histograms
-                    atime_bucket = classify_atime_bucket(parsed.atime, scan_date) if scan_date else 9
-                    hist.atime_hist[atime_bucket] += 1
-                    hist.atime_size[atime_bucket] += parsed.allocated
-
-                    size_bucket = classify_size_bucket(parsed.allocated)
-                    hist.size_hist[size_bucket] += 1
-                    hist.size_size[size_bucket] += parsed.allocated
-
-        return results, hist_results, len(chunk)
-
-    else:
-        # Standard behavior for Pass 1 (Dirs)
-
-        results = []
-        for line in chunk:
-            parsed = parser.parse_line(line.rstrip("\n"))
-            if parsed:
-                if filter_type == "all":
-                    results.append(parsed)
-                elif filter_type == "dirs" and parsed.is_dir:
-                    results.append(parsed)
-                elif filter_type == "files" and not parsed.is_dir:
-                    results.append(parsed)  # Fallback if ever needed
-        return results, None, len(chunk)
-
-
 def open_input_file(filepath: Path) -> TextIO:
     """Open input file for reading with a large buffer."""
     # Use 8MB buffer to minimize syscalls
@@ -146,7 +23,7 @@ def run_parallel_file_processing(
     parser: FilesystemParser,
     num_workers: int,
     chunk_bytes: int,
-    filter_type: str,
+    worker_parse_chunk: Callable[[Any], Any],
     process_results_fn: Callable[[Any], None],
     progress_callback: Callable[[int], None] | None = None,
     flush_callback: Callable[[], None] | None = None,
@@ -163,12 +40,12 @@ def run_parallel_file_processing(
         parser: Parser instance to use for parsing
         num_workers: Number of worker processes
         chunk_bytes: Approx bytes per chunk (passed to readlines)
-        filter_type: "dirs" or "files"
+        worker_parse_chunk:
         process_results_fn: Function to process parsed results
         progress_callback: Optional callback receiving estimated line count
         flush_callback: Optional callback to flush accumulated data
         should_flush_fn: Optional function that returns True if flush needed
-        scan_date: Scan timestamp (needed for histogram classification in filter_type="files")
+        scan_date: Scan timestamp (needed for histogram classification)
 
     Returns:
         Total line count
@@ -178,12 +55,12 @@ def run_parallel_file_processing(
     # Generator for pool arguments
     def args_generator():
         for chunk in chunk_file_generator(input_file, chunk_bytes):
-            yield (chunk, filter_type, parser, scan_date)
+            yield (chunk, parser, scan_date)
 
     # Use a Pool to manage workers automatically
     with mp.Pool(processes=num_workers) as pool:
         # imap_unordered allows processing results as soon as they are ready
-        for dir_results, hist_results, lines_in_chunk in pool.imap_unordered(_worker_parse_chunk, args_generator(), chunksize=1):
+        for dir_results, hist_results, lines_in_chunk in pool.imap_unordered(worker_parse_chunk, args_generator(), chunksize=1):
             total_lines += lines_in_chunk
 
             if dir_results or hist_results:

@@ -3,6 +3,85 @@ from ..parsers.base import FilesystemParser
 from .file_handling import *
 
 
+def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime | None]) -> tuple[Any, Any, int]:
+    """
+    Worker function to parse a chunk of lines using the provided parser.
+
+    Args:
+        args: Tuple of (lines_chunk, parser, scan_date)
+
+    Returns:
+        Tuple of (dir_results, hist_results, count of lines processed)
+        - dir_results is dict[parent_path, DirStatsAccumulator]
+        - hist_results is dict[uid, HistAccumulator]
+    """
+    chunk, parser, scan_date = args
+
+    # Map-Reduce Optimization: Aggregate stats locally in worker
+    # This reduces IPC traffic and main thread load by ~1000x
+    results = {}
+    hist_results = {}
+
+    for line in chunk:
+        parsed = parser.parse_line(line.rstrip("\n"))
+        if parsed:
+            parent = os.path.dirname(parsed.path)
+            if parent not in results:
+                results[parent] = DirStatsAccumulator()
+            stats = results[parent]
+
+            if parsed.is_dir:
+                # Track directory count for parent
+                stats.nr_dirs += 1
+            else:
+                # Track file stats
+                # Accumulate count and size
+                stats.nr_count += 1
+                stats.nr_size += parsed.allocated
+
+                # Accumulate atime
+                if parsed.atime:
+                    cur_max = stats.nr_atime
+                    stats.nr_atime = max(cur_max, parsed.atime) if cur_max else parsed.atime
+
+                # Accumulate UID (Single pass logic)
+                # None = init, -999 = multiple/conflict, else = single UID
+                p_uid = parsed.uid
+                s_uid = stats.first_uid
+
+                if s_uid is None:
+                    stats.first_uid = p_uid
+                elif s_uid != -999 and s_uid != p_uid:
+                    stats.first_uid = -999
+
+                # Accumulate GID (Single pass logic)
+                # None = init, -999 = multiple/conflict, else = single GID
+                p_gid = parsed.gid
+                s_gid = stats.first_gid
+
+                if s_gid is None:
+                    stats.first_gid = p_gid
+                elif s_gid != -999 and s_gid != p_gid:
+                    stats.first_gid = -999
+
+                # NEW: Track histograms per UID (files only)
+                uid = parsed.uid
+                if uid not in hist_results:
+                    hist_results[uid] = HistAccumulator()
+
+                hist = hist_results[uid]
+
+                # Classify and update histograms
+                atime_bucket = classify_atime_bucket(parsed.atime, scan_date) if scan_date else 9
+                hist.atime_hist[atime_bucket] += 1
+                hist.atime_size[atime_bucket] += parsed.allocated
+
+                size_bucket = classify_size_bucket(parsed.allocated)
+                hist.size_hist[size_bucket] += 1
+                hist.size_size[size_bucket] += parsed.allocated
+
+    return results, hist_results, len(chunk)
+
 
 def flush_nr_updates(session, pending_updates: dict) -> None:
     """
@@ -290,7 +369,7 @@ def pass2a_nonrecursive_stats(
             parser=parser,
             num_workers=num_workers,
             chunk_bytes=CHUNK_BYTES,
-            filter_type="files",
+            worker_parse_chunk=_worker_parse_chunk,
             process_results_fn=process_results_batch,
             progress_callback=update_progress_bar,
             flush_callback=do_flush,
