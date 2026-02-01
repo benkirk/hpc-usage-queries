@@ -40,6 +40,7 @@ from ..core.models import (
 from ..parsers.base import FilesystemParser
 from .file_handling import *
 
+
 def pass1_discover_directories(
     input_file: Path,
     parser: FilesystemParser,
