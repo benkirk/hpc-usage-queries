@@ -1,7 +1,6 @@
 from .common_imports import *
 from ..parsers.base import FilesystemParser
 from .file_handling import *
-from itertools import groupby
 
 
 def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime | None]) -> tuple[Any, Any, int]:
@@ -122,6 +121,12 @@ def pass1_discover_directories(
     # Sort paths by depth (O(N log N) - more efficient than O(N*D) dict scans)
     sorted_paths = sorted(path_to_depth.keys(), key=lambda p: path_to_depth[p])
 
+    # Determine starting ID (0 if empty, else max+1)
+    max_id = session.execute(
+        text("SELECT COALESCE(MAX(dir_id), -1) FROM directories")
+    ).scalar()
+    current_dir_id = max_id + 1
+
     with create_progress_bar(show_rate=False) as progress:
         task = progress.add_task(
             "[green]Inserting directories...",
@@ -129,57 +134,50 @@ def pass1_discover_directories(
         )
 
         insert_batch_size = 25_000
+        dir_inserts = []
+        stats_inserts = []
 
-        # Group by depth using groupby (requires sorted input)
-        for depth, paths_iter in groupby(sorted_paths, key=lambda p: path_to_depth[p]):
-            paths_at_depth = list(paths_iter)
+        for p in sorted_paths:
+            depth = path_to_depth[p]  # Retrieve depth before overwriting
+            parent_path, _, name = p.rpartition('/')
+            if not name:  # Root case
+                name = p
 
-            # Prepare insertion data
-            dir_inserts = []
-            for p in paths_at_depth:
-                parent_path, _, name = p.rpartition('/')
-                if not name:  # Root case
-                    name = p
+            # Parent lookup: parent must have been processed already (lower depth)
+            parent_id = path_to_depth.get(parent_path) if parent_path else None
 
-                # Parent lookup: parent already has dir_id (processed earlier)
-                parent_id = path_to_depth.get(parent_path) if parent_path else None
+            # Assign ID and update map
+            dir_id = current_dir_id
+            current_dir_id += 1
+            path_to_depth[p] = dir_id
 
-                dir_inserts.append({
-                    "parent_id": parent_id,
-                    "name": name,
-                    "depth": depth,
-                })
+            dir_inserts.append({
+                "dir_id": dir_id,
+                "parent_id": parent_id,
+                "name": name,
+                "depth": depth,
+            })
 
-            # Get max dir_id before insert
-            max_id_before = session.execute(
-                text("SELECT COALESCE(MAX(dir_id), 0) FROM directories")
-            ).scalar()
+            stats_inserts.append({"dir_id": dir_id})
 
-            # Bulk insert directories
-            for i in range(0, len(dir_inserts), insert_batch_size):
-                session.execute(
-                    insert(Directory),
-                    dir_inserts[i : i + insert_batch_size]
-                )
-            session.commit()
-
-            # Assign IDs sequentially and OVERWRITE dict in place (safe now!)
-            stats_inserts = []
-            for idx, p in enumerate(paths_at_depth):
-                dir_id = max_id_before + idx + 1
-                path_to_depth[p] = dir_id  # Overwrites depth with dir_id
-                stats_inserts.append({"dir_id": dir_id})
-
-            # Bulk insert stats
-            if stats_inserts:
-                for i in range(0, len(stats_inserts), insert_batch_size):
-                    stmt = sqlite_insert(DirectoryStats).values(
-                        stats_inserts[i : i + insert_batch_size]
-                    ).on_conflict_do_nothing(index_elements=['dir_id'])
-                    session.execute(stmt)
+            # Flush batch
+            if len(dir_inserts) >= insert_batch_size:
+                session.execute(insert(Directory), dir_inserts)
+                stmt = sqlite_insert(DirectoryStats).values(stats_inserts).on_conflict_do_nothing(index_elements=['dir_id'])
+                session.execute(stmt)
                 session.commit()
 
-            progress.update(task, advance=len(paths_at_depth))
+                progress.update(task, advance=len(dir_inserts))
+                dir_inserts = []
+                stats_inserts = []
+
+        # Flush remaining
+        if dir_inserts:
+            session.execute(insert(Directory), dir_inserts)
+            stmt = sqlite_insert(DirectoryStats).values(stats_inserts).on_conflict_do_nothing(index_elements=['dir_id'])
+            session.execute(stmt)
+            session.commit()
+            progress.update(task, advance=len(dir_inserts))
 
     console.print(f"    Inserted {len(path_to_depth):,} directories")
 
