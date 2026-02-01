@@ -3,9 +3,16 @@
 This module provides the multi-pass import algorithm that works with any
 filesystem parser (GPFS, Lustre, POSIX, etc.).
 
+Parser Requirements:
+    - Parsers should provide inode and fileset_id fields for efficient deduplication
+    - For most filesystems: fileset_id=0, inode=actual inode number
+    - For GPFS: fileset_id and inode both vary per entry
+    - If not provided, defaults to 0 (may cause import issues)
+
 Multi-Pass Algorithm:
     Pass 1: Directory Discovery
         Phase 1a: Stream directories to SQLite staging table (parallelizable)
+                  Uses (fileset_id, inode) primary key for fast deduplication
         Phase 1b: Sort by depth, insert into database, build path_to_id lookup
 
     Pass 2: Statistics Accumulation
@@ -442,20 +449,20 @@ def pass1_discover_directories(
     """
     console.print(f"[bold]Pass 1:[/bold] Discovering directories ({num_workers} workers)...")
 
-    # Create staging table (parser-agnostic version without inode/fileset_id)
+    # Create staging table with inode-based primary key for faster deduplication
     # Drop existing staging_dirs from previous run (if any) before Phase 1a starts
     # This way any cleanup delay happens upfront rather than after Phase 1b
     session.execute(text("DROP TABLE IF EXISTS staging_dirs"))
     session.execute(
         text("""
-        CREATE TABLE staging_dirs (
+        CREATE TEMPORARY TABLE IF NOT EXISTS staging_dirs (
+            inode INTEGER NOT NULL,
+            fileset_id INTEGER NOT NULL,
             depth INTEGER NOT NULL,
-            path TEXT NOT NULL PRIMARY KEY
+            path TEXT NOT NULL,
+            PRIMARY KEY (fileset_id, inode)
         )
     """)
-    )
-    session.execute(
-        text("CREATE INDEX idx_staging_depth ON staging_dirs(depth)")
     )
     session.commit()
 
@@ -496,6 +503,8 @@ def pass1_discover_directories(
             for parsed in dir_results:
                 batch.append(
                     {
+                        "inode": parsed.inode if parsed.inode is not None else 0,
+                        "fileset_id": parsed.fileset_id if parsed.fileset_id is not None else 0,
                         "depth": parsed.path.count("/"),
                         "path": parsed.path,
                     }
@@ -508,8 +517,8 @@ def pass1_discover_directories(
             if batch:
                 session.execute(
                     text("""
-                    INSERT OR IGNORE INTO staging_dirs (depth, path)
-                    VALUES (:depth, :path)
+                    INSERT OR IGNORE INTO staging_dirs (inode, fileset_id, depth, path)
+                    VALUES (:inode, :fileset_id, :depth, :path)
                 """),
                     batch,
                 )
@@ -532,6 +541,13 @@ def pass1_discover_directories(
         # Final flush
         flush_batch()
         update_progress()
+
+    # index after
+    session.execute(
+        text("CREATE INDEX idx_staging_depth ON staging_dirs(depth)")
+    )
+    session.commit()
+
 
     console.print(f"    Lines scanned: {line_count:,}")
     console.print(f"    Found {dir_count:,} directories")
@@ -622,8 +638,9 @@ def pass1_discover_directories(
 
     console.print(f"    Inserted {len(path_to_id):,} directories")
 
-    # Note: staging_dirs table is preserved and reused on next import
-    # (cleared at start of Phase 1a instead of dropped here)
+    # Explicitly drop staging table now that Phase 1b is complete (immediate cleanup)
+    session.execute(text("DROP TABLE IF EXISTS staging_dirs"))
+    session.commit()
 
     # Return path_to_id and metadata for Phase 2
     metadata = {
@@ -709,7 +726,7 @@ def pass2a_nonrecursive_stats(
 
                 # Merge into main accumulator
                 upd = local_updates[parent_id]
-                
+
                 # Update file count for progress tracking
                 file_count += w_stats.nr_count
 
