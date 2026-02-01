@@ -464,9 +464,6 @@ def pass1_discover_directories(
         )
     """)
     )
-    session.execute(
-        text("CREATE INDEX idx_staging_depth ON staging_dirs(depth)")
-    )
     session.commit()
 
     # Phase 1a: Stream directories to staging table
@@ -544,6 +541,13 @@ def pass1_discover_directories(
         # Final flush
         flush_batch()
         update_progress()
+
+    # index after
+    session.execute(
+        text("CREATE INDEX idx_staging_depth ON staging_dirs(depth)")
+    )
+    session.commit()
+
 
     console.print(f"    Lines scanned: {line_count:,}")
     console.print(f"    Found {dir_count:,} directories")
@@ -722,7 +726,7 @@ def pass2a_nonrecursive_stats(
 
                 # Merge into main accumulator
                 upd = local_updates[parent_id]
-                
+
                 # Update file count for progress tracking
                 file_count += w_stats.nr_count
 
