@@ -83,6 +83,7 @@ def import_cmd(
     progress_interval: int,
     workers: int,
     echo: bool,
+    replace: bool,
 ):
     """Import filesystem scan logs into SQLite database.
 
