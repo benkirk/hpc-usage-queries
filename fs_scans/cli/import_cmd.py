@@ -43,7 +43,7 @@ DynamicHelpCommand = make_dynamic_help_command("fs-scans import")
 @click.option(
     "--batch-size",
     type=int,
-    default=10000,
+    default=25_000,
     show_default=True,
     help="Batch size for database operations",
 )

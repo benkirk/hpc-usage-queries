@@ -40,7 +40,7 @@ def run_import(
     filesystem: str | None = None,
     db_path: Path | None = None,
     data_dir: Path | None = None,
-    batch_size: int = 10000,
+    batch_size: int = 25_000,
     progress_interval: int = 1_000_000,
     workers: int = 1,
     echo: bool = False,

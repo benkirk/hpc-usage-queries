@@ -19,15 +19,13 @@ def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime |
 
     # Map-Reduce Optimization: Aggregate stats locally in worker
     # This reduces IPC traffic and main thread load by ~1000x
-    results = {}
-    hist_results = {}
+    results = defaultdict(DirStatsAccumulator)
+    hist_results = defaultdict(HistAccumulator)
 
     for line in chunk:
         parsed = parser.parse_line(line.rstrip("\n"))
         if parsed:
             parent = os.path.dirname(parsed.path)
-            if parent not in results:
-                results[parent] = DirStatsAccumulator()
             stats = results[parent]
 
             if parsed.is_dir:
@@ -66,9 +64,6 @@ def _worker_parse_chunk(args: tuple[list[str], str, FilesystemParser, datetime |
 
                 # NEW: Track histograms per UID (files only)
                 uid = parsed.uid
-                if uid not in hist_results:
-                    hist_results[uid] = HistAccumulator()
-
                 hist = hist_results[uid]
 
                 # Classify and update histograms
@@ -219,7 +214,7 @@ def pass2a_nonrecursive_stats(
     session,
     path_to_id: dict[str, int],
     scan_date: datetime | None = None,
-    batch_size: int = 10000,
+    batch_size: int = 25_000,
     progress_interval: int = 1_000_000,
     total_lines: int | None = None,
     num_workers: int = 1,
