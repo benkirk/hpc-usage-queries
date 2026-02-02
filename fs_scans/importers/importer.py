@@ -124,6 +124,7 @@ def run_import(
             num_workers=workers,
         )
 
+        # add indexing *after* insertions but before the detailed tree queries of recursive stats
         add_directories_indexing(session)
         add_directory_stats_indexing(session)
 
