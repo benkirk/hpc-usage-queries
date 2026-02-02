@@ -17,6 +17,21 @@ def add_directories_indexing(session):
 
 
 
+def add_directory_stats_nr_indexing(session):
+    with Progress() as progress:
+        desc = "  [green]Indexing directory_stats table..."
+        task = progress.add_task(desc, total=None)
+
+        session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_file_count_nr  ON directory_stats(file_count_nr);"))
+        session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_total_size_nr  ON directory_stats(total_size_nr);"))
+        session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_dir_count_nr   ON directory_stats(dir_count_nr);"))
+        session.commit()
+        progress.update(task, description=f"{desc} [dim]done in {progress.tasks[task].elapsed:.1f}s[/dim]")
+
+    return
+
+
+
 def add_directory_stats_indexing(session):
     with Progress() as progress:
         desc = "  [green]Indexing directory_stats table..."

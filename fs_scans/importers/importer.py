@@ -124,12 +124,16 @@ def run_import(
             num_workers=workers,
         )
 
-        # add indexing *after* insertions but before the detailed tree queries of recursive stats
+        # add directory indexing *after* insertions but *before* recursive stats
+        # since we search on directories
         add_directories_indexing(session)
-        add_directory_stats_indexing(session)
+        add_directory_stats_nr_indexing(session)
 
         # Pass 2b: Compute recursive stats via bottom-up aggregation (pure SQL)
         pass2b_aggregate_recursive_stats(session)
+
+        # add all other directory_stats indexing *after* recursive stats
+        add_directory_stats_indexing(session)
 
         # Pass 3: Populate summary tables (parser-agnostic)
         pass3_populate_summary_tables(session, input_file, filesystem, metadata)
