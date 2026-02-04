@@ -32,3 +32,4 @@ samples/
 fs_scans/*.db
 fs_scans/data/
 fs_scans/PBS/fs_scan_*.o*
+fs_scans/
