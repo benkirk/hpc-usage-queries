@@ -976,17 +976,20 @@ class JobQueries:
                 - users: List of unique users
                 - queues: List of unique queues
         """
-        query = self.session.query(JobCharge).filter(
+        # JOIN Job and JobCharge to get both job metadata and charges
+        query = self.session.query(Job, JobCharge).join(
+            JobCharge, Job.id == JobCharge.job_id
+        ).filter(
             and_(
-                JobCharge.account == account,
-                JobCharge.end >= datetime.combine(start, datetime.min.time()),
-                JobCharge.end <= datetime.combine(end, datetime.max.time()),
+                Job.account == account,
+                Job.end >= datetime.combine(start, datetime.min.time()),
+                Job.end <= datetime.combine(end, datetime.max.time()),
             )
         )
 
-        jobs = query.all()
+        results = query.all()
 
-        if not jobs:
+        if not results:
             return {
                 "job_count": 0,
                 "total_elapsed_seconds": 0,
@@ -997,16 +1000,16 @@ class JobQueries:
                 "queues": [],
             }
 
-        total_elapsed = sum((j.elapsed or 0) for j in jobs)
-        total_cpu_hours = sum((j.cpu_hours or 0.0) for j in jobs)
-        total_gpu_hours = sum((j.gpu_hours or 0.0) for j in jobs)
-        total_memory_hours = sum((j.memory_hours or 0.0) for j in jobs)
+        total_elapsed = sum((job.elapsed or 0) for job, charge in results)
+        total_cpu_hours = sum((charge.cpu_hours or 0.0) for job, charge in results)
+        total_gpu_hours = sum((charge.gpu_hours or 0.0) for job, charge in results)
+        total_memory_hours = sum((charge.memory_hours or 0.0) for job, charge in results)
 
-        unique_users = sorted(set(j.user for j in jobs if j.user))
-        unique_queues = sorted(set(j.queue for j in jobs if j.queue))
+        unique_users = sorted(set(job.user for job, charge in results if job.user))
+        unique_queues = sorted(set(job.queue for job, charge in results if job.queue))
 
         return {
-            "job_count": len(jobs),
+            "job_count": len(results),
             "total_elapsed_seconds": total_elapsed,
             "total_cpu_hours": total_cpu_hours,
             "total_gpu_hours": total_gpu_hours,
@@ -1034,17 +1037,20 @@ class JobQueries:
         Returns:
             Dict with aggregated metrics similar to usage_summary
         """
-        query = self.session.query(JobCharge).filter(
+        # JOIN Job and JobCharge to get both job metadata and charges
+        query = self.session.query(Job, JobCharge).join(
+            JobCharge, Job.id == JobCharge.job_id
+        ).filter(
             and_(
-                JobCharge.user == user,
-                JobCharge.end >= datetime.combine(start, datetime.min.time()),
-                JobCharge.end <= datetime.combine(end, datetime.max.time()),
+                Job.user == user,
+                Job.end >= datetime.combine(start, datetime.min.time()),
+                Job.end <= datetime.combine(end, datetime.max.time()),
             )
         )
 
-        jobs = query.all()
+        results = query.all()
 
-        if not jobs:
+        if not results:
             return {
                 "job_count": 0,
                 "total_elapsed_seconds": 0,
@@ -1055,16 +1061,16 @@ class JobQueries:
                 "queues": [],
             }
 
-        total_elapsed = sum((j.elapsed or 0) for j in jobs)
-        total_cpu_hours = sum((j.cpu_hours or 0.0) for j in jobs)
-        total_gpu_hours = sum((j.gpu_hours or 0.0) for j in jobs)
-        total_memory_hours = sum((j.memory_hours or 0.0) for j in jobs)
+        total_elapsed = sum((job.elapsed or 0) for job, charge in results)
+        total_cpu_hours = sum((charge.cpu_hours or 0.0) for job, charge in results)
+        total_gpu_hours = sum((charge.gpu_hours or 0.0) for job, charge in results)
+        total_memory_hours = sum((charge.memory_hours or 0.0) for job, charge in results)
 
-        unique_accounts = sorted(set(j.account for j in jobs if j.account))
-        unique_queues = sorted(set(j.queue for j in jobs if j.queue))
+        unique_accounts = sorted(set(job.account for job, charge in results if job.account))
+        unique_queues = sorted(set(job.queue for job, charge in results if job.queue))
 
         return {
-            "job_count": len(jobs),
+            "job_count": len(results),
             "total_elapsed_seconds": total_elapsed,
             "total_cpu_hours": total_cpu_hours,
             "total_gpu_hours": total_gpu_hours,
