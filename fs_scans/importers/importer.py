@@ -31,6 +31,7 @@ from .pass1 import *
 from .pass2a import *
 from .pass2b import *
 from .pass3 import *
+from .add_table_indexing import *
 
 
 def run_import(
@@ -39,9 +40,8 @@ def run_import(
     filesystem: str | None = None,
     db_path: Path | None = None,
     data_dir: Path | None = None,
-    batch_size: int = 10000,
+    batch_size: int = 25_000,
     progress_interval: int = 1_000_000,
-    replace: bool = False,
     workers: int = 1,
     echo: bool = False,
 ) -> None:
@@ -58,7 +58,6 @@ def run_import(
         data_dir: Data directory override
         batch_size: Batch size for database operations
         progress_interval: Progress report interval (lines)
-        replace: If True, drop existing tables before import
         workers: Number of parallel workers for parsing
         echo: If True, enable SQL echo for debugging
     """
@@ -86,9 +85,8 @@ def run_import(
     resolved_db_path = get_db_path(filesystem, db_path)
 
     # Initialize database
-    if replace:
-        console.print("[yellow]Dropping existing tables...[/yellow]")
-        drop_tables(filesystem, echo=echo, db_path=resolved_db_path)
+    console.print("[yellow]Dropping existing tables...[/yellow]")
+    drop_tables(filesystem, echo=echo, db_path=resolved_db_path)
 
     engine = init_db(filesystem, echo=echo, db_path=resolved_db_path)
     session = get_session(filesystem, engine=engine)
@@ -126,8 +124,16 @@ def run_import(
             num_workers=workers,
         )
 
+        # add directory indexing *after* insertions but *before* recursive stats
+        # since we search on directories
+        add_directories_indexing(session)
+        add_directory_stats_nr_indexing(session)
+
         # Pass 2b: Compute recursive stats via bottom-up aggregation (pure SQL)
         pass2b_aggregate_recursive_stats(session)
+
+        # add all other directory_stats indexing *after* recursive stats
+        add_directory_stats_indexing(session)
 
         # Pass 3: Populate summary tables (parser-agnostic)
         pass3_populate_summary_tables(session, input_file, filesystem, metadata)

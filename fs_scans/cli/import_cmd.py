@@ -43,7 +43,7 @@ DynamicHelpCommand = make_dynamic_help_command("fs-scans import")
 @click.option(
     "--batch-size",
     type=int,
-    default=10000,
+    default=25_000,
     show_default=True,
     help="Batch size for database operations",
 )
@@ -58,7 +58,7 @@ DynamicHelpCommand = make_dynamic_help_command("fs-scans import")
 @click.option(
     "--replace",
     is_flag=True,
-    help="Drop and recreate tables (deletes existing data)",
+    help="Drop and recreate tables (no-op for backwards compatibility - always happens)",
 )
 @click.option(
     "--workers",
@@ -81,9 +81,9 @@ def import_cmd(
     filesystem: str | None,
     batch_size: int,
     progress_interval: int,
-    replace: bool,
     workers: int,
     echo: bool,
+    replace: bool,
 ):
     """Import filesystem scan logs into SQLite database.
 
@@ -131,7 +131,6 @@ def import_cmd(
         data_dir=data_dir,
         batch_size=batch_size,
         progress_interval=progress_interval,
-        replace=replace,
         workers=workers,
         echo=echo,
     )

@@ -34,19 +34,13 @@ class Directory(Base):
     __tablename__ = "directories"
 
     dir_id = Column(Integer, primary_key=True, autoincrement=True)
-    parent_id = Column(
-        Integer, ForeignKey("directories.dir_id"), nullable=True, index=True
-    )
+    parent_id = Column(Integer, ForeignKey("directories.dir_id"), nullable=True)
     name = Column(Text, nullable=False)  # component only, e.g. "username" not full path
-    depth = Column(Integer, nullable=False, index=True)
+    depth = Column(Integer, nullable=False)
 
     # Relationships
     stats = relationship("DirectoryStats", back_populates="directory", uselist=False)
     parent = relationship("Directory", remote_side=[dir_id], backref="children")
-
-    __table_args__ = (
-        UniqueConstraint("parent_id", "name", name="uq_dir_parent_name"),
-    )
 
     def __repr__(self):
         return f"<Directory(dir_id={self.dir_id}, name='{self.name}', depth={self.depth})>"
@@ -71,37 +65,26 @@ class DirectoryStats(Base):
 
     __tablename__ = "directory_stats"
 
-    dir_id = Column(
-        Integer, ForeignKey("directories.dir_id"), primary_key=True
-    )
+    dir_id = Column(Integer, ForeignKey("directories.dir_id"), primary_key=True)
 
     # Non-recursive metrics (direct children only)
-    file_count_nr = Column(BigInteger, nullable=False, default=0, index=True)
-    total_size_nr = Column(BigInteger, nullable=False, default=0, index=True)
-    dir_count_nr = Column(BigInteger, nullable=False, default=0, index=True)
+    file_count_nr = Column(BigInteger, nullable=False, default=0)
+    total_size_nr = Column(BigInteger, nullable=False, default=0)
+    dir_count_nr = Column(BigInteger, nullable=False, default=0)
     max_atime_nr = Column(DateTime)
 
     # Recursive metrics (all descendants)
-    file_count_r = Column(BigInteger, nullable=False, default=0, index=True)
-    total_size_r = Column(BigInteger, nullable=False, default=0, index=True)
-    dir_count_r = Column(BigInteger, nullable=False, default=0, index=True)
+    file_count_r = Column(BigInteger, nullable=False, default=0)
+    total_size_r = Column(BigInteger, nullable=False, default=0)
+    dir_count_r = Column(BigInteger, nullable=False, default=0)
     max_atime_r = Column(DateTime, nullable=True)
 
     # Owner/group tracking: -1=no files yet, NULL=multiple, else=single UID/GID
-    owner_uid = Column(Integer, nullable=True, default=-1, index=True)
-    owner_gid = Column(Integer, nullable=True, default=-1, index=True)
+    owner_uid = Column(Integer, nullable=True, default=-1)
+    owner_gid = Column(Integer, nullable=True, default=-1)
 
     # Relationship
     directory = relationship("Directory", back_populates="stats")
-
-    __table_args__ = (
-        # Composite indexes for optimized owner-filtered queries
-        Index("ix_stats_owner_size", "owner_uid", "total_size_r"),
-        Index("ix_stats_owner_files", "owner_uid", "file_count_r"),
-        # Composite indexes for optimized group-filtered queries
-        Index("ix_stats_group_size", "owner_gid", "total_size_r"),
-        Index("ix_stats_group_files", "owner_gid", "file_count_r"),
-    )
 
     def __repr__(self):
         return (

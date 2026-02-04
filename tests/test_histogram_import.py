@@ -169,7 +169,6 @@ class TestHistogramImport:
             parser=GPFSParser(),
             filesystem="test",
             db_path=db_path,
-            replace=True,
         )
 
         # Clear engine cache to release database lock
@@ -204,7 +203,6 @@ class TestHistogramImport:
             parser=GPFSParser(),
             filesystem="test",
             db_path=db_path,
-            replace=True,
         )
 
         # Clear engine cache to release database lock
@@ -236,7 +234,6 @@ class TestHistogramImport:
             parser=GPFSParser(),
             filesystem="test",
             db_path=db_path,
-            replace=True,
         )
 
         # Clear engine cache to release database lock
@@ -269,7 +266,6 @@ class TestHistogramImport:
             parser=GPFSParser(),
             filesystem="test",
             db_path=db_path,
-            replace=True,
         )
 
         # Clear engine cache to release database lock
@@ -312,7 +308,6 @@ class TestHistogramImport:
             parser=GPFSParser(),
             filesystem="test",
             db_path=db_path,
-            replace=True,
         )
 
         # Clear engine cache to release database lock
@@ -349,7 +344,6 @@ class TestHistogramImport:
             parser=GPFSParser(),
             filesystem="test",
             db_path=db_path,
-            replace=True,
         )
 
         # Clear engine cache to release database lock
@@ -386,7 +380,6 @@ class TestHistogramImport:
             parser=GPFSParser(),
             filesystem="test",
             db_path=db_path,
-            replace=True,
         )
 
         # Clear engine cache to release database lock
