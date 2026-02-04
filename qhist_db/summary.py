@@ -1,7 +1,8 @@
 """Daily summary generation for charging data."""
 
-from datetime import date
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Set
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
@@ -30,7 +31,9 @@ def generate_daily_summary(
 ) -> dict:
     """Generate daily summary for a specific date.
 
-    Aggregates job data from the v_jobs_charged view into the daily_summary table.
+    Aggregates job data from the job_charges table into the daily_summary table.
+    Uses UTC timestamp ranges that match the Mountain Time day to ensure
+    consistent attribution.
 
     Args:
         session: SQLAlchemy session
@@ -43,6 +46,18 @@ def generate_daily_summary(
     """
     _ = machine  # All machines now use same summary structure
     stats = {"rows_deleted": 0, "rows_inserted": 0}
+
+    # Mountain Time zone (handles MST/MDT automatically)
+    mountain = ZoneInfo("America/Denver")
+    
+    # Calculate UTC range for the local day
+    # target_date 00:00:00 MT
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=mountain)
+    # target_date + 1 00:00:00 MT
+    end_dt = datetime.combine(target_date + timedelta(days=1), time.min).replace(tzinfo=mountain)
+    
+    start_utc = start_dt.astimezone(timezone.utc)
+    end_utc = end_dt.astimezone(timezone.utc)
 
     # Delete existing summaries for this date if replacing
     if replace:
@@ -66,7 +81,7 @@ def generate_daily_summary(
         INSERT INTO daily_summary (date, user, account, queue, user_id, account_id, queue_id,
                                  job_count, cpu_hours, gpu_hours, memory_hours)
         SELECT
-            date(j.end) as date,
+            :target_date as date,
             u.username as user,
             a.account_name as account,
             q.queue_name as queue,
@@ -82,15 +97,19 @@ def generate_daily_summary(
         LEFT JOIN users u ON j.user_id = u.id
         LEFT JOIN accounts a ON j.account_id = a.id
         LEFT JOIN queues q ON j.queue_id = q.id
-        WHERE date(j.end) = :target_date
+        WHERE j.end >= :start_utc AND j.end < :end_utc
           AND j.user_id IS NOT NULL
           AND j.account_id IS NOT NULL
           AND j.queue_id IS NOT NULL
-        GROUP BY date(j.end), j.user_id, j.account_id, j.queue_id, u.username, a.account_name, q.queue_name
+        GROUP BY j.user_id, j.account_id, j.queue_id, u.username, a.account_name, q.queue_name
     """
     )
 
-    result = session.execute(sql, {"target_date": target_date.isoformat()})
+    result = session.execute(sql, {
+        "target_date": target_date.isoformat(),
+        "start_utc": start_utc,
+        "end_utc": end_utc
+    })
     session.commit()
 
     stats["rows_inserted"] = result.rowcount
