@@ -3,17 +3,39 @@
 import os
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from .models import Base
-from .charging import get_view_sql
 
 # Default database directory
 DATA_DIR = Path(__file__).parent.parent / "data"
 
 # Valid machine names
 VALID_MACHINES = {"casper", "derecho"}
+
+
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_conn, connection_record):
+    """Configure SQLite for optimal performance.
+
+    This event listener runs every time a connection is established.
+    - WAL mode: Allows concurrent readers during writes
+    - synchronous=NORMAL: Faster writes with acceptable durability
+    - cache_size: 64MB cache for better query performance
+    - temp_store: Keep temporary tables in memory
+    - mmap_size: 256MB memory-mapped I/O for faster reads
+    - foreign_keys: Enable foreign key constraints
+    """
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA cache_size=-64000")  # Negative = kibibytes
+    cursor.execute("PRAGMA temp_store=MEMORY")
+    cursor.execute("PRAGMA mmap_size=268435456")  # 256MB
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 
 def get_db_path(machine: str) -> Path:
@@ -72,28 +94,8 @@ def get_session(machine: str, engine=None):
     return Session()
 
 
-def create_views(engine, machine: str):
-    """Create charging views for a specific machine.
-
-    Args:
-        engine: SQLAlchemy engine
-        machine: Machine name ('casper' or 'derecho')
-    """
-    view_sql = get_view_sql(machine)
-    with engine.connect() as conn:
-        # Drop existing view/table first (SQLite doesn't support CREATE OR REPLACE VIEW)
-        # Try dropping as view first, then as table if that fails
-        try:
-            conn.execute(text("DROP VIEW IF EXISTS v_jobs_charged"))
-        except Exception:
-            # If it's a table instead of a view, drop it as a table
-            conn.execute(text("DROP TABLE IF EXISTS v_jobs_charged"))
-        conn.execute(text(view_sql))
-        conn.commit()
-
-
 def init_db(machine: str | None = None, echo: bool = False):
-    """Initialize database(s) by creating all tables and views.
+    """Initialize database(s) by creating all tables.
 
     Args:
         machine: Machine name, or None to initialize all machines
@@ -105,7 +107,6 @@ def init_db(machine: str | None = None, echo: bool = False):
     if machine is not None:
         engine = get_engine(machine, echo=echo)
         Base.metadata.create_all(engine)
-        create_views(engine, machine)
         return engine
 
     # Initialize all machines
@@ -113,5 +114,4 @@ def init_db(machine: str | None = None, echo: bool = False):
     for m in VALID_MACHINES:
         engines[m] = get_engine(m, echo=echo)
         Base.metadata.create_all(engines[m])
-        create_views(engines[m], m)
     return engines

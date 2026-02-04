@@ -209,75 +209,63 @@ class ResourceTypeResolver:
     to machine-specific queue names and appropriate charging hour fields.
 
     Examples:
-        >>> from qhist_db.models import JobCharged
+        >>> from qhist_db.models import JobCharge
         >>> # Resolve CPU resources for Derecho
-        >>> queues, hours = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharged)
+        >>> queues, hours = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharge)
         >>> # queues = ['cpu', 'cpudev']
-        >>> # hours = JobCharged.cpu_hours
+        >>> # hours = JobCharge.cpu_hours
     """
 
     @staticmethod
-    def resolve(resource_type: str, machine: str, JobCharged) -> Tuple[List[str], Any]:
-        """Resolve resource type to queues and hours field.
+    def resolve(resource_type: str, machine: str, ChargeTable) -> Tuple:
+        """Resolve resource type to queue IDs and hours field.
 
         Args:
             resource_type: Type of resources ('cpu', 'gpu', or 'all')
             machine: Machine name for queue lookup ('casper' or 'derecho')
-            JobCharged: JobCharged model class for field access
+            ChargeTable: Charge model class (JobCharge) for field access
 
         Returns:
-            Tuple of (queue_list, hours_field_expression)
-            - queue_list: List of queue names to filter by
+            Tuple of (queue_ids, hours_field_expression)
+            - queue_ids: List of queue IDs to filter by
             - hours_field_expression: SQLAlchemy expression for charging hours
 
         Raises:
             ValueError: If resource_type is not 'cpu', 'gpu', or 'all'
 
         Examples:
-            >>> from qhist_db.models import JobCharged
+            >>> from qhist_db.models import JobCharge
             >>> # CPU resources
             >>> queues, hours = ResourceTypeResolver.resolve(
-            ...     'cpu', 'derecho', JobCharged
+            ...     'cpu', 'derecho', JobCharge
             ... )
-            >>> # queues = ['cpu', 'cpudev']
-            >>> # hours = JobCharged.cpu_hours
+            >>> # queues = [queue_id_1, queue_id_2]
+            >>> # hours = JobCharge.cpu_hours
 
             >>> # GPU resources
             >>> queues, hours = ResourceTypeResolver.resolve(
-            ...     'gpu', 'derecho', JobCharged
+            ...     'gpu', 'derecho', JobCharge
             ... )
-            >>> # queues = ['gpu', 'gpudev', 'pgpu']
-            >>> # hours = JobCharged.gpu_hours
-
-            >>> # All resources (sum of CPU and GPU)
-            >>> queues, hours = ResourceTypeResolver.resolve(
-            ...     'all', 'derecho', JobCharged
-            ... )
-            >>> # queues = ['cpu', 'cpudev', 'gpu', 'gpudev', 'pgpu']
-            >>> # hours = coalesce(cpu_hours, 0) + coalesce(gpu_hours, 0)
+            >>> # queues = [queue_id_1, queue_id_2]
+            >>> # hours = JobCharge.gpu_hours
         """
         from .queries import QueryConfig
 
         if resource_type == 'cpu':
             queues = QueryConfig.get_cpu_queues(machine)
-            hours_field = JobCharged.cpu_hours
+            hours_field = ChargeTable.cpu_hours
         elif resource_type == 'gpu':
             queues = QueryConfig.get_gpu_queues(machine)
-            hours_field = JobCharged.gpu_hours
+            hours_field = ChargeTable.gpu_hours
         elif resource_type == 'all':
-            queues = (
-                QueryConfig.get_cpu_queues(machine) +
-                QueryConfig.get_gpu_queues(machine)
-            )
+            queues = QueryConfig.get_cpu_queues(machine) + QueryConfig.get_gpu_queues(machine)
             # For 'all', sum both cpu_hours and gpu_hours
-            hours_field = (
-                func.coalesce(JobCharged.cpu_hours, 0) +
-                func.coalesce(JobCharged.gpu_hours, 0)
+            hours_field = func.coalesce(ChargeTable.cpu_hours, 0) + func.coalesce(
+                ChargeTable.gpu_hours, 0
             )
         else:
             raise ValueError(
-                f"Invalid resource_type: {resource_type}. "
-                f"Must be 'cpu', 'gpu', or 'all'."
+                f"Invalid resource_type: {resource_type}. " f"Must be 'cpu', 'gpu', or 'all'."
             )
 
         return queues, hours_field

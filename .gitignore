@@ -30,5 +30,6 @@ samples/
 *~
 .ipynb_checkpoints/
 fs_scans/*.db
+fs_scans/*.lfs-scan
 fs_scans/data/
 fs_scans/PBS/fs_scan_*.o*

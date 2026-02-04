@@ -3,7 +3,7 @@
 import pytest
 from datetime import date, datetime, timedelta, timezone
 
-from qhist_db.models import Job, DailySummary
+from qhist_db.models import Job, DailySummary, JobCharge
 from qhist_db.queries import JobQueries
 
 
@@ -96,6 +96,27 @@ def sample_jobs(in_memory_session):
 
     for job in jobs:
         in_memory_session.add(job)
+
+    in_memory_session.commit()
+
+    # Create job_charges for each job (using casper charging rules for tests)
+    from qhist_db.charging import casper_charge
+
+    for job in jobs:
+        charges = casper_charge({
+            'elapsed': job.elapsed or 0,
+            'numcpus': job.numcpus or 0,
+            'numgpus': job.numgpus or 0,
+            'memory': job.memory or 0,
+        })
+        job_charge = JobCharge(
+            job_id=job.id,
+            cpu_hours=charges['cpu_hours'],
+            gpu_hours=charges['gpu_hours'],
+            memory_hours=charges['memory_hours'],
+            charge_version=1
+        )
+        in_memory_session.add(job_charge)
 
     in_memory_session.commit()
     return jobs

@@ -3,8 +3,7 @@
 This module defines charging calculations for NCAR HPC clusters. Each machine
 has different charging rules based on queue type and resource usage.
 
-Constants are defined once and used by both Python functions (for ad-hoc
-calculations) and SQL view generation (for bulk queries in the database).
+Charges are computed in Python during job import and stored in the job_charges table.
 """
 
 from typing import Callable
@@ -37,10 +36,8 @@ def derecho_charge(job: dict) -> dict:
     Derecho tracks CPU-hours, GPU-hours, and memory-hours.
     CPU/GPU hours depend on queue type (dev vs production).
 
-    Note: This Python function is available for ad-hoc calculations but is not
-    used in the normal data pipeline. The primary charging source is the SQL
-    view v_jobs_charged, created by generate_derecho_view_sql() below, which
-    provides better performance for bulk queries.
+    This function is called by Job.calculate_charges() during import to populate
+    the job_charges table.
 
     Args:
         job: Job record dict with elapsed, numnodes, numcpus, numgpus, memory, queue
@@ -88,10 +85,8 @@ def casper_charge(job: dict) -> dict:
 
     Casper tracks CPU-hours, memory-hours, and GPU-hours (when GPUs used).
 
-    Note: This Python function is available for ad-hoc calculations but is not
-    used in the normal data pipeline. The primary charging source is the SQL
-    view v_jobs_charged, created by generate_casper_view_sql() below, which
-    provides better performance for bulk queries.
+    This function is called by Job.calculate_charges() during import to populate
+    the job_charges table.
 
     Args:
         job: Job record dict with elapsed, numcpus, numgpus, memory
@@ -109,77 +104,3 @@ def casper_charge(job: dict) -> dict:
         "gpu_hours": elapsed * numgpus / SECONDS_PER_HOUR,
         "memory_hours": elapsed * memory / (SECONDS_PER_HOUR * BYTES_PER_GB),
     }
-
-
-# ============================================================================
-# SQL view generation (uses same constants as Python functions)
-# ============================================================================
-
-def generate_derecho_view_sql() -> str:
-    """Generate Derecho charging view SQL from Python constants.
-
-    This ensures the SQL view uses the same charging logic as the Python
-    function, avoiding duplication and potential inconsistencies.
-
-    Returns:
-        SQL CREATE VIEW statement for Derecho charging
-    """
-    return f"""
-CREATE VIEW IF NOT EXISTS v_jobs_charged AS
-SELECT *,
-  CASE
-    WHEN queue LIKE '%dev%'
-      THEN elapsed * COALESCE(numcpus, 0) / {SECONDS_PER_HOUR}.0
-    ELSE elapsed * COALESCE(numnodes, 0) * {DERECHO_CORES_PER_NODE} / {SECONDS_PER_HOUR}.0
-  END AS cpu_hours,
-  CASE
-    WHEN queue LIKE '%gpu%' AND queue LIKE '%dev%'
-      THEN elapsed * COALESCE(numgpus, 0) / {SECONDS_PER_HOUR}.0
-    WHEN queue LIKE '%gpu%'
-      THEN elapsed * COALESCE(numnodes, 0) * {DERECHO_GPUS_PER_NODE} / {SECONDS_PER_HOUR}.0
-    ELSE 0.0
-  END AS gpu_hours,
-  elapsed * COALESCE(memory, 0) / ({SECONDS_PER_HOUR}.0 * {BYTES_PER_GB}) AS memory_hours
-FROM jobs;
-"""
-
-
-def generate_casper_view_sql() -> str:
-    """Generate Casper charging view SQL from Python constants.
-
-    This ensures the SQL view uses the same charging logic as the Python
-    function, avoiding duplication and potential inconsistencies.
-
-    Returns:
-        SQL CREATE VIEW statement for Casper charging
-    """
-    return f"""
-CREATE VIEW IF NOT EXISTS v_jobs_charged AS
-SELECT *,
-  elapsed * COALESCE(numcpus, 0) / {SECONDS_PER_HOUR}.0 AS cpu_hours,
-  elapsed * COALESCE(numgpus, 0) / {SECONDS_PER_HOUR}.0 AS gpu_hours,
-  elapsed * COALESCE(memory, 0) / ({SECONDS_PER_HOUR}.0 * {BYTES_PER_GB}) AS memory_hours
-FROM jobs;
-"""
-
-
-# Pre-generated SQL for backwards compatibility
-DERECHO_VIEW_SQL = generate_derecho_view_sql()
-CASPER_VIEW_SQL = generate_casper_view_sql()
-
-VIEW_SQL = {
-    "derecho": DERECHO_VIEW_SQL,
-    "casper": CASPER_VIEW_SQL,
-}
-
-
-def get_view_sql(machine: str) -> str:
-    """Get the SQL to create the charging view for a machine.
-
-    Args:
-        machine: Machine name ('casper' or 'derecho')
-
-    Returns:
-        SQL CREATE VIEW statement
-    """
-    return VIEW_SQL.get(machine, DERECHO_VIEW_SQL)

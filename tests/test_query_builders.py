@@ -260,32 +260,32 @@ class TestResourceTypeResolver:
 
     def test_resolve_cpu_derecho(self):
         """Test CPU resource type resolution for Derecho."""
-        from qhist_db.models import JobCharged
+        from qhist_db.models import JobCharge
 
-        queues, hours_field = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharged)
+        queues, hours_field = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharge)
 
         assert 'cpu' in queues
         assert 'cpudev' in queues
-        # hours_field should reference JobCharged.cpu_hours
+        # hours_field should reference JobCharge.cpu_hours
         assert 'cpu_hours' in str(hours_field)
 
     def test_resolve_gpu_derecho(self):
         """Test GPU resource type resolution for Derecho."""
-        from qhist_db.models import JobCharged
+        from qhist_db.models import JobCharge
 
-        queues, hours_field = ResourceTypeResolver.resolve('gpu', 'derecho', JobCharged)
+        queues, hours_field = ResourceTypeResolver.resolve('gpu', 'derecho', JobCharge)
 
         assert 'gpu' in queues
         assert 'gpudev' in queues
         assert 'pgpu' in queues
-        # hours_field should reference JobCharged.gpu_hours
+        # hours_field should reference JobCharge.gpu_hours
         assert 'gpu_hours' in str(hours_field)
 
     def test_resolve_all_derecho(self):
         """Test 'all' resource type resolution for Derecho."""
-        from qhist_db.models import JobCharged
+        from qhist_db.models import JobCharge
 
-        queues, hours_field = ResourceTypeResolver.resolve('all', 'derecho', JobCharged)
+        queues, hours_field = ResourceTypeResolver.resolve('all', 'derecho', JobCharge)
 
         # Should include both CPU and GPU queues
         assert 'cpu' in queues
@@ -302,9 +302,9 @@ class TestResourceTypeResolver:
 
     def test_resolve_cpu_casper(self):
         """Test CPU resource type resolution for Casper."""
-        from qhist_db.models import JobCharged
+        from qhist_db.models import JobCharge
 
-        queues, hours_field = ResourceTypeResolver.resolve('cpu', 'casper', JobCharged)
+        queues, hours_field = ResourceTypeResolver.resolve('cpu', 'casper', JobCharge)
 
         # Casper CPU queues
         assert 'htc' in queues
@@ -315,19 +315,19 @@ class TestResourceTypeResolver:
 
     def test_resolve_gpu_casper(self):
         """Test GPU resource type resolution for Casper."""
-        from qhist_db.models import JobCharged
+        from qhist_db.models import JobCharge
 
-        queues, hours_field = ResourceTypeResolver.resolve('gpu', 'casper', JobCharged)
+        queues, hours_field = ResourceTypeResolver.resolve('gpu', 'casper', JobCharge)
 
         # Casper GPU queues
         assert 'nvgpu' in queues or 'gpgpu' in queues or 'a100' in queues
 
     def test_resolve_invalid_resource_type(self):
         """Test that invalid resource type raises ValueError."""
-        from qhist_db.models import JobCharged
+        from qhist_db.models import JobCharge
 
         with pytest.raises(ValueError) as exc_info:
-            ResourceTypeResolver.resolve('invalid', 'derecho', JobCharged)
+            ResourceTypeResolver.resolve('invalid', 'derecho', JobCharge)
 
         assert "Invalid resource_type" in str(exc_info.value)
         assert "invalid" in str(exc_info.value)
@@ -336,12 +336,12 @@ class TestResourceTypeResolver:
 
     def test_resolve_case_insensitive_machine(self):
         """Test that machine names are case-insensitive."""
-        from qhist_db.models import JobCharged
+        from qhist_db.models import JobCharge
 
         # Test uppercase
-        queues_upper, _ = ResourceTypeResolver.resolve('cpu', 'DERECHO', JobCharged)
+        queues_upper, _ = ResourceTypeResolver.resolve('cpu', 'DERECHO', JobCharge)
         # Test lowercase
-        queues_lower, _ = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharged)
+        queues_lower, _ = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharge)
 
         # Should produce same results (case-insensitive in QueryConfig.get_cpu_queues)
         assert queues_upper == queues_lower or set(queues_upper) == set(queues_lower)

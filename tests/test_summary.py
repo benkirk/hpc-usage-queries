@@ -7,7 +7,6 @@ from sqlalchemy import text
 
 from qhist_db.models import Job, DailySummary
 from qhist_db.summary import get_summarized_dates, generate_daily_summary
-from qhist_db.charging import get_view_sql
 
 
 class TestGetSummarizedDates:
@@ -68,55 +67,76 @@ class TestGenerateDailySummary:
 
     @pytest.fixture
     def db_with_jobs_and_view(self, in_memory_engine, in_memory_session):
-        """Create jobs and the charging view for testing."""
-        # Add test jobs
-        jobs = [
-            Job(
-                job_id="1.desched1",
-                user="user1",
-                account="NCAR0001",
-                queue="main",
-                end=datetime(2025, 1, 15, 18, 0, 0, tzinfo=timezone.utc),
-                elapsed=3600,
-                numnodes=2,
-                numcpus=256,
-                numgpus=0,
-                memory=107374182400,
-            ),
-            Job(
-                job_id="2.desched1",
-                user="user1",
-                account="NCAR0001",
-                queue="main",
-                end=datetime(2025, 1, 15, 19, 0, 0, tzinfo=timezone.utc),
-                elapsed=7200,
-                numnodes=4,
-                numcpus=512,
-                numgpus=0,
-                memory=214748364800,
-            ),
-            Job(
-                job_id="3.desched1",
-                user="user2",
-                account="NCAR0002",
-                queue="develop",
-                end=datetime(2025, 1, 15, 20, 0, 0, tzinfo=timezone.utc),
-                elapsed=1800,
-                numnodes=1,
-                numcpus=32,
-                numgpus=0,
-                memory=32212254720,
-            ),
-        ]
-        in_memory_session.add_all(jobs)
-        in_memory_session.commit()
+        """Create jobs and related records for testing."""
+        from qhist_db.models import User, Account, Queue, JobCharge
 
-        # Create the charging view
-        view_sql = get_view_sql("derecho")
-        with in_memory_engine.connect() as conn:
-            conn.execute(text("DROP VIEW IF EXISTS v_jobs_charged"))
-            conn.execute(text(view_sql))
-            conn.commit()
+        # Create lookup records
+        user1 = User(username="user1")
+        user2 = User(username="user2")
+        acct1 = Account(account_name="NCAR0001")
+        acct2 = Account(account_name="NCAR0002")
+        queue1 = Queue(queue_name="main")
+        queue2 = Queue(queue_name="develop")
+        
+        in_memory_session.add_all([user1, user2, acct1, acct2, queue1, queue2])
+        in_memory_session.flush()  # To get IDs
+
+        # Add test jobs
+        job1 = Job(
+            job_id="1.desched1",
+            user="user1",
+            account="NCAR0001",
+            queue="main",
+            user_id=user1.id,
+            account_id=acct1.id,
+            queue_id=queue1.id,
+            end=datetime(2025, 1, 15, 18, 0, 0, tzinfo=timezone.utc),
+            elapsed=3600,
+            numnodes=2,
+            numcpus=256,
+            numgpus=0,
+            memory=107374182400,
+        )
+        job2 = Job(
+            job_id="2.desched1",
+            user="user1",
+            account="NCAR0001",
+            queue="main",
+            user_id=user1.id,
+            account_id=acct1.id,
+            queue_id=queue1.id,
+            end=datetime(2025, 1, 15, 19, 0, 0, tzinfo=timezone.utc),
+            elapsed=7200,
+            numnodes=4,
+            numcpus=512,
+            numgpus=0,
+            memory=214748364800,
+        )
+        job3 = Job(
+            job_id="3.desched1",
+            user="user2",
+            account="NCAR0002",
+            queue="develop",
+            user_id=user2.id,
+            account_id=acct2.id,
+            queue_id=queue2.id,
+            end=datetime(2025, 1, 15, 20, 0, 0, tzinfo=timezone.utc),
+            elapsed=1800,
+            numnodes=1,
+            numcpus=32,
+            numgpus=0,
+            memory=32212254720,
+        )
+        in_memory_session.add_all([job1, job2, job3])
+        in_memory_session.flush() # Get Job IDs
+
+        # Add job charges
+        charge1 = JobCharge(job_id=job1.id, cpu_hours=10.0, gpu_hours=0.0, memory_hours=10.0)
+        charge2 = JobCharge(job_id=job2.id, cpu_hours=20.0, gpu_hours=0.0, memory_hours=20.0)
+        charge3 = JobCharge(job_id=job3.id, cpu_hours=5.0, gpu_hours=0.0, memory_hours=5.0)
+        
+        in_memory_session.add_all([charge1, charge2, charge3])
+        in_memory_session.commit()
 
         return in_memory_session
 

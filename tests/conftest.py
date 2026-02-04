@@ -1,33 +1,30 @@
 """Shared fixtures for qhist-db tests."""
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from qhist_db.models import Base
-from qhist_db.charging import generate_casper_view_sql
+
+
+# Apply SQLite optimizations for test databases
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_conn, connection_record):
+    """Configure SQLite for optimal performance in tests."""
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 
 @pytest.fixture
 def in_memory_engine():
     """Create an in-memory SQLite database engine for testing.
 
-    Uses Casper charging rules for the test view since tests don't
-    specify a particular machine.
+    Creates all tables including normalized schema (users, accounts, queues, job_charges).
     """
     engine = create_engine("sqlite:///:memory:")
-
-    # Create only the actual tables, not views
-    # JobCharged will be skipped since it's a view
-    tables_to_create = [table for table in Base.metadata.sorted_tables
-                        if table.name != 'v_jobs_charged']
-    Base.metadata.create_all(engine, tables=tables_to_create)
-
-    # Create the charging view for queries that need it
-    with engine.connect() as conn:
-        conn.execute(text(generate_casper_view_sql()))
-        conn.commit()
-
+    Base.metadata.create_all(engine)
     yield engine
     engine.dispose()
 

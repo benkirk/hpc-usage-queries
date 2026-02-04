@@ -1,7 +1,7 @@
 """QHist Database - SQLAlchemy ORM for HPC job history data."""
 
-from .database import get_db_path, get_engine, get_session, init_db, create_views, VALID_MACHINES
-from .models import Job, DailySummary, JobCharged
+from .database import get_db_path, get_engine, get_session, init_db, VALID_MACHINES
+from .models import Job, DailySummary, JobCharge
 from .queries import JobQueries
 
 __all__ = [
@@ -9,10 +9,9 @@ __all__ = [
     "get_engine",
     "get_session",
     "init_db",
-    "create_views",
     "Job",
     "DailySummary",
-    "JobCharged",
+    "JobCharge",
     "JobQueries",
     "VALID_MACHINES",
 ]

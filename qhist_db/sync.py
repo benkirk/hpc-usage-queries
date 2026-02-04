@@ -280,6 +280,11 @@ def _sync_single_day(
     stats = {"fetched": 0, "inserted": 0, "errors": 0, "failed": False, "error_msg": None}
     batch = []
 
+    # Create importer for this machine if not in dry run mode
+    importer = None
+    if not dry_run:
+        importer = JobImporter(session, machine)
+
     try:
         for record in fetch_jobs_ssh(machine, period=period):
             stats["fetched"] += 1
@@ -300,13 +305,13 @@ def _sync_single_day(
 
             if len(batch) >= batch_size:
                 if not dry_run:
-                    inserted = _insert_batch(session, batch)
+                    inserted = _insert_batch(session, batch, importer)
                     stats["inserted"] += inserted
                 batch = []
 
         # Insert remaining records
         if batch and not dry_run:
-            inserted = _insert_batch(session, batch)
+            inserted = _insert_batch(session, batch, importer)
             stats["inserted"] += inserted
 
     except RuntimeError as e:
@@ -327,10 +332,138 @@ def _sync_single_day(
     return stats
 
 
-def _insert_batch(session: Session, records: list[dict]) -> int:
+class JobImporter:
+    """Handle job imports with normalized schema and charge calculation.
+
+    This class manages job imports with:
+    - In-memory caches of lookup tables (users, accounts, queues)
+    - Foreign key resolution during import
+    - Charge calculation immediately after job insertion
+    """
+
+    def __init__(self, session: Session, machine: str):
+        """Initialize the importer.
+
+        Args:
+            session: SQLAlchemy session
+            machine: Machine name ('casper' or 'derecho')
+        """
+        self.session = session
+        self.machine = machine
+
+        # Initialize caches
+        self.user_cache = {}  # username -> id
+        self.account_cache = {}  # account_name -> id
+        self.queue_cache = {}  # queue_name -> id
+        self._load_caches()
+
+    def _load_caches(self):
+        """Load lookup tables into memory for fast inserts."""
+        from .models import Account, Queue, User
+
+        for user in self.session.query(User).all():
+            self.user_cache[user.username] = user.id
+
+        for account in self.session.query(Account).all():
+            self.account_cache[account.account_name] = account.id
+
+        for queue in self.session.query(Queue).all():
+            self.queue_cache[queue.queue_name] = queue.id
+
+    def _get_or_create_user(self, username: str) -> int:
+        """Get user ID, creating if necessary.
+
+        Args:
+            username: Username string
+
+        Returns:
+            User ID
+        """
+        if username in self.user_cache:
+            return self.user_cache[username]
+
+        from .models import User
+
+        user = User(username=username)
+        self.session.add(user)
+        self.session.flush()
+        self.user_cache[username] = user.id
+        return user.id
+
+    def _get_or_create_account(self, account_name: str) -> int:
+        """Get account ID, creating if necessary.
+
+        Args:
+            account_name: Account name string
+
+        Returns:
+            Account ID
+        """
+        if account_name in self.account_cache:
+            return self.account_cache[account_name]
+
+        from .models import Account
+
+        account = Account(account_name=account_name)
+        self.session.add(account)
+        self.session.flush()
+        self.account_cache[account_name] = account.id
+        return account.id
+
+    def _get_or_create_queue(self, queue_name: str) -> int:
+        """Get queue ID, creating if necessary.
+
+        Args:
+            queue_name: Queue name string
+
+        Returns:
+            Queue ID
+        """
+        if queue_name in self.queue_cache:
+            return self.queue_cache[queue_name]
+
+        from .models import Queue
+
+        queue = Queue(queue_name=queue_name)
+        self.session.add(queue)
+        self.session.flush()
+        self.queue_cache[queue_name] = queue.id
+        return queue.id
+
+    def prepare_record(self, record: dict) -> dict:
+        """Prepare record for insertion by resolving foreign keys.
+
+        Args:
+            record: Raw job record dictionary
+
+        Returns:
+            Prepared record with foreign keys resolved
+        """
+        # Make a copy to avoid mutating the original
+        prepared = record.copy()
+
+        # Resolve foreign keys
+        if 'user' in prepared and prepared['user']:
+            prepared['user_id'] = self._get_or_create_user(prepared['user'])
+
+        if 'account' in prepared and prepared['account']:
+            prepared['account_id'] = self._get_or_create_account(prepared['account'])
+
+        if 'queue' in prepared and prepared['queue']:
+            prepared['queue_id'] = self._get_or_create_queue(prepared['queue'])
+
+        return prepared
+
+
+def _insert_batch(session: Session, records: list[dict], importer: JobImporter | None = None) -> int:
     """Insert a batch of records, ignoring duplicates.
 
     Duplicates are detected by the unique constraint on (job_id, submit).
+
+    Args:
+        session: SQLAlchemy session
+        records: List of job record dictionaries
+        importer: JobImporter for handling FK resolution and charge calculation
 
     Returns:
         Number of records actually inserted
@@ -338,12 +471,55 @@ def _insert_batch(session: Session, records: list[dict]) -> int:
     if not records:
         return 0
 
+    # Prepare records with foreign keys
+    if importer:
+        prepared = [importer.prepare_record(r) for r in records]
+    else:
+        prepared = records
+
     # Use SQLite's INSERT OR IGNORE via on_conflict_do_nothing
     # Conflict is on the unique constraint (job_id, submit)
-    stmt = sqlite_insert(Job.__table__).values(records)
+    stmt = sqlite_insert(Job.__table__).values(prepared)
     stmt = stmt.on_conflict_do_nothing(index_elements=["job_id", "submit"])
 
     result = session.execute(stmt)
-    session.commit()
+    rows_inserted = result.rowcount
+    session.flush()
 
-    return result.rowcount
+    # Calculate charges for newly inserted jobs
+    if importer and rows_inserted > 0:
+        from .models import JobCharge
+        from sqlalchemy import and_
+
+        # Find jobs that were just inserted (by job_id and submit time)
+        # and don't have charges yet
+        job_ids = [r['job_id'] for r in prepared]
+        submit_times = [r['submit'] for r in prepared]
+
+        jobs = (
+            session.query(Job)
+            .filter(and_(Job.job_id.in_(job_ids), Job.submit.in_(submit_times)))
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+            .filter(JobCharge.job_id.is_(None))
+            .all()
+        )
+
+        if jobs:
+            charge_records = []
+            for job in jobs:
+                charges = job.calculate_charges(importer.machine)
+                charge_records.append(
+                    {
+                        'job_id': job.id,
+                        'cpu_hours': charges['cpu_hours'],
+                        'gpu_hours': charges['gpu_hours'],
+                        'memory_hours': charges['memory_hours'],
+                        'charge_version': 1,
+                    }
+                )
+
+            if charge_records:
+                session.bulk_insert_mappings(JobCharge, charge_records)
+
+    session.commit()
+    return rows_inserted
