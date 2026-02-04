@@ -209,11 +209,11 @@ class ResourceTypeResolver:
     to machine-specific queue names and appropriate charging hour fields.
 
     Examples:
-        >>> from qhist_db.models import JobCharged
+        >>> from qhist_db.models import JobCharge
         >>> # Resolve CPU resources for Derecho
-        >>> queues, hours = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharged)
+        >>> queues, hours = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharge)
         >>> # queues = ['cpu', 'cpudev']
-        >>> # hours = JobCharged.cpu_hours
+        >>> # hours = JobCharge.cpu_hours
     """
 
     @staticmethod

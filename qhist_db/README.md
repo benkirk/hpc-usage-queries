@@ -31,7 +31,7 @@ python -m qhist_db.queries
 ## Project Structure
 
 ```
-qhist-queries/
+hpc-usage-queries/
 ├── qhist_db/              # Python package
 │   ├── models.py          # SQLAlchemy ORM models
 │   ├── database.py        # Engine/session management with PRAGMA optimizations

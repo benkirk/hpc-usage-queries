@@ -13,7 +13,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
 
-from .models import Job, DailySummary, JobCharged
+from .models import Job, DailySummary, JobCharge
 
 
 from sqlalchemy import case
@@ -303,14 +303,14 @@ class JobQueries:
         # Determine queues and hours field (machine-specific)
         if resource_type == 'cpu':
             queues = QueryConfig.get_cpu_queues(self.machine)
-            hours_field = JobCharged.cpu_hours
+            hours_field = JobCharge.cpu_hours
         elif resource_type == 'gpu':
             queues = QueryConfig.get_gpu_queues(self.machine)
-            hours_field = JobCharged.gpu_hours
+            hours_field = JobCharge.gpu_hours
         else:  # 'all'
             queues = QueryConfig.get_cpu_queues(self.machine) + QueryConfig.get_gpu_queues(self.machine)
             # For 'all', sum both cpu_hours and gpu_hours
-            hours_field = func.coalesce(JobCharged.cpu_hours, 0) + func.coalesce(JobCharged.gpu_hours, 0)
+            hours_field = func.coalesce(JobCharge.cpu_hours, 0) + func.coalesce(JobCharge.gpu_hours, 0)
 
         # Determine group field
         group_field = Job.user if group_by == 'user' else Job.account
@@ -320,7 +320,7 @@ class JobQueries:
             group_field.label("label"),
             func.sum(hours_field).label("usage_hours"),
             func.count(Job.id).label("job_count")
-        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(queues))
+        ).join(JobCharge, Job.id == JobCharge.id).filter(Job.queue.in_(queues))
 
         query = self._apply_date_filter(query, start, end)
         results = query.group_by(group_field).order_by(func.sum(hours_field).desc()).all()
@@ -450,13 +450,13 @@ class JobQueries:
         # Determine queues and hours field (machine-specific)
         if resource_type == 'cpu':
             queues = QueryConfig.get_cpu_queues(self.machine)
-            hours_field = JobCharged.cpu_hours
+            hours_field = JobCharge.cpu_hours
         elif resource_type == 'gpu':
             queues = QueryConfig.get_gpu_queues(self.machine)
-            hours_field = JobCharged.gpu_hours
+            hours_field = JobCharge.gpu_hours
         else:  # 'all'
             queues = QueryConfig.get_cpu_queues(self.machine) + QueryConfig.get_gpu_queues(self.machine)
-            hours_field = func.coalesce(JobCharged.cpu_hours, 0) + func.coalesce(JobCharged.gpu_hours, 0)
+            hours_field = func.coalesce(JobCharge.cpu_hours, 0) + func.coalesce(JobCharge.gpu_hours, 0)
 
         # Determine ranges and field
         if range_type == 'gpu':
@@ -485,7 +485,7 @@ class JobQueries:
             Job.user,
             hours_field.label("hours_field"),
             range_case
-        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(queues))
+        ).join(JobCharge, Job.id == JobCharge.id).filter(Job.queue.in_(queues))
 
         subquery = self._apply_date_filter(subquery, start, end)
         subquery = subquery.subquery()
@@ -541,7 +541,7 @@ class JobQueries:
         from .query_builders import ResourceTypeResolver, PeriodGrouper
 
         # Resolve resource type to queues and hours field (machine-specific)
-        queues, hours_field = ResourceTypeResolver.resolve(resource_type, self.machine, JobCharged)
+        queues, hours_field = ResourceTypeResolver.resolve(resource_type, self.machine, JobCharge)
 
         # Get duration buckets
         duration_buckets = QueryConfig.get_duration_buckets()
@@ -556,7 +556,7 @@ class JobQueries:
                 func.sum(case((bucket, hours_field), else_=0)).label(label)
                 for label, bucket in duration_buckets.items()
             ]
-        ).join(JobCharged, Job.id == JobCharged.id).filter(Job.queue.in_(queues))
+        ).join(JobCharge, Job.id == JobCharge.id).filter(Job.queue.in_(queues))
 
         query = self._apply_date_filter(query, start, end)
         results = query.group_by("job_date").order_by("job_date").all()
@@ -599,7 +599,7 @@ class JobQueries:
         from .query_builders import ResourceTypeResolver, PeriodGrouper
 
         # Resolve resource type to queues and hours field (machine-specific)
-        queues, hours_field = ResourceTypeResolver.resolve(resource_type, self.machine, JobCharged)
+        queues, hours_field = ResourceTypeResolver.resolve(resource_type, self.machine, JobCharge)
 
         # Get memory-per-rank buckets
         memory_buckets = QueryConfig.get_memory_per_rank_buckets()
@@ -614,7 +614,7 @@ class JobQueries:
                 func.sum(case((bucket, hours_field), else_=0)).label(label)
                 for label, bucket in memory_buckets.items()
             ]
-        ).join(JobCharged, Job.id == JobCharged.id).filter(
+        ).join(JobCharge, Job.id == JobCharge.id).filter(
             Job.queue.in_(queues),
             Job.mpiprocs.isnot(None),   # Filter NULL
             Job.mpiprocs > 0,           # Filter zero (prevents division by zero)
@@ -751,7 +751,7 @@ class JobQueries:
         from .query_builders import ResourceTypeResolver
 
         queues, hours_field = ResourceTypeResolver.resolve(
-            resource_type, self.machine, JobCharged
+            resource_type, self.machine, JobCharge
         )
 
         prefix = resource_type.lower()
@@ -763,7 +763,7 @@ class JobQueries:
             func.count(Job.id).label(f"{prefix}_jobs"),
             func.sum(hours_field).label(f"{prefix}_hours")
         ).join(
-            JobCharged, Job.id == JobCharged.id
+            JobCharge, Job.id == JobCharge.id
         ).filter(
             Job.queue.in_(queues), *date_filter
         ).group_by("period").subquery()
@@ -958,8 +958,8 @@ class JobQueries:
     ) -> Dict[str, Any]:
         """Get usage summary for an account over a date range.
 
-        Aggregates job counts and resource usage using charging hours from
-        the v_jobs_charged view, which applies machine-specific charging rules.
+        Aggregates job counts and resource usage using pre-computed charging hours
+        from the job_charges table.
 
         Args:
             account: Account name to query
@@ -976,11 +976,11 @@ class JobQueries:
                 - users: List of unique users
                 - queues: List of unique queues
         """
-        query = self.session.query(JobCharged).filter(
+        query = self.session.query(JobCharge).filter(
             and_(
-                JobCharged.account == account,
-                JobCharged.end >= datetime.combine(start, datetime.min.time()),
-                JobCharged.end <= datetime.combine(end, datetime.max.time()),
+                JobCharge.account == account,
+                JobCharge.end >= datetime.combine(start, datetime.min.time()),
+                JobCharge.end <= datetime.combine(end, datetime.max.time()),
             )
         )
 
@@ -1023,8 +1023,8 @@ class JobQueries:
     ) -> Dict[str, Any]:
         """Get usage summary for a user over a date range.
 
-        Aggregates job counts and resource usage using charging hours from
-        the v_jobs_charged view, which applies machine-specific charging rules.
+        Aggregates job counts and resource usage using pre-computed charging hours
+        from the job_charges table.
 
         Args:
             user: Username to query
@@ -1034,11 +1034,11 @@ class JobQueries:
         Returns:
             Dict with aggregated metrics similar to usage_summary
         """
-        query = self.session.query(JobCharged).filter(
+        query = self.session.query(JobCharge).filter(
             and_(
-                JobCharged.user == user,
-                JobCharged.end >= datetime.combine(start, datetime.min.time()),
-                JobCharged.end <= datetime.combine(end, datetime.max.time()),
+                JobCharge.user == user,
+                JobCharge.end >= datetime.combine(start, datetime.min.time()),
+                JobCharge.end <= datetime.combine(end, datetime.max.time()),
             )
         )
 
