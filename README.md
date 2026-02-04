@@ -14,7 +14,7 @@ Both tools use SQLite databases for efficient querying and provide Python APIs w
 Historical job data tracking for Casper and Derecho HPC systems.
 
 **Key Features:**
-- Optimized SQLite schema with 5-10x query performance improvements
+- Optimized SQLite schema with high-performance queries.
 - Pre-computed charging calculations (CPU-hours, GPU-hours, memory-hours)
 - Daily summary tables for fast historical queries
 - Python query interface and CLI reporting tools
@@ -22,10 +22,8 @@ Historical job data tracking for Casper and Derecho HPC systems.
 
 **Quick Start:**
 ```bash
-cd qhist_db
 make init-db
-make sync-all START=20250801 END=20251123
-python -m qhist_db.queries
+qhist-sync --verbose
 ```
 
 **Common Use Cases:**
