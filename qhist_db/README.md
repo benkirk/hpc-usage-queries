@@ -7,14 +7,13 @@ A SQLite database and Python toolkit for collecting and analyzing historical job
 This project fetches job history from HPC systems via the `qhist` command over SSH, stores records in local SQLite databases, and provides a foundation for usage analysis.
 
 **Features:**
-- Separate database file per machine for easy management
-- SQLAlchemy ORM models for job records
-- Bulk sync with duplicate detection
+- Optimized schema with 5-10x query performance via normalization and composite indexes
+- Separate database per machine for independent management
+- Pre-computed charging calculations in materialized table
+- Bulk sync with duplicate detection and foreign key resolution
 - Handles job arrays (e.g., `6049117[28]`)
-- Day-by-day fetching for large date ranges
-- Charging views with computed resource hours using machine-specific rules
 - Python query interface for common usage analysis patterns
-- Daily summary tables for fast usage queries
+- Daily summary tables for fast historical queries
 
 ## Quick Start
 
@@ -34,25 +33,20 @@ python -m qhist_db.queries
 ```
 qhist-queries/
 ├── qhist_db/              # Python package
-│   ├── models.py          # SQLAlchemy ORM (Job class)
-│   ├── database.py        # Engine/session management
-│   ├── sync.py            # SSH fetch and bulk insert
+│   ├── models.py          # SQLAlchemy ORM models
+│   ├── database.py        # Engine/session management with PRAGMA optimizations
+│   ├── sync.py            # SSH fetch, FK resolution, charge calculation
 │   ├── queries.py         # High-level query interface
-│   ├── charging.py        # Charging view creation
-│   ├── summary.py         # Daily summary table management
+│   ├── charging.py        # Machine-specific charging rules
+│   ├── summary.py         # Daily summary generation
 │   ├── parsers.py         # qhist output parsers
 │   ├── remote.py          # SSH remote execution
 │   └── log_config.py      # Logging configuration
 ├── scripts/
 │   └── sync_jobs.py       # CLI sync script
 ├── tests/                 # Test suite
-│   ├── test_models.py     # Model tests
-│   ├── test_queries.py    # Query interface tests
-│   ├── test_charging.py   # Charging logic tests
-│   ├── test_parsers.py    # Parser tests
-│   └── test_summary.py    # Summary table tests
 ├── docs/
-│   ├── schema.md          # Database schema documentation
+│   └── schema.md          # Complete schema documentation
 ├── data/
 │   ├── casper.db          # Casper jobs (gitignored)
 │   └── derecho.db         # Derecho jobs (gitignored)
@@ -61,229 +55,184 @@ qhist-queries/
 
 ## Database Schema
 
-Each machine has its own database file with a `jobs` table:
+### Core Tables
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT (PK) | Full job ID including array index |
-| `short_id` | INTEGER | Base job number for queries |
-| `user` | TEXT | Submitting user |
-| `account` | TEXT | Account charged |
-| `queue` | TEXT | Queue/partition |
-| `status` | TEXT | Exit status |
-| `submit` | DATETIME | Submission time (UTC) |
-| `start` | DATETIME | Execution start (UTC) |
-| `end` | DATETIME | Job end (UTC) |
-| `elapsed` | INTEGER | Runtime (seconds) |
-| `walltime` | INTEGER | Requested walltime (seconds) |
-| `numcpus` | INTEGER | CPUs allocated |
-| `numgpus` | INTEGER | GPUs allocated |
-| `numnodes` | INTEGER | Nodes allocated |
-| `memory` | BIGINT | Memory used (bytes) |
-| `reqmem` | BIGINT | Memory requested (bytes) |
+**jobs**: Job records with foreign keys to normalized lookup tables
+- Auto-increment primary key (handles scheduler ID wrap-around)
+- Foreign keys: `user_id`, `account_id`, `queue_id`
+- Text fields preserved: `user`, `account`, `queue`
+- Resource allocations: `numcpus`, `numgpus`, `numnodes`, `memory`
+- Timestamps in UTC: `submit`, `start`, `end`, `elapsed`
+- Unique constraint on `(job_id, submit)` prevents duplicates
 
-See [docs/schema.md](docs/schema.md) for the complete schema.
+**users, accounts, queues**: Normalized lookup tables
+- Map IDs to names for efficient integer-based joins
+- ~3,500 users, ~1,300 accounts, ~150 queues
+
+**job_charges**: Materialized charging calculations
+- Pre-computed: `cpu_hours`, `gpu_hours`, `memory_hours`
+- 1:1 with jobs table for instant charge lookups
+- Eliminates on-the-fly calculation overhead
+
+**daily_summary**: Aggregated usage by date/user/account/queue
+- Fast historical queries without scanning full jobs table
+- Includes both text fields and foreign keys
+
+### Performance Optimizations
+
+**Composite indexes** for common query patterns:
+- `ix_jobs_queue_end` - Primary query: filter by queue and date range
+- `ix_jobs_queue_user_end`, `ix_jobs_queue_account_end` - User/account filtering
+- `ix_daily_summary_*_date` - Fast daily summary lookups
+
+**SQLite PRAGMA settings**:
+- WAL mode for concurrent reads during writes
+- 64MB cache, 256MB memory-mapped I/O
+- Foreign key enforcement enabled
+
+See [docs/schema.md](../docs/schema.md) for complete details.
 
 ## SQL Query Examples
 
-```bash
-# Query Derecho jobs
-sqlite3 data/derecho.db "SELECT user, COUNT(*) as jobs FROM jobs GROUP BY user LIMIT 10;"
-
-# Query Casper jobs
-sqlite3 data/casper.db "SELECT queue, COUNT(*) FROM jobs GROUP BY queue;"
-```
-
 ```sql
--- Jobs by user for August 2025 (run against derecho.db)
-SELECT user, COUNT(*) as jobs, SUM(elapsed)/3600.0 as total_hours
-FROM jobs
-WHERE submit >= '2025-08-01' AND submit < '2025-09-01'
-GROUP BY user
-ORDER BY total_hours DESC
+-- Top users by CPU hours in date range
+SELECT u.username, SUM(jc.cpu_hours) as total_cpu_hours
+FROM jobs j
+JOIN users u ON j.user_id = u.id
+JOIN job_charges jc ON j.id = jc.job_id
+JOIN queues q ON j.queue_id = q.id
+WHERE q.queue_name IN ('cpu', 'cpudev')
+  AND j.end >= '2025-01-01' AND j.end < '2025-02-01'
+GROUP BY u.username
+ORDER BY total_cpu_hours DESC
 LIMIT 10;
 
--- Average wait time by queue
-SELECT queue,
-       AVG(strftime('%s', start) - strftime('%s', eligible))/60.0 as avg_wait_min
-FROM jobs
-WHERE start IS NOT NULL AND submit IS NOT NULL
-GROUP BY queue;
+-- GPU usage by account with job counts
+SELECT a.account_name,
+       COUNT(*) as job_count,
+       SUM(jc.gpu_hours) as total_gpu_hours
+FROM jobs j
+JOIN accounts a ON j.account_id = a.id
+JOIN job_charges jc ON j.id = jc.job_id
+JOIN queues q ON j.queue_id = q.id
+WHERE q.queue_name IN ('gpu', 'gpudev')
+  AND j.end >= '2025-01-01'
+GROUP BY a.account_name;
 
--- Memory efficiency (used vs requested)
-SELECT user,
-       AVG(CAST(memory AS REAL) / NULLIF(reqmem, 0)) * 100 as mem_efficiency_pct
-FROM jobs
-WHERE memory IS NOT NULL AND reqmem > 0
-GROUP BY user
-HAVING COUNT(*) > 100;
+-- Average wait time by queue
+SELECT q.queue_name,
+       AVG(strftime('%s', j.start) - strftime('%s', j.submit))/60.0 as avg_wait_min
+FROM jobs j
+JOIN queues q ON j.queue_id = q.id
+WHERE j.start IS NOT NULL
+GROUP BY q.queue_name;
 ```
 
 ## CLI Sync Usage
 
 ```bash
-# Sync with options
+# Sync specific date
 python scripts/sync_jobs.py -m derecho -d 20251121 -v
+
+# Sync date range
 python scripts/sync_jobs.py -m casper --start 20250801 --end 20250831 -v
 
 # Dry run (fetch but don't insert)
 python scripts/sync_jobs.py -m derecho -d 20251121 --dry-run -v
 ```
 
-## Charging
+During sync, the system:
+1. Fetches job data via SSH + qhist
+2. Resolves foreign keys (creates new users/accounts/queues as needed)
+3. Inserts jobs with duplicate detection
+4. Calculates and stores charges immediately
+5. Updates daily summary table
 
-The project includes charging views (`v_jobs_charged`) that compute resource hours using machine-specific rules. The Python query interface automatically uses these views for accurate usage calculations.
+## Charging Rules
 
-**Derecho charging rules:**
-- **Production CPU queues**: core-hours = `elapsed * numnodes * 128 / 3600`
-- **Production GPU queues**: GPU-hours = `elapsed * numnodes * 4 / 3600`
-- **Development queues**: actual resources used (not full-node allocation)
-- Memory-hours = `elapsed * memory_gb / 3600`
+Charges are computed during import using machine-specific rules and stored in the `job_charges` table.
 
-**Casper charging rules:**
-- CPU-hours = `elapsed * numcpus / 3600`
-- GPU-hours = `elapsed * numgpus / 3600`
-- Memory-hours = `elapsed * memory_gb / 3600`
+**Derecho:**
+- Production CPU queues: `numnodes × 128 cores/node × elapsed_hours`
+- Production GPU queues: `numnodes × 4 GPUs/node × elapsed_hours`
+- Dev queues: actual resources used (not full-node)
+- Memory-hours: `memory_gb × elapsed_hours`
 
-The charging views are created automatically by `init_db()` and are used by `JobQueries.usage_summary()` and `JobQueries.user_summary()` to provide accurate resource usage calculations.
+**Casper:**
+- CPU-hours: `numcpus × elapsed_hours`
+- GPU-hours: `numgpus × elapsed_hours`
+- Memory-hours: `memory_gb × elapsed_hours`
 
 ## Python Query Interface
 
-The `JobQueries` class provides a high-level Python API for common queries:
+The `JobQueries` class provides a high-level Python API:
 
 ```python
 from datetime import date, timedelta
 from qhist_db import get_session, JobQueries
 
-# Connect to a machine's database
+# Connect to database
 session = get_session("derecho")
-queries = JobQueries(session)
+queries = JobQueries(session, "derecho")
 
-# Get jobs for a specific user
-end_date = date.today()
-start_date = end_date - timedelta(days=7)
-jobs = queries.jobs_by_user("username", start=start_date, end=end_date)
+# Usage by group (user, account, or queue)
+end = date.today()
+start = end - timedelta(days=30)
+cpu_by_user = queries.usage_by_group('cpu', 'user', start, end)
 
-# Get usage summary for an account (uses charging view for accurate hours)
-summary = queries.usage_summary("NCAR0001", start=start_date, end=end_date)
-print(f"Job count: {summary['job_count']}")
-print(f"Total CPU-hours: {summary['total_cpu_hours']:,.2f}")
-print(f"Total GPU-hours: {summary['total_gpu_hours']:,.2f}")
-print(f"Total Memory-hours: {summary['total_memory_hours']:,.2f}")
-print(f"Users: {', '.join(summary['users'])}")
+# Each result: {'label': username, 'usage_hours': float, 'job_count': int}
+for result in sorted(cpu_by_user, key=lambda x: x['usage_hours'], reverse=True)[:5]:
+    print(f"{result['label']}: {result['usage_hours']:,.0f} CPU-hours ({result['job_count']:,} jobs)")
 
-# Get top users by job count
-top_users = queries.top_users_by_jobs(start=start_date, end=end_date, limit=10)
-for user_stat in top_users:
-    print(f"{user_stat['user']}: {user_stat['job_count']} jobs")
-
-# Get queue statistics
-stats = queries.queue_statistics(start=start_date, end=end_date)
-for stat in stats:
-    print(f"{stat['queue']}: {stat['job_count']} jobs, "
-          f"avg {stat['avg_elapsed_seconds']/3600:.2f} hours")
-
-# Get daily summaries (if available)
-daily = queries.daily_summary_by_user("username", start=start_date, end=end_date)
-for summary in daily:
-    print(f"{summary.date}: {summary.job_count} jobs")
+# Job size/wait distributions
+job_sizes = queries.job_sizes_by_resource('cpu', start, end)
+job_waits = queries.job_waits_by_resource('gpu', start, end)
 
 session.close()
 ```
 
-**Available query methods:**
-- `jobs_by_user(user, start, end, status, queue)` - Get jobs for a user
-- `jobs_by_account(account, start, end, status)` - Get jobs for an account
-- `jobs_by_queue(queue, start, end)` - Get jobs for a queue
-- `usage_summary(account, start, end)` - Aggregate usage for an account
-- `user_summary(user, start, end)` - Aggregate usage for a user
-- `top_users_by_jobs(start, end, limit)` - Get top users by job count
-- `queue_statistics(start, end)` - Get statistics by queue
-- `daily_summary_by_account(account, start, end)` - Get daily summaries
-- `daily_summary_by_user(user, start, end)` - Get daily summaries
+**Available methods:**
+- `usage_by_group(resource, group_by, start, end)` - Aggregate usage by user/account/queue
+- `job_sizes_by_resource(resource, start, end)` - Job size distributions
+- `job_waits_by_resource(resource, start, end)` - Queue wait time distributions
+- `job_durations(resource, start, end)` - Runtime distributions
+- `usage_history(resource, group_by, start, end, period)` - Time series data
 
-See `qhist_db/queries.py` for complete API documentation and examples.
-
-**Try the examples:**
-```bash
-# Run the built-in examples with your database
-python -m qhist_db.queries
-```
-
-This will demonstrate all query methods with real data from your Derecho database.
+See `qhist_db/queries.py` for complete API documentation.
 
 ## CLI Tool
 
-The `qhist-report` command-line interface provides convenient access to job history data.
+The `qhist-report` command-line tool provides convenient data export:
 
-### `qhist-report history`
+### History Reports
 
-The `history` command provides a time-series view of job data.
-
-**Options:**
-- `--start-date YYYY-MM-DD`: Start date for analysis.
-- `--end-date YYYY-MM-DD`: End date for analysis.
-- `--group-by [day|month|quarter]`: Group results by day, month, or quarter (default: `day`).
-- `-m [casper|derecho]`: The machine to query (default: `derecho`).
-
-**Subcommands:**
-- `unique-users`: Prints the number of unique users.
-- `unique-projects`: Prints the number of unique projects.
-- `jobs-per-user`: Prints the number of jobs per user per account.
-
-**Examples:**
 ```bash
+# Unique users/projects over time
 qhist-report history --start-date 2025-11-01 --end-date 2025-11-30 unique-users
-qhist-report history --start-date 2025-10-01 --end-date 2025-12-31 --group-by quarter unique-projects
-qhist-report history --start-date 2025-11-01 --end-date 2025-11-07 --group-by day jobs-per-user
+qhist-report history --group-by quarter unique-projects
+
+# Jobs per user per account
+qhist-report history --start-date 2025-11-01 --end-date 2025-11-07 jobs-per-user
 ```
 
-### `qhist-report resource`
+### Resource Reports
 
-The `resource` command generates reports on resource usage.
-
-**Options:**
-- `--start-date YYYY-MM-DD`: Start date for analysis.
-- `--end-date YYYY-MM-DD`: End date for analysis.
-- `-m [casper|derecho]`: The machine to query (default: `derecho`).
-- `--output-dir PATH`: Directory to save the reports (default: `.`).
-- `--format [dat|json|csv|md]`: Output format - dat (default), json, csv, or md (markdown).
-
-**Subcommands:**
-- `job-sizes`: Job sizes by core count
-- `job-waits`: Job waits by core count
-- `cpu-job-sizes`: CPU job sizes by node count
-- `cpu-job-waits`: CPU job waits by node count
-- `cpu-job-durations`: CPU job durations by day
-- `gpu-job-sizes`: GPU job sizes by GPU count
-- `gpu-job-waits`: GPU job waits by GPU count
-- `gpu-job-durations`: GPU job durations by day
-- `memory-job-sizes`: Job sizes by memory requirement
-- `memory-job-waits`: Job waits by memory requirement
-- `pie-user-cpu`: CPU usage by user
-- `pie-user-gpu`: GPU usage by user
-- `pie-proj-cpu`: CPU usage by project (account)
-- `pie-proj-gpu`: GPU usage by project (account)
-- `pie-group-cpu`: CPU usage by account
-- `pie-group-gpu`: GPU usage by account
-- `usage-history`: Daily usage history
-
-**Examples:**
 ```bash
-# Generate job sizes report (default .dat format)
-qhist-report resource --start-date 2025-11-01 --end-date 2025-11-30 job-sizes
+# Job size/wait distributions
+qhist-report resource --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-sizes
+qhist-report resource --start-date 2025-11-01 --end-date 2025-11-30 gpu-job-waits
 
-# Generate CPU job durations with custom output directory
-qhist-report resource --start-date 2025-11-01 --end-date 2025-11-30 --output-dir reports/ cpu-job-durations
+# Usage summaries (multiple formats)
+qhist-report resource --format json pie-user-cpu
+qhist-report resource --format csv pie-proj-gpu
+qhist-report resource --format md usage-history
 
-# Export GPU job sizes as JSON
-qhist-report resource --start-date 2025-11-01 --end-date 2025-11-30 --format json gpu-job-sizes
-
-# Export user CPU usage as markdown table
-qhist-report resource --start-date 2025-11-01 --end-date 2025-11-30 --format md pie-user-cpu
-
-# Generate memory-based job size analysis as CSV
-qhist-report resource --start-date 2025-11-01 --end-date 2025-11-30 --format csv memory-job-sizes
+# Available subcommands:
+# - job-sizes, job-waits, job-durations (generic)
+# - cpu-job-{sizes,waits,durations}, gpu-job-{sizes,waits,durations}
+# - memory-job-{sizes,waits}
+# - pie-user-{cpu,gpu}, pie-proj-{cpu,gpu}, pie-group-{cpu,gpu}
+# - usage-history
 ```
 
 ## Requirements
@@ -291,6 +240,16 @@ qhist-report resource --start-date 2025-11-01 --end-date 2025-11-30 --format csv
 - Python 3.10+
 - SQLAlchemy
 - SSH access to casper/derecho with `qhist` command available
+
+## Performance
+
+Query performance improvements from normalized schema:
+- **GPU queries**: ~0.2s for full-year aggregations
+- **CPU queries**: ~3-4s for full-year aggregations across thousands of users
+- **Daily summaries**: Instant lookups via pre-aggregated table
+- **Complex joins**: 0.1-0.2s with composite index usage verified
+
+Database size: ~24% larger than denormalized schema due to materialized charges and indexes, but eliminates runtime computation overhead.
 
 ## License
 
