@@ -78,6 +78,7 @@ from .database import get_session
 from .queries import JobQueries
 from .exporters import get_exporter
 
+
 @click.group(invoke_without_command=True)
 @click.option("--start-date", type=str, callback=parse_date, help="Start date for analysis (YYYY-MM-DD).")
 @click.option("--end-date", type=str, callback=parse_date, help="End date for analysis (YYYY-MM-DD).")

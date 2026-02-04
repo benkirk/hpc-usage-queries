@@ -1,9 +1,39 @@
 """SQLAlchemy ORM models for HPC job history data."""
 
-from sqlalchemy import BigInteger, Column, Date, DateTime, Float, Index, Integer, Text, UniqueConstraint
-from sqlalchemy.orm import declarative_base
+from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint
+from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
+
+
+class User(Base):
+    """Normalized user lookup table."""
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(Text, unique=True, nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<User(id={self.id}, username='{self.username}')>"
+
+
+class Account(Base):
+    """Normalized account lookup table."""
+    __tablename__ = "accounts"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_name = Column(Text, unique=True, nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<Account(id={self.id}, account_name='{self.account_name}')>"
+
+
+class Queue(Base):
+    """Normalized queue lookup table."""
+    __tablename__ = "queues"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    queue_name = Column(Text, unique=True, nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<Queue(id={self.id}, queue_name='{self.queue_name}')>"
 
 
 class Job(Base):
@@ -31,6 +61,16 @@ class Job(Base):
     # Queue and status
     queue = Column(Text, index=True)
     status = Column(Text, index=True)
+
+    # Foreign keys for normalized schema (NULL until migrated)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True)
+    account_id = Column(Integer, ForeignKey('accounts.id'), index=True)
+    queue_id = Column(Integer, ForeignKey('queues.id'), index=True)
+
+    # Relationships (only populated after migration)
+    user_obj = relationship("User")
+    account_obj = relationship("Account")
+    queue_obj = relationship("Queue")
 
     # Timestamps (stored in UTC)
     submit = Column(DateTime, index=True)
@@ -86,6 +126,42 @@ class Job(Base):
         """Convert job record to dictionary."""
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
+    def calculate_charges(self, machine: str) -> dict:
+        """Calculate charging hours for this job.
+
+        Args:
+            machine: Either 'derecho' or 'casper'
+
+        Returns:
+            Dictionary with keys: cpu_hours, gpu_hours, memory_hours
+        """
+        from .charging import casper_charge, derecho_charge
+
+        job_dict = self.to_dict()
+        return derecho_charge(job_dict) if machine == 'derecho' else casper_charge(job_dict)
+
+
+class JobCharge(Base):
+    """Materialized charging calculations.
+
+    Stores pre-computed charge hours for each job, avoiding recalculation
+    every time charges are queried. The charge_version field allows tracking
+    charging algorithm changes over time.
+    """
+
+    __tablename__ = "job_charges"
+
+    job_id = Column(Integer, primary_key=True)
+    cpu_hours = Column(Float, nullable=False, default=0.0)
+    gpu_hours = Column(Float, nullable=False, default=0.0)
+    memory_hours = Column(Float, nullable=False, default=0.0)
+    charge_version = Column(Integer, default=1)
+
+    __table_args__ = (ForeignKeyConstraint(['job_id'], ['jobs.id'], ondelete='CASCADE'),)
+
+    def __repr__(self):
+        return f"<JobCharge(job_id={self.job_id}, cpu={self.cpu_hours:.2f}, gpu={self.gpu_hours:.2f})>"
+
 
 class DailySummary(Base):
     """Daily summary of job charges per user/account/queue.
@@ -103,6 +179,11 @@ class DailySummary(Base):
     user = Column(Text, nullable=False)
     account = Column(Text, nullable=False)
     queue = Column(Text, nullable=False)
+
+    # Foreign keys for normalized schema (NULL until migrated)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True)
+    account_id = Column(Integer, ForeignKey('accounts.id'), index=True)
+    queue_id = Column(Integer, ForeignKey('queues.id'), index=True)
 
     # Aggregated metrics
     job_count = Column(Integer, default=0)

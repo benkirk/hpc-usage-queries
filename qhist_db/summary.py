@@ -60,25 +60,35 @@ def generate_daily_summary(
     if existing and not replace:
         return stats
 
-    # Aggregate from the charging view (same structure for all machines)
-    sql = text("""
-        INSERT INTO daily_summary (date, user, account, queue, job_count, cpu_hours, gpu_hours, memory_hours)
+    # Aggregate from job_charges table with foreign keys
+    sql = text(
+        """
+        INSERT INTO daily_summary (date, user, account, queue, user_id, account_id, queue_id,
+                                 job_count, cpu_hours, gpu_hours, memory_hours)
         SELECT
-            date(end) as date,
-            user,
-            account,
-            queue,
+            date(j.end) as date,
+            u.username as user,
+            a.account_name as account,
+            q.queue_name as queue,
+            j.user_id,
+            j.account_id,
+            j.queue_id,
             COUNT(*) as job_count,
-            SUM(cpu_hours) as cpu_hours,
-            SUM(gpu_hours) as gpu_hours,
-            SUM(memory_hours) as memory_hours
-        FROM v_jobs_charged
-        WHERE date(end) = :target_date
-          AND user IS NOT NULL
-          AND account IS NOT NULL
-          AND queue IS NOT NULL
-        GROUP BY date(end), user, account, queue
-    """)
+            SUM(jc.cpu_hours) as cpu_hours,
+            SUM(jc.gpu_hours) as gpu_hours,
+            SUM(jc.memory_hours) as memory_hours
+        FROM jobs j
+        JOIN job_charges jc ON j.id = jc.job_id
+        LEFT JOIN users u ON j.user_id = u.id
+        LEFT JOIN accounts a ON j.account_id = a.id
+        LEFT JOIN queues q ON j.queue_id = q.id
+        WHERE date(j.end) = :target_date
+          AND j.user_id IS NOT NULL
+          AND j.account_id IS NOT NULL
+          AND j.queue_id IS NOT NULL
+        GROUP BY date(j.end), j.user_id, j.account_id, j.queue_id, u.username, a.account_name, q.queue_name
+    """
+    )
 
     result = session.execute(sql, {"target_date": target_date.isoformat()})
     session.commit()
