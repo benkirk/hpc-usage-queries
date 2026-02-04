@@ -92,8 +92,8 @@ from .gpfs import GPFSParser
 register_parser(GPFSParser)
 
 # Future parsers (uncomment when implemented):
-# from .lustre import LustreParser
-# register_parser(LustreParser)
+from .lustre import LustreParser
+register_parser(LustreParser)
 # from .posix import POSIXParser
 # register_parser(POSIXParser)
 
