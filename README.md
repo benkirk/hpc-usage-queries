@@ -1,11 +1,75 @@
 # HPC Usage Queries
 
-A collection of user-facing tools for quering resoure usage on NSF NCAR HPC systems
+A collection of user-facing tools for analyzing resource usage on NSF NCAR HPC systems. This repository contains two complementary toolkits for understanding compute and storage utilization patterns.
+
+## Overview
+
+**QHist Queries** - Track and analyze HPC job history across NCAR's supercomputing resources
+**FS Scans** - Analyze filesystem usage patterns from metadata scans
+
+Both tools use SQLite databases for efficient querying and provide Python APIs with command-line interfaces.
 
 ## QHist Queries
-HPC job history.
-See `qhist_db/README.md`
 
-## FS Scan
-Filesystem usage queries from metadata scans.
-See `fs_scans/README.md`
+Historical job data tracking for Casper and Derecho HPC systems.
+
+**Key Features:**
+- Optimized SQLite schema with 5-10x query performance improvements
+- Pre-computed charging calculations (CPU-hours, GPU-hours, memory-hours)
+- Daily summary tables for fast historical queries
+- Python query interface and CLI reporting tools
+- SSH-based sync with duplicate detection
+
+**Quick Start:**
+```bash
+cd qhist_db
+make init-db
+make sync-all START=20250801 END=20251123
+python -m qhist_db.queries
+```
+
+**Common Use Cases:**
+- Track resource consumption by user, account, or queue
+- Analyze job size and wait time distributions
+- Generate usage reports for allocation management
+- Historical trend analysis
+
+See [qhist_db/README.md](qhist_db/README.md) for complete documentation.
+
+## FS Scans
+
+Filesystem usage analysis from GPFS, Lustre, and POSIX metadata scans.
+
+**Key Features:**
+- Directory-level aggregation (recursive and non-recursive statistics)
+- Pre-computed histograms for instant access-age and size-distribution queries
+- Single-owner/single-group directory detection
+- Handles multi-billion file filesystems efficiently
+- Unified CLI with import, query, and analyze commands
+
+**Quick Start:**
+```bash
+cd fs_scans
+pip install -e .
+fs-scans import scan.log
+fs-scans query asp --min-size 10GiB
+fs-scans analyze --access-history
+```
+
+**Common Use Cases:**
+- Identify cold data for archival or cleanup
+- Find large directories by user or path
+- Track storage inefficiencies (tiny files, abandoned data)
+- Generate per-user storage reports
+
+See [fs_scans/README.md](fs_scans/README.md) for complete documentation.
+
+## Requirements
+
+- Python 3.10+
+- SQLAlchemy
+- SSH access to NCAR systems (for QHist sync)
+
+## License
+
+Internal NCAR tool.
