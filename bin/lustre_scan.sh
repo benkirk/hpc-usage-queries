@@ -17,13 +17,19 @@ echo "ofile=${ofile}"
 rm -f ${ofile}*
 
 # Recursively find work units by subdividing large directories
+# Args:
+#   $1: dir                    - Directory to analyze
+#   $2: current_depth          - Current recursion depth (0 = starting point)
+#   $3: max_subdivision_depth  - Maximum recursion depth (stop subdividing after this)
+#   $4: subdir_threshold       - Subdivide if dir has more than this many subdirs
+#   $5: lookahead_depth        - How many levels deep to count subdirs for size estimation
 find_work_units()
 {
     local dir=$1
     local current_depth=${2:-0}
     local max_subdivision_depth=${3:-3}
-    local subdir_threshold=${4:-30}
-    local lookahead_depth=${5:-1}
+    local subdir_threshold=${4:-10}
+    local lookahead_depth=${5:-3}
 
     # Safety: don't recurse forever
     if [ ${current_depth} -ge ${max_subdivision_depth} ]; then
@@ -37,10 +43,8 @@ find_work_units()
 
     if [ ${subdir_count} -gt ${subdir_threshold} ]; then
         # Large directory tree - subdivide it
-        # If beyond initial scan depth, also scan this dir non-recursively to catch files directly in it
-        if [ ${current_depth} -gt 0 ]; then
-            echo "${dir} --maxdepth 1"
-        fi
+        # Scan this dir non-recursively first to catch files directly in it
+        echo "${dir} --maxdepth 1"
         find "${dir}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | while IFS= read -r subdir; do
             find_work_units "${subdir}" $((current_depth + 1)) ${max_subdivision_depth} ${subdir_threshold} ${lookahead_depth}
         done
@@ -96,20 +100,12 @@ cat <<EOF >${ofile}
 EOF
 
 #----------------------------
-lfs_cmd ${path} --maxdepth 3
-
-# Generate work units using adaptive depth subdivision (parallelized)
-work_units_dir=$(mktemp -d)
-find ${path} -maxdepth 3 -mindepth 3 -type d 2>/dev/null | \
-    xargs -d '\n' -n 1 -P 8 --process-slot-var=XARGS_RANK bash -c '
-        set +e  # Disable exit-on-error for permission errors
-        find_work_units "$@" 0 3 10 2 >> "'"${work_units_dir}"'/work_units.${XARGS_RANK}"
-    ' _
-
-# Combine work units from all workers
+# Generate work units using adaptive depth subdivision starting from root
+# Parameters: dir, current_depth=0, max_subdivision_depth=3, subdir_threshold=10, lookahead_depth=3
 work_units=$(mktemp)
-cat ${work_units_dir}/work_units.* > ${work_units} 2>/dev/null
-rm -rf ${work_units_dir}
+set +e  # Disable exit-on-error for permission errors during work unit generation
+find_work_units "${path}" 0 3 10 3 > ${work_units}
+set -e
 
 # Process work units in parallel
 cat ${work_units} | \
