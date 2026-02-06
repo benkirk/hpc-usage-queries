@@ -102,7 +102,7 @@ lfs_cmd ${path} --maxdepth 3
 work_units_dir=$(mktemp -d)
 find ${path} -maxdepth 3 -mindepth 3 -type d 2>/dev/null | \
     xargs -d '\n' -n 1 -P 8 --process-slot-var=XARGS_RANK bash -c '
-        find_work_units "$@" 0 2 10 2 > "'"${work_units_dir}"'/work_units.${XARGS_RANK}"
+        find_work_units "$@" 0 3 10 2 > "'"${work_units_dir}"'/work_units.${XARGS_RANK}"
     ' _
 
 # Combine work units from all workers
