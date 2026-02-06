@@ -6,7 +6,9 @@ from datetime import datetime
 
 from fs_scans.parsers.base import FilesystemParser, ParsedEntry
 from fs_scans.parsers.gpfs import GPFSParser
+from fs_scans.parsers.lustre import LustreParser
 from fs_scans.parsers import get_parser, detect_parser, list_formats
+from fs_scans.core.database import extract_filesystem_from_filename
 
 
 # ============================================================================
@@ -121,6 +123,7 @@ class TestParserRegistry:
         """Test listing registered formats."""
         formats = list_formats()
         assert "gpfs" in formats
+        assert "lustre" in formats
         assert isinstance(formats, list)
 
     def test_get_parser_by_name(self):
@@ -139,6 +142,12 @@ class TestParserRegistry:
         parser = detect_parser(Path("20260111_csfs1_asp.list.list_all.log"))
         assert parser is not None
         assert isinstance(parser, GPFSParser)
+
+    def test_detect_parser_lustre(self):
+        """Test auto-detection for Lustre files."""
+        parser = detect_parser(Path("20260204_desc1_gdex.lfs-scan"))
+        assert parser is not None
+        assert isinstance(parser, LustreParser)
 
     def test_detect_parser_unknown_returns_none(self):
         """Test unknown format returns None."""
@@ -196,25 +205,141 @@ class TestParsedEntry:
 
 
 # ============================================================================
+# Lustre Parser Tests
+# ============================================================================
+
+
+class TestLustreParser:
+    """Tests for Lustre parser."""
+
+    def test_format_name(self):
+        """Test parser format name."""
+        parser = LustreParser()
+        assert parser.format_name == "lustre"
+
+    def test_can_parse_valid_filename(self):
+        """Test auto-detection of Lustre format by filename."""
+        parser = LustreParser()
+
+        # Valid Lustre filenames
+        assert parser.can_parse(Path("20260204_desc1_gdex.lfs-scan"))
+        assert parser.can_parse(Path("20260204_desc1_glade_p_archive.lfs-scan"))
+        assert parser.can_parse(Path("scan_output.lfs-scan"))
+
+    def test_can_parse_invalid_filename(self):
+        """Test rejection of non-Lustre filenames."""
+        parser = LustreParser()
+
+        # Invalid filenames
+        assert not parser.can_parse(Path("scan.log"))
+        assert not parser.can_parse(Path("data.csv"))
+        assert not parser.can_parse(Path("20260204_desc1_gdex.list"))
+
+    def test_parse_file_line(self):
+        """Test parsing a file entry."""
+        parser = LustreParser()
+        line = "0x28001ff98:0xe66b:0x0 s=51 b=8 u=16093 g=4801 p=1 type=f perm=0755 a=1708547123 m=1670625642 c=1708547123 -- /lustre/path/file.txt"
+
+        entry = parser.parse_line(line)
+
+        assert entry is not None
+        assert entry.path == "/lustre/path/file.txt"
+        assert entry.size == 51
+        assert entry.allocated == 4096  # 8 blocks * 512
+        assert entry.uid == 16093
+        assert entry.gid == 4801
+        assert entry.is_dir is False
+        assert entry.atime == datetime.fromtimestamp(1708547123)
+        assert entry.inode is None
+        assert entry.fileset_id is None
+
+    def test_parse_directory_line(self):
+        """Test parsing a directory entry."""
+        parser = LustreParser()
+        line = "0x24001959d:0x1f:0x0 s=16384 b=32 u=38057 g=68122 p=1 type=d perm=0750 a=1769700762 m=1739055225 c=1739055225 -- /lustre/path/dir"
+
+        entry = parser.parse_line(line)
+
+        assert entry is not None
+        assert entry.path == "/lustre/path/dir"
+        assert entry.size == 16384
+        assert entry.allocated == 16384  # 32 blocks * 512
+        assert entry.is_dir is True
+        assert entry.uid == 38057
+        assert entry.gid == 68122
+
+    def test_parse_large_file(self):
+        """Test parsing a large file with correct block calculation."""
+        parser = LustreParser()
+        # Large file: 159GB with 311033880 blocks
+        line = "0x28001ff98:0xe66c:0x0 s=159249182720 b=311033880 u=16093 g=4801 p=1 type=f perm=0755 a=1708547467 m=1539293571 c=1708547467 -- /lustre/data.tar"
+
+        entry = parser.parse_line(line)
+
+        assert entry is not None
+        assert entry.size == 159249182720
+        assert entry.allocated == 159249346560  # 311033880 * 512
+        assert entry.is_dir is False
+
+    def test_parse_line_invalid(self):
+        """Test parsing invalid line returns None."""
+        parser = LustreParser()
+
+        # Invalid lines
+        assert parser.parse_line("invalid line") is None
+        assert parser.parse_line("") is None
+        assert parser.parse_line("# comment") is None
+
+    def test_parse_line_missing_required_fields(self):
+        """Test parsing line with missing required fields returns None."""
+        parser = LustreParser()
+
+        # Missing size field
+        line = "0x28001ff98:0xe66b:0x0 b=8 u=16093 g=4801 p=1 type=f perm=0755 a=1708547123 -- /file.txt"
+        assert parser.parse_line(line) is None
+
+        # Missing blocks field
+        line = "0x28001ff98:0xe66b:0x0 s=51 u=16093 g=4801 p=1 type=f perm=0755 a=1708547123 -- /file.txt"
+        assert parser.parse_line(line) is None
+
+        # Missing type field
+        line = "0x28001ff98:0xe66b:0x0 s=51 b=8 u=16093 g=4801 p=1 perm=0755 a=1708547123 -- /file.txt"
+        assert parser.parse_line(line) is None
+
+
+# ============================================================================
+# Filesystem Name Extraction Tests
+# ============================================================================
+
+
+class TestFilesystemNameExtraction:
+    """Tests for filesystem name extraction from filenames."""
+
+    def test_extract_gpfs_filename(self):
+        """Test extracting filesystem from GPFS filename."""
+        assert extract_filesystem_from_filename("20260111_csfs1_asp.list.list_all.log") == "asp"
+        assert extract_filesystem_from_filename("20260111_csfs1_cisl.list") == "cisl"
+        assert extract_filesystem_from_filename("20240101_server_filesystem.list.gz") == "filesystem"
+
+    def test_extract_lustre_filename(self):
+        """Test extracting filesystem from Lustre filename."""
+        assert extract_filesystem_from_filename("20260204_desc1_gdex.lfs-scan") == "gdex"
+        assert extract_filesystem_from_filename("20260204_desc1_glade_p_archive.lfs-scan") == "glade_p_archive"
+
+    def test_extract_invalid_filename(self):
+        """Test that invalid filenames return None."""
+        assert extract_filesystem_from_filename("scan.log") is None
+        assert extract_filesystem_from_filename("data.csv") is None
+        assert extract_filesystem_from_filename("random_file.txt") is None
+
+
+# ============================================================================
 # Placeholder Parser Tests
 # ============================================================================
 
 
 class TestPlaceholderParsers:
-    """Tests for placeholder parsers (Lustre, POSIX)."""
-
-    def test_lustre_parser_not_implemented(self):
-        """Test that Lustre parser raises NotImplementedError."""
-        from fs_scans.parsers.lustre import LustreParser
-
-        parser = LustreParser()
-        assert parser.format_name == "lustre"
-
-        with pytest.raises(NotImplementedError):
-            parser.can_parse(Path("scan.log"))
-
-        with pytest.raises(NotImplementedError):
-            parser.parse_line("test line")
+    """Tests for placeholder parsers (POSIX)."""
 
     def test_posix_parser_not_implemented(self):
         """Test that POSIX parser raises NotImplementedError."""

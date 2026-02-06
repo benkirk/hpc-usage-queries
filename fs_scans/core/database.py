@@ -74,11 +74,15 @@ def get_data_dir_info() -> tuple[Path, str]:
 
 
 def extract_filesystem_from_filename(filename: str) -> str | None:
-    """Extract filesystem name from a GPFS scan log filename.
+    """Extract filesystem name from a scan log filename.
 
     Expected patterns:
-        20260111_csfs1_asp.list.list_all.log -> asp
-        20260111_csfs1_cisl.list.list_all.log.xz -> cisl
+        GPFS format:
+            20260111_csfs1_asp.list.list_all.log -> asp
+            20260111_csfs1_cisl.list.list_all.log.xz -> cisl
+        Lustre format:
+            20260204_desc1_gdex.lfs-scan -> gdex
+            20260204_desc1_glade_p_archive.lfs-scan -> glade_p_archive
 
     Args:
         filename: Name of the log file (with or without path)
@@ -87,10 +91,17 @@ def extract_filesystem_from_filename(filename: str) -> str | None:
         Filesystem name or None if pattern doesn't match
     """
     basename = Path(filename).name
-    # Pattern: YYYYMMDD_server_filesystem.list...
+
+    # Try GPFS pattern: YYYYMMDD_server_filesystem.list...
     match = re.match(r"\d{8}_[^_]+_([^.]+)\.list", basename)
     if match:
         return match.group(1)
+
+    # Try Lustre pattern: YYYYMMDD_server_filesystem.lfs-scan
+    match = re.match(r"\d{8}_[^_]+_([^.]+)\.lfs-scan", basename)
+    if match:
+        return match.group(1)
+
     return None
 
 
