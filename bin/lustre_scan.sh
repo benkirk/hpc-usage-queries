@@ -102,7 +102,8 @@ lfs_cmd ${path} --maxdepth 3
 work_units_dir=$(mktemp -d)
 find ${path} -maxdepth 3 -mindepth 3 -type d 2>/dev/null | \
     xargs -d '\n' -n 1 -P 8 --process-slot-var=XARGS_RANK bash -c '
-        find_work_units "$@" 0 3 10 2 > "'"${work_units_dir}"'/work_units.${XARGS_RANK}"
+        set +e  # Disable exit-on-error for permission errors
+        find_work_units "$@" 0 3 10 2 >> "'"${work_units_dir}"'/work_units.${XARGS_RANK}"
     ' _
 
 # Combine work units from all workers
@@ -112,7 +113,10 @@ rm -rf ${work_units_dir}
 
 # Process work units in parallel
 cat ${work_units} | \
-    xargs -d '\n' -n 1 -P 8 --process-slot-var=XARGS_RANK bash -c 'process_work_unit "$@"' _
+    xargs -d '\n' -n 1 -P 8 --process-slot-var=XARGS_RANK bash -c '
+        set +e  # Disable exit-on-error for permission errors
+        process_work_unit "$@"
+    ' _
 
 rm -f ${work_units}
 
