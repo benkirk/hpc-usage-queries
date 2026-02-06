@@ -16,6 +16,40 @@ echo "ofile=${ofile}"
 
 rm -f ${ofile}*
 
+# Recursively find work units by subdividing large directories
+find_work_units()
+{
+    local dir=$1
+    local current_depth=${2:-0}
+    local max_subdivision_depth=${3:-3}
+    local subdir_threshold=${4:-30}
+    local lookahead_depth=${5:-2}
+
+    # Safety: don't recurse forever
+    if [ ${current_depth} -ge ${max_subdivision_depth} ]; then
+        echo "${dir}"
+        return
+    fi
+
+    # Count subdirectories within lookahead depth to catch fan-out cases
+    # A dir with 2 immediate subdirs but 1000 total descendants will be caught
+    local subdir_count=$(find "${dir}" -maxdepth ${lookahead_depth} -mindepth 1 -type d 2>/dev/null | wc -l)
+
+    if [ ${subdir_count} -gt ${subdir_threshold} ]; then
+        # Large directory tree - subdivide it
+        # If beyond initial scan depth, also scan this dir non-recursively to catch files directly in it
+        if [ ${current_depth} -gt 0 ]; then
+            echo "${dir} --maxdepth 1"
+        fi
+        find "${dir}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | while IFS= read -r subdir; do
+            find_work_units "${subdir}" $((current_depth + 1)) ${max_subdivision_depth} ${subdir_threshold} ${lookahead_depth}
+        done
+    else
+        # Small enough subtree - use as work unit (recursive)
+        echo "${dir}"
+    fi
+}
+
 lfs_cmd()
 {
     local path=$1
@@ -39,8 +73,22 @@ lfs_cmd()
         >> ${out} 2>/dev/null
 }
 
+# Process a work unit specification (may include --maxdepth args)
+process_work_unit()
+{
+    local spec="$1"
+    # Check if spec contains "--maxdepth N" suffix
+    if [[ "$spec" =~ ^(.*)\ --maxdepth\ ([0-9]+)$ ]]; then
+        lfs_cmd "${BASH_REMATCH[1]}" --maxdepth "${BASH_REMATCH[2]}"
+    else
+        lfs_cmd "$spec"
+    fi
+}
+
 export ofile
+export -f find_work_units
 export -f lfs_cmd
+export -f process_work_unit
 
 cat <<EOF >${ofile}
 # lfs scan of ${path}
@@ -50,10 +98,17 @@ EOF
 #----------------------------
 lfs_cmd ${path} --maxdepth 3
 
+# Generate work units using adaptive depth subdivision
+work_units=$(mktemp)
+find ${path} -maxdepth 3 -mindepth 3 -type d 2>/dev/null | while IFS= read -r dir; do
+    find_work_units "${dir}" 0 3 10 2
+done > ${work_units}
 
-find ${path} -maxdepth 3 -mindepth 3 -type d -print0 \
-    | \
-    xargs -0 -n 1 -P 8 --process-slot-var=XARGS_RANK bash -c 'lfs_cmd ${@}' _
+# Process work units in parallel
+cat ${work_units} | \
+    xargs -d '\n' -n 1 -P 8 --process-slot-var=XARGS_RANK bash -c 'process_work_unit "$@"' _
+
+rm -f ${work_units}
 
 
 cat ${ofile}.* \
