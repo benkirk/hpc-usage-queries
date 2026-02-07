@@ -114,11 +114,9 @@ cat ${work_units} | \
         process_work_unit "$@"
     ' _
 
-rm -f ${work_units}
 
-cat ${ofile}.* \
-    >> ${ofile}
+cat ${ofile}.* >> ${ofile}
 
-rm -f ${ofile}.*
+rm -f ${ofile}.* ${work_units}
 
 exit 0
