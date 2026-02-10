@@ -183,8 +183,20 @@ class TestGenerateDailySummary:
         assert result["rows_inserted"] == 0
 
     def test_no_jobs_on_date(self, db_with_jobs_and_view):
-        """Should handle dates with no jobs."""
+        """Should insert marker row when no jobs on date."""
         session = db_with_jobs_and_view
 
         result = generate_daily_summary(session, "derecho", date(2025, 1, 14))
-        assert result["rows_inserted"] == 0
+        # Should insert 1 marker row for empty days
+        assert result["rows_inserted"] == 1
+
+        # Verify marker row was created
+        from qhist_db.models import DailySummary
+        marker = session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 1, 14)
+        ).first()
+        assert marker is not None
+        assert marker.user == 'NO_JOBS'
+        assert marker.account == 'NO_JOBS'
+        assert marker.queue == 'NO_JOBS'
+        assert marker.job_count == 0
