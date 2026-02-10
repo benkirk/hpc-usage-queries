@@ -488,8 +488,9 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
             submit_dt = submit_dt.replace(tzinfo=None)
         existing_pairs.add((job_id, submit_dt))
 
-    # Filter out records that already exist
+    # Filter out records that already exist or are duplicates within this batch
     # Normalize submit times to naive datetimes for comparison
+    seen_keys = set()
     new_records = []
     for r in prepared:
         submit_dt = r['submit']
@@ -497,8 +498,10 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
             submit_dt = submit_dt.replace(tzinfo=None)
 
         key = (r['job_id'], submit_dt)
-        if key not in existing_pairs:
+        # Skip if already in database OR already seen in this batch
+        if key not in existing_pairs and key not in seen_keys:
             new_records.append(r)
+            seen_keys.add(key)
 
     if not new_records:
         return 0
