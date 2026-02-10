@@ -335,4 +335,14 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         "count": safe_int(pbs_record.run_count),
     }
 
+    # Fix start=0 (Unix epoch) bug by calculating from end - duration
+    # Many PBS records have start=0 but valid end time and walltime
+    if result["start"] is not None and result["end"] is not None and result["elapsed"] is not None:
+        # Check if start is Unix epoch (1970-01-01)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        if result["start"] == epoch:
+            # Calculate start from end - elapsed
+            from datetime import timedelta
+            result["start"] = result["end"] - timedelta(seconds=result["elapsed"])
+
     return result
