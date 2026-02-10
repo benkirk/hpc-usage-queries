@@ -1102,6 +1102,7 @@ class JobQueries:
                 DailySummary.account == account,
                 DailySummary.date >= start,
                 DailySummary.date <= end,
+                DailySummary.user != 'NO_JOBS',  # Exclude empty day markers
             )
         )
 
@@ -1130,6 +1131,7 @@ class JobQueries:
                 DailySummary.user == user,
                 DailySummary.date >= start,
                 DailySummary.date <= end,
+                DailySummary.user != 'NO_JOBS',  # Exclude empty day markers
             )
         )
 

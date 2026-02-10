@@ -113,6 +113,23 @@ def generate_daily_summary(
     session.commit()
 
     stats["rows_inserted"] = result.rowcount
+
+    # If no rows were inserted, create a marker to indicate date was processed
+    # This prevents infinite re-fetching for days with no job completions
+    if result.rowcount == 0:
+        marker_sql = text(
+            """
+            INSERT INTO daily_summary (date, user, account, queue,
+                                      user_id, account_id, queue_id,
+                                      job_count, cpu_hours, gpu_hours, memory_hours)
+            VALUES (:target_date, 'NO_JOBS', 'NO_JOBS', 'NO_JOBS',
+                    NULL, NULL, NULL, 0, 0.0, 0.0, 0.0)
+            """
+        )
+        session.execute(marker_sql, {"target_date": target_date.isoformat()})
+        session.commit()
+        stats["rows_inserted"] = 1  # Mark as processed
+
     return stats
 
 
