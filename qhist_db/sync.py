@@ -442,7 +442,7 @@ class JobImporter:
         # Make a copy to avoid mutating the original
         prepared = record.copy()
 
-        # Resolve foreign keys
+        # Resolve foreign keys - keep both normalized and denormalized fields
         if 'user' in prepared and prepared['user']:
             prepared['user_id'] = self._get_or_create_user(prepared['user'])
 
@@ -477,13 +477,36 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
     else:
         prepared = records
 
-    # Use SQLite's INSERT OR IGNORE via on_conflict_do_nothing
-    # Conflict is on the unique constraint (job_id, submit)
-    stmt = sqlite_insert(Job.__table__).values(prepared)
-    stmt = stmt.on_conflict_do_nothing(index_elements=["job_id", "submit"])
+    # Get existing (job_id, submit) pairs to filter out duplicates
+    # SQLite stores datetimes as naive, so normalize to naive for comparison
+    existing_pairs = set()
+    for job_id, submit_dt in session.query(Job.job_id, Job.submit).filter(
+        Job.job_id.in_([r['job_id'] for r in prepared])
+    ).all():
+        # Normalize to naive datetime for comparison
+        if submit_dt and submit_dt.tzinfo:
+            submit_dt = submit_dt.replace(tzinfo=None)
+        existing_pairs.add((job_id, submit_dt))
 
-    result = session.execute(stmt)
-    rows_inserted = result.rowcount
+    # Filter out records that already exist
+    # Normalize submit times to naive datetimes for comparison
+    new_records = []
+    for r in prepared:
+        submit_dt = r['submit']
+        if submit_dt and submit_dt.tzinfo:
+            submit_dt = submit_dt.replace(tzinfo=None)
+
+        key = (r['job_id'], submit_dt)
+        if key not in existing_pairs:
+            new_records.append(r)
+
+    if not new_records:
+        return 0
+
+    # Use ORM bulk_insert_mappings which handles foreign keys properly
+    # render_nulls=True ensures NULL foreign keys are properly inserted
+    session.bulk_insert_mappings(Job, new_records, render_nulls=True)
+    rows_inserted = len(new_records)
     session.flush()
 
     # Calculate charges for newly inserted jobs
