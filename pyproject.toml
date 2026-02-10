@@ -27,6 +27,7 @@ analysis = [
 
 [project.scripts]
 qhist-sync = "scripts.sync_jobs:main"
+qhist-parse-logs = "scripts.parse_pbs_logs:main"
 qhist-report = "qhist_db.cli:cli"
 
 # New unified CLI
