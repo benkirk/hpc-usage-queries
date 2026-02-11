@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""CLI script to sync job data from HPC machines to local database."""
+"""CLI script to sync job data from HPC machines to local database.
+
+DEPRECATED: This script is maintained for backward compatibility.
+New users should use: qhist-db sync remote
+
+The qhist-sync entry point now delegates to the unified qhist-db CLI.
+"""
 
 import argparse
 import sys

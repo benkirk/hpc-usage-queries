@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Parse PBS accounting logs and import jobs into the database.
 
+DEPRECATED: This script is maintained for backward compatibility.
+New users should use: qhist-db sync local
+
 This script provides an alternative to qhist-sync that works with local PBS
 accounting log files. It's useful when:
 - Log files have been copied locally
@@ -11,6 +14,8 @@ accounting log files. It's useful when:
 The PBS logs contain cpu_type and gpu_type in select strings which are NOT
 available in qhist JSON output, allowing this tool to populate fields that
 qhist-sync cannot.
+
+The qhist-parse-logs entry point now delegates to the unified qhist-db CLI.
 """
 
 import argparse
