@@ -320,7 +320,7 @@ class JobQueries:
             group_field.label("label"),
             func.sum(hours_field).label("usage_hours"),
             func.count(Job.id).label("job_count")
-        ).join(JobCharge, Job.id == JobCharge.id).filter(Job.queue.in_(queues))
+        ).join(JobCharge, Job.id == JobCharge.job_id).filter(Job.queue.in_(queues))
 
         query = self._apply_date_filter(query, start, end)
         results = query.group_by(group_field).order_by(func.sum(hours_field).desc()).all()
@@ -485,7 +485,7 @@ class JobQueries:
             Job.user,
             hours_field.label("hours_field"),
             range_case
-        ).join(JobCharge, Job.id == JobCharge.id).filter(Job.queue.in_(queues))
+        ).join(JobCharge, Job.id == JobCharge.job_id).filter(Job.queue.in_(queues))
 
         subquery = self._apply_date_filter(subquery, start, end)
         subquery = subquery.subquery()
@@ -556,7 +556,7 @@ class JobQueries:
                 func.sum(case((bucket, hours_field), else_=0)).label(label)
                 for label, bucket in duration_buckets.items()
             ]
-        ).join(JobCharge, Job.id == JobCharge.id).filter(Job.queue.in_(queues))
+        ).join(JobCharge, Job.id == JobCharge.job_id).filter(Job.queue.in_(queues))
 
         query = self._apply_date_filter(query, start, end)
         results = query.group_by("job_date").order_by("job_date").all()
@@ -614,7 +614,7 @@ class JobQueries:
                 func.sum(case((bucket, hours_field), else_=0)).label(label)
                 for label, bucket in memory_buckets.items()
             ]
-        ).join(JobCharge, Job.id == JobCharge.id).filter(
+        ).join(JobCharge, Job.id == JobCharge.job_id).filter(
             Job.queue.in_(queues),
             Job.mpiprocs.isnot(None),   # Filter NULL
             Job.mpiprocs > 0,           # Filter zero (prevents division by zero)
@@ -763,7 +763,7 @@ class JobQueries:
             func.count(Job.id).label(f"{prefix}_jobs"),
             func.sum(hours_field).label(f"{prefix}_hours")
         ).join(
-            JobCharge, Job.id == JobCharge.id
+            JobCharge, Job.id == JobCharge.job_id
         ).filter(
             Job.queue.in_(queues), *date_filter
         ).group_by("period").subquery()
