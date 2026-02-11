@@ -1,5 +1,4 @@
-"""Sync job data from remote HPC machines via qhist command."""
-
+"""Sync job data from remote HPC machines via qhist command or locally from PBS logs."""
 from datetime import datetime, date, timedelta
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -31,7 +30,7 @@ from .parsers import (
 )
 
 
-def sync_jobs(
+def sync_ssh_jobs(
     session: Session,
     machine: str,
     period: str | None = None,
@@ -90,7 +89,7 @@ def sync_jobs(
     return stats
 
 
-def sync_jobs_bulk(
+def sync_ssh_jobs_bulk(
     session: Session,
     machine: str,
     period: str | None = None,
@@ -145,7 +144,7 @@ def sync_jobs_bulk(
             # Get a new session for this machine
             machine_session = get_db_session(m)
             try:
-                machine_stats = sync_jobs_bulk(
+                machine_stats = sync_ssh_jobs_bulk(
                     session=machine_session,
                     machine=m,
                     period=period,
@@ -567,7 +566,7 @@ def sync_pbs_logs_bulk(
     """Sync job records from local PBS accounting logs using bulk insert.
 
     This function parses local PBS log files instead of SSH'ing to remote machines.
-    It produces the same database records as sync_jobs_bulk() but can work offline
+    It produces the same database records as sync_ssh_jobs_bulk() but can work offline
     and has access to additional fields (cputype, gputype) from PBS select strings.
 
     Args:

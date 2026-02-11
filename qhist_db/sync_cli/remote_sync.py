@@ -4,7 +4,7 @@ import click
 from datetime import datetime, timedelta
 from .common import machine_option, date_options, sync_options, validate_dates, print_sync_stats
 from ..database import get_session, init_db, get_db_path, VALID_MACHINES
-from ..sync import sync_jobs_bulk
+from ..sync import sync_ssh_jobs_bulk
 from ..summary import generate_daily_summary, generate_summaries_for_range
 
 
@@ -122,7 +122,7 @@ def remote(machine, date, start, end, batch_size, dry_run, verbose, force, no_su
                 click.echo("(FORCE - will sync even if already summarized)")
 
         # Run sync
-        stats = sync_jobs_bulk(
+        stats = sync_ssh_jobs_bulk(
             session=session,
             machine=machine,
             period=date,
