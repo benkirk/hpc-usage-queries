@@ -145,12 +145,12 @@ Examples:
 
         # Print summary
         print("\nSync Summary:")
-        print(f"  Fetched:     {stats['fetched']:,} jobs")
-        print(f"  Inserted:    {stats['inserted']:,} new jobs")
-        print(f"  Errors:      {stats['errors']:,}")
-        print(f"  Summarized:  {stats['days_summarized']} days")
-        print(f"  Skipped:     {stats['days_skipped']} days (already summarized)")
-        print(f"  Failed:      {stats['days_failed']} days")
+        print(f"  Parsed:     {stats['fetched']:,} jobs")
+        print(f"  Inserted:   {stats['inserted']:,} new jobs")
+        print(f"  Errors:     {stats['errors']:,}")
+        print(f"  Summarized: {stats['days_summarized']} days")
+        print(f"  Skipped:    {stats['days_skipped']} days (already summarized)")
+        print(f"  Failed:     {stats['days_failed']} days")
 
         if stats['failed_days']:
             print(f"\nFailed days: {', '.join(stats['failed_days'])}")

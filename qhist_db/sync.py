@@ -651,7 +651,7 @@ def sync_pbs_logs_bulk(
                 stats["failed_days"].append(day)
             else:
                 if verbose:
-                    print(f"  Fetched {day} - {day_stats['fetched']:,} jobs, {day_stats['inserted']:,} new", flush=True)
+                    print(f"  Parsed {day} - {day_stats['fetched']:,} jobs, {day_stats['inserted']:,} new", flush=True)
 
                 # Generate summary for this day
                 if generate_summary and not dry_run and day_stats["fetched"] > 0:

@@ -102,3 +102,8 @@ dry-run-all:
 solve-%: %.yaml
 	$(config_env)
 	conda env create --file $< --prefix $@ --dry-run
+
+
+sync-logs:
+	rsync -axv derecho:/ncar/pbs/accounting/20* ./data/sample_pbs_logs/derecho/
+	rsync -axv casper:casper:/ssg/pbs/casper/accounting/2026* ./data/sample_pbs_logs/casper/
