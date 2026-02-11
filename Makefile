@@ -51,23 +51,23 @@ init-db:
 
 sync-casper:
 ifdef START
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m casper --start $(START) $(if $(END),--end $(END)) -v
+	qhist-db sync remote -m casper --start $(START) $(if $(END),--end $(END)) -v
 else
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m casper -d $(DATE) -v
+	qhist-db sync remote -m casper -d $(DATE) -v
 endif
 
 sync-derecho:
 ifdef START
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m derecho --start $(START) $(if $(END),--end $(END)) -v
+	qhist-db sync remote -m derecho --start $(START) $(if $(END),--end $(END)) -v
 else
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m derecho -d $(DATE) -v
+	qhist-db sync remote -m derecho -d $(DATE) -v
 endif
 
 sync-all:
 ifdef START
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m all --start $(START) $(if $(END),--end $(END)) -v
+	qhist-db sync remote -m all --start $(START) $(if $(END),--end $(END)) -v
 else
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m all -d $(DATE) -v
+	qhist-db sync remote -m all -d $(DATE) -v
 endif
 
 clean:
@@ -82,13 +82,13 @@ test-import:
 	@$(PYTHON) -c "from qhist_db import Job, init_db; print('Import successful')"
 
 dry-run-casper:
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m casper -d $(DATE) --dry-run -v
+	qhist-db sync remote -m casper -d $(DATE) --dry-run -v
 
 dry-run-derecho:
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m derecho -d $(DATE) --dry-run -v
+	qhist-db sync remote -m derecho -d $(DATE) --dry-run -v
 
 dry-run-all:
-	$(PYTHON) $(SCRIPTS)/sync_jobs.py -m all -d $(DATE) --dry-run -v
+	qhist-db sync remote -m all -d $(DATE) --dry-run -v
 
 %: %.yaml
 	[ -d $@ ] && mv $@ $@.old && rm -rf $@.old &
@@ -102,3 +102,8 @@ dry-run-all:
 solve-%: %.yaml
 	$(config_env)
 	conda env create --file $< --prefix $@ --dry-run
+
+
+sync-logs:
+	rsync -axv derecho:/ncar/pbs/accounting/20* ./data/sample_pbs_logs/derecho/
+	rsync -axv casper:/ssg/pbs/casper/accounting/2026* ./data/sample_pbs_logs/casper/

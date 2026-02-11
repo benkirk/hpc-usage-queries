@@ -1,5 +1,4 @@
-"""Sync job data from remote HPC machines via qhist command."""
-
+"""Sync job data from remote HPC machines via qhist command or locally from PBS logs."""
 from datetime import datetime, date, timedelta
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -31,7 +30,7 @@ from .parsers import (
 )
 
 
-def sync_jobs(
+def sync_ssh_jobs(
     session: Session,
     machine: str,
     period: str | None = None,
@@ -90,7 +89,7 @@ def sync_jobs(
     return stats
 
 
-def sync_jobs_bulk(
+def sync_ssh_jobs_bulk(
     session: Session,
     machine: str,
     period: str | None = None,
@@ -145,7 +144,7 @@ def sync_jobs_bulk(
             # Get a new session for this machine
             machine_session = get_db_session(m)
             try:
-                machine_stats = sync_jobs_bulk(
+                machine_stats = sync_ssh_jobs_bulk(
                     session=machine_session,
                     machine=m,
                     period=period,
@@ -442,7 +441,7 @@ class JobImporter:
         # Make a copy to avoid mutating the original
         prepared = record.copy()
 
-        # Resolve foreign keys
+        # Resolve foreign keys - keep both normalized and denormalized fields
         if 'user' in prepared and prepared['user']:
             prepared['user_id'] = self._get_or_create_user(prepared['user'])
 
@@ -477,13 +476,39 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
     else:
         prepared = records
 
-    # Use SQLite's INSERT OR IGNORE via on_conflict_do_nothing
-    # Conflict is on the unique constraint (job_id, submit)
-    stmt = sqlite_insert(Job.__table__).values(prepared)
-    stmt = stmt.on_conflict_do_nothing(index_elements=["job_id", "submit"])
+    # Get existing (job_id, submit) pairs to filter out duplicates
+    # SQLite stores datetimes as naive, so normalize to naive for comparison
+    existing_pairs = set()
+    for job_id, submit_dt in session.query(Job.job_id, Job.submit).filter(
+        Job.job_id.in_([r['job_id'] for r in prepared])
+    ).all():
+        # Normalize to naive datetime for comparison
+        if submit_dt and submit_dt.tzinfo:
+            submit_dt = submit_dt.replace(tzinfo=None)
+        existing_pairs.add((job_id, submit_dt))
 
-    result = session.execute(stmt)
-    rows_inserted = result.rowcount
+    # Filter out records that already exist or are duplicates within this batch
+    # Normalize submit times to naive datetimes for comparison
+    seen_keys = set()
+    new_records = []
+    for r in prepared:
+        submit_dt = r['submit']
+        if submit_dt and submit_dt.tzinfo:
+            submit_dt = submit_dt.replace(tzinfo=None)
+
+        key = (r['job_id'], submit_dt)
+        # Skip if already in database OR already seen in this batch
+        if key not in existing_pairs and key not in seen_keys:
+            new_records.append(r)
+            seen_keys.add(key)
+
+    if not new_records:
+        return 0
+
+    # Use ORM bulk_insert_mappings which handles foreign keys properly
+    # render_nulls=True ensures NULL foreign keys are properly inserted
+    session.bulk_insert_mappings(Job, new_records, render_nulls=True)
+    rows_inserted = len(new_records)
     session.flush()
 
     # Calculate charges for newly inserted jobs
@@ -523,3 +548,223 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
 
     session.commit()
     return rows_inserted
+
+
+def sync_pbs_logs_bulk(
+    session: Session,
+    machine: str,
+    log_dir: str,
+    period: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    dry_run: bool = False,
+    batch_size: int = 1000,
+    verbose: bool = False,
+    force: bool = False,
+    generate_summary: bool = True,
+) -> dict:
+    """Sync job records from local PBS accounting logs using bulk insert.
+
+    This function parses local PBS log files instead of SSH'ing to remote machines.
+    It produces the same database records as sync_ssh_jobs_bulk() but can work offline
+    and has access to additional fields (cputype, gputype) from PBS select strings.
+
+    Args:
+        session: SQLAlchemy session
+        machine: Machine name ('casper' or 'derecho')
+        log_dir: Directory containing PBS log files (named YYYYMMDD)
+        period: Single date in YYYY-MM-DD format (takes precedence over start/end)
+        start_date: Start date for range (YYYY-MM-DD). Defaults to '2024-01-01' if None and period is None.
+        end_date: End date for range (YYYY-MM-DD). Defaults to yesterday if None and period is None.
+        dry_run: If True, don't actually insert records
+        batch_size: Number of records to insert per batch
+        verbose: If True, print progress for each day
+        force: If True, sync even if day has already been summarized
+        generate_summary: If True, generate daily summary after syncing
+
+    Returns:
+        Dictionary with sync statistics: {fetched, inserted, errors, days_summarized, days_failed, days_skipped}
+
+    Raises:
+        ValueError: If machine is not valid or if neither period nor date range is provided
+        RuntimeError: If PBS log file is missing or cannot be parsed
+    """
+    from pathlib import Path
+    from .summary import get_summarized_dates, generate_daily_summary
+    from .pbs_local import fetch_jobs_from_pbs_logs
+
+    # Validate machine
+    if machine not in VALID_MACHINES:
+        raise ValueError(f"Invalid machine: {machine}. Must be one of {VALID_MACHINES}")
+
+    # Validate log_dir
+    log_path = Path(log_dir)
+    if not log_path.exists():
+        raise RuntimeError(f"PBS log directory not found: {log_dir}")
+
+    stats = {
+        "fetched": 0, "inserted": 0, "errors": 0,
+        "days_failed": 0, "failed_days": [],
+        "days_skipped": 0, "skipped_days": [],
+        "days_summarized": 0,
+    }
+
+    # Apply default date range if not syncing a single period
+    if period is None:
+        if start_date is None:
+            start_date = "2024-01-01"  # Default epoch
+        if end_date is None:
+            yesterday = date.today() - timedelta(days=1)
+            end_date = yesterday.strftime("%Y-%m-%d")
+
+    # Get already-summarized dates if smart skip is enabled
+    summarized_dates = set()
+    if not force and not dry_run:
+        summarized_dates = get_summarized_dates(session)
+
+    # If date range specified, loop one day at a time
+    if start_date and end_date:
+        days = date_range(start_date, end_date)
+        ndays = date_range_length(start_date, end_date)
+        iterator = track(days, total=ndays, description="Processing...") if track and verbose else days
+        for day in iterator:
+            day_date = parse_date_string(day).date()
+
+            # Smart skip: if already summarized, skip fetching
+            if day_date in summarized_dates:
+                if verbose:
+                    print(f"  Skipping {day}... (already summarized)")
+                stats["days_skipped"] += 1
+                stats["skipped_days"].append(day)
+                continue
+
+            day_stats = _sync_pbs_logs_single_day(
+                session, machine, log_dir, day, dry_run, batch_size, verbose
+            )
+            stats["fetched"] += day_stats["fetched"]
+            stats["inserted"] += day_stats["inserted"]
+            stats["errors"] += day_stats["errors"]
+
+            if day_stats.get("failed"):
+                stats["days_failed"] += 1
+                stats["failed_days"].append(day)
+            else:
+                if verbose:
+                    print(f"  Parsed {day} - {day_stats['fetched']:,} jobs, {day_stats['inserted']:,} new", flush=True)
+
+                # Generate summary for this day
+                if generate_summary and not dry_run and day_stats["fetched"] > 0:
+                    generate_daily_summary(session, machine, day_date, replace=True)
+                    stats["days_summarized"] += 1
+    else:
+        # Single day or no date specified
+        target_period = period or start_date or end_date
+        if target_period:
+            day_date = parse_date_string(target_period).date()
+
+            # Smart skip for single day
+            if day_date in summarized_dates:
+                if verbose:
+                    print(f"  Skipping {target_period}... (already summarized)")
+                stats["days_skipped"] = 1
+                stats["skipped_days"] = [target_period]
+                return stats
+
+        day_stats = _sync_pbs_logs_single_day(
+            session, machine, log_dir, target_period, dry_run, batch_size, verbose
+        )
+        stats["fetched"] = day_stats["fetched"]
+        stats["inserted"] = day_stats["inserted"]
+        stats["errors"] = day_stats["errors"]
+
+        if day_stats.get("failed"):
+            stats["days_failed"] = 1
+            stats["failed_days"] = [target_period]
+        elif generate_summary and not dry_run and target_period and day_stats["fetched"] > 0:
+            day_date = parse_date_string(target_period).date()
+            generate_daily_summary(session, machine, day_date, replace=True)
+            stats["days_summarized"] = 1
+
+    return stats
+
+
+def _sync_pbs_logs_single_day(
+    session: Session,
+    machine: str,
+    log_dir: str,
+    period: str | None,
+    dry_run: bool,
+    batch_size: int,
+    verbose: bool = False,
+) -> dict:
+    """Sync jobs from PBS logs for a single day.
+
+    Args:
+        session: SQLAlchemy session
+        machine: Machine name
+        log_dir: Directory containing PBS log files
+        period: Date in YYYY-MM-DD format
+        dry_run: If True, don't insert
+        batch_size: Batch size for inserts
+        verbose: If True, print warnings
+
+    Returns:
+        Dictionary with sync statistics for this day
+    """
+    from .pbs_local import fetch_jobs_from_pbs_logs
+
+    stats = {"fetched": 0, "inserted": 0, "errors": 0, "failed": False, "error_msg": None}
+    batch = []
+
+    # Create importer for this machine if not in dry run mode
+    importer = None
+    if not dry_run:
+        importer = JobImporter(session, machine)
+
+    try:
+        for record in fetch_jobs_from_pbs_logs(log_dir=log_dir, machine=machine, date=period):
+            stats["fetched"] += 1
+
+            if not record.get("job_id"):
+                stats["errors"] += 1
+                continue
+
+            # Validate timestamp ordering
+            submit = record.get("submit")
+            eligible = record.get("eligible")
+            start = record.get("start")
+            end = record.get("end")
+
+            if submit and eligible and start and end:
+                if not (submit <= eligible <= start <= end):
+                    stats["errors"] += 1
+                    stats["error_msg"] = "bad timestamp"
+                    continue
+
+            batch.append(record)
+
+            if len(batch) >= batch_size:
+                if not dry_run:
+                    inserted = _insert_batch(session, batch, importer)
+                    stats["inserted"] += inserted
+                batch = []
+
+        # Insert remaining records
+        if batch and not dry_run:
+            inserted = _insert_batch(session, batch, importer)
+            stats["inserted"] += inserted
+
+    except RuntimeError as e:
+        # Handle PBS log parsing failures gracefully
+        stats["failed"] = True
+        stats["error_msg"] = str(e)
+        if verbose:
+            error_str = str(e)
+            if "not found" in error_str.lower():
+                print(f"  Skipping {period}... (PBS log file not found)")
+            elif "Failed to parse" in error_str:
+                print(f"  Skipping {period}... (malformed PBS log)")
+            else:
+                print(f"  Failed to sync {period}: {error_str[:80]}")
+
+    return stats

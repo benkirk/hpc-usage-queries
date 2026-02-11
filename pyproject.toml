@@ -7,6 +7,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "rich",
     "click",
+    "pbsparse",
 ]
 
 [project.optional-dependencies]
@@ -25,8 +26,13 @@ analysis = [
 ]
 
 [project.scripts]
-qhist-sync = "scripts.sync_jobs:main"
+# Main unified CLI
+qhist-db = "qhist_db.cli:cli"
+
+# Backward compatibility wrappers
 qhist-report = "qhist_db.cli:cli"
+qhist-sync = "qhist_db.sync_cli.wrappers:sync_wrapper"
+qhist-parse-logs = "qhist_db.sync_cli.wrappers:parse_logs_wrapper"
 
 # New unified CLI
 fs-scans = "fs_scans.cli.main:fs_scans_cli"
