@@ -1,6 +1,8 @@
 """SQLAlchemy ORM models for HPC job history data."""
 
-from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint, select
+from datetime import datetime
+
+from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, Text, UniqueConstraint, select
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -213,6 +215,49 @@ class Job(Base):
         job_dict = self.to_dict()
         return derecho_charge(job_dict) if machine == 'derecho' else casper_charge(job_dict)
 
+    @property
+    def pbs_record(self):
+        """Retrieve and unpickle the original PbsRecord object.
+
+        Returns None if no JobRecord exists (e.g., job was synced via SSH).
+        Uses lazy loading with instance-level cache to avoid repeated decompression.
+
+        Returns:
+            PbsRecord object or None
+        """
+        # Check instance cache first (avoid re-decompressing on multiple accesses)
+        if hasattr(self, '_cached_pbs_record'):
+            return self._cached_pbs_record
+
+        # Query for JobRecord (will be None for SSH-synced jobs)
+        from sqlalchemy.orm import object_session
+        session = object_session(self)
+        if session is None:
+            self._cached_pbs_record = None
+            return None
+
+        job_record = session.query(JobRecord).filter_by(job_id=self.id).first()
+
+        if job_record is None:
+            self._cached_pbs_record = None
+            return None
+
+        # Decompress and unpickle
+        import gzip
+        import pickle
+        try:
+            decompressed = gzip.decompress(job_record.compressed_data)
+            pbs_record_obj = pickle.loads(decompressed)
+            self._cached_pbs_record = pbs_record_obj
+            return pbs_record_obj
+        except Exception as e:
+            # Log error but don't crash (handle data corruption gracefully)
+            from .log_config import get_logger
+            logger = get_logger(__name__)
+            logger.error(f"Failed to decompress/unpickle JobRecord for job {self.id}: {e}")
+            self._cached_pbs_record = None
+            return None
+
 
 class JobCharge(Base):
     """Materialized charging calculations.
@@ -234,6 +279,32 @@ class JobCharge(Base):
 
     def __repr__(self):
         return f"<JobCharge(job_id={self.job_id}, cpu={self.cpu_hours:.2f}, gpu={self.gpu_hours:.2f})>"
+
+
+class JobRecord(Base):
+    """Compressed, pickled PbsRecord storage.
+
+    Stores the raw PBS accounting record object for jobs imported from local
+    PBS logs. Not available for jobs synced via SSH (qhist command).
+    """
+
+    __tablename__ = "job_records"
+
+    # Primary key = foreign key (true 1-to-1, matches JobCharge pattern)
+    job_id = Column(Integer, primary_key=True)
+
+    # Gzip-compressed pickle of PbsRecord object
+    compressed_data = Column(LargeBinary, nullable=False)
+
+    # Metadata for debugging/auditing
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        ForeignKeyConstraint(['job_id'], ['jobs.id'], ondelete='CASCADE'),
+    )
+
+    def __repr__(self):
+        return f"<JobRecord(job_id={self.job_id})>"
 
 
 class DailySummary(Base):

@@ -546,6 +546,54 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
             if charge_records:
                 session.bulk_insert_mappings(JobCharge, charge_records)
 
+        # Insert JobRecords for PBS log imports (if record_object present)
+        # NOTE: Use NEW records (actually inserted), not ALL prepared records
+        new_job_ids = [r['job_id'] for r in new_records]
+        new_submit_times = [r['submit'] for r in new_records]
+
+        # Create map with NAIVE datetimes for matching (SQLite stores as naive)
+        job_ids_map = {}
+        for r in new_records:
+            if 'record_object' in r:
+                submit = r['submit']
+                submit_naive = submit.replace(tzinfo=None) if submit and submit.tzinfo else submit
+                job_ids_map[(r['job_id'], submit_naive)] = r
+
+        if job_ids_map:
+            from .models import JobRecord
+            import pickle
+            import gzip
+
+            # Query ALL newly inserted jobs (not just those without charges)
+            all_new_jobs = (
+                session.query(Job)
+                .filter(and_(Job.job_id.in_(new_job_ids), Job.submit.in_(new_submit_times)))
+                .outerjoin(JobRecord, Job.id == JobRecord.job_id)
+                .filter(JobRecord.job_id.is_(None))
+                .all()
+            )
+
+            job_record_data = []
+            for job in all_new_jobs:
+                # Match job to its original record by (job_id, submit)
+                submit_naive = job.submit.replace(tzinfo=None) if job.submit and job.submit.tzinfo else job.submit
+                record = job_ids_map.get((job.job_id, submit_naive))
+
+                if record and 'record_object' in record:
+                    pbs_record = record['record_object']
+
+                    # Compress and pickle
+                    pickled = pickle.dumps(pbs_record, protocol=pickle.HIGHEST_PROTOCOL)
+                    compressed = gzip.compress(pickled, compresslevel=6)  # Balance speed vs size
+
+                    job_record_data.append({
+                        'job_id': job.id,
+                        'compressed_data': compressed,
+                    })
+
+            if job_record_data:
+                session.bulk_insert_mappings(JobRecord, job_record_data)
+
     session.commit()
     return rows_inserted
 
