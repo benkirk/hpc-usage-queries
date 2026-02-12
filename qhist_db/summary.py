@@ -78,13 +78,10 @@ def generate_daily_summary(
     # Aggregate from job_charges table with foreign keys
     sql = text(
         """
-        INSERT INTO daily_summary (date, user, account, queue, user_id, account_id, queue_id,
+        INSERT INTO daily_summary (date, user_id, account_id, queue_id,
                                  job_count, cpu_hours, gpu_hours, memory_hours)
         SELECT
             :target_date as date,
-            u.username as user,
-            a.account_name as account,
-            q.queue_name as queue,
             j.user_id,
             j.account_id,
             j.queue_id,
@@ -94,14 +91,11 @@ def generate_daily_summary(
             SUM(jc.memory_hours) as memory_hours
         FROM jobs j
         JOIN job_charges jc ON j.id = jc.job_id
-        LEFT JOIN users u ON j.user_id = u.id
-        LEFT JOIN accounts a ON j.account_id = a.id
-        LEFT JOIN queues q ON j.queue_id = q.id
         WHERE j.end >= :start_utc AND j.end < :end_utc
           AND j.user_id IS NOT NULL
           AND j.account_id IS NOT NULL
           AND j.queue_id IS NOT NULL
-        GROUP BY j.user_id, j.account_id, j.queue_id, u.username, a.account_name, q.queue_name
+        GROUP BY j.user_id, j.account_id, j.queue_id
     """
     )
 
@@ -119,11 +113,9 @@ def generate_daily_summary(
     if result.rowcount == 0:
         marker_sql = text(
             """
-            INSERT INTO daily_summary (date, user, account, queue,
-                                      user_id, account_id, queue_id,
+            INSERT INTO daily_summary (date, user_id, account_id, queue_id,
                                       job_count, cpu_hours, gpu_hours, memory_hours)
-            VALUES (:target_date, 'NO_JOBS', 'NO_JOBS', 'NO_JOBS',
-                    NULL, NULL, NULL, 0, 0.0, 0.0, 0.0)
+            VALUES (:target_date, NULL, NULL, NULL, 0, 0.0, 0.0, 0.0)
             """
         )
         session.execute(marker_sql, {"target_date": target_date.isoformat()})

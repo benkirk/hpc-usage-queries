@@ -1,6 +1,7 @@
 """SQLAlchemy ORM models for HPC job history data."""
 
-from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint, select
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -55,22 +56,19 @@ class Job(Base):
 
     # Job identification
     name = Column(Text)
-    user = Column(Text, index=True)
-    account = Column(Text, index=True)
 
-    # Queue and status
-    queue = Column(Text, index=True)
-    status = Column(Text, index=True)
-
-    # Foreign keys for normalized schema (NULL until migrated)
+    # Foreign keys for normalized schema
     user_id = Column(Integer, ForeignKey('users.id'), index=True)
     account_id = Column(Integer, ForeignKey('accounts.id'), index=True)
     queue_id = Column(Integer, ForeignKey('queues.id'), index=True)
 
-    # Relationships (only populated after migration)
+    # Relationships
     user_obj = relationship("User")
     account_obj = relationship("Account")
     queue_obj = relationship("Queue")
+
+    # Queue and status
+    status = Column(Text, index=True)
 
     # Timestamps (stored in UTC)
     submit = Column(DateTime, index=True)
@@ -110,21 +108,96 @@ class Job(Base):
         # Unique constraint: same job_id + submit time = same job
         # This handles job ID wrap-around across years
         UniqueConstraint("job_id", "submit", name="uq_jobs_job_id_submit"),
-        # Existing composite indexes
-        Index("ix_jobs_user_account", "user", "account"),
+        # Existing composite indexes (using FKs)
+        Index("ix_jobs_user_account", "user_id", "account_id"),
         Index("ix_jobs_submit_end", "submit", "end"),
-        # Date-filtered aggregation indexes
-        Index("ix_jobs_user_submit", "user", "submit"),
-        Index("ix_jobs_account_submit", "account", "submit"),
-        Index("ix_jobs_queue_submit", "queue", "submit"),
+        # Date-filtered aggregation indexes (using FKs)
+        Index("ix_jobs_user_submit", "user_id", "submit"),
+        Index("ix_jobs_account_submit", "account_id", "submit"),
+        Index("ix_jobs_queue_submit", "queue_id", "submit"),
     )
+
+    @hybrid_property
+    def user(self):
+        """Username from normalized users table."""
+        return self.user_obj.username if self.user_obj else None
+
+    @user.setter
+    def user(self, username):
+        """Set user by username, storing temporarily until flush."""
+        if username is None:
+            self.user_id = None
+            self.user_obj = None
+            self._pending_username = None
+            return
+
+        # Store the username to be resolved during flush
+        self._pending_username = username
+
+    @user.expression
+    def user(cls):
+        """Query expression for filtering by username."""
+        return select(User.username).where(User.id == cls.user_id).correlate(cls).scalar_subquery()
+
+    @hybrid_property
+    def account(self):
+        """Account name from normalized accounts table."""
+        return self.account_obj.account_name if self.account_obj else None
+
+    @account.setter
+    def account(self, account_name):
+        """Set account by name, storing temporarily until flush."""
+        if account_name is None:
+            self.account_id = None
+            self.account_obj = None
+            self._pending_account_name = None
+            return
+
+        # Store the account name to be resolved during flush
+        self._pending_account_name = account_name
+
+    @account.expression
+    def account(cls):
+        """Query expression for filtering by account."""
+        return select(Account.account_name).where(Account.id == cls.account_id).correlate(cls).scalar_subquery()
+
+    @hybrid_property
+    def queue(self):
+        """Queue name from normalized queues table."""
+        return self.queue_obj.queue_name if self.queue_obj else None
+
+    @queue.setter
+    def queue(self, queue_name):
+        """Set queue by name, storing temporarily until flush."""
+        if queue_name is None:
+            self.queue_id = None
+            self.queue_obj = None
+            self._pending_queue_name = None
+            return
+
+        # Store the queue name to be resolved during flush
+        self._pending_queue_name = queue_name
+
+    @queue.expression
+    def queue(cls):
+        """Query expression for filtering by queue."""
+        return select(Queue.queue_name).where(Queue.id == cls.queue_id).correlate(cls).scalar_subquery()
 
     def __repr__(self):
         return f"<Job(id='{self.id}', user='{self.user}', status='{self.status}')>"
 
     def to_dict(self):
-        """Convert job record to dictionary."""
-        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+        """Convert job record to dictionary.
+
+        Explicitly includes hybrid properties (user, account, queue) that
+        are not part of __table__.columns.
+        """
+        result = {c.name: getattr(self, c.name) for c in self.__table__.columns}
+        # Add hybrid properties
+        result['user'] = self.user
+        result['account'] = self.account
+        result['queue'] = self.queue
+        return result
 
     def calculate_charges(self, machine: str) -> dict:
         """Calculate charging hours for this job.
@@ -176,14 +249,16 @@ class DailySummary(Base):
 
     # Summary dimensions
     date = Column(Date, nullable=False)
-    user = Column(Text, nullable=False)
-    account = Column(Text, nullable=False)
-    queue = Column(Text, nullable=False)
 
-    # Foreign keys for normalized schema (NULL until migrated)
+    # Foreign keys for normalized schema (NULL for 'NO_JOBS' markers)
     user_id = Column(Integer, ForeignKey('users.id'), index=True)
     account_id = Column(Integer, ForeignKey('accounts.id'), index=True)
     queue_id = Column(Integer, ForeignKey('queues.id'), index=True)
+
+    # Relationships
+    user_obj = relationship("User")
+    account_obj = relationship("Account")
+    queue_obj = relationship("Queue")
 
     # Aggregated metrics
     job_count = Column(Integer, default=0)
@@ -197,13 +272,158 @@ class DailySummary(Base):
     memory_hours = Column(Float, default=0)
 
     __table_args__ = (
-        # Each (date, user, account, queue) combination is unique
-        UniqueConstraint("date", "user", "account", "queue", name="uq_daily_summary"),
+        # Each (date, user_id, account_id, queue_id) combination is unique
+        UniqueConstraint("date", "user_id", "account_id", "queue_id", name="uq_daily_summary"),
         # Index for date-based queries
         Index("ix_daily_summary_date", "date"),
-        # Index for user/account lookups
-        Index("ix_daily_summary_user_account", "user", "account"),
+        # Index for user/account lookups (using FKs)
+        Index("ix_daily_summary_user_account", "user_id", "account_id"),
     )
+
+    @hybrid_property
+    def user(self):
+        """Username or 'NO_JOBS' marker for empty days."""
+        if self.user_obj:
+            return self.user_obj.username
+        return 'NO_JOBS' if self.user_id is None else None
+
+    @user.setter
+    def user(self, username):
+        """Set user by username, storing temporarily until flush."""
+        if username is None or username == 'NO_JOBS':
+            self.user_id = None
+            self.user_obj = None
+            self._pending_username = None
+            return
+
+        # Store the username to be resolved during flush
+        self._pending_username = username
+
+    @user.expression
+    def user(cls):
+        """Query expression for filtering by username."""
+        return select(User.username).where(User.id == cls.user_id).correlate(cls).scalar_subquery()
+
+    @hybrid_property
+    def account(self):
+        """Account name or 'NO_JOBS' marker for empty days."""
+        if self.account_obj:
+            return self.account_obj.account_name
+        return 'NO_JOBS' if self.account_id is None else None
+
+    @account.setter
+    def account(self, account_name):
+        """Set account by name, storing temporarily until flush."""
+        if account_name is None or account_name == 'NO_JOBS':
+            self.account_id = None
+            self.account_obj = None
+            self._pending_account_name = None
+            return
+
+        # Store the account name to be resolved during flush
+        self._pending_account_name = account_name
+
+    @account.expression
+    def account(cls):
+        """Query expression for filtering by account."""
+        return select(Account.account_name).where(Account.id == cls.account_id).correlate(cls).scalar_subquery()
+
+    @hybrid_property
+    def queue(self):
+        """Queue name or 'NO_JOBS' marker for empty days."""
+        if self.queue_obj:
+            return self.queue_obj.queue_name
+        return 'NO_JOBS' if self.queue_id is None else None
+
+    @queue.setter
+    def queue(self, queue_name):
+        """Set queue by name, storing temporarily until flush."""
+        if queue_name is None or queue_name == 'NO_JOBS':
+            self.queue_id = None
+            self.queue_obj = None
+            self._pending_queue_name = None
+            return
+
+        # Store the queue name to be resolved during flush
+        self._pending_queue_name = queue_name
+
+    @queue.expression
+    def queue(cls):
+        """Query expression for filtering by queue."""
+        return select(Queue.queue_name).where(Queue.id == cls.queue_id).correlate(cls).scalar_subquery()
 
     def __repr__(self):
         return f"<DailySummary(date='{self.date}', user='{self.user}', account='{self.account}')>"
+
+
+# Event listeners to ensure foreign keys are populated from relationship objects
+
+
+from sqlalchemy import event
+from sqlalchemy.orm import Session as SessionClass
+
+
+@event.listens_for(SessionClass, 'before_flush')
+def ensure_lookup_tables_before_flush(session, flush_context, instances):
+    """Ensure user/account/queue FKs are set from pending names before flush."""
+    # Check if we have any Job or DailySummary objects to process
+    has_job_related_objects = any(
+        isinstance(obj, (Job, DailySummary))
+        for obj in session.new
+    )
+    if not has_job_related_objects:
+        return
+
+    # Check if lookup tables exist in this database
+    try:
+        # Build a cache of lookup objects to avoid duplicates
+        lookup_cache = {
+            'users': {},  # username -> User object
+            'accounts': {},  # account_name -> Account object
+            'queues': {},  # queue_name -> Queue object
+        }
+
+        # First pass: catalog existing lookup objects in DB
+        for user in session.query(User).all():
+            lookup_cache['users'][user.username] = user
+        for account in session.query(Account).all():
+            lookup_cache['accounts'][account.account_name] = account
+        for queue in session.query(Queue).all():
+            lookup_cache['queues'][queue.queue_name] = queue
+    except Exception:
+        # Tables don't exist in this database (e.g., filesystem scan DB)
+        # Skip processing
+        return
+
+    # Process new objects to resolve pending names
+    for obj in list(session.new):
+        if isinstance(obj, Job) or isinstance(obj, DailySummary):
+            # Handle user
+            if hasattr(obj, '_pending_username') and obj._pending_username:
+                username = obj._pending_username
+                if username not in lookup_cache['users']:
+                    user_obj = User(username=username)
+                    session.add(user_obj)
+                    lookup_cache['users'][username] = user_obj
+                obj.user_obj = lookup_cache['users'][username]
+                del obj._pending_username  # Clean up
+
+            # Handle account
+            if hasattr(obj, '_pending_account_name') and obj._pending_account_name:
+                account_name = obj._pending_account_name
+                if account_name not in lookup_cache['accounts']:
+                    account_obj = Account(account_name=account_name)
+                    session.add(account_obj)
+                    lookup_cache['accounts'][account_name] = account_obj
+                obj.account_obj = lookup_cache['accounts'][account_name]
+                del obj._pending_account_name  # Clean up
+
+            # Handle queue
+            if hasattr(obj, '_pending_queue_name') and obj._pending_queue_name:
+                queue_name = obj._pending_queue_name
+                if queue_name not in lookup_cache['queues']:
+                    queue_obj = Queue(queue_name=queue_name)
+                    session.add(queue_obj)
+                    lookup_cache['queues'][queue_name] = queue_obj
+                obj.queue_obj = lookup_cache['queues'][queue_name]
+                del obj._pending_queue_name  # Clean up
