@@ -234,6 +234,7 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         - cputype/gputype: from select string or inferred from queue
         - resources: Resource_List.select
         - ptargets: Resource_List.preempt_targets
+        - record_object: full pbs_record for convenience
     """
     resource_list = getattr(pbs_record, 'Resource_List', None) or {}
     resources_used = getattr(pbs_record, 'resources_used', None) or {}
@@ -333,6 +334,9 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         "cpupercent": safe_float(resources_used.get("cpupercent")),
         "avgcpu": None,  # Not available in PBS logs
         "count": safe_int(pbs_record.run_count),
+
+        # pass the full record object in case this is useful downstream.
+        "record_object": pbs_record,
     }
 
     # Check if start / eligible / etc... is Unix epoch (1970-01-01)

@@ -735,6 +735,8 @@ def _sync_pbs_logs_single_day(
             start = record.get("start")
             end = record.get("end")
 
+            #print(record.get("record_object"))
+
             if submit and eligible and start and end:
                 if not (submit <= eligible <= start <= end):
                     stats["errors"] += 1
