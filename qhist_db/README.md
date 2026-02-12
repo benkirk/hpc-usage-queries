@@ -71,7 +71,7 @@ hpc-usage-queries/
 **jobs**: Job records with foreign keys to normalized lookup tables
 - Auto-increment primary key (handles scheduler ID wrap-around)
 - Foreign keys: `user_id`, `account_id`, `queue_id`
-- Text fields preserved: `user`, `account`, `queue`
+- Hybrid properties: `user`, `account`, `queue` (transparently fetch from lookup tables)
 - Resource allocations: `numcpus`, `numgpus`, `numnodes`, `memory`
 - Timestamps in UTC: `submit`, `start`, `end`, `elapsed`
 - Unique constraint on `(job_id, submit)` prevents duplicates
@@ -87,7 +87,8 @@ hpc-usage-queries/
 
 **daily_summary**: Aggregated usage by date/user/account/queue
 - Fast historical queries without scanning full jobs table
-- Includes both text fields and foreign keys
+- Uses foreign keys with hybrid properties for backward compatibility
+- NULL FKs represent 'NO_JOBS' markers for empty days
 
 ### Performance Optimizations
 

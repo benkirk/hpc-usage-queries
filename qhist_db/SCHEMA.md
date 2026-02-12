@@ -13,16 +13,23 @@ This document describes the optimized database schema for NCAR's Casper and Dere
 
 ### Normalization Strategy
 
-The schema uses **foreign key normalization** for frequently-queried text fields:
+The schema uses **foreign key normalization** with **hybrid properties** for frequently-queried text fields:
 
 - **users** table: Maps `user_id` → `username` (~3,500 entries)
 - **accounts** table: Maps `account_id` → `account_name` (~1,300 entries)
 - **queues** table: Maps `queue_id` → `queue_name` (~150 entries)
 
+The `user`, `account`, and `queue` attributes are implemented as SQLAlchemy `@hybrid_property` decorators that:
+- Return text values from relationships (e.g., `job.user` → `"alice"`)
+- Accept text assignments via setters (e.g., `job.user = "alice"`)
+- Generate SQL subqueries for filtering (e.g., `Job.user == "alice"`)
+- Maintain 100% backward compatibility with denormalized schema
+
 Benefits:
 - Integer joins vastly faster than text comparisons
 - Reduced storage (IDs vs repeated strings)
 - Referential integrity enforced
+- Transparent access pattern (looks like text columns to application code)
 
 ### Materialized Charges
 
@@ -52,12 +59,12 @@ Core job records with foreign keys to normalized tables.
 | `id` | INTEGER | PK, AUTO | Primary key (handles scheduler ID wrap) |
 | `job_id` | TEXT | YES | Scheduler job ID (e.g., "2712367.desched1") |
 | `short_id` | INTEGER | YES | Base job number (array index stripped) |
-| `user` | TEXT | YES | Username (denormalized for compatibility) |
-| `account` | TEXT | YES | Account name (denormalized) |
-| `queue` | TEXT | YES | Queue name (denormalized) |
-| `user_id` | INTEGER | FK | → users.id |
-| `account_id` | INTEGER | FK | → accounts.id |
-| `queue_id` | INTEGER | FK | → queues.id |
+| `user` | HYBRID | - | Username (hybrid property → user_obj.username) |
+| `account` | HYBRID | - | Account name (hybrid property → account_obj.account_name) |
+| `queue` | HYBRID | - | Queue name (hybrid property → queue_obj.queue_name) |
+| `user_id` | INTEGER | FK, YES | → users.id |
+| `account_id` | INTEGER | FK, YES | → accounts.id |
+| `queue_id` | INTEGER | FK, YES | → queues.id |
 | `name` | TEXT | NO | Job name |
 | `status` | TEXT | YES | Completion status |
 | `submit` | DATETIME | YES | Submission time (UTC) |
@@ -135,19 +142,19 @@ Pre-aggregated usage by date/user/account/queue for fast historical queries.
 |--------|------|-------|-------------|
 | `id` | INTEGER | PK, AUTO | Primary key |
 | `date` | DATE | YES | Summary date |
-| `user` | TEXT | YES | Username (denormalized) |
-| `account` | TEXT | YES | Account name (denormalized) |
-| `queue` | TEXT | NO | Queue name (denormalized) |
-| `user_id` | INTEGER | FK | → users.id |
-| `account_id` | INTEGER | FK | → accounts.id |
-| `queue_id` | INTEGER | FK | → queues.id |
+| `user` | HYBRID | - | Username (hybrid property, 'NO_JOBS' if NULL FK) |
+| `account` | HYBRID | - | Account name (hybrid property, 'NO_JOBS' if NULL FK) |
+| `queue` | HYBRID | - | Queue name (hybrid property, 'NO_JOBS' if NULL FK) |
+| `user_id` | INTEGER | FK, YES | → users.id (NULL for empty day markers) |
+| `account_id` | INTEGER | FK, YES | → accounts.id (NULL for empty day markers) |
+| `queue_id` | INTEGER | FK, YES | → queues.id (NULL for empty day markers) |
 | `job_count` | INTEGER | NO | Number of jobs |
 | `cpu_hours` | FLOAT | NO | Total CPU-hours |
 | `gpu_hours` | FLOAT | NO | Total GPU-hours |
 | `memory_hours` | FLOAT | NO | Total memory GB-hours |
 
 **Constraints:**
-- Unique: `(date, user, account, queue)`
+- Unique: `(date, user_id, account_id, queue_id)`
 
 ## Composite Indexes
 
@@ -156,14 +163,14 @@ Optimized for common query patterns:
 | Index Name | Columns | Purpose |
 |------------|---------|---------|
 | `uq_jobs_job_id_submit` | `(job_id, submit)` | Duplicate detection |
-| `ix_jobs_queue_end` | `(queue_id, end)` | **Primary**: queue + date filter |
-| `ix_jobs_queue_user_end` | `(queue_id, user_id, end)` | User usage by queue |
-| `ix_jobs_queue_account_end` | `(queue_id, account_id, end)` | Account usage by queue |
-| `ix_daily_summary_user_date` | `(user_id, date)` | User history |
-| `ix_daily_summary_account_date` | `(account_id, date)` | Account history |
-| `ix_daily_summary_queue_date` | `(queue_id, date)` | Queue history |
+| `ix_jobs_user_account` | `(user_id, account_id)` | User/account combinations |
+| `ix_jobs_submit_end` | `(submit, end)` | Time range queries |
+| `ix_jobs_user_submit` | `(user_id, submit)` | User activity over time |
+| `ix_jobs_account_submit` | `(account_id, submit)` | Account activity over time |
+| `ix_jobs_queue_submit` | `(queue_id, submit)` | Queue activity over time |
+| `ix_daily_summary_user_account` | `(user_id, account_id)` | Summary lookups |
 
-Single-column indexes also on: `job_id`, `short_id`, `user`, `account`, `queue`, `status`, `submit`, `start`, `end`
+Single-column indexes also on: `job_id`, `short_id`, `user_id`, `account_id`, `queue_id`, `status`, `submit`, `start`, `end`
 
 ## SQLite Optimizations
 
@@ -264,10 +271,46 @@ ORDER BY avg_wait_min DESC;
    - Prefers job_charges table over on-the-fly calculation
    - Falls back to daily_summary for historical queries
 
-## Migration Notes
+## Schema Evolution
 
-Both casper and derecho databases have been migrated to the optimized schema:
+The schema has evolved through several optimization phases:
+
+**Phase 1**: Denormalized schema with text columns
+**Phase 2**: Added foreign keys alongside text columns (dual columns)
+**Phase 3**: Replaced text columns with hybrid properties (current)
+
+### Hybrid Property Implementation
+
+The current schema uses SQLAlchemy `@hybrid_property` decorators for user/account/queue fields:
+
+```python
+@hybrid_property
+def user(self):
+    """Username from normalized users table."""
+    return self.user_obj.username if self.user_obj else None
+
+@user.setter
+def user(self, username):
+    """Set user by username, creating User if necessary."""
+    # Stores pending value, resolved to FK during flush
+
+@user.expression
+def user(cls):
+    """Query expression for filtering by username."""
+    return select(User.username).where(User.id == cls.user_id).scalar_subquery()
+```
+
+This approach provides:
+- ✅ 100% backward compatibility with existing code
+- ✅ Automatic FK resolution via event listeners
+- ✅ Transparent query filtering (`Job.user == "alice"` works)
+- ✅ Reduced storage (integer FKs vs repeated text)
+- ✅ Faster queries (integer comparisons vs text)
+
+### Migration Notes
+
+Both casper and derecho databases have been migrated to the hybrid property schema:
 - Migration time: ~25-50 minutes per database
 - Timestamped backups created automatically
 - All verification checks passed (FK integrity, charge accuracy, index usage)
-- Backward-compatible text columns preserved on jobs table
+- Text columns removed, hybrid properties maintain API compatibility
