@@ -561,8 +561,6 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
 
         if job_ids_map:
             from .models import JobRecord
-            import pickle
-            import gzip
 
             # Query ALL newly inserted jobs (not just those without charges)
             all_new_jobs = (
@@ -573,7 +571,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
                 .all()
             )
 
-            job_record_data = []
+            job_records = []
             for job in all_new_jobs:
                 # Match job to its original record by (job_id, submit)
                 submit_naive = job.submit.replace(tzinfo=None) if job.submit and job.submit.tzinfo else job.submit
@@ -581,18 +579,12 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
 
                 if record and 'record_object' in record:
                     pbs_record = record['record_object']
+                    # Use JobRecord class method to handle compression/pickling
+                    job_record = JobRecord.from_pbs_record(job.id, pbs_record)
+                    job_records.append(job_record)
 
-                    # Compress and pickle
-                    pickled = pickle.dumps(pbs_record, protocol=pickle.HIGHEST_PROTOCOL)
-                    compressed = gzip.compress(pickled, compresslevel=6)  # Balance speed vs size
-
-                    job_record_data.append({
-                        'job_id': job.id,
-                        'compressed_data': compressed,
-                    })
-
-            if job_record_data:
-                session.bulk_insert_mappings(JobRecord, job_record_data)
+            if job_records:
+                session.add_all(job_records)
 
     session.commit()
     return rows_inserted

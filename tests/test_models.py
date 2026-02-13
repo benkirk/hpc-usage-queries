@@ -243,3 +243,44 @@ class TestJobRecordModel:
 
         # Verify same object returned (cache hit)
         assert record1 is record2
+
+    def test_from_pbs_record_class_method(self, in_memory_session):
+        """Test JobRecord.from_pbs_record() class method."""
+        pbs_record = MockPbsRecord(job_id="method.test", user="methoduser", queue="cpu")
+
+        # Create Job
+        job = Job(job_id="method.test", submit=datetime.utcnow())
+        job.user = "methoduser"
+        in_memory_session.add(job)
+        in_memory_session.flush()
+
+        # Use class method to create JobRecord
+        job_record = JobRecord.from_pbs_record(job.id, pbs_record)
+        in_memory_session.add(job_record)
+        in_memory_session.commit()
+
+        # Verify it was created and can be retrieved
+        assert job_record.job_id == job.id
+        assert job_record.compressed_data is not None
+        assert len(job_record.compressed_data) > 0
+
+    def test_to_pbs_record_method(self, in_memory_session):
+        """Test JobRecord.to_pbs_record() method."""
+        pbs_record = MockPbsRecord(job_id="to.test", user="touser", queue="gpu")
+
+        # Create Job and JobRecord using class method
+        job = Job(job_id="to.test", submit=datetime.utcnow())
+        job.user = "touser"
+        in_memory_session.add(job)
+        in_memory_session.flush()
+
+        job_record = JobRecord.from_pbs_record(job.id, pbs_record)
+        in_memory_session.add(job_record)
+        in_memory_session.commit()
+
+        # Use instance method to retrieve
+        retrieved = job_record.to_pbs_record()
+        assert retrieved is not None
+        assert retrieved.id == "to.test"
+        assert retrieved.user == "touser"
+        assert retrieved.queue == "gpu"

@@ -242,21 +242,10 @@ class Job(Base):
             self._cached_pbs_record = None
             return None
 
-        # Decompress and unpickle
-        import gzip
-        import pickle
-        try:
-            decompressed = gzip.decompress(job_record.compressed_data)
-            pbs_record_obj = pickle.loads(decompressed)
-            self._cached_pbs_record = pbs_record_obj
-            return pbs_record_obj
-        except Exception as e:
-            # Log error but don't crash (handle data corruption gracefully)
-            from .log_config import get_logger
-            logger = get_logger(__name__)
-            logger.error(f"Failed to decompress/unpickle JobRecord for job {self.id}: {e}")
-            self._cached_pbs_record = None
-            return None
+        # Use JobRecord's method to decompress and unpickle
+        pbs_record_obj = job_record.to_pbs_record()
+        self._cached_pbs_record = pbs_record_obj
+        return pbs_record_obj
 
 
 class JobCharge(Base):
@@ -302,6 +291,43 @@ class JobRecord(Base):
     __table_args__ = (
         ForeignKeyConstraint(['job_id'], ['jobs.id'], ondelete='CASCADE'),
     )
+
+    @classmethod
+    def from_pbs_record(cls, job_id: int, pbs_record) -> 'JobRecord':
+        """Create a JobRecord from a PbsRecord object.
+
+        Args:
+            job_id: Database ID of the associated Job
+            pbs_record: PbsRecord object to compress and store
+
+        Returns:
+            JobRecord instance ready for insertion
+        """
+        import gzip
+        import pickle
+
+        pickled = pickle.dumps(pbs_record, protocol=pickle.HIGHEST_PROTOCOL)
+        compressed = gzip.compress(pickled, compresslevel=6)
+
+        return cls(job_id=job_id, compressed_data=compressed)
+
+    def to_pbs_record(self):
+        """Decompress and unpickle the stored PbsRecord.
+
+        Returns:
+            PbsRecord object or None if decompression/unpickling fails
+        """
+        import gzip
+        import pickle
+
+        try:
+            decompressed = gzip.decompress(self.compressed_data)
+            return pickle.loads(decompressed)
+        except Exception as e:
+            from .log_config import get_logger
+            logger = get_logger(__name__)
+            logger.error(f"Failed to decompress/unpickle JobRecord for job {self.job_id}: {e}")
+            return None
 
     def __repr__(self):
         return f"<JobRecord(job_id={self.job_id})>"
