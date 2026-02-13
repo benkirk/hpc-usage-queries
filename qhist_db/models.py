@@ -219,7 +219,7 @@ class Job(Base):
     def pbs_record(self):
         """Retrieve and unpickle the original PbsRecord object.
 
-        Returns None if no JobRecord exists (e.g., job was synced via SSH).
+        Returns None if no JobRecord exists.
         Uses lazy loading with instance-level cache to avoid repeated decompression.
 
         Returns:
@@ -229,7 +229,7 @@ class Job(Base):
         if hasattr(self, '_cached_pbs_record'):
             return self._cached_pbs_record
 
-        # Query for JobRecord (will be None for SSH-synced jobs)
+        # Query for JobRecord
         from sqlalchemy.orm import object_session
         session = object_session(self)
         if session is None:
@@ -274,7 +274,7 @@ class JobRecord(Base):
     """Compressed, pickled PbsRecord storage.
 
     Stores the raw PBS accounting record object for jobs imported from local
-    PBS logs. Not available for jobs synced via SSH (qhist command).
+    PBS logs.
     """
 
     __tablename__ = "job_records"

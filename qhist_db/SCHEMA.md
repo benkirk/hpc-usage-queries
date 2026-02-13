@@ -257,7 +257,7 @@ ORDER BY avg_wait_min DESC;
 ## Data Flow
 
 1. **Import** (sync.py)
-   - Fetch via SSH + qhist
+   - Parse local PBS accounting logs
    - Resolve FKs (create new users/accounts/queues as needed)
    - Insert jobs with duplicate detection
    - Calculate and insert charges
