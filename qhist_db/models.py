@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for HPC job history data."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, Text, UniqueConstraint, select
 from sqlalchemy.ext.hybrid import hybrid_property
@@ -286,7 +286,7 @@ class JobRecord(Base):
     compressed_data = Column(LargeBinary, nullable=False)
 
     # Metadata for debugging/auditing
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
         ForeignKeyConstraint(['job_id'], ['jobs.id'], ondelete='CASCADE'),

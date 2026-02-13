@@ -194,7 +194,7 @@ class TestJobRecordModel:
         pbs_record = MockPbsRecord()
 
         # Create Job
-        job = Job(job_id="123456.desched1", submit=datetime.utcnow())
+        job = Job(job_id="123456.desched1", submit=datetime.now(timezone.utc))
         job.user = "testuser"
         in_memory_session.add(job)
         in_memory_session.flush()
@@ -213,7 +213,7 @@ class TestJobRecordModel:
 
     def test_job_without_record(self, in_memory_session):
         """Jobs without JobRecord should return None."""
-        job = Job(job_id="ssh.job", submit=datetime.utcnow())
+        job = Job(job_id="ssh.job", submit=datetime.now(timezone.utc))
         job.user = "sshuser"
         in_memory_session.add(job)
         in_memory_session.commit()
@@ -226,7 +226,7 @@ class TestJobRecordModel:
         import gzip
 
         pbs_record = MockPbsRecord(job_id="cached.123")
-        job = Job(job_id="cached.123", submit=datetime.utcnow())
+        job = Job(job_id="cached.123", submit=datetime.now(timezone.utc))
         job.user = "cacheuser"
         in_memory_session.add(job)
         in_memory_session.flush()
@@ -249,7 +249,7 @@ class TestJobRecordModel:
         pbs_record = MockPbsRecord(job_id="method.test", user="methoduser", queue="cpu")
 
         # Create Job
-        job = Job(job_id="method.test", submit=datetime.utcnow())
+        job = Job(job_id="method.test", submit=datetime.now(timezone.utc))
         job.user = "methoduser"
         in_memory_session.add(job)
         in_memory_session.flush()
@@ -269,7 +269,7 @@ class TestJobRecordModel:
         pbs_record = MockPbsRecord(job_id="to.test", user="touser", queue="gpu")
 
         # Create Job and JobRecord using class method
-        job = Job(job_id="to.test", submit=datetime.utcnow())
+        job = Job(job_id="to.test", submit=datetime.now(timezone.utc))
         job.user = "touser"
         in_memory_session.add(job)
         in_memory_session.flush()
