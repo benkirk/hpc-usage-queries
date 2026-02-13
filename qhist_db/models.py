@@ -64,10 +64,14 @@ class Job(Base):
     account_id = Column(Integer, ForeignKey('accounts.id'), index=True)
     queue_id = Column(Integer, ForeignKey('queues.id'), index=True)
 
-    # Relationships
+    # Relationships to lookup tables
     user_obj = relationship("User")
     account_obj = relationship("Account")
     queue_obj = relationship("Queue")
+
+    # Relationships to associated data (1:1)
+    job_record_obj = relationship("JobRecord", uselist=False, back_populates="job")
+    job_charge_obj = relationship("JobCharge", uselist=False, back_populates="job")
 
     # Queue and status
     status = Column(Text, index=True)
@@ -219,8 +223,11 @@ class Job(Base):
     def pbs_record(self):
         """Retrieve and unpickle the original PbsRecord object.
 
-        Returns None if no JobRecord exists.
-        Uses lazy loading with instance-level cache to avoid repeated decompression.
+        Returns None if no JobRecord exists (historical data imported before
+        JobRecord feature was added).
+
+        Uses SQLAlchemy relationship for lazy loading and instance-level caching
+        to avoid repeated decompression of the same PbsRecord.
 
         Returns:
             PbsRecord object or None
@@ -229,21 +236,13 @@ class Job(Base):
         if hasattr(self, '_cached_pbs_record'):
             return self._cached_pbs_record
 
-        # Query for JobRecord
-        from sqlalchemy.orm import object_session
-        session = object_session(self)
-        if session is None:
+        # Use relationship to get JobRecord (SQLAlchemy handles lazy loading)
+        if self.job_record_obj is None:
             self._cached_pbs_record = None
             return None
 
-        job_record = session.query(JobRecord).filter_by(job_id=self.id).first()
-
-        if job_record is None:
-            self._cached_pbs_record = None
-            return None
-
-        # Use JobRecord's method to decompress and unpickle
-        pbs_record_obj = job_record.to_pbs_record()
+        # Decompress and cache the PbsRecord object
+        pbs_record_obj = self.job_record_obj.to_pbs_record()
         self._cached_pbs_record = pbs_record_obj
         return pbs_record_obj
 
@@ -254,6 +253,8 @@ class JobCharge(Base):
     Stores pre-computed charge hours for each job, avoiding recalculation
     every time charges are queried. The charge_version field allows tracking
     charging algorithm changes over time.
+
+    Has a 1:1 relationship with Job (every job gets charges calculated during import).
     """
 
     __tablename__ = "job_charges"
@@ -263,6 +264,9 @@ class JobCharge(Base):
     gpu_hours = Column(Float, nullable=False, default=0.0)
     memory_hours = Column(Float, nullable=False, default=0.0)
     charge_version = Column(Integer, default=1)
+
+    # Relationship back to Job
+    job = relationship("Job", back_populates="job_charge_obj")
 
     __table_args__ = (ForeignKeyConstraint(['job_id'], ['jobs.id'], ondelete='CASCADE'),)
 
@@ -274,7 +278,10 @@ class JobRecord(Base):
     """Compressed, pickled PbsRecord storage.
 
     Stores the raw PBS accounting record object for jobs imported from local
-    PBS logs.
+    PBS logs. Now that SSH sync is removed, all new jobs will have a JobRecord.
+
+    Has a 1:1 relationship with Job (accessible via job.job_record_obj or
+    job.pbs_record for the decompressed object).
     """
 
     __tablename__ = "job_records"
@@ -287,6 +294,9 @@ class JobRecord(Base):
 
     # Metadata for debugging/auditing
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    # Relationship back to Job
+    job = relationship("Job", back_populates="job_record_obj")
 
     __table_args__ = (
         ForeignKeyConstraint(['job_id'], ['jobs.id'], ondelete='CASCADE'),
