@@ -10,8 +10,7 @@ from typing import Iterator
 
 import pbsparse
 
-from .parsers import date_range, parse_date_string
-from .pbs_parsers import parse_pbs_record
+from .pbs_parsers import date_range, parse_date_string, parse_pbs_record
 
 logger = logging.getLogger(__name__)
 

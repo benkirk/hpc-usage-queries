@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from qhist_db.database import Base
 from qhist_db.models import Job, Account, User, Queue, JobCharge
-from qhist_db.pbs_local import fetch_jobs_from_pbs_logs
+from qhist_db.pbs_read_logs import fetch_jobs_from_pbs_logs
 from qhist_db.sync import sync_pbs_logs_bulk, JobImporter
 
 

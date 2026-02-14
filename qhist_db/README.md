@@ -45,9 +45,8 @@ hpc-usage-queries/
 │   ├── queries.py         # High-level query interface
 │   ├── charging.py        # Machine-specific charging rules
 │   ├── summary.py         # Daily summary generation
-│   ├── parsers.py         # qhist output parsers
-│   ├── pbs_parsers.py     # PBS accounting log parsers
-│   ├── pbs_local.py       # Local PBS log file processing
+│   ├── pbs_parsers.py     # PBS field/date parsers and record transformation
+│   ├── pbs_read_logs.py   # Local PBS log file scanning and streaming
 │   ├── exporters.py       # Data export formats (JSON, CSV, markdown)
 │   └── log_config.py      # Logging configuration
 ├── scripts/               # Legacy scripts (deprecated, use qhist-db CLI)

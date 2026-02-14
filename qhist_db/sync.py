@@ -13,7 +13,7 @@ except ImportError:
 
 from .database import VALID_MACHINES
 from .models import Job, LookupCache
-from .parsers import date_range, date_range_length, parse_date_string
+from .pbs_parsers import date_range, date_range_length, parse_date_string
 
 
 class JobImporter:
@@ -226,7 +226,7 @@ def sync_pbs_logs_bulk(
     """
     from pathlib import Path
     from .summary import get_summarized_dates, generate_daily_summary
-    from .pbs_local import fetch_jobs_from_pbs_logs
+    from .pbs_read_logs import fetch_jobs_from_pbs_logs
 
     # Validate machine
     if machine not in VALID_MACHINES:
@@ -346,7 +346,7 @@ def _sync_pbs_logs_single_day(
     Returns:
         Dictionary with sync statistics for this day
     """
-    from .pbs_local import fetch_jobs_from_pbs_logs
+    from .pbs_read_logs import fetch_jobs_from_pbs_logs
 
     stats = {"fetched": 0, "inserted": 0, "errors": 0, "failed": False, "error_msg": None}
     batch = []
