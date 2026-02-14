@@ -39,6 +39,56 @@ class Queue(Base):
         return f"<Queue(id={self.id}, queue_name='{self.queue_name}')>"
 
 
+class LookupCache:
+    """Session-scoped cache for User/Account/Queue lookup tables.
+
+    Provides get-or-create semantics with in-memory caching to avoid
+    duplicate inserts.  Used by both the before_flush event listener
+    (ORM path) and JobImporter (bulk-insert path).
+    """
+
+    def __init__(self, session, auto_flush=True):
+        """
+        Args:
+            session: SQLAlchemy session
+            auto_flush: If True, flush after creating new lookup objects
+                        (needed to assign IDs for bulk-insert dicts).
+                        Must be False inside before_flush listeners.
+        """
+        self._session = session
+        self._auto_flush = auto_flush
+        self._users = {u.username: u for u in session.query(User).all()}
+        self._accounts = {a.account_name: a for a in session.query(Account).all()}
+        self._queues = {q.queue_name: q for q in session.query(Queue).all()}
+
+    def get_or_create_user(self, username):
+        if username not in self._users:
+            obj = User(username=username)
+            self._session.add(obj)
+            if self._auto_flush:
+                self._session.flush()
+            self._users[username] = obj
+        return self._users[username]
+
+    def get_or_create_account(self, account_name):
+        if account_name not in self._accounts:
+            obj = Account(account_name=account_name)
+            self._session.add(obj)
+            if self._auto_flush:
+                self._session.flush()
+            self._accounts[account_name] = obj
+        return self._accounts[account_name]
+
+    def get_or_create_queue(self, queue_name):
+        if queue_name not in self._queues:
+            obj = Queue(queue_name=queue_name)
+            self._session.add(obj)
+            if self._auto_flush:
+                self._session.flush()
+            self._queues[queue_name] = obj
+        return self._queues[queue_name]
+
+
 class LookupMixin:
     """Mixin providing normalized user/account/queue FK columns and hybrid properties.
 
@@ -412,64 +462,25 @@ from sqlalchemy.orm import Session as SessionClass
 @event.listens_for(SessionClass, 'before_flush')
 def ensure_lookup_tables_before_flush(session, flush_context, instances):
     """Ensure user/account/queue FKs are set from pending names before flush."""
-    # Check if we have any Job or DailySummary objects to process
-    has_job_related_objects = any(
-        isinstance(obj, LookupMixin)
-        for obj in session.new
-    )
-    if not has_job_related_objects:
+    if not any(isinstance(obj, LookupMixin) for obj in session.new):
         return
 
-    # Check if lookup tables exist in this database
     try:
-        # Build a cache of lookup objects to avoid duplicates
-        lookup_cache = {
-            'users': {},  # username -> User object
-            'accounts': {},  # account_name -> Account object
-            'queues': {},  # queue_name -> Queue object
-        }
-
-        # First pass: catalog existing lookup objects in DB
-        for user in session.query(User).all():
-            lookup_cache['users'][user.username] = user
-        for account in session.query(Account).all():
-            lookup_cache['accounts'][account.account_name] = account
-        for queue in session.query(Queue).all():
-            lookup_cache['queues'][queue.queue_name] = queue
+        cache = LookupCache(session, auto_flush=False)
     except Exception:
         # Tables don't exist in this database (e.g., filesystem scan DB)
-        # Skip processing
         return
 
-    # Process new objects to resolve pending names
     for obj in list(session.new):
         if isinstance(obj, LookupMixin):
-            # Handle user
             if hasattr(obj, '_pending_username') and obj._pending_username:
-                username = obj._pending_username
-                if username not in lookup_cache['users']:
-                    user_obj = User(username=username)
-                    session.add(user_obj)
-                    lookup_cache['users'][username] = user_obj
-                obj.user_obj = lookup_cache['users'][username]
-                del obj._pending_username  # Clean up
+                obj.user_obj = cache.get_or_create_user(obj._pending_username)
+                del obj._pending_username
 
-            # Handle account
             if hasattr(obj, '_pending_account_name') and obj._pending_account_name:
-                account_name = obj._pending_account_name
-                if account_name not in lookup_cache['accounts']:
-                    account_obj = Account(account_name=account_name)
-                    session.add(account_obj)
-                    lookup_cache['accounts'][account_name] = account_obj
-                obj.account_obj = lookup_cache['accounts'][account_name]
-                del obj._pending_account_name  # Clean up
+                obj.account_obj = cache.get_or_create_account(obj._pending_account_name)
+                del obj._pending_account_name
 
-            # Handle queue
             if hasattr(obj, '_pending_queue_name') and obj._pending_queue_name:
-                queue_name = obj._pending_queue_name
-                if queue_name not in lookup_cache['queues']:
-                    queue_obj = Queue(queue_name=queue_name)
-                    session.add(queue_obj)
-                    lookup_cache['queues'][queue_name] = queue_obj
-                obj.queue_obj = lookup_cache['queues'][queue_name]
-                del obj._pending_queue_name  # Clean up
+                obj.queue_obj = cache.get_or_create_queue(obj._pending_queue_name)
+                del obj._pending_queue_name

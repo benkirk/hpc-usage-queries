@@ -12,107 +12,20 @@ except ImportError:
     track = None
 
 from .database import VALID_MACHINES
-from .models import Job
+from .models import Job, LookupCache
 from .parsers import date_range, date_range_length, parse_date_string
 
 
 class JobImporter:
     """Handle job imports with normalized schema and charge calculation.
 
-    This class manages job imports with:
-    - In-memory caches of lookup tables (users, accounts, queues)
-    - Foreign key resolution during import
-    - Charge calculation immediately after job insertion
+    Delegates lookup-table caching and get-or-create to LookupCache.
     """
 
     def __init__(self, session: Session, machine: str):
-        """Initialize the importer.
-
-        Args:
-            session: SQLAlchemy session
-            machine: Machine name ('casper' or 'derecho')
-        """
         self.session = session
         self.machine = machine
-
-        # Initialize caches
-        self.user_cache = {}  # username -> id
-        self.account_cache = {}  # account_name -> id
-        self.queue_cache = {}  # queue_name -> id
-        self._load_caches()
-
-    def _load_caches(self):
-        """Load lookup tables into memory for fast inserts."""
-        from .models import Account, Queue, User
-
-        for user in self.session.query(User).all():
-            self.user_cache[user.username] = user.id
-
-        for account in self.session.query(Account).all():
-            self.account_cache[account.account_name] = account.id
-
-        for queue in self.session.query(Queue).all():
-            self.queue_cache[queue.queue_name] = queue.id
-
-    def _get_or_create_user(self, username: str) -> int:
-        """Get user ID, creating if necessary.
-
-        Args:
-            username: Username string
-
-        Returns:
-            User ID
-        """
-        if username in self.user_cache:
-            return self.user_cache[username]
-
-        from .models import User
-
-        user = User(username=username)
-        self.session.add(user)
-        self.session.flush()
-        self.user_cache[username] = user.id
-        return user.id
-
-    def _get_or_create_account(self, account_name: str) -> int:
-        """Get account ID, creating if necessary.
-
-        Args:
-            account_name: Account name string
-
-        Returns:
-            Account ID
-        """
-        if account_name in self.account_cache:
-            return self.account_cache[account_name]
-
-        from .models import Account
-
-        account = Account(account_name=account_name)
-        self.session.add(account)
-        self.session.flush()
-        self.account_cache[account_name] = account.id
-        return account.id
-
-    def _get_or_create_queue(self, queue_name: str) -> int:
-        """Get queue ID, creating if necessary.
-
-        Args:
-            queue_name: Queue name string
-
-        Returns:
-            Queue ID
-        """
-        if queue_name in self.queue_cache:
-            return self.queue_cache[queue_name]
-
-        from .models import Queue
-
-        queue = Queue(queue_name=queue_name)
-        self.session.add(queue)
-        self.session.flush()
-        self.queue_cache[queue_name] = queue.id
-        return queue.id
+        self.cache = LookupCache(session)
 
     def prepare_record(self, record: dict) -> dict:
         """Prepare record for insertion by resolving foreign keys.
@@ -123,18 +36,16 @@ class JobImporter:
         Returns:
             Prepared record with foreign keys resolved
         """
-        # Make a copy to avoid mutating the original
         prepared = record.copy()
 
-        # Resolve foreign keys - keep both normalized and denormalized fields
-        if 'user' in prepared and prepared['user']:
-            prepared['user_id'] = self._get_or_create_user(prepared['user'])
+        if prepared.get('user'):
+            prepared['user_id'] = self.cache.get_or_create_user(prepared['user']).id
 
-        if 'account' in prepared and prepared['account']:
-            prepared['account_id'] = self._get_or_create_account(prepared['account'])
+        if prepared.get('account'):
+            prepared['account_id'] = self.cache.get_or_create_account(prepared['account']).id
 
-        if 'queue' in prepared and prepared['queue']:
-            prepared['queue_id'] = self._get_or_create_queue(prepared['queue'])
+        if prepared.get('queue'):
+            prepared['queue_id'] = self.cache.get_or_create_queue(prepared['queue']).id
 
         return prepared
 
