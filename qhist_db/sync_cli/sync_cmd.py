@@ -5,15 +5,12 @@ import click
 
 @click.group()
 def sync():
-    """Sync job data from various sources.
+    """Sync job data from local PBS accounting logs.
 
-    Supported sources:
-    - remote: SSH to HPC machines (derecho, casper)
-    - local: Parse PBS accounting logs from local filesystem
+    Parses PBS accounting log files from local filesystem.
 
     \b
-    Examples:
-      qhist-db sync remote -m all --start 2024-01-01 -v
+    Example:
       qhist-db sync local -m derecho -l ./data/pbs_logs -d 2024-01-29
     """
     pass

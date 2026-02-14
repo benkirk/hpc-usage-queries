@@ -402,7 +402,7 @@ class TestIntegrationWithSampleData:
     )
     def test_fetch_jobs_iterator(self):
         """Test the full iterator interface."""
-        from qhist_db.pbs_local import fetch_jobs_from_pbs_logs
+        from qhist_db.pbs_read_logs import fetch_jobs_from_pbs_logs
 
         log_dir = "./data/sample_pbs_logs/derecho"
         jobs = list(fetch_jobs_from_pbs_logs(

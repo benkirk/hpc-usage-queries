@@ -85,7 +85,6 @@ Core job records with foreign keys to normalized tables.
 | `cputype` | TEXT | NO | CPU type (e.g., milan) |
 | `gputype` | TEXT | NO | GPU type (e.g., a100) |
 | `resources` | TEXT | NO | Resource specification |
-| `ptargets` | TEXT | NO | Placement targets |
 | `cpupercent` | REAL | NO | CPU utilization % |
 | `avgcpu` | REAL | NO | Average CPU usage |
 | `count` | INTEGER | NO | Job array count |
@@ -257,7 +256,7 @@ ORDER BY avg_wait_min DESC;
 ## Data Flow
 
 1. **Import** (sync.py)
-   - Fetch via SSH + qhist
+   - Parse local PBS accounting logs
    - Resolve FKs (create new users/accounts/queues as needed)
    - Insert jobs with duplicate detection
    - Calculate and insert charges

@@ -31,7 +31,6 @@ qhist-db = "qhist_db.cli:cli"
 
 # Backward compatibility wrappers
 qhist-report = "qhist_db.cli:cli"
-qhist-sync = "qhist_db.sync_cli.wrappers:sync_wrapper"
 qhist-parse-logs = "qhist_db.sync_cli.wrappers:parse_logs_wrapper"
 
 # New unified CLI

@@ -5,7 +5,17 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from qhist_db.models import Job, DailySummary
+from qhist_db.models import Job, DailySummary, JobRecord
+
+
+# Mock PbsRecord class for testing (must be module-level to be pickleable)
+class MockPbsRecord:
+    """Mock PbsRecord object for testing."""
+
+    def __init__(self, job_id="123456.desched1", user="testuser", queue="cpu"):
+        self.id = job_id
+        self.user = user
+        self.queue = queue
 
 
 class TestJobModel:
@@ -171,3 +181,106 @@ class TestDailySummaryModel:
 
         count = in_memory_session.query(DailySummary).count()
         assert count == 2
+
+
+class TestJobRecordModel:
+    """Tests for JobRecord model."""
+
+    def test_job_record_round_trip(self, in_memory_session):
+        """Test pickle → compress → store → retrieve → decompress → unpickle."""
+        import pickle
+        import gzip
+
+        pbs_record = MockPbsRecord()
+
+        # Create Job
+        job = Job(job_id="123456.desched1", submit=datetime.now(timezone.utc))
+        job.user = "testuser"
+        in_memory_session.add(job)
+        in_memory_session.flush()
+
+        # Create JobRecord
+        compressed = gzip.compress(pickle.dumps(pbs_record))
+        job_record = JobRecord(job_id=job.id, compressed_data=compressed)
+        in_memory_session.add(job_record)
+        in_memory_session.commit()
+
+        # Retrieve via property
+        retrieved_record = job.pbs_record
+        assert retrieved_record is not None
+        assert retrieved_record.id == "123456.desched1"
+        assert retrieved_record.user == "testuser"
+
+    def test_job_without_record(self, in_memory_session):
+        """Jobs without JobRecord should return None."""
+        job = Job(job_id="ssh.job", submit=datetime.now(timezone.utc))
+        job.user = "sshuser"
+        in_memory_session.add(job)
+        in_memory_session.commit()
+
+        assert job.pbs_record is None
+
+    def test_pbs_record_caching(self, in_memory_session):
+        """Verify instance-level caching works."""
+        import pickle
+        import gzip
+
+        pbs_record = MockPbsRecord(job_id="cached.123")
+        job = Job(job_id="cached.123", submit=datetime.now(timezone.utc))
+        job.user = "cacheuser"
+        in_memory_session.add(job)
+        in_memory_session.flush()
+
+        compressed = gzip.compress(pickle.dumps(pbs_record))
+        job_record = JobRecord(job_id=job.id, compressed_data=compressed)
+        in_memory_session.add(job_record)
+        in_memory_session.commit()
+
+        # First access - will decompress
+        record1 = job.pbs_record
+        # Second access - should use cache
+        record2 = job.pbs_record
+
+        # Verify same object returned (cache hit)
+        assert record1 is record2
+
+    def test_from_pbs_record_class_method(self, in_memory_session):
+        """Test JobRecord.from_pbs_record() class method."""
+        pbs_record = MockPbsRecord(job_id="method.test", user="methoduser", queue="cpu")
+
+        # Create Job
+        job = Job(job_id="method.test", submit=datetime.now(timezone.utc))
+        job.user = "methoduser"
+        in_memory_session.add(job)
+        in_memory_session.flush()
+
+        # Use class method to create JobRecord
+        job_record = JobRecord.from_pbs_record(job.id, pbs_record)
+        in_memory_session.add(job_record)
+        in_memory_session.commit()
+
+        # Verify it was created and can be retrieved
+        assert job_record.job_id == job.id
+        assert job_record.compressed_data is not None
+        assert len(job_record.compressed_data) > 0
+
+    def test_to_pbs_record_method(self, in_memory_session):
+        """Test JobRecord.to_pbs_record() method."""
+        pbs_record = MockPbsRecord(job_id="to.test", user="touser", queue="gpu")
+
+        # Create Job and JobRecord using class method
+        job = Job(job_id="to.test", submit=datetime.now(timezone.utc))
+        job.user = "touser"
+        in_memory_session.add(job)
+        in_memory_session.flush()
+
+        job_record = JobRecord.from_pbs_record(job.id, pbs_record)
+        in_memory_session.add(job_record)
+        in_memory_session.commit()
+
+        # Use instance method to retrieve
+        retrieved = job_record.to_pbs_record()
+        assert retrieved is not None
+        assert retrieved.id == "to.test"
+        assert retrieved.user == "touser"
+        assert retrieved.queue == "gpu"

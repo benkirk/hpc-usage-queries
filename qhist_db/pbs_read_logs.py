@@ -10,8 +10,7 @@ from typing import Iterator
 
 import pbsparse
 
-from .parsers import date_range, parse_date_string
-from .pbs_parsers import parse_pbs_record
+from .pbs_parsers import date_range, parse_date_string, parse_pbs_record
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +46,8 @@ def fetch_jobs_from_pbs_logs(
 ) -> Iterator[dict]:
     """Scan PBS log files and yield parsed job dictionaries.
 
-    This function mirrors the interface of remote.fetch_jobs_ssh() for compatibility
-    with existing sync infrastructure. It streams job records from local PBS
-    accounting logs without loading everything into memory.
+    Streams job records from local PBS accounting logs without loading
+    everything into memory.
 
     Args:
         log_dir: Directory containing PBS log files (named YYYYMMDD)

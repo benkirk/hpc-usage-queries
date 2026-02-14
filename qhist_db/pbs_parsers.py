@@ -1,11 +1,62 @@
 """Field parsing and type conversion for PBS accounting log records.
 
-This module transforms pbsparse.PbsRecord objects into the same normalized
-dictionary format as qhist_db.parsers.parse_job_record(), enabling complete
-code reuse for database insertion, charge calculation, and summaries.
+Includes date-range utilities and PBS record transformation into the
+normalized dictionary format used for database insertion, charge
+calculation, and summaries.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Iterator
+
+
+def parse_date_string(date_str: str) -> datetime:
+    """Parse YYYY-MM-DD string to datetime object.
+
+    Args:
+        date_str: Date string in YYYY-MM-DD format
+
+    Returns:
+        datetime object
+
+    Raises:
+        ValueError: If date_str is not in YYYY-MM-DD format
+    """
+    return datetime.strptime(date_str, "%Y-%m-%d")
+
+
+def date_range(start_date: str, end_date: str) -> Iterator[str]:
+    """Iterate through dates from start to end (inclusive).
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+
+    Yields:
+        Date strings in YYYY-MM-DD format
+    """
+    start = parse_date_string(start_date)
+    end = parse_date_string(end_date)
+
+    current = start
+    while current <= end:
+        yield current.strftime("%Y-%m-%d")
+        current += timedelta(days=1)
+
+
+def date_range_length(start_date: str, end_date: str) -> int:
+    """Determine the length of a date range (inclusive).
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+
+    Returns:
+        The number of days in the range
+    """
+    start = parse_date_string(start_date)
+    end = parse_date_string(end_date)
+
+    return (end-start).days
 
 
 def parse_pbs_time(time_str: str) -> int | None:
@@ -234,6 +285,7 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         - cputype/gputype: from select string or inferred from queue
         - resources: Resource_List.select
         - ptargets: Resource_List.preempt_targets
+        - record_object: full pbs_record for convenience
     """
     resource_list = getattr(pbs_record, 'Resource_List', None) or {}
     resources_used = getattr(pbs_record, 'resources_used', None) or {}
@@ -333,6 +385,9 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         "cpupercent": safe_float(resources_used.get("cpupercent")),
         "avgcpu": None,  # Not available in PBS logs
         "count": safe_int(pbs_record.run_count),
+
+        # pass the full record object in case this is useful downstream.
+        "record_object": pbs_record,
     }
 
     # Check if start / eligible / etc... is Unix epoch (1970-01-01)

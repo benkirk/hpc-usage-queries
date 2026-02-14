@@ -4,7 +4,7 @@ A SQLite database and Python toolkit for collecting and analyzing historical job
 
 ## Overview
 
-This project fetches job history from HPC systems via the `qhist` command over SSH, stores records in local SQLite databases, and provides a foundation for usage analysis.
+This project parses PBS accounting logs from NCAR's HPC systems, stores records in local SQLite databases, and provides a foundation for usage analysis.
 
 **Features:**
 - Optimized schema with 5-10x query performance via normalization and composite indexes
@@ -37,19 +37,16 @@ hpc-usage-queries/
 │   ├── sync_cli/          # Sync command implementations
 │   │   ├── common.py      # Shared Click decorators/utilities
 │   │   ├── sync_cmd.py    # Sync command group
-│   │   ├── remote_sync.py # Remote SSH sync subcommand
 │   │   ├── local_sync.py  # Local PBS log sync subcommand
-│   │   └── wrappers.py    # Backward compatibility wrappers
+│   │   └── wrappers.py    # Backward compatibility wrapper
 │   ├── models.py          # SQLAlchemy ORM models
 │   ├── database.py        # Engine/session management with PRAGMA optimizations
-│   ├── sync.py            # SSH fetch, FK resolution, charge calculation
+│   ├── sync.py            # FK resolution, charge calculation
 │   ├── queries.py         # High-level query interface
 │   ├── charging.py        # Machine-specific charging rules
 │   ├── summary.py         # Daily summary generation
-│   ├── parsers.py         # qhist output parsers
-│   ├── pbs_parsers.py     # PBS accounting log parsers
-│   ├── pbs_local.py       # Local PBS log file processing
-│   ├── remote.py          # SSH remote execution
+│   ├── pbs_parsers.py     # PBS field/date parsers and record transformation
+│   ├── pbs_read_logs.py   # Local PBS log file scanning and streaming
 │   ├── exporters.py       # Data export formats (JSON, CSV, markdown)
 │   └── log_config.py      # Logging configuration
 ├── scripts/               # Legacy scripts (deprecated, use qhist-db CLI)
@@ -142,23 +139,7 @@ GROUP BY q.queue_name;
 
 ## CLI Sync Usage
 
-The unified `qhist-db` CLI provides sync commands for both remote and local data sources:
-
-### Remote Sync (SSH to HPC machines)
-
-```bash
-# Sync specific date
-qhist-db sync remote -m derecho -d 2025-11-21 -v
-
-# Sync date range
-qhist-db sync remote -m casper --start 2025-08-01 --end 2025-08-31 -v
-
-# Sync all machines
-qhist-db sync remote -m all --start 2025-11-01 --end 2025-11-30 -v
-
-# Dry run (fetch but don't insert)
-qhist-db sync remote -m derecho -d 2025-11-21 --dry-run -v
-```
+The `qhist-db` CLI provides a sync command for parsing PBS accounting logs:
 
 ### Local Sync (Parse PBS accounting logs)
 
@@ -168,20 +149,22 @@ qhist-db sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 -v
 
 # Sync date range from local logs
 qhist-db sync local -m casper -l ./data/pbs_logs/casper --start 2025-11-01 --end 2025-11-30 -v
+
+# Dry run (parse but don't insert)
+qhist-db sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --dry-run -v
 ```
 
-**Note:** Local sync can populate `cpu_type` and `gpu_type` fields from PBS select strings, which are not available in qhist JSON output.
+**Note:** PBS log parsing can populate `cpu_type` and `gpu_type` fields from PBS select strings.
 
 ### Backward Compatibility
 
-Legacy commands still work via wrappers:
+Legacy command still works via wrapper:
 ```bash
-qhist-sync -m derecho -d 2025-11-21 -v          # → qhist-db sync remote
 qhist-parse-logs -m derecho -l ./logs -d 2025-11-21 -v  # → qhist-db sync local
 ```
 
 During sync, the system:
-1. Fetches job data (via SSH + qhist OR local PBS logs)
+1. Parses job data from local PBS accounting logs
 2. Resolves foreign keys (creates new users/accounts/queues as needed)
 3. Inserts jobs with duplicate detection
 4. Calculates and stores charges immediately
@@ -289,7 +272,7 @@ qhist-db resource --format md usage-history
 
 - Python 3.10+
 - SQLAlchemy
-- SSH access to casper/derecho with `qhist` command available
+- Access to PBS accounting log files
 
 ## Performance
 
