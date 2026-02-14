@@ -189,7 +189,6 @@ class Job(LookupMixin, Base):
     cputype = Column(Text)
     gputype = Column(Text)
     resources = Column(Text)
-    ptargets = Column(Text)
 
     # Performance metrics
     cpupercent = Column(Float)

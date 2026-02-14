@@ -15,19 +15,6 @@ from .database import VALID_MACHINES
 from .models import Job
 from .parsers import date_range, date_range_length, parse_date_string
 
-# Re-export for backwards compatibility
-from .parsers import (
-    ALL_FIELDS,
-    TIMESTAMP_FIELDS,
-    INTEGER_FIELDS,
-    FLOAT_FIELDS,
-    parse_timestamp,
-    parse_int,
-    parse_job_id,
-    parse_float,
-    parse_job_record,
-)
-
 
 class JobImporter:
     """Handle job imports with normalized schema and charge calculation.
