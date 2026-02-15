@@ -8,6 +8,8 @@ calculation, and summaries.
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
+from .utils import safe_int, safe_float
+
 
 def parse_date_string(date_str: str) -> datetime:
     """Parse YYYY-MM-DD string to datetime object.
@@ -321,24 +323,6 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
     account = pbs_record.account
     if account and account.startswith('"') and account.endswith('"'):
         account = account[1:-1]
-
-    # Parse integer fields
-    def safe_int(value):
-        if value is None or value == "":
-            return None
-        try:
-            return int(value)
-        except (ValueError, TypeError):
-            return None
-
-    # Parse float fields
-    def safe_float(value):
-        if value is None or value == "":
-            return None
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return None
 
     result = {
         # Job identification

@@ -11,6 +11,7 @@ from typing import Iterator
 import pbsparse
 
 from .pbs_parsers import date_range, parse_date_string, parse_pbs_record
+from .utils import validate_timestamp_ordering
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +120,11 @@ def fetch_jobs_from_pbs_logs(
             start = job_dict.get("start")
             end = job_dict.get("end")
 
-            # Check ordering if all timestamps are present
-            if submit and eligible and start and end:
-                if not (submit <= eligible <= start <= end):
-                    logger.warning(
-                        f"Invalid timestamp ordering for job {job_dict['job_id']}: "
-                        f"submit={submit}, eligible={eligible}, start={start}, end={end}"
-                    )
-                    # Still yield the record - database constraints will catch serious issues
-                    # This is just a warning for potential data quality issues
+            if not validate_timestamp_ordering(submit, eligible, start, end):
+                logger.warning(
+                    f"Invalid timestamp ordering for job {job_dict['job_id']}: "
+                    f"submit={submit}, eligible={eligible}, start={start}, end={end}"
+                )
+                # Still yield the record - sync.py will validate again and skip if needed
 
             yield job_dict

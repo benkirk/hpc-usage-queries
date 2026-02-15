@@ -14,6 +14,7 @@ except ImportError:
 from .database import VALID_MACHINES
 from .models import Job, LookupCache
 from .pbs_parsers import date_range, date_range_length, parse_date_string
+from .utils import normalize_datetime_to_naive, validate_timestamp_ordering
 
 
 class JobImporter:
@@ -79,8 +80,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
         Job.job_id.in_([r['job_id'] for r in prepared])
     ).all():
         # Normalize to naive datetime for comparison
-        if submit_dt and submit_dt.tzinfo:
-            submit_dt = submit_dt.replace(tzinfo=None)
+        submit_dt = normalize_datetime_to_naive(submit_dt)
         existing_pairs.add((job_id, submit_dt))
 
     # Filter out records that already exist or are duplicates within this batch
@@ -88,9 +88,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
     seen_keys = set()
     new_records = []
     for r in prepared:
-        submit_dt = r['submit']
-        if submit_dt and submit_dt.tzinfo:
-            submit_dt = submit_dt.replace(tzinfo=None)
+        submit_dt = normalize_datetime_to_naive(r['submit'])
 
         key = (r['job_id'], submit_dt)
         # Skip if already in database OR already seen in this batch
@@ -151,8 +149,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
         job_ids_map = {}
         for r in new_records:
             if 'record_object' in r:
-                submit = r['submit']
-                submit_naive = submit.replace(tzinfo=None) if submit and submit.tzinfo else submit
+                submit_naive = normalize_datetime_to_naive(r['submit'])
                 job_ids_map[(r['job_id'], submit_naive)] = r
 
         if job_ids_map:
@@ -170,7 +167,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
             job_records = []
             for job in all_new_jobs:
                 # Match job to its original record by (job_id, submit)
-                submit_naive = job.submit.replace(tzinfo=None) if job.submit and job.submit.tzinfo else job.submit
+                submit_naive = normalize_datetime_to_naive(job.submit)
                 record = job_ids_map.get((job.job_id, submit_naive))
 
                 if record and 'record_object' in record:
@@ -372,11 +369,10 @@ def _sync_pbs_logs_single_day(
 
             #print(record.get("record_object"))
 
-            if submit and eligible and start and end:
-                if not (submit <= eligible <= start <= end):
-                    stats["errors"] += 1
-                    stats["error_msg"] = "bad timestamp"
-                    continue
+            if not validate_timestamp_ordering(submit, eligible, start, end):
+                stats["errors"] += 1
+                stats["error_msg"] = "Invalid timestamp ordering"
+                continue
 
             batch.append(record)
 
