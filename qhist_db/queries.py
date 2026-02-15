@@ -885,10 +885,7 @@ class JobQueries:
         """
         query = self.session.query(Job).filter(Job.user == user)
 
-        if start:
-            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
-        if end:
-            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+        query = self._apply_date_filter(query, start, end)
         if status:
             query = query.filter(Job.status == status)
         if queue:
@@ -916,10 +913,7 @@ class JobQueries:
         """
         query = self.session.query(Job).filter(Job.account == account)
 
-        if start:
-            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
-        if end:
-            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+        query = self._apply_date_filter(query, start, end)
         if status:
             query = query.filter(Job.status == status)
 
@@ -943,10 +937,7 @@ class JobQueries:
         """
         query = self.session.query(Job).filter(Job.queue == queue)
 
-        if start:
-            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
-        if end:
-            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+        query = self._apply_date_filter(query, start, end)
 
         return query.order_by(Job.end.desc()).all()
 

@@ -33,36 +33,6 @@ class ReportConfig:
         prefix = machine[:2].capitalize()
         return f"{prefix}_{self.filename_base}_{start}_{end}.dat"
 
-    def format_header(self) -> str:
-        """Format header row according to column specs."""
-        parts = []
-        for col in self.columns:
-            if col.width > 0:
-                parts.append(f"{col.header:<{col.width}}")
-            else:
-                # Last column - no width padding
-                parts.append(col.header)
-        return "".join(parts) + "\n"
-
-    def format_row(self, row: Dict[str, Any]) -> str:
-        """Format a single data row according to column specs."""
-        parts = []
-        for col in self.columns:
-            value = row[col.key]
-            if col.width > 0:
-                if col.format == "s":
-                    parts.append(f"{value:<{col.width}}")
-                elif col.format:
-                    parts.append(f"{value:<{col.width}{col.format}}")
-                else:
-                    parts.append(f"{value:<{col.width}}")
-            else:
-                # Last column - no width padding
-                if col.format:
-                    parts.append(f"{value:{col.format}}")
-                else:
-                    parts.append(str(value))
-        return "".join(parts) + "\n"
 
 def parse_date(ctx, param, value):
     """Callback to parse date strings into date objects."""
@@ -121,6 +91,27 @@ def _run_jobs_per_entity_report(ctx, group_by, primary_entity: str, verbose: boo
         end=end_date,
         period=group_by
     )
+
+    # If not verbose, aggregate data to collapse secondary dimension
+    if not verbose:
+        from collections import defaultdict
+        aggregated = defaultdict(int)
+
+        # Group by (period, primary_entity) and sum job counts
+        for row in data:
+            if primary_entity == "user":
+                key = (row['period'], row['user'])
+            else:  # "account"
+                key = (row['period'], row['account'])
+            aggregated[key] += row['job_count']
+
+        # Convert back to list of dicts
+        data = []
+        for (period, entity), job_count in sorted(aggregated.items()):
+            if primary_entity == "user":
+                data.append({'period': period, 'user': entity, 'job_count': job_count})
+            else:  # "account"
+                data.append({'period': period, 'account': entity, 'job_count': job_count})
 
     console = Console()
 

@@ -1,10 +1,13 @@
 """SQLAlchemy ORM models for HPC job history data."""
 
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, Text, UniqueConstraint, select
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import declarative_base, declared_attr, relationship
+
+logger = logging.getLogger(__name__)
 
 Base = declarative_base()
 
@@ -90,10 +93,34 @@ class LookupCache:
 
 
 class LookupMixin:
-    """Mixin providing normalized user/account/queue FK columns and hybrid properties.
+    """Mixin providing hybrid properties for normalized lookup table foreign keys.
+
+    This mixin implements a "pending-value pattern" for transparent FK resolution:
+
+    1. When you set a text property (e.g., job.user = "username"):
+       - The value is stored in a temporary attribute (_pending_username)
+       - The FK is NOT immediately resolved
+
+    2. Before the session flushes (via before_flush event listener):
+       - All pending values are resolved to FKs using LookupCache
+       - The lookup objects are assigned to the relationship properties
+       - The temporary _pending_* attributes are deleted
+
+    3. When you read a property (e.g., job.user):
+       - Returns the username from the related User object via FK
+       - Transparent to the caller
+
+    This pattern enables:
+    - Backward-compatible API (set/get by text, stored as FK)
+    - Automatic deduplication via LookupCache
+    - Efficient bulk operations without per-record FK lookups
+
+    Note: The pattern relies on the before_flush event listener. If you're using
+    session.bulk_insert_mappings() or bypassing the ORM, you must resolve FKs
+    manually using LookupCache.
 
     Subclasses can set _null_sentinel to control what value is returned (and
-    treated as NULL on set) when FKs are NULL.  Job uses None (default),
+    treated as NULL on set) when FKs are NULL. Job uses None (default),
     DailySummary uses 'NO_JOBS'.
     """
 
@@ -140,6 +167,7 @@ class LookupMixin:
             self.user_obj = None
             self._pending_username = None
             return
+        # Store for deferred FK resolution in before_flush listener
         self._pending_username = username
 
     @user.expression
@@ -159,6 +187,7 @@ class LookupMixin:
             self.account_obj = None
             self._pending_account_name = None
             return
+        # Store for deferred FK resolution in before_flush listener
         self._pending_account_name = account_name
 
     @account.expression
@@ -178,6 +207,7 @@ class LookupMixin:
             self.queue_obj = None
             self._pending_queue_name = None
             return
+        # Store for deferred FK resolution in before_flush listener
         self._pending_queue_name = queue_name
 
     @queue.expression
@@ -467,8 +497,13 @@ def ensure_lookup_tables_before_flush(session, flush_context, instances):
 
     try:
         cache = LookupCache(session, auto_flush=False)
-    except Exception:
+    except Exception as e:
         # Tables don't exist in this database (e.g., filesystem scan DB)
+        # This is expected in certain contexts and not an error
+        logger.debug(
+            f"Skipping FK resolution - lookup tables not available: "
+            f"{e.__class__.__name__}: {e}"
+        )
         return
 
     for obj in list(session.new):
