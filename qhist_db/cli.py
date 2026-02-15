@@ -92,6 +92,27 @@ def _run_jobs_per_entity_report(ctx, group_by, primary_entity: str, verbose: boo
         period=group_by
     )
 
+    # If not verbose, aggregate data to collapse secondary dimension
+    if not verbose:
+        from collections import defaultdict
+        aggregated = defaultdict(int)
+
+        # Group by (period, primary_entity) and sum job counts
+        for row in data:
+            if primary_entity == "user":
+                key = (row['period'], row['user'])
+            else:  # "account"
+                key = (row['period'], row['account'])
+            aggregated[key] += row['job_count']
+
+        # Convert back to list of dicts
+        data = []
+        for (period, entity), job_count in sorted(aggregated.items()):
+            if primary_entity == "user":
+                data.append({'period': period, 'user': entity, 'job_count': job_count})
+            else:  # "account"
+                data.append({'period': period, 'account': entity, 'job_count': job_count})
+
     console = Console()
 
     # Determine columns based on verbose flag
