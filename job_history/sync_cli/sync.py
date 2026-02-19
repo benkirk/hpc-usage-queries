@@ -1,4 +1,4 @@
-"""Local sync subcommand - Parse local PBS logs."""
+"""Sync command - Parse local PBS logs into the job history database."""
 
 import click
 from pathlib import Path
@@ -9,7 +9,7 @@ from ..sync import sync_pbs_logs_bulk
 
 
 @click.command()
-@machine_option(allow_all=False)  # Local logs don't support machine='all'
+@machine_option(allow_all=False)
 @click.option(
     "-l", "--log-path",
     required=True,
@@ -18,16 +18,13 @@ from ..sync import sync_pbs_logs_bulk
 )
 @date_options()
 @sync_options()
-def local(machine, log_path, date, start, end, batch_size, dry_run, verbose, force, no_summary, summary_only):
+def sync(machine, log_path, date, start, end, batch_size, dry_run, verbose, force, no_summary, summary_only):
     """Sync jobs from local PBS accounting logs.
 
-    Parses PBS accounting log files from local filesystem instead of SSH'ing
-    to remote machines. Useful when log files have been copied locally or
-    SSH access is unavailable.
-
-    PBS logs contain cpu_type and gpu_type in select strings which are NOT
-    available in qhist JSON output, allowing this tool to populate fields
-    that remote sync cannot.
+    Parses PBS accounting log files (named YYYYMMDD) from the given directory
+    and imports them into the local SQLite database.  PBS logs contain
+    cpu_type and gpu_type in select strings which are not available from
+    other sources.
 
     \b
     Date Selection (all optional):
@@ -38,16 +35,16 @@ def local(machine, log_path, date, start, end, batch_size, dry_run, verbose, for
     \b
     Examples:
       # Single day
-      jobhist sync local -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29
+      jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29
 
       # Date range
-      jobhist sync local -m derecho -l ./data/pbs_logs --start 2026-01-01 --end 2026-01-31
+      jobhist sync -m derecho -l ./data/pbs_logs --start 2026-01-01 --end 2026-01-31
 
       # Dry run to preview
-      jobhist sync local -m casper -l ./logs -d 2026-01-29 --dry-run -v
+      jobhist sync -m casper -l ./logs -d 2026-01-29 --dry-run -v
 
       # Force re-sync already summarized dates
-      jobhist sync local -m derecho -l ./logs -d 2026-01-29 --force
+      jobhist sync -m derecho -l ./logs -d 2026-01-29 --force
     """
     # Validate dates
     validate_dates(date, start, end)

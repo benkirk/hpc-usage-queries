@@ -1,16 +1,14 @@
-"""Wrapper for invoking the sync local command programmatically."""
+"""Wrapper for invoking the sync command programmatically."""
 
-import sys
 import click
-from .local_sync import local as local_sync
+from .sync import sync
 
 
 def parse_logs_wrapper():
-    """Invoke the sync local command.
+    """Invoke the sync command.
 
-    Delegates to: jobhist sync local
+    Delegates to: jobhist sync
 
     Preserves all existing command-line arguments and behavior.
     """
-    # Invoke local sync command
-    local_sync(standalone_mode=True)
+    sync(standalone_mode=True)

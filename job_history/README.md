@@ -38,9 +38,8 @@ hpc-usage-queries/
 │   ├── cli.py             # Main CLI entry point (Click-based)
 │   ├── sync_cli/          # Sync command implementations
 │   │   ├── common.py      # Shared Click decorators/utilities
-│   │   ├── sync_cmd.py    # Sync command group
-│   │   ├── local_sync.py  # Local PBS log sync subcommand
-│   │   └── wrappers.py    # Backward compatibility wrapper
+│   │   ├── sync.py        # jobhist sync command
+│   │   └── wrappers.py    # Programmatic wrapper
 │   ├── models.py          # SQLAlchemy ORM models
 │   ├── database.py        # Engine/session management with PRAGMA optimizations
 │   ├── jobhist_compat.py    # DB-backed record retrieval for qhist frontend
@@ -142,29 +141,23 @@ GROUP BY q.queue_name;
 
 ## CLI Sync Usage
 
-The `jobhist` CLI provides a sync command for parsing PBS accounting logs:
-
-### Local Sync (Parse PBS accounting logs)
+The `jobhist sync` command parses PBS accounting logs into the local database:
 
 ```bash
-# Sync from local PBS log directory
-jobhist sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 -v
+# Sync a single date
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 -v
 
-# Sync date range from local logs
-jobhist sync local -m casper -l ./data/pbs_logs/casper --start 2025-11-01 --end 2025-11-30 -v
+# Sync a date range
+jobhist sync -m casper -l ./data/pbs_logs/casper --start 2025-11-01 --end 2025-11-30 -v
 
 # Dry run (parse but don't insert)
-jobhist sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --dry-run -v
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --dry-run -v
+
+# Force re-sync of already-summarized dates
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --force -v
 ```
 
-**Note:** PBS log parsing can populate `cpu_type` and `gpu_type` fields from PBS select strings.
-
-### Backward Compatibility
-
-Use `jobhist sync local` directly:
-```bash
-jobhist sync local -m derecho -l ./logs -d 2025-11-21 -v
-```
+**Note:** PBS log parsing populates `cpu_type` and `gpu_type` fields from PBS select strings.
 
 During sync, the system:
 1. Parses job data from local PBS accounting logs
@@ -288,7 +281,7 @@ jobhist --help
 Commands:
   history   Time history view of job data
   resource  Resource-centric view of job data
-  sync      Sync job data from various sources
+  sync      Sync jobs from local PBS accounting logs
 ```
 
 ### History Reports

@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import List, Dict, Any
 
-# Import sync commands
-from .sync_cli.sync_cmd import sync
-from .sync_cli.local_sync import local as local_sync
+# Import sync command
+from .sync_cli.sync import sync
 
 @dataclass
 class ColumnSpec:
@@ -639,10 +638,6 @@ for report_config in RESOURCE_REPORTS:
 
 cli.add_command(resource)
 
-# Register sync subcommands
-sync.add_command(local_sync, name="local")
-
-# Add sync group to main CLI
 cli.add_command(sync)
 
 if __name__ == "__main__":
