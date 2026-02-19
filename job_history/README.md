@@ -38,8 +38,7 @@ hpc-usage-queries/
 │   ├── cli.py             # Main CLI entry point (Click-based)
 │   ├── sync_cli/          # Sync command implementations
 │   │   ├── common.py      # Shared Click decorators/utilities
-│   │   ├── sync.py        # jobhist sync command
-│   │   └── wrappers.py    # Programmatic wrapper
+│   │   └── sync.py        # jobhist sync command
 │   ├── models.py          # SQLAlchemy ORM models
 │   ├── database.py        # Engine/session management with PRAGMA optimizations
 │   ├── jobhist_compat.py    # DB-backed record retrieval for qhist frontend
