@@ -1,4 +1,4 @@
-"""Sync command group for qhist-db CLI."""
+"""Sync command group for jobhist CLI."""
 
 import click
 
@@ -11,7 +11,7 @@ def sync():
 
     \b
     Example:
-      qhist-db sync local -m derecho -l ./data/pbs_logs -d 2024-01-29
+      jobhist sync local -m derecho -l ./data/pbs_logs -d 2024-01-29
     """
     pass
 

@@ -1,4 +1,4 @@
-"""Logging configuration for qhist-db."""
+"""Logging configuration for jobhist."""
 
 import logging
 import sys
@@ -44,15 +44,15 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
 def configure_logging(level: int = logging.INFO, format_str: str | None = None):
     """Configure root logging for the application.
 
-    This sets up logging for all qhist_db modules.
+    This sets up logging for all job_history modules.
 
     Args:
-        level: Logging level for qhist_db loggers
+        level: Logging level for job_history loggers
         format_str: Custom format string (optional)
     """
     fmt = format_str or LOG_FORMAT
     logging.basicConfig(level=level, format=fmt, stream=sys.stderr)
 
-    # Also configure qhist_db namespace
-    qhist_logger = logging.getLogger("qhist_db")
+    # Also configure job_history namespace
+    qhist_logger = logging.getLogger("job_history")
     qhist_logger.setLevel(level)

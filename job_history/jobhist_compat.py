@@ -3,8 +3,8 @@
 Provides db_available() and db_get_records() as drop-in replacements
 for the get_pbs_records() log-scanning call in qhist's main loop.
 
-Usage in bin/qhist-db:
-    from qhist_db.qhist_compat import db_available, db_get_records
+Usage in bin/jobhist:
+    from job_history.jobhist_compat import db_available, db_get_records
 
     if machine and db_available(machine):
         jobs = db_get_records(machine, bounds[0], bounds[1], ...)
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def db_available(machine: str) -> bool:
-    """Return True if a qhist-db SQLite database exists for the given machine."""
+    """Return True if a jobhist SQLite database exists for the given machine."""
     if machine not in VALID_MACHINES:
         return False
     try:

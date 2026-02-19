@@ -52,7 +52,7 @@ class PeriodGrouper:
             ValueError: If period is not 'day', 'month', 'quarter', or 'year'
 
         Examples:
-            >>> from qhist_db.models import Job
+            >>> from job_history.models import Job
             >>> # Day grouping
             >>> func_day = PeriodGrouper.get_period_func('day', Job.end)
             >>> # Month grouping
@@ -209,7 +209,7 @@ class ResourceTypeResolver:
     to machine-specific queue names and appropriate charging hour fields.
 
     Examples:
-        >>> from qhist_db.models import JobCharge
+        >>> from job_history.models import JobCharge
         >>> # Resolve CPU resources for Derecho
         >>> queues, hours = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharge)
         >>> # queues = ['cpu', 'cpudev']
@@ -234,7 +234,7 @@ class ResourceTypeResolver:
             ValueError: If resource_type is not 'cpu', 'gpu', or 'all'
 
         Examples:
-            >>> from qhist_db.models import JobCharge
+            >>> from job_history.models import JobCharge
             >>> # CPU resources
             >>> queues, hours = ResourceTypeResolver.resolve(
             ...     'cpu', 'derecho', JobCharge

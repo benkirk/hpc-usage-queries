@@ -1,11 +1,11 @@
-"""Shared fixtures for qhist-db tests."""
+"""Shared fixtures for jobhist tests."""
 
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
-from qhist_db.models import Base
+from job_history.models import Base
 
 
 # Apply SQLite optimizations for test databases

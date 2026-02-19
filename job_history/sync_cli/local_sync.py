@@ -38,16 +38,16 @@ def local(machine, log_path, date, start, end, batch_size, dry_run, verbose, for
     \b
     Examples:
       # Single day
-      qhist-db sync local -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29
+      jobhist sync local -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29
 
       # Date range
-      qhist-db sync local -m derecho -l ./data/pbs_logs --start 2026-01-01 --end 2026-01-31
+      jobhist sync local -m derecho -l ./data/pbs_logs --start 2026-01-01 --end 2026-01-31
 
       # Dry run to preview
-      qhist-db sync local -m casper -l ./logs -d 2026-01-29 --dry-run -v
+      jobhist sync local -m casper -l ./logs -d 2026-01-29 --dry-run -v
 
       # Force re-sync already summarized dates
-      qhist-db sync local -m derecho -l ./logs -d 2026-01-29 --force
+      jobhist sync local -m derecho -l ./logs -d 2026-01-29 --force
     """
     # Validate dates
     validate_dates(date, start, end)

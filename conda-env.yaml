@@ -1,4 +1,4 @@
-name: qhist_db
+name: job_history
 channels:
   - conda-forge
   - defaults

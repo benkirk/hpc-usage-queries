@@ -25,7 +25,7 @@ make init-db
 make sync-all START=20250801 END=20251123
 
 # Run the built-in examples with your database
-python -m qhist_db.queries
+python -m job_history.queries
 ```
 
 ## Project Structure
@@ -33,8 +33,8 @@ python -m qhist_db.queries
 ```
 hpc-usage-queries/
 ├── bin/
-│   └── qhist-db           # qhist-compatible job query frontend (DB-backed)
-├── qhist_db/              # Python package
+│   └── jobhist           # qhist-compatible job query frontend (DB-backed)
+├── job_history/              # Python package
 │   ├── cli.py             # Main CLI entry point (Click-based)
 │   ├── sync_cli/          # Sync command implementations
 │   │   ├── common.py      # Shared Click decorators/utilities
@@ -43,7 +43,7 @@ hpc-usage-queries/
 │   │   └── wrappers.py    # Backward compatibility wrapper
 │   ├── models.py          # SQLAlchemy ORM models
 │   ├── database.py        # Engine/session management with PRAGMA optimizations
-│   ├── qhist_compat.py    # DB-backed record retrieval for qhist frontend
+│   ├── jobhist_compat.py    # DB-backed record retrieval for qhist frontend
 │   ├── sync.py            # FK resolution, charge calculation
 │   ├── queries.py         # High-level query interface
 │   ├── charging.py        # Machine-specific charging rules
@@ -52,7 +52,7 @@ hpc-usage-queries/
 │   ├── pbs_read_logs.py   # Local PBS log file scanning and streaming
 │   ├── exporters.py       # Data export formats (JSON, CSV, markdown)
 │   └── log_config.py      # Logging configuration
-├── scripts/               # Legacy scripts (deprecated, use qhist-db CLI)
+├── scripts/               # Legacy scripts (deprecated, use jobhist CLI)
 │   ├── sync_jobs.py       # Backward compat wrapper
 │   └── parse_pbs_logs.py  # Backward compat wrapper
 ├── tests/                 # Test suite
@@ -142,28 +142,28 @@ GROUP BY q.queue_name;
 
 ## CLI Sync Usage
 
-The `qhist-db` CLI provides a sync command for parsing PBS accounting logs:
+The `jobhist` CLI provides a sync command for parsing PBS accounting logs:
 
 ### Local Sync (Parse PBS accounting logs)
 
 ```bash
 # Sync from local PBS log directory
-qhist-db sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 -v
+jobhist sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 -v
 
 # Sync date range from local logs
-qhist-db sync local -m casper -l ./data/pbs_logs/casper --start 2025-11-01 --end 2025-11-30 -v
+jobhist sync local -m casper -l ./data/pbs_logs/casper --start 2025-11-01 --end 2025-11-30 -v
 
 # Dry run (parse but don't insert)
-qhist-db sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --dry-run -v
+jobhist sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --dry-run -v
 ```
 
 **Note:** PBS log parsing can populate `cpu_type` and `gpu_type` fields from PBS select strings.
 
 ### Backward Compatibility
 
-Legacy command still works via wrapper:
+Use `jobhist sync local` directly:
 ```bash
-qhist-parse-logs -m derecho -l ./logs -d 2025-11-21 -v  # → qhist-db sync local
+jobhist sync local -m derecho -l ./logs -d 2025-11-21 -v
 ```
 
 During sync, the system:
@@ -194,7 +194,7 @@ The `JobQueries` class provides a high-level Python API:
 
 ```python
 from datetime import date, timedelta
-from qhist_db import get_session, JobQueries
+from job_history import get_session, JobQueries
 
 # Connect to database
 session = get_session("derecho")
@@ -223,11 +223,11 @@ session.close()
 - `job_durations(resource, start, end)` - Runtime distributions
 - `usage_history(resource, group_by, start, end, period)` - Time series data
 
-See `qhist_db/queries.py` for complete API documentation.
+See `job_history/queries.py` for complete API documentation.
 
-## qhist Frontend (bin/qhist-db)
+## qhist Frontend (bin/jobhist)
 
-`bin/qhist-db` is a drop-in replacement for the `qhist` job query tool that replaces
+`bin/jobhist` is a drop-in replacement for the `qhist` job query tool that replaces
 day-by-day PBS log scanning with a single, memory-bounded SQLAlchemy streaming query.
 When the database is unavailable it falls back transparently to standard log scanning.
 
@@ -245,17 +245,17 @@ scanning with a stderr warning.
 
 ```bash
 # Same flags as qhist — DB used when QHIST_MACHINE is set
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115             # single day, tabular
-QHIST_MACHINE=derecho bin/qhist-db -p 20250101-20250131    # date range
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -u jsmith   # user filter
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -q gpu -A PROJ0001  # queue + account
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -r          # reverse order
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -l          # list mode
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 --csv       # CSV output
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -J          # JSON output
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -j 7362988  # specific job ID
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -H dec0001  # host filter (Python phase)
-QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -w -a       # wide + averages
+QHIST_MACHINE=derecho bin/jobhist -p 20250115             # single day, tabular
+QHIST_MACHINE=derecho bin/jobhist -p 20250101-20250131    # date range
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -u jsmith   # user filter
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -q gpu -A PROJ0001  # queue + account
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -r          # reverse order
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -l          # list mode
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 --csv       # CSV output
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -J          # JSON output
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -j 7362988  # specific job ID
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -H dec0001  # host filter (Python phase)
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -w -a       # wide + averages
 ```
 
 ### Two-phase filtering
@@ -272,18 +272,18 @@ so qhist's output functions receive the same object type they always expect.
 
 | File | Role |
 |------|------|
-| `bin/qhist-db` | Entrypoint: arg parsing, config loading, output dispatch, DB/fallback routing |
-| `qhist_db/qhist_compat.py` | `db_available()`, `db_get_records()` generator with two-phase filtering |
-| `qhist_db/models.py` | `JobRecord.to_pbs_record()` — decompress + unpickle stored record |
+| `bin/jobhist` | Entrypoint: arg parsing, config loading, output dispatch, DB/fallback routing |
+| `job_history/jobhist_compat.py` | `db_available()`, `db_get_records()` generator with two-phase filtering |
+| `job_history/models.py` | `JobRecord.to_pbs_record()` — decompress + unpickle stored record |
 
 ---
 
 ## CLI Tool
 
-The `qhist-db` command-line tool provides a unified interface for syncing data and generating reports:
+The `jobhist` command-line tool provides a unified interface for syncing data and generating reports:
 
 ```bash
-qhist-db --help
+jobhist --help
 
 Commands:
   history   Time history view of job data
@@ -295,24 +295,24 @@ Commands:
 
 ```bash
 # Unique users/projects over time
-qhist-db history --start-date 2025-11-01 --end-date 2025-11-30 unique-users
-qhist-db history --group-by quarter unique-projects
+jobhist history --start-date 2025-11-01 --end-date 2025-11-30 unique-users
+jobhist history --group-by quarter unique-projects
 
 # Jobs per user per account
-qhist-db history --start-date 2025-11-01 --end-date 2025-11-07 jobs-per-user
+jobhist history --start-date 2025-11-01 --end-date 2025-11-07 jobs-per-user
 ```
 
 ### Resource Reports
 
 ```bash
 # Job size/wait distributions
-qhist-db resource --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-sizes
-qhist-db resource --start-date 2025-11-01 --end-date 2025-11-30 gpu-job-waits
+jobhist resource --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-sizes
+jobhist resource --start-date 2025-11-01 --end-date 2025-11-30 gpu-job-waits
 
 # Usage summaries (multiple formats)
-qhist-db resource --format json pie-user-cpu
-qhist-db resource --format csv pie-proj-gpu
-qhist-db resource --format md usage-history
+jobhist resource --format json pie-user-cpu
+jobhist resource --format csv pie-proj-gpu
+jobhist resource --format md usage-history
 
 # Available subcommands:
 # - job-sizes, job-waits, job-durations (generic)
@@ -322,7 +322,6 @@ qhist-db resource --format md usage-history
 # - usage-history
 ```
 
-**Backward Compatibility:** The `qhist-report` command still works as an alias for `qhist-db`.
 
 ## Requirements
 

@@ -32,7 +32,7 @@ qhist-sync --verbose
 - Generate usage reports for allocation management
 - Historical trend analysis
 
-See [qhist_db/README.md](qhist_db/README.md) for complete documentation.
+See [job_history/README.md](job_history/README.md) for complete documentation.
 
 ## FS Scans
 

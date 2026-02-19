@@ -199,7 +199,7 @@ class JobQueries:
     requiring direct knowledge of the underlying SQLAlchemy models.
 
     Example:
-        >>> from qhist_db import get_session, JobQueries
+        >>> from job_history import get_session, JobQueries
         >>> session = get_session("derecho")
         >>> queries = JobQueries(session)
         >>> jobs = queries.jobs_by_user("jdoe", start=date(2024, 1, 1))

@@ -1,5 +1,5 @@
 [project]
-name = "qhist-db"
+name = "job-history"
 version = "0.1.0"
 description = "SQLite database toolkit for NCAR HPC job history"
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ dev = [
 ]
 
 analysis = [
-         "qhist-db[dev]",
+         "job-history[dev]",
          "jupyterlab",
          "numpy",
          "matplotlib",
@@ -27,11 +27,7 @@ analysis = [
 
 [project.scripts]
 # Main unified CLI
-qhist-db = "qhist_db.cli:cli"
-
-# Backward compatibility wrappers
-qhist-report = "qhist_db.cli:cli"
-qhist-parse-logs = "qhist_db.sync_cli.wrappers:parse_logs_wrapper"
+jobhist = "job_history.cli:cli"
 
 # New unified CLI
 fs-scans = "fs_scans.cli.main:fs_scans_cli"
@@ -46,7 +42,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["qhist_db*", "scripts*", "fs_scans*"]
+include = ["job_history*", "scripts*", "fs_scans*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

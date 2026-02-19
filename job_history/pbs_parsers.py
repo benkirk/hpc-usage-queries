@@ -257,7 +257,7 @@ def infer_types_from_queue(queue_name: str, machine: str) -> dict:
 def parse_pbs_record(pbs_record, machine: str) -> dict:
     """Transform pbsparse.PbsRecord to database dictionary.
 
-    This produces the EXACT same format as qhist_db.parsers.parse_job_record(),
+    This produces the EXACT same format as job_history.parsers.parse_job_record(),
     ensuring compatibility with existing sync infrastructure.
 
     Args:

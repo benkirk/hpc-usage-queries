@@ -45,29 +45,29 @@ help:
 
 init-db:
 	@echo "Initializing databases..."
-	@$(PYTHON) -c "from qhist_db import init_db; init_db()"
+	@$(PYTHON) -c "from job_history import init_db; init_db()"
 	@echo "Created $(DATA_DIR)/casper.db"
 	@echo "Created $(DATA_DIR)/derecho.db"
 
 sync-casper:
 ifdef START
-	qhist-db sync remote -m casper --start $(START) $(if $(END),--end $(END)) -v
+	jobhist sync remote -m casper --start $(START) $(if $(END),--end $(END)) -v
 else
-	qhist-db sync remote -m casper -d $(DATE) -v
+	jobhist sync remote -m casper -d $(DATE) -v
 endif
 
 sync-derecho:
 ifdef START
-	qhist-db sync remote -m derecho --start $(START) $(if $(END),--end $(END)) -v
+	jobhist sync remote -m derecho --start $(START) $(if $(END),--end $(END)) -v
 else
-	qhist-db sync remote -m derecho -d $(DATE) -v
+	jobhist sync remote -m derecho -d $(DATE) -v
 endif
 
 sync-all:
 ifdef START
-	qhist-db sync remote -m all --start $(START) $(if $(END),--end $(END)) -v
+	jobhist sync remote -m all --start $(START) $(if $(END),--end $(END)) -v
 else
-	qhist-db sync remote -m all -d $(DATE) -v
+	jobhist sync remote -m all -d $(DATE) -v
 endif
 
 clean:
@@ -79,16 +79,16 @@ clean:
 .PHONY: test-import dry-run-casper dry-run-derecho dry-run-all
 
 test-import:
-	@$(PYTHON) -c "from qhist_db import Job, init_db; print('Import successful')"
+	@$(PYTHON) -c "from job_history import Job, init_db; print('Import successful')"
 
 dry-run-casper:
-	qhist-db sync remote -m casper -d $(DATE) --dry-run -v
+	jobhist sync remote -m casper -d $(DATE) --dry-run -v
 
 dry-run-derecho:
-	qhist-db sync remote -m derecho -d $(DATE) --dry-run -v
+	jobhist sync remote -m derecho -d $(DATE) --dry-run -v
 
 dry-run-all:
-	qhist-db sync remote -m all -d $(DATE) --dry-run -v
+	jobhist sync remote -m all -d $(DATE) --dry-run -v
 
 %: %.yaml
 	[ -d $@ ] && mv $@ $@.old && rm -rf $@.old &

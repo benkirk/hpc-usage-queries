@@ -22,7 +22,7 @@ Based on user preferences:
 
 ### 1. Add JobRecord Model
 
-**File**: `qhist_db/models.py`
+**File**: `job_history/models.py`
 
 Add new ORM model following the `JobCharge` pattern (lines 217-237):
 
@@ -61,7 +61,7 @@ class JobRecord(Base):
 
 ### 2. Add `pbs_record` Property to Job
 
-**File**: `qhist_db/models.py`
+**File**: `job_history/models.py`
 
 Add property to `Job` class (after `calculate_charges` method around line 215):
 
@@ -119,7 +119,7 @@ def pbs_record(self):
 
 ### 3. Populate JobRecords During Sync
 
-**File**: `qhist_db/sync.py`
+**File**: `job_history/sync.py`
 
 Modify `_insert_batch()` function to insert JobRecords after JobCharge insertion (after line 547):
 
@@ -167,7 +167,7 @@ if importer and rows_inserted > 0:
 
 ### 4. Export JobRecord Model
 
-**File**: `qhist_db/__init__.py`
+**File**: `job_history/__init__.py`
 
 Add JobRecord to exports (around line 14, following the JobCharge pattern):
 
@@ -184,7 +184,7 @@ Add tests for JobRecord functionality:
 ```python
 def test_job_record_round_trip(session_derecho):
     """Test pickle → compress → store → retrieve → decompress → unpickle."""
-    from qhist_db.models import Job, JobRecord
+    from job_history.models import Job, JobRecord
     import pickle
     import gzip
 
@@ -226,7 +226,7 @@ def test_job_without_record(session_derecho):
 
 def test_pbs_record_caching(session_derecho):
     """Verify instance-level caching works."""
-    from qhist_db.models import Job, JobRecord
+    from job_history.models import Job, JobRecord
     import pickle
     import gzip
 
@@ -268,7 +268,7 @@ def test_pbs_record_caching(session_derecho):
 1. **PBS log import test**:
    ```bash
    # Sync a day of PBS logs
-   python -m qhist_db.cli sync-pbs derecho ./data/sample_pbs_logs/derecho --period 2026-01-29
+   python -m job_history.cli sync-pbs derecho ./data/sample_pbs_logs/derecho --period 2026-01-29
    ```
    - Verify jobs inserted into `jobs` table
    - Verify corresponding entries in `job_records` table
@@ -276,7 +276,7 @@ def test_pbs_record_caching(session_derecho):
 
 2. **Access via property**:
    ```python
-   from qhist_db import get_session, Job
+   from job_history import get_session, Job
 
    session = get_session("derecho")
    job = session.query(Job).filter(Job.job_id.like("%.desched1")).first()
@@ -290,7 +290,7 @@ def test_pbs_record_caching(session_derecho):
 3. **SSH import test** (verify no JobRecords created):
    ```bash
    # Sync via SSH
-   python -m qhist_db.cli sync derecho --period 2026-01-29
+   python -m job_history.cli sync derecho --period 2026-01-29
    ```
    - Verify jobs inserted but NO job_records entries
 
@@ -311,9 +311,9 @@ All tests should pass.
 
 ## Critical Files
 
-- **qhist_db/models.py**: Add `JobRecord` class (after `JobCharge` at line 217) and `Job.pbs_record` property (after `calculate_charges` at line 215)
-- **qhist_db/sync.py**: Modify `_insert_batch()` to populate JobRecords (after line 547)
-- **qhist_db/__init__.py**: Export `JobRecord` model (line 14)
+- **job_history/models.py**: Add `JobRecord` class (after `JobCharge` at line 217) and `Job.pbs_record` property (after `calculate_charges` at line 215)
+- **job_history/sync.py**: Modify `_insert_batch()` to populate JobRecords (after line 547)
+- **job_history/__init__.py**: Export `JobRecord` model (line 14)
 - **tests/test_models.py**: Add unit tests for JobRecord functionality
 
 ## Performance Characteristics

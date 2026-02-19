@@ -1,4 +1,4 @@
-Consider the python ORMs in @qhist_db/models.py and sample queries in @qhist_db/queries.py
+Consider the python ORMs in @job_history/models.py and sample queries in @job_history/queries.py
 
 I would like to create a CLI tool with the following features:
 (1) takes a date range as input for analysis over a specific time window,

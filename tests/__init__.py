@@ -1,1 +1,1 @@
-"""Test suite for qhist-db."""
+"""Test suite for jobhist."""

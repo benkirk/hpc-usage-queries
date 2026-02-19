@@ -7,10 +7,10 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from qhist_db.database import Base
-from qhist_db.models import Job, Account, User, Queue, JobCharge
-from qhist_db.pbs_read_logs import fetch_jobs_from_pbs_logs
-from qhist_db.sync import sync_pbs_logs_bulk, JobImporter
+from job_history.database import Base
+from job_history.models import Job, Account, User, Queue, JobCharge
+from job_history.pbs_read_logs import fetch_jobs_from_pbs_logs
+from job_history.sync import sync_pbs_logs_bulk, JobImporter
 
 
 @pytest.fixture

@@ -1,13 +1,13 @@
 Consider the histogram created by e.g.
 
-qhist-report resource --machine derecho --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-durations:
+jobhist resource --machine derecho --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-durations:
 
 Date                <30s        30s-30m     30-60m      1-5h        5-12h       12-18h      >18h
 2024-12-01          1054.9      163552.6    78585.5     917447.0    5483819.0   136880.4    0.0
 2024-12-02          622.9       144125.3    117931.0    907891.0    5087191.3   293667.5    0.0
 [...]
 
-I would like to make an analogous command "qhist-report resource {cpu,gpu}-job-memory-per-rank" which has a similar structure.
+I would like to make an analogous command "jobhist resource {cpu,gpu}-job-memory-per-rank" which has a similar structure.
 
 It should compute the average memory per mpiprocs, so total memory(GB)/mpiprocs from the job data
 
