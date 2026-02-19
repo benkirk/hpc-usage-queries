@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""qhist-db: qhist frontend backed by qhist-db SQLite when available.
+
+Accepts the same CLI arguments as qhist but replaces the day-by-day
+PBS log-file scanning loop with a single streaming DB query when a
+qhist-db database exists for the target machine.
+
+Machine selection:
+    Set QHIST_MACHINE=derecho|casper to enable DB mode.
+    Falls back to PBS log-file scanning when DB is unavailable or
+    QHIST_MACHINE is unset.
+
+DB location override:
+    QHIST_DERECHO_DB=/path/to/derecho.db
+    QHIST_CASPER_DB=/path/to/casper.db
+"""
+
+import sys
+import os
+import re
+import datetime
+import operator
+import textwrap
+from collections import OrderedDict
+from glob import glob
+
+from pbsparse import get_pbs_records
+from qhist.qhist import (
+    get_parser,
+    QhistConfig,
+    get_time_bounds,
+    keep_going,
+    tabular_output,
+    list_output,
+    csv_output,
+    json_output,
+    format_help,
+    filter_help,
+    ONE_DAY,
+)
+from qhist_db.qhist_compat import db_available, db_get_records
+
+
+def main():
+    # -------------------------------------------------------------------------
+    # Arg parsing (identical to qhist)
+    # -------------------------------------------------------------------------
+    parser = get_parser()
+    args = parser.parse_args()
+
+    # -------------------------------------------------------------------------
+    # Config loading (same search order as qhist's main())
+    # -------------------------------------------------------------------------
+    config = QhistConfig(time_format=args.time)
+
+    # Find qhist package directory for server.json and extensions
+    import qhist.qhist as _qhist_mod
+    _qhist_dir = os.path.dirname(_qhist_mod.__file__)
+
+    if "QHIST_SERVER_CONFIG" in os.environ:
+        config.load_config(os.environ["QHIST_SERVER_CONFIG"])
+    else:
+        config_path = os.path.join(_qhist_dir, "cfg", "server.json")
+        if os.path.isfile(config_path):
+            config.load_config(config_path)
+        elif os.path.isfile("/etc/qhist/server.json"):
+            config.load_config("/etc/qhist/server.json")
+
+    machine = os.environ.get("QHIST_MACHINE", "").lower()
+
+    # Require log path unless running in DB-only mode
+    if not hasattr(config, "pbs_log_path"):
+        if not (machine and db_available(machine)):
+            sys.exit("Error: path to PBS accounting logs not set by config file.")
+        # DB-only mode: set dummy log path so QhistConfig doesn't error;
+        # pbs_log_start is needed by get_time_bounds for bound validation.
+        if not hasattr(config, "pbs_log_start"):
+            config.pbs_log_start = "20200101"
+        if not hasattr(config, "pbs_date_format"):
+            config.pbs_date_format = "%Y%m%d"
+
+    # -------------------------------------------------------------------------
+    # CustomRecord for log-scan fallback (same as qhist's main())
+    # -------------------------------------------------------------------------
+    CustomRecord = None
+
+    if config.record_class != "PbsRecord":
+        extensions_path = os.path.join(_qhist_dir, "extensions")
+        extension_files = glob(extensions_path + "/*.py")
+
+        if extension_files:
+            sys.path.append(extensions_path)
+            for ef in extension_files:
+                ext_name = re.search(r".*/(.*)\.py", ef).group(1)
+                try:
+                    import importlib
+                    CustomRecord = importlib.import_module(ext_name).__getattribute__(
+                        config.record_class
+                    )
+                    break
+                except AttributeError:
+                    pass
+
+        if not CustomRecord:
+            sys.exit(
+                f"Error: given custom record class not found in code extensions "
+                f"({config.record_class})"
+            )
+
+    # -------------------------------------------------------------------------
+    # Long-form help (same as qhist)
+    # -------------------------------------------------------------------------
+    if args.format == "help":
+        print(format_help)
+        for key in ["id", "short_id"] + sorted(config.format_map):
+            print(f"    {key}")
+        print()
+        sys.exit()
+    elif args.filter == "help":
+        print(filter_help)
+        for key in sorted(k for k in config.format_map if k not in ("end", "start", "nodelist")):
+            print(f"    {key}")
+        print()
+        sys.exit()
+
+    # -------------------------------------------------------------------------
+    # Time divisor
+    # -------------------------------------------------------------------------
+    time_divisor = {"h": 3600.0, "m": 60.0, "s": 1.0, "d": 86400.0}[args.time]
+
+    # -------------------------------------------------------------------------
+    # Intra-day time filter (from period range with T component)
+    # -------------------------------------------------------------------------
+    time_filters = None
+    if args.period and "T" in args.period:
+        if "-" not in args.period:
+            print(
+                "Warning: Time only valid when specifying period range. Ignoring...",
+                file=sys.stderr,
+            )
+        else:
+            time_filters = []
+            input_format = "%Y%m%dT%H%M%S"
+            for bound in args.period.split("-"):
+                time_filters.append(
+                    datetime.datetime.strptime(bound, input_format[: (len(bound) - 2)])
+                )
+
+    # -------------------------------------------------------------------------
+    # id_filter, host_filter, data_filters (identical to qhist's main())
+    # -------------------------------------------------------------------------
+    if args.jobs:
+        if len(args.jobs) == 1:
+            id_filter = [
+                job.split(".")[0] if "." in job else job
+                for job in args.jobs[0].split(",")
+            ]
+        else:
+            id_filter = [job.split(".")[0] if "." in job else job for job in args.jobs]
+    else:
+        id_filter = None
+
+    if args.hosts:
+        host_filter = args.hosts[0].split(",") if len(args.hosts) == 1 else args.hosts
+    else:
+        host_filter = None
+
+    ops = OrderedDict(
+        [
+            ("==", operator.eq),
+            ("~=", operator.ne),
+            ("<=", operator.le),
+            (">=", operator.ge),
+            ("=", operator.eq),
+            ("<", operator.lt),
+            (">", operator.gt),
+            (" has ", operator.contains),
+        ]
+    )
+
+    data_filters = []
+    for arg_filter in ("account", "jobname", "queue", "user", "Exit_status"):
+        filter_value = getattr(args, arg_filter)
+        if filter_value:
+            if filter_value[0] == "~":
+                data_filters.append((False, operator.ne, arg_filter, filter_value[1:]))
+            elif filter_value[0] == "*":
+                data_filters.append(
+                    (False, operator.contains, arg_filter, filter_value[1:])
+                )
+            elif filter_value != "field":
+                data_filters.append((False, operator.eq, arg_filter, filter_value))
+
+    if args.wait:
+        if args.wait[0] == "~":
+            data_filters.append(
+                (False, operator.le, "waittime", float(args.wait[1:]) / 60)
+            )
+        else:
+            data_filters.append(
+                (False, operator.gt, "waittime", float(args.wait) / 60)
+            )
+
+    if args.filter:
+        for fexpr in args.filter.split(";"):
+            for op in ops:
+                if op in fexpr:
+                    if fexpr[0] == "~":
+                        negation = True
+                        field, match = [e.strip() for e in fexpr[1:].split(op)]
+                    else:
+                        negation = False
+                        field, match = [e.strip() for e in fexpr.split(op)]
+                    data_filters.append(
+                        (negation, ops[op], config.translate_field(field), match)
+                    )
+                    break
+
+    # -------------------------------------------------------------------------
+    # Output format setup (identical to qhist's main())
+    # -------------------------------------------------------------------------
+    # Initialize with safe defaults (used only in the matching output branch)
+    fields = []
+    labels = {}
+    list_format = ""
+    table_format = ""
+    format_type = "default"
+    units = "none"
+
+    if args.list or args.csv or args.json:
+        if args.format:
+            field_list = args.format.split(",")
+            labels = {config.translate_field(f): config.wide_labels[f] for f in field_list}
+            fields = [config.translate_field(f) for f in field_list]
+        else:
+            labels = {
+                config.translate_field(f): config.wide_labels[f]
+                for f in config.long_fields
+            }
+            fields = config.long_fields_data
+
+        max_width = 0
+        if args.list:
+            for lbl in labels.values():
+                if len(lbl) > max_width:
+                    max_width = len(lbl)
+            list_format = "   {:" + str(max_width) + "} = {}"
+
+        if args.list or args.json:
+            try:
+                fields.remove("id")
+            except ValueError:
+                pass
+        else:
+            if args.nodes and "nodelist" not in fields:
+                fields.append("nodelist")
+            if not args.noheader:
+                if args.units:
+                    print(",".join(labels[f] for f in fields))
+                else:
+                    print(",".join(labels[f].split("(")[0].rstrip() for f in fields))
+    else:
+        if args.units:
+            units = "break"
+
+        if args.wide:
+            format_type = "wide"
+
+        if args.Exit_status == "field":
+            format_type += "_status"
+
+        if args.format:
+            if "QHIST_LEGACY_FORMATTING" in os.environ:
+                user_format = "{short_id:7.7} " + config.legacy_translate(args.format)
+                if not args.noheader:
+                    print(
+                        config.generate_header(
+                            format_type,
+                            custom_format=user_format,
+                            units="inline",
+                            divider=False,
+                        )
+                    )
+            else:
+                user_format = args.format
+                if not args.noheader:
+                    print(
+                        config.generate_header(
+                            format_type, custom_format=user_format, units=units
+                        )
+                    )
+            table_format = config.translate_format(user_format)
+        else:
+            if not args.noheader:
+                print(config.generate_header(format_type, units=units))
+            table_format = config.table_format_data[format_type]
+
+    # averages state (tabular mode only; checked at end)
+    num_jobs = 0
+    averages = {}
+    averages_format = ""
+    if not (args.list or args.csv or args.json) and args.average:
+        averages = {"Resource_List": {}, "resources_used": {}}
+        for field in ("ncpus", "ngpus", "nodect", "walltime", "mem"):
+            averages["Resource_List"][field] = 0.0
+        for field in ("cpupercent", "walltime", "mem", "avgcpu"):
+            averages["resources_used"][field] = 0.0
+        averages_format = re.sub(r"(\d+)d", r"\1.2f", table_format)
+
+    # -------------------------------------------------------------------------
+    # Date bounds
+    # -------------------------------------------------------------------------
+    bounds = get_time_bounds(
+        config.pbs_log_start,
+        config.pbs_date_format,
+        period=args.period,
+        days=args.days,
+    )
+
+    # -------------------------------------------------------------------------
+    # JSON preamble
+    # -------------------------------------------------------------------------
+    if args.json:
+        print("{")
+        print('    "timestamp":{},'.format(int(datetime.datetime.today().timestamp())))
+        print('    "Jobs":{')
+
+    # -------------------------------------------------------------------------
+    # Output dispatcher: handles both DB stream and per-day log-scan batches
+    # -------------------------------------------------------------------------
+    is_first_json_job = True
+
+    def emit_jobs(jobs_iter):
+        """Dispatch a job stream to the requested output format.
+
+        Handles list, csv, json, nodes+tabular, average+tabular, plain tabular.
+        Updates num_jobs and averages in-place when --average is active.
+        """
+        nonlocal num_jobs, is_first_json_job
+
+        for job in jobs_iter:
+            if args.list:
+                list_output(job, fields, labels, list_format, nodes=args.nodes)
+
+            elif args.csv:
+                csv_output(job, fields)
+
+            elif args.json:
+                if not is_first_json_job:
+                    print(",")
+                print(textwrap.indent(json_output(job)[2:-2], "    "), end="")
+                is_first_json_job = False
+
+            elif args.nodes:
+                if averages and "[]" not in job.id:
+                    for category in averages:
+                        for f in averages[category]:
+                            averages[category][f] += getattr(job, category)[f]
+                    num_jobs += 1
+                print(
+                    "{}\n    {}".format(
+                        tabular_output(vars(job), table_format),
+                        ",".join(job.get_nodes()),
+                    )
+                )
+
+            else:
+                if averages and "[]" not in job.id:
+                    for category in averages:
+                        for f in averages[category]:
+                            averages[category][f] += getattr(job, category)[f]
+                    num_jobs += 1
+                print(tabular_output(vars(job), table_format))
+
+    # -------------------------------------------------------------------------
+    # Run: DB query or log-scan fallback
+    # -------------------------------------------------------------------------
+    if machine and db_available(machine):
+        emit_jobs(
+            db_get_records(
+                machine,
+                bounds[0],
+                bounds[1],
+                time_divisor=time_divisor,
+                id_filter=id_filter,
+                host_filter=host_filter,
+                data_filters=data_filters,
+                time_filter=time_filters,
+                reverse=args.reverse,
+            )
+        )
+    else:
+        if machine:
+            print(
+                f"Warning: DB not available for {machine!r}; falling back to log scanning",
+                file=sys.stderr,
+            )
+        log_date = bounds[1] if args.reverse else bounds[0]
+        while keep_going(bounds, log_date, args.reverse):
+            data_date = datetime.datetime.strftime(log_date, config.pbs_date_format)
+            data_file = os.path.join(config.pbs_log_path, data_date)
+            jobs = get_pbs_records(
+                data_file,
+                CustomRecord,
+                True,
+                args.events,
+                id_filter,
+                host_filter,
+                data_filters,
+                time_filters,
+                args.reverse,
+                time_divisor,
+            )
+            emit_jobs(jobs)
+            log_date += -ONE_DAY if args.reverse else ONE_DAY
+
+    # -------------------------------------------------------------------------
+    # JSON footer
+    # -------------------------------------------------------------------------
+    if args.json:
+        print("\n    }\n}")
+
+    # -------------------------------------------------------------------------
+    # Averages (tabular mode with --average)
+    # -------------------------------------------------------------------------
+    if averages and num_jobs > 0:
+        for category in averages:
+            for field in averages[category]:
+                averages[category][field] /= num_jobs
+        print(f"\nAverages across {num_jobs} jobs:\n")
+        if not args.noheader:
+            if args.format:
+                print(config.generate_header(format_type, custom_format=args.format, units=units))
+            else:
+                print(config.generate_header(format_type, units=units))
+        print(tabular_output(averages, averages_format))
+    elif args.average and (args.list or args.csv or args.json):
+        print(
+            "Note: statistics output is only currently supported for tabular mode",
+            file=sys.stderr,
+        )
+
+
+if __name__ == "__main__":
+    main()

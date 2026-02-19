@@ -32,6 +32,8 @@ python -m qhist_db.queries
 
 ```
 hpc-usage-queries/
+├── bin/
+│   └── qhist-db           # qhist-compatible job query frontend (DB-backed)
 ├── qhist_db/              # Python package
 │   ├── cli.py             # Main CLI entry point (Click-based)
 │   ├── sync_cli/          # Sync command implementations
@@ -41,6 +43,7 @@ hpc-usage-queries/
 │   │   └── wrappers.py    # Backward compatibility wrapper
 │   ├── models.py          # SQLAlchemy ORM models
 │   ├── database.py        # Engine/session management with PRAGMA optimizations
+│   ├── qhist_compat.py    # DB-backed record retrieval for qhist frontend
 │   ├── sync.py            # FK resolution, charge calculation
 │   ├── queries.py         # High-level query interface
 │   ├── charging.py        # Machine-specific charging rules
@@ -221,6 +224,59 @@ session.close()
 - `usage_history(resource, group_by, start, end, period)` - Time series data
 
 See `qhist_db/queries.py` for complete API documentation.
+
+## qhist Frontend (bin/qhist-db)
+
+`bin/qhist-db` is a drop-in replacement for the `qhist` job query tool that replaces
+day-by-day PBS log scanning with a single, memory-bounded SQLAlchemy streaming query.
+When the database is unavailable it falls back transparently to standard log scanning.
+
+### Machine selection
+
+```bash
+export QHIST_MACHINE=derecho   # or casper
+```
+
+With `QHIST_MACHINE` set and the corresponding `.db` file present, all queries go to
+the database.  Without it (or when the DB is missing) the tool falls back to log
+scanning with a stderr warning.
+
+### Usage
+
+```bash
+# Same flags as qhist — DB used when QHIST_MACHINE is set
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115             # single day, tabular
+QHIST_MACHINE=derecho bin/qhist-db -p 20250101-20250131    # date range
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -u jsmith   # user filter
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -q gpu -A PROJ0001  # queue + account
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -r          # reverse order
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -l          # list mode
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 --csv       # CSV output
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -J          # JSON output
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -j 7362988  # specific job ID
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -H dec0001  # host filter (Python phase)
+QHIST_MACHINE=derecho bin/qhist-db -p 20250115 -w -a       # wide + averages
+```
+
+### Two-phase filtering
+
+| Phase | Filters | How |
+|-------|---------|-----|
+| SQL (pre-decompression) | date range, job ID, user, account, queue, jobname, Exit_status | WHERE clauses on indexed columns |
+| Python (post-decompression) | host (`-H`), waittime (`-W`), numeric `--filter` ops, exotic fields | Applied to the live PbsRecord after `to_pbs_record()` |
+
+The stored `PbsRecord`/`DerechoRecord` is returned directly — no adapter class —
+so qhist's output functions receive the same object type they always expect.
+
+### Key implementation files
+
+| File | Role |
+|------|------|
+| `bin/qhist-db` | Entrypoint: arg parsing, config loading, output dispatch, DB/fallback routing |
+| `qhist_db/qhist_compat.py` | `db_available()`, `db_get_records()` generator with two-phase filtering |
+| `qhist_db/models.py` | `JobRecord.to_pbs_record()` — decompress + unpickle stored record |
+
+---
 
 ## CLI Tool
 
