@@ -27,6 +27,16 @@ for log_dir in log_dirs:
     # Get job end records
     job_ends = get_pbs_records(log_dir, type_filter="E")
 
+    cnt=0
+    for job in job_ends:
+        print(job)
+        print(job.short_id)
+        for k,v in job.__dict__.items():
+            print(f"\t{k} = {v}")
+        #print(job.__dict__)
+        cnt=cnt+1
+        if cnt > 10: break
+
     for job in job_ends:
         # Pickle without compression
         pickled_uncompressed = pickle.dumps(job)
