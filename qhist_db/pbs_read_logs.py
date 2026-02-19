@@ -16,6 +16,22 @@ from .utils import validate_timestamp_ordering
 logger = logging.getLogger(__name__)
 
 
+def _get_record_class(machine: str) -> type:
+    """Return the appropriate PbsRecord subclass for the given machine.
+
+    For Derecho, uses DerechoRecord from the optional pbs-qhist package
+    (qhist.extensions.ncar) if available, falling back to PbsRecord.
+    All other machines use PbsRecord directly.
+    """
+    if machine == "derecho":
+        try:
+            from qhist.extensions.ncar import DerechoRecord
+            return DerechoRecord
+        except ImportError:
+            logger.debug("qhist.extensions.ncar not available; using base PbsRecord for derecho")
+    return pbsparse.PbsRecord
+
+
 def get_log_file_path(log_dir: Path, date_str: str) -> Path:
     """Construct PBS log file path for a given date.
 
@@ -93,7 +109,7 @@ def fetch_jobs_from_pbs_logs(
 
         # Parse PBS records (only End records)
         try:
-            records = pbsparse.get_pbs_records(str(log_path), type_filter="E")
+            records = pbsparse.get_pbs_records(str(log_path), CustomRecord=_get_record_class(machine), type_filter="E")
         except Exception as e:
             raise RuntimeError(f"Failed to parse PBS log {log_path}: {e}") from e
 
