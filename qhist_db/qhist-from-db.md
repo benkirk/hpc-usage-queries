@@ -10,9 +10,6 @@ The goal: a new `bin/qhist-db` wrapper that accepts identical CLI arguments as `
 replaces the `while keep_going / get_pbs_records()` scanning loop with efficient DB queries that
 stream the stored, real `PbsRecord` objects — falling back to log scanning when the DB is unavailable.
 
-Key insight: since we decompress the original `PbsRecord`, qhist's output functions receive the exact
-same object type they always expect, with no adapter class needed.
-
 Machine selection: `QHIST_MACHINE=derecho|casper` environment variable (consistent with
 `QHIST_DERECHO_DB` / `QHIST_CASPER_DB` already in use).
 
@@ -162,7 +159,11 @@ from pbsparse import get_pbs_records
 from qhist_db.qhist_compat import db_available, db_get_records
 
 def _output_jobs(jobs, args, table_format, fields, labels, list_format):
-    """Dispatch a stream of job objects to the requested output format."""
+    """Dispatch a stream of job objects to the requested output format.
+
+    Handles: list, csv, json, tabular (default), --average accumulation.
+    JSON header/footer (print("{") / print("}")) is emitted by the caller.
+    """
     if args.list:
         for job in jobs:
             list_output(job, fields, labels, list_format, nodes=args.nodes)
@@ -170,10 +171,25 @@ def _output_jobs(jobs, args, table_format, fields, labels, list_format):
         for job in jobs:
             csv_output(job, fields)
     elif args.json:
-        ...  # same as qhist
-    else:
+        first_job = True
         for job in jobs:
-            print(tabular_output(vars(job), table_format))
+            if not first_job:
+                print(",")
+            print(textwrap.indent(json_output(job)[2:-2], "    "), end="")
+            first_job = False
+    else:
+        if args.average:
+            # Same averaging logic as qhist: accumulate, then print summary after loop
+            for job in jobs:
+                if '[]' not in job.id:
+                    for category in averages:
+                        for field in averages[category]:
+                            averages[category][field] += getattr(job, category)[field]
+                    num_jobs += 1
+                print(tabular_output(vars(job), table_format))
+        else:
+            for job in jobs:
+                print(tabular_output(vars(job), table_format))
 
 def main():
     args = get_parser().parse_args()
@@ -186,6 +202,12 @@ def main():
                              period=args.period, days=args.days)
 
     machine = os.environ.get("QHIST_MACHINE", "").lower()
+
+    # JSON output: header emitted before the job stream, footer after
+    if args.json:
+        print("{")
+        print('    "timestamp":{},'.format(int(datetime.datetime.today().timestamp())))
+        print('    "Jobs":{')
 
     if machine and db_available(machine):
         # DB path: single streaming query over full date range
