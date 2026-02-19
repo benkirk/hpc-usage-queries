@@ -479,10 +479,12 @@ class JobQueries:
         # Build range case
         range_case = self._build_range_case(ranges, overflow, field)
 
-        # Build subquery
+        # Build subquery — use user_id (real FK column) not the hybrid property,
+        # since hybrid properties expand to correlated scalar subqueries which
+        # SQLite cannot reference by column name inside a derived table alias.
         subquery = self.session.query(
             Job.id,
-            Job.user,
+            Job.user_id,
             hours_field.label("hours_field"),
             range_case
         ).join(JobCharge, Job.id == JobCharge.job_id).filter(Job.queue.in_(queues))
@@ -494,7 +496,7 @@ class JobQueries:
         query = self.session.query(
             subquery.c.range_label,
             func.count(subquery.c.id).label("job_count"),
-            func.count(func.distinct(subquery.c.user)).label("user_count"),
+            func.count(func.distinct(subquery.c.user_id)).label("user_count"),
             func.sum(subquery.c.hours_field).label("hours")
         ).group_by(subquery.c.range_label)
 

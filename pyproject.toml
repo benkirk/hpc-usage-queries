@@ -1,13 +1,14 @@
 [project]
-name = "job-history"
+name = "hpc-usage-queries"
 version = "0.1.0"
-description = "SQLite database toolkit for NCAR HPC job history"
+description = "SQLite database toolkit for NCAR HPC resource usage queries"
 requires-python = ">=3.10"
 dependencies = [
     "sqlalchemy>=2.0",
     "rich",
     "click",
     "pbsparse",
+    "pbs-qhist",
 ]
 
 [project.optional-dependencies]
@@ -17,7 +18,7 @@ dev = [
 ]
 
 analysis = [
-         "job-history[dev]",
+         "hpc-usage-queries[dev]",
          "jupyterlab",
          "numpy",
          "matplotlib",
