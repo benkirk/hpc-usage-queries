@@ -1,12 +1,12 @@
-# Plan: DB-backed qhist frontend (bin/qhist-db)
+# Plan: DB-backed qhist frontend (bin/jobhist)
 
 ## Context
 
-`qhist` scans raw PBS accounting log files day-by-day to answer queries. Our `qhist_db` project
+`qhist` scans raw PBS accounting log files day-by-day to answer queries. Our `job_history` project
 already parses those same logs into a SQLite/SQLAlchemy ORM — and, critically, **stores the
 original `PbsRecord` (or `DerechoRecord`) object compressed in `JobRecord.compressed_data`**.
 
-The goal: a new `bin/qhist-db` wrapper that accepts identical CLI arguments as `qhist`, but
+The goal: a new `bin/jobhist` wrapper that accepts identical CLI arguments as `qhist`, but
 replaces the `while keep_going / get_pbs_records()` scanning loop with efficient DB queries that
 stream the stored, real `PbsRecord` objects — falling back to log scanning when the DB is unavailable.
 
@@ -17,7 +17,7 @@ Machine selection: `QHIST_MACHINE=derecho|casper` environment variable (consiste
 
 ## Two New Files
 
-### 1. `qhist_db/qhist_compat.py`  — adapter module
+### 1. `job_history/jobhist_compat.py`  — adapter module
 
 No `DbRecord` class needed — we yield real `PbsRecord`/`DerechoRecord` objects.
 
@@ -26,7 +26,7 @@ No `DbRecord` class needed — we yield real `PbsRecord`/`DerechoRecord` objects
 #### `db_available(machine) -> bool`
 
 ```python
-from qhist_db import get_db_path, VALID_MACHINES
+from job_history import get_db_path, VALID_MACHINES
 def db_available(machine):
     return machine in VALID_MACHINES and get_db_path(machine).exists()
 ```
@@ -43,8 +43,8 @@ Query strategy:
 
 ```python
 from sqlalchemy.orm import joinedload, aliased
-from qhist_db.models import Job, JobRecord, User, Account, Queue
-from qhist_db.database import get_session
+from job_history.models import Job, JobRecord, User, Account, Queue
+from job_history.database import get_session
 
 def db_get_records(machine, start_dt, end_dt, time_divisor=3600.0,
                    id_filter=None, host_filter=None, data_filters=None,
@@ -137,7 +137,7 @@ for job in query:
 
 ---
 
-### 2. `bin/qhist-db`  — wrapper entrypoint
+### 2. `bin/jobhist`  — wrapper entrypoint
 
 Reuses qhist's arg parser, config loading, and all output functions.
 Replaces only the scanning loop with a single DB query (or falls back to log scanning).
@@ -147,7 +147,7 @@ Replaces only the scanning loop with a single DB query (or falls back to log sca
 ```python
 #!/usr/bin/env python3
 """
-qhist-db: qhist frontend backed by qhist-db SQLite when available.
+jobhist: qhist frontend backed by jobhist SQLite when available.
 Set QHIST_MACHINE=derecho|casper to enable DB mode; falls back to log scanning.
 """
 import os, sys, datetime, operator
@@ -156,7 +156,7 @@ from qhist.qhist import (get_parser, QhistConfig, get_time_bounds, keep_going,
                           tabular_output, list_output, csv_output, json_output,
                           FillFormatter, ONE_DAY)
 from pbsparse import get_pbs_records
-from qhist_db.qhist_compat import db_available, db_get_records
+from job_history.jobhist_compat import db_available, db_get_records
 
 def _output_jobs(jobs, args, table_format, fields, labels, list_format):
     """Dispatch a stream of job objects to the requested output format.
@@ -239,10 +239,10 @@ def main():
 
 | File | Role |
 |---|---|
-| `qhist_db/qhist_compat.py` | New: `db_available()` + `db_get_records()` generator |
-| `bin/qhist-db` | New: wrapper entrypoint |
-| `qhist_db/models.py` | `Job`, `JobRecord`, `User`, `Account`, `Queue` — read-only |
-| `qhist_db/database.py` | `get_db_path()`, `get_session()` — read-only |
+| `job_history/jobhist_compat.py` | New: `db_available()` + `db_get_records()` generator |
+| `bin/jobhist` | New: wrapper entrypoint |
+| `job_history/models.py` | `Job`, `JobRecord`, `User`, `Account`, `Queue` — read-only |
+| `job_history/database.py` | `get_db_path()`, `get_session()` — read-only |
 | `conda-env/.../qhist/qhist.py` | Read-only reference; import its functions |
 
 No existing files need modification.
@@ -251,9 +251,9 @@ No existing files need modification.
 
 - `qhist.qhist.get_parser()`, `QhistConfig`, `get_time_bounds()`, `keep_going()` — qhist plumbing
 - `qhist.qhist.tabular_output()`, `list_output()`, `csv_output()`, `json_output()` — output
-- `qhist_db.database.get_session()`, `get_db_path()` — DB access
-- `qhist_db.models.JobRecord.to_pbs_record()` — decompress + unpickle stored record
-- `qhist_db.models.Job.job_record_obj` — relationship to `JobRecord`
+- `job_history.database.get_session()`, `get_db_path()` — DB access
+- `job_history.models.JobRecord.to_pbs_record()` — decompress + unpickle stored record
+- `job_history.models.Job.job_record_obj` — relationship to `JobRecord`
 
 ## Verification
 
@@ -262,24 +262,24 @@ No existing files need modification.
 ls data/derecho.db
 
 # Basic smoke test: compare DB and log results for a single date
-QHIST_MACHINE=derecho bin/qhist-db -p 20260115 | head -20
+QHIST_MACHINE=derecho bin/jobhist -p 20260115 | head -20
 qhist -p 20260115 | head -20   # should match
 
 # Confirm fallback works when QHIST_MACHINE is unset
-bin/qhist-db -p 20260115 | head -5   # should log-scan (no DB warning)
+bin/jobhist -p 20260115 | head -5   # should log-scan (no DB warning)
 
 # Test common filters via DB
-QHIST_MACHINE=derecho bin/qhist-db -p 20260101-20260131 -A <account> -q cpu --csv
+QHIST_MACHINE=derecho bin/jobhist -p 20260101-20260131 -A <account> -q cpu --csv
 
 # Test reverse order
-QHIST_MACHINE=derecho bin/qhist-db -p 20260101-20260115 -r | head -5
+QHIST_MACHINE=derecho bin/jobhist -p 20260101-20260115 -r | head -5
 
 # Test host_filter warning (should warn to stderr, not crash)
-QHIST_MACHINE=derecho bin/qhist-db -H dec0001 -p 20260115 2>&1 | grep -i "warn"
+QHIST_MACHINE=derecho bin/jobhist -H dec0001 -p 20260115 2>&1 | grep -i "warn"
 
 # Confirm memory-bounded streaming on large range (no OOM)
-QHIST_MACHINE=derecho bin/qhist-db -p 20250101-20260101 --csv | wc -l
+QHIST_MACHINE=derecho bin/jobhist -p 20250101-20260101 --csv | wc -l
 
 # Verify DerechoRecord power fields appear when applicable
-QHIST_MACHINE=derecho bin/qhist-db -p 20260115 --list | grep power
+QHIST_MACHINE=derecho bin/jobhist -p 20260115 --list | grep power
 ```

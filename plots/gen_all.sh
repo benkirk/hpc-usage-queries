@@ -46,6 +46,6 @@ subcommands=(
 
 for cmd in "${subcommands[@]}"; do
     echo $cmd
-    qhist-report resource --machine derecho --start-date ${month_start} --end-date ${month_end} --group-by day ${cmd}
-    qhist-report resource --machine derecho --start-date ${year_start} --end-date ${year_end} --group-by month ${cmd}
+    jobhist resource --machine derecho --start-date ${month_start} --end-date ${month_end} --group-by day ${cmd}
+    jobhist resource --machine derecho --start-date ${year_start} --end-date ${year_end} --group-by month ${cmd}
 done

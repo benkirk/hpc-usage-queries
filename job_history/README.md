@@ -25,22 +25,23 @@ make init-db
 make sync-all START=20250801 END=20251123
 
 # Run the built-in examples with your database
-python -m qhist_db.queries
+python -m job_history.queries
 ```
 
 ## Project Structure
 
 ```
 hpc-usage-queries/
-├── qhist_db/              # Python package
+├── bin/
+│   └── jobhist           # qhist-compatible job query frontend (DB-backed)
+├── job_history/              # Python package
 │   ├── cli.py             # Main CLI entry point (Click-based)
 │   ├── sync_cli/          # Sync command implementations
 │   │   ├── common.py      # Shared Click decorators/utilities
-│   │   ├── sync_cmd.py    # Sync command group
-│   │   ├── local_sync.py  # Local PBS log sync subcommand
-│   │   └── wrappers.py    # Backward compatibility wrapper
+│   │   └── sync.py        # jobhist sync command
 │   ├── models.py          # SQLAlchemy ORM models
 │   ├── database.py        # Engine/session management with PRAGMA optimizations
+│   ├── jobhist_compat.py    # DB-backed record retrieval for qhist frontend
 │   ├── sync.py            # FK resolution, charge calculation
 │   ├── queries.py         # High-level query interface
 │   ├── charging.py        # Machine-specific charging rules
@@ -49,7 +50,7 @@ hpc-usage-queries/
 │   ├── pbs_read_logs.py   # Local PBS log file scanning and streaming
 │   ├── exporters.py       # Data export formats (JSON, CSV, markdown)
 │   └── log_config.py      # Logging configuration
-├── scripts/               # Legacy scripts (deprecated, use qhist-db CLI)
+├── scripts/               # Legacy scripts (deprecated, use jobhist CLI)
 │   ├── sync_jobs.py       # Backward compat wrapper
 │   └── parse_pbs_logs.py  # Backward compat wrapper
 ├── tests/                 # Test suite
@@ -139,29 +140,23 @@ GROUP BY q.queue_name;
 
 ## CLI Sync Usage
 
-The `qhist-db` CLI provides a sync command for parsing PBS accounting logs:
-
-### Local Sync (Parse PBS accounting logs)
+The `jobhist sync` command parses PBS accounting logs into the local database:
 
 ```bash
-# Sync from local PBS log directory
-qhist-db sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 -v
+# Sync a single date
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 -v
 
-# Sync date range from local logs
-qhist-db sync local -m casper -l ./data/pbs_logs/casper --start 2025-11-01 --end 2025-11-30 -v
+# Sync a date range
+jobhist sync -m casper -l ./data/pbs_logs/casper --start 2025-11-01 --end 2025-11-30 -v
 
 # Dry run (parse but don't insert)
-qhist-db sync local -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --dry-run -v
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --dry-run -v
+
+# Force re-sync of already-summarized dates
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --force -v
 ```
 
-**Note:** PBS log parsing can populate `cpu_type` and `gpu_type` fields from PBS select strings.
-
-### Backward Compatibility
-
-Legacy command still works via wrapper:
-```bash
-qhist-parse-logs -m derecho -l ./logs -d 2025-11-21 -v  # → qhist-db sync local
-```
+**Note:** PBS log parsing populates `cpu_type` and `gpu_type` fields from PBS select strings.
 
 During sync, the system:
 1. Parses job data from local PBS accounting logs
@@ -191,7 +186,7 @@ The `JobQueries` class provides a high-level Python API:
 
 ```python
 from datetime import date, timedelta
-from qhist_db import get_session, JobQueries
+from job_history import get_session, JobQueries
 
 # Connect to database
 session = get_session("derecho")
@@ -220,43 +215,96 @@ session.close()
 - `job_durations(resource, start, end)` - Runtime distributions
 - `usage_history(resource, group_by, start, end, period)` - Time series data
 
-See `qhist_db/queries.py` for complete API documentation.
+See `job_history/queries.py` for complete API documentation.
+
+## qhist Frontend (bin/jobhist)
+
+`bin/jobhist` is a drop-in replacement for the `qhist` job query tool that replaces
+day-by-day PBS log scanning with a single, memory-bounded SQLAlchemy streaming query.
+When the database is unavailable it falls back transparently to standard log scanning.
+
+### Machine selection
+
+```bash
+export QHIST_MACHINE=derecho   # or casper
+```
+
+With `QHIST_MACHINE` set and the corresponding `.db` file present, all queries go to
+the database.  Without it (or when the DB is missing) the tool falls back to log
+scanning with a stderr warning.
+
+### Usage
+
+```bash
+# Same flags as qhist — DB used when QHIST_MACHINE is set
+QHIST_MACHINE=derecho bin/jobhist -p 20250115             # single day, tabular
+QHIST_MACHINE=derecho bin/jobhist -p 20250101-20250131    # date range
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -u jsmith   # user filter
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -q gpu -A PROJ0001  # queue + account
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -r          # reverse order
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -l          # list mode
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 --csv       # CSV output
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -J          # JSON output
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -j 7362988  # specific job ID
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -H dec0001  # host filter (Python phase)
+QHIST_MACHINE=derecho bin/jobhist -p 20250115 -w -a       # wide + averages
+```
+
+### Two-phase filtering
+
+| Phase | Filters | How |
+|-------|---------|-----|
+| SQL (pre-decompression) | date range, job ID, user, account, queue, jobname, Exit_status | WHERE clauses on indexed columns |
+| Python (post-decompression) | host (`-H`), waittime (`-W`), numeric `--filter` ops, exotic fields | Applied to the live PbsRecord after `to_pbs_record()` |
+
+The stored `PbsRecord`/`DerechoRecord` is returned directly — no adapter class —
+so qhist's output functions receive the same object type they always expect.
+
+### Key implementation files
+
+| File | Role |
+|------|------|
+| `bin/jobhist` | Entrypoint: arg parsing, config loading, output dispatch, DB/fallback routing |
+| `job_history/jobhist_compat.py` | `db_available()`, `db_get_records()` generator with two-phase filtering |
+| `job_history/models.py` | `JobRecord.to_pbs_record()` — decompress + unpickle stored record |
+
+---
 
 ## CLI Tool
 
-The `qhist-db` command-line tool provides a unified interface for syncing data and generating reports:
+The `jobhist` command-line tool provides a unified interface for syncing data and generating reports:
 
 ```bash
-qhist-db --help
+jobhist --help
 
 Commands:
   history   Time history view of job data
   resource  Resource-centric view of job data
-  sync      Sync job data from various sources
+  sync      Sync jobs from local PBS accounting logs
 ```
 
 ### History Reports
 
 ```bash
 # Unique users/projects over time
-qhist-db history --start-date 2025-11-01 --end-date 2025-11-30 unique-users
-qhist-db history --group-by quarter unique-projects
+jobhist history --start-date 2025-11-01 --end-date 2025-11-30 unique-users
+jobhist history --group-by quarter unique-projects
 
 # Jobs per user per account
-qhist-db history --start-date 2025-11-01 --end-date 2025-11-07 jobs-per-user
+jobhist history --start-date 2025-11-01 --end-date 2025-11-07 jobs-per-user
 ```
 
 ### Resource Reports
 
 ```bash
 # Job size/wait distributions
-qhist-db resource --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-sizes
-qhist-db resource --start-date 2025-11-01 --end-date 2025-11-30 gpu-job-waits
+jobhist resource --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-sizes
+jobhist resource --start-date 2025-11-01 --end-date 2025-11-30 gpu-job-waits
 
 # Usage summaries (multiple formats)
-qhist-db resource --format json pie-user-cpu
-qhist-db resource --format csv pie-proj-gpu
-qhist-db resource --format md usage-history
+jobhist resource --format json pie-user-cpu
+jobhist resource --format csv pie-proj-gpu
+jobhist resource --format md usage-history
 
 # Available subcommands:
 # - job-sizes, job-waits, job-durations (generic)
@@ -266,7 +314,6 @@ qhist-db resource --format md usage-history
 # - usage-history
 ```
 
-**Backward Compatibility:** The `qhist-report` command still works as an alias for `qhist-db`.
 
 ## Requirements
 

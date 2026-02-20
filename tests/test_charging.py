@@ -2,7 +2,7 @@
 
 import pytest
 
-from qhist_db.charging import derecho_charge, casper_charge
+from job_history.charging import derecho_charge, casper_charge
 
 
 class TestDerechoCharging:

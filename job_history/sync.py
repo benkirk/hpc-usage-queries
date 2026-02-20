@@ -51,7 +51,7 @@ class JobImporter:
         return prepared
 
 
-def _insert_batch(session: Session, records: list[dict], importer: JobImporter | None = None) -> int:
+def _insert_batch(session: Session, records: list[dict], importer: JobImporter) -> int:
     """Insert a batch of records, ignoring duplicates.
 
     Duplicates are detected by the unique constraint on (job_id, submit).
@@ -68,10 +68,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
         return 0
 
     # Prepare records with foreign keys
-    if importer:
-        prepared = [importer.prepare_record(r) for r in records]
-    else:
-        prepared = records
+    prepared = [importer.prepare_record(r) for r in records]
 
     # Get existing (job_id, submit) pairs to filter out duplicates
     # SQLite stores datetimes as naive, so normalize to naive for comparison
@@ -106,7 +103,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter |
     session.flush()
 
     # Calculate charges for newly inserted jobs
-    if importer and rows_inserted > 0:
+    if rows_inserted > 0:
         from .models import JobCharge
         from sqlalchemy import and_
 

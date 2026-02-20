@@ -1,4 +1,4 @@
-"""Shared utility functions for qhist_db module."""
+"""Shared utility functions for job_history module."""
 
 
 def normalize_datetime_to_naive(dt):

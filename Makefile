@@ -17,6 +17,8 @@ DATA_DIR := data
 
 # Default date is today in YYYY-MM-DD format
 DATE ?= $(shell date +%Y-%m-%d)
+# Root of locally-mirrored PBS accounting logs (see sync-logs target)
+LOG_DIR ?= ./data/sample_pbs_logs
 
 .PHONY: help init-db sync-casper sync-derecho sync-all clean
 
@@ -27,7 +29,7 @@ help:
 	@echo "  make init-db          Create database tables (both machines)"
 	@echo "  make sync-casper      Sync Casper jobs for DATE"
 	@echo "  make sync-derecho     Sync Derecho jobs for DATE"
-	@echo "  make sync-all         Sync both machines for DATE (uses --machine all)"
+	@echo "  make sync-all         Sync both machines for DATE"
 	@echo "  make clean            Remove all database files"
 	@echo ""
 	@echo "Database files:"
@@ -38,6 +40,7 @@ help:
 	@echo "  DATE=YYYY-MM-DD        Date to sync (default: today)"
 	@echo "  START=YYYY-MM-DD       Start date for range sync"
 	@echo "  END=YYYY-MM-DD         End date for range sync"
+	@echo "  LOG_DIR=<path>         Root of PBS log mirror (default: $(LOG_DIR))"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make sync-derecho DATE=2025-11-21"
@@ -45,30 +48,25 @@ help:
 
 init-db:
 	@echo "Initializing databases..."
-	@$(PYTHON) -c "from qhist_db import init_db; init_db()"
+	@$(PYTHON) -c "from job_history import init_db; init_db()"
 	@echo "Created $(DATA_DIR)/casper.db"
 	@echo "Created $(DATA_DIR)/derecho.db"
 
 sync-casper:
 ifdef START
-	qhist-db sync remote -m casper --start $(START) $(if $(END),--end $(END)) -v
+	jobhist sync -m casper -l $(LOG_DIR)/casper --start $(START) $(if $(END),--end $(END)) -v
 else
-	qhist-db sync remote -m casper -d $(DATE) -v
+	jobhist sync -m casper -l $(LOG_DIR)/casper -d $(DATE) -v
 endif
 
 sync-derecho:
 ifdef START
-	qhist-db sync remote -m derecho --start $(START) $(if $(END),--end $(END)) -v
+	jobhist sync -m derecho -l $(LOG_DIR)/derecho --start $(START) $(if $(END),--end $(END)) -v
 else
-	qhist-db sync remote -m derecho -d $(DATE) -v
+	jobhist sync -m derecho -l $(LOG_DIR)/derecho -d $(DATE) -v
 endif
 
-sync-all:
-ifdef START
-	qhist-db sync remote -m all --start $(START) $(if $(END),--end $(END)) -v
-else
-	qhist-db sync remote -m all -d $(DATE) -v
-endif
+sync-all: sync-casper sync-derecho
 
 clean:
 	@echo "Removing databases..."
@@ -79,16 +77,15 @@ clean:
 .PHONY: test-import dry-run-casper dry-run-derecho dry-run-all
 
 test-import:
-	@$(PYTHON) -c "from qhist_db import Job, init_db; print('Import successful')"
+	@$(PYTHON) -c "from job_history import Job, init_db; print('Import successful')"
 
 dry-run-casper:
-	qhist-db sync remote -m casper -d $(DATE) --dry-run -v
+	jobhist sync -m casper -l $(LOG_DIR)/casper -d $(DATE) --dry-run -v
 
 dry-run-derecho:
-	qhist-db sync remote -m derecho -d $(DATE) --dry-run -v
+	jobhist sync -m derecho -l $(LOG_DIR)/derecho -d $(DATE) --dry-run -v
 
-dry-run-all:
-	qhist-db sync remote -m all -d $(DATE) --dry-run -v
+dry-run-all: dry-run-casper dry-run-derecho
 
 %: %.yaml
 	[ -d $@ ] && mv $@ $@.old && rm -rf $@.old &
