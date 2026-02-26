@@ -208,8 +208,41 @@ def unique_users(ctx, group_by):
         table.add_row(row['period'], str(row['user_count']))
         
     console.print(table)
-    
+
     session.close()
+
+
+@history.command("daily-summary")
+@click.pass_context
+def daily_summary_cmd(ctx):
+    """Show daily usage summary by date, user, account, and queue."""
+    start_date = ctx.obj['start_date']
+    end_date = ctx.obj['end_date']
+    machine = ctx.obj['machine']
+
+    session = get_session(machine)
+    queries = JobQueries(session)
+
+    data = queries.daily_summary_report(start=start_date, end=end_date)
+
+    console = Console()
+    table = Table("Date", "User", "Account", "Queue", "Jobs",
+                  "CPU-h", "GPU-h", "Mem-h")
+    for row in data:
+        table.add_row(
+            row["date"],
+            row["user"],
+            row["account"],
+            row["queue"],
+            str(row["job_count"]),
+            f"{row['cpu_hours']:.1f}",
+            f"{row['gpu_hours']:.1f}",
+            f"{row['memory_hours']:.1f}",
+        )
+
+    console.print(table)
+    session.close()
+
 
 cli.add_command(history)
 

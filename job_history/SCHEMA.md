@@ -120,6 +120,7 @@ Materialized charging calculations for instant lookups.
 | `gpu_hours` | FLOAT | GPU-hours charged |
 | `memory_hours` | FLOAT | Memory GB-hours charged |
 | `charge_version` | INTEGER | Algorithm version (for future changes) |
+| `qos_factor` | FLOAT | QoS scaling factor (default 1.0, reserved for future use) |
 
 **Charging rules:**
 
@@ -136,6 +137,7 @@ Materialized charging calculations for instant lookups.
 ### daily_summary
 
 Pre-aggregated usage by date/user/account/queue for fast historical queries.
+All three dimensions (user, account, queue) are fully supported for aggregation and filtering.
 
 | Column | Type | Index | Description |
 |--------|------|-------|-------------|

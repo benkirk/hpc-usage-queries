@@ -1101,6 +1101,52 @@ class JobQueries:
 
         return query.order_by(DailySummary.date).all()
 
+    def daily_summary_report(
+        self,
+        start: date,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get daily usage summary rows for a date range.
+
+        Reads directly from the pre-aggregated DailySummary table.
+        Excludes NO_JOBS marker rows (where user_id IS NULL).
+
+        Args:
+            start: Start date (inclusive)
+            end: End date (inclusive)
+
+        Returns:
+            List of dicts with keys: date, user, account, queue,
+            job_count, cpu_hours, gpu_hours, memory_hours
+        """
+        if end is None:
+            end = date.today()
+
+        rows = (
+            self.session.query(DailySummary)
+            .filter(
+                DailySummary.date >= start,
+                DailySummary.date <= end,
+                DailySummary.user_id.isnot(None),  # exclude NO_JOBS markers
+            )
+            .order_by(DailySummary.date, DailySummary.user_id,
+                      DailySummary.account_id, DailySummary.queue_id)
+            .all()
+        )
+        return [
+            {
+                "date": str(row.date),
+                "user": row.user or "",
+                "account": row.account or "",
+                "queue": row.queue or "",
+                "job_count": row.job_count or 0,
+                "cpu_hours": row.cpu_hours or 0.0,
+                "gpu_hours": row.gpu_hours or 0.0,
+                "memory_hours": row.memory_hours or 0.0,
+            }
+            for row in rows
+        ]
+
     def daily_summary_by_user(
         self,
         user: str,

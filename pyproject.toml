@@ -27,16 +27,21 @@ analysis = [
 ]
 
 [project.scripts]
-# Main unified CLI
+# unified job history CLI
 jobhist = "job_history.cli:cli"
 
-# New unified CLI
+# unified filesystem scans CLI
 fs-scans = "fs_scans.cli.main:fs_scans_cli"
 
 # Convenience wrappers (allow selective deployment)
 fs-scans-import = "fs_scans.wrappers.fs_scans_import:main"
 fs-scans-query = "fs_scans.wrappers.fs_scans_query:main"
 fs-scans-analyze = "fs_scans.wrappers.fs_scans_analyze:main"
+
+# jobhist convenience wrappers (allow selective deployment)
+jobhist-sync = "job_history.wrappers.jobhist_sync:main"
+jobhist-history = "job_history.wrappers.jobhist_history:main"
+jobhist-resource = "job_history.wrappers.jobhist_resource:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -46,7 +51,7 @@ build-backend = "setuptools.build_meta"
 include = ["job_history*", "scripts*", "fs_scans*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["job_history/tests", "fs_scans/tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"

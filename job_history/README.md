@@ -9,7 +9,7 @@ This project parses PBS accounting logs from NCAR's HPC systems, stores records 
 **Features:**
 - Optimized schema with 5-10x query performance via normalization and composite indexes
 - Separate database per machine for independent management
-- Pre-computed charging calculations in materialized table
+- Pre-computed charging calculations in materialized table (`qos_factor` support built in)
 - Bulk sync with duplicate detection and foreign key resolution
 - Handles job arrays (e.g., `6049117[28]`)
 - Python query interface for common usage analysis patterns
@@ -33,33 +33,35 @@ python -m job_history.queries
 ```
 hpc-usage-queries/
 ├── bin/
-│   └── jobhist           # qhist-compatible job query frontend (DB-backed)
-├── job_history/              # Python package
-│   ├── cli.py             # Main CLI entry point (Click-based)
-│   ├── sync_cli/          # Sync command implementations
-│   │   ├── common.py      # Shared Click decorators/utilities
-│   │   └── sync.py        # jobhist sync command
-│   ├── models.py          # SQLAlchemy ORM models
-│   ├── database.py        # Engine/session management with PRAGMA optimizations
+│   └── jobhist              # qhist-compatible job query frontend (DB-backed)
+├── job_history/             # Python package
+│   ├── cli.py               # Main CLI entry point (Click-based)
+│   ├── sync_cli/            # Sync command implementations
+│   │   ├── common.py        # Shared Click decorators/utilities
+│   │   └── sync.py          # jobhist sync command
+│   ├── wrappers/            # Convenience entry points for selective deployment
+│   │   ├── jobhist_sync.py      # jobhist-sync → jobhist sync
+│   │   ├── jobhist_history.py   # jobhist-history → jobhist history
+│   │   └── jobhist_resource.py  # jobhist-resource → jobhist resource
+│   ├── tests/               # Test suite (pytest)
+│   │   ├── conftest.py      # Shared fixtures (in-memory DB, job data)
+│   │   └── fixtures/        # PBS log fixtures for integration tests
+│   ├── models.py            # SQLAlchemy ORM models
+│   ├── database.py          # Engine/session management with PRAGMA optimizations
 │   ├── jobhist_compat.py    # DB-backed record retrieval for qhist frontend
-│   ├── sync.py            # FK resolution, charge calculation
-│   ├── queries.py         # High-level query interface
-│   ├── charging.py        # Machine-specific charging rules
-│   ├── summary.py         # Daily summary generation
-│   ├── pbs_parsers.py     # PBS field/date parsers and record transformation
-│   ├── pbs_read_logs.py   # Local PBS log file scanning and streaming
-│   ├── exporters.py       # Data export formats (JSON, CSV, markdown)
-│   └── log_config.py      # Logging configuration
-├── scripts/               # Legacy scripts (deprecated, use jobhist CLI)
-│   ├── sync_jobs.py       # Backward compat wrapper
-│   └── parse_pbs_logs.py  # Backward compat wrapper
-├── tests/                 # Test suite
-├── docs/
-│   └── schema.md          # Complete schema documentation
+│   ├── sync.py              # FK resolution, charge calculation
+│   ├── queries.py           # High-level query interface
+│   ├── charging.py          # Machine-specific charging rules
+│   ├── summary.py           # Daily summary generation
+│   ├── pbs_parsers.py       # PBS field/date parsers and record transformation
+│   ├── pbs_read_logs.py     # Local PBS log file scanning and streaming
+│   ├── exporters.py         # Data export formats (JSON, CSV, markdown)
+│   ├── SCHEMA.md            # Complete schema documentation
+│   └── log_config.py        # Logging configuration
 ├── data/
-│   ├── casper.db          # Casper jobs (gitignored)
-│   └── derecho.db         # Derecho jobs (gitignored)
-└── Makefile               # Convenience targets
+│   ├── casper.db            # Casper jobs (gitignored)
+│   └── derecho.db           # Derecho jobs (gitignored)
+└── Makefile                 # Convenience targets
 ```
 
 ## Database Schema
@@ -80,6 +82,7 @@ hpc-usage-queries/
 
 **job_charges**: Materialized charging calculations
 - Pre-computed: `cpu_hours`, `gpu_hours`, `memory_hours`
+- `qos_factor` (default 1.0) reserved for future QoS-based scaling
 - 1:1 with jobs table for instant charge lookups
 - Eliminates on-the-fly calculation overhead
 
@@ -100,7 +103,7 @@ hpc-usage-queries/
 - 64MB cache, 256MB memory-mapped I/O
 - Foreign key enforcement enabled
 
-See [docs/schema.md](../docs/schema.md) for complete details.
+See [SCHEMA.md](SCHEMA.md) for complete details.
 
 ## SQL Query Examples
 
@@ -217,6 +220,39 @@ session.close()
 
 See `job_history/queries.py` for complete API documentation.
 
+## Daily Summary Programmatic Access
+
+The pre-aggregated `daily_summary` table supports fast date-range queries by user, account, and queue:
+
+```python
+from datetime import date
+from job_history import get_session
+from job_history.queries import JobQueries
+
+session = get_session("derecho")
+queries = JobQueries(session)
+
+rows = queries.daily_summary_report(
+    start=date(2026, 2, 1),
+    end=date(2026, 2, 28),
+)
+
+# Each row: {'date', 'user', 'account', 'queue',
+#            'job_count', 'cpu_hours', 'gpu_hours', 'memory_hours'}
+for row in rows:
+    print(f"{row['date']}  {row['user']:15s}  {row['account']:12s}  "
+          f"{row['queue']:10s}  {row['job_count']:5d}  "
+          f"{row['cpu_hours']:10.1f} CPU-h  {row['gpu_hours']:8.1f} GPU-h")
+
+session.close()
+```
+
+CLI equivalent:
+
+```bash
+jobhist history --start-date 2026-02-01 --end-date 2026-02-28 daily-summary
+```
+
 ## qhist Frontend (bin/jobhist)
 
 `bin/jobhist` is a drop-in replacement for the `qhist` job query tool that replaces
@@ -292,6 +328,10 @@ jobhist history --group-by quarter unique-projects
 
 # Jobs per user per account
 jobhist history --start-date 2025-11-01 --end-date 2025-11-07 jobs-per-user
+
+# Daily usage summary (user × account × queue; end-date defaults to today)
+jobhist history --start-date 2026-02-01 daily-summary
+jobhist history --start-date 2026-02-01 --end-date 2026-02-28 daily-summary
 ```
 
 ### Resource Reports
@@ -314,6 +354,28 @@ jobhist resource --format md usage-history
 # - usage-history
 ```
 
+
+## Convenience Wrappers
+
+Three thin entry points expose each subcommand group independently, mirroring the
+`fs-scans-{import,query,analyze}` pattern. This allows selective deployment — for
+example, restricting `jobhist-sync` to administrators while making `jobhist-history`
+and `jobhist-resource` available to all users.
+
+| Command | Equivalent to | Defined in |
+|---------|--------------|------------|
+| `jobhist-sync` | `jobhist sync` | `job_history/wrappers/jobhist_sync.py` |
+| `jobhist-history` | `jobhist history` | `job_history/wrappers/jobhist_history.py` |
+| `jobhist-resource` | `jobhist resource` | `job_history/wrappers/jobhist_resource.py` |
+
+```bash
+# These are equivalent:
+jobhist history --start-date 2026-02-01 daily-summary
+jobhist-history --start-date 2026-02-01 daily-summary
+
+jobhist resource --start-date 2026-01-01 pie-user-cpu
+jobhist-resource --start-date 2026-01-01 pie-user-cpu
+```
 
 ## Requirements
 
