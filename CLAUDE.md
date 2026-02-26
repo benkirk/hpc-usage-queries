@@ -105,7 +105,3 @@ Normalize before comparing: `dt.replace(tzinfo=None)`.
 - Co-Authored-By trailer: `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>`
 - **Never auto-commit** — only commit when explicitly asked
 - **Never push** without explicit instruction
-
-## Current Branch
-
-`charging_calucations` (note: intentional misspelling in branch name)
