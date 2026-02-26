@@ -27,6 +27,10 @@ class ShellScriptItem(pytest.Item):
             capture_output=True,
             text=True,
         )
+        if result.stdout.strip():
+            self.add_report_section("call", "stdout", result.stdout.rstrip())
+        if result.stderr.strip():
+            self.add_report_section("call", "stderr", result.stderr.rstrip())
         if result.returncode != 0:
             raise ShellScriptError(result)
 
