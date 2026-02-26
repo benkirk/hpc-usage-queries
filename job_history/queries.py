@@ -1104,7 +1104,7 @@ class JobQueries:
     def daily_summary_report(
         self,
         start: date,
-        end: date,
+        end: Optional[date] = None,
     ) -> List[Dict[str, Any]]:
         """Get daily usage summary rows for a date range.
 
@@ -1119,6 +1119,9 @@ class JobQueries:
             List of dicts with keys: date, user, account, queue,
             job_count, cpu_hours, gpu_hours, memory_hours
         """
+        if end is None:
+            end = date.today()
+
         rows = (
             self.session.query(DailySummary)
             .filter(
