@@ -1,4 +1,7 @@
-"""Collection hooks for fs_scans tests."""
+"""Root pytest configuration shared across all test suites.
+
+Hooks defined here apply to both job_history/tests/ and fs_scans/tests/.
+"""
 
 import subprocess
 
@@ -7,9 +10,9 @@ import pytest
 
 # ---------------------------------------------------------------------------
 # Shell-script test collection
-# Any file matching *_test.sh in this directory tree is auto-collected and
+# Any file matching *_test.sh anywhere under testpaths is auto-collected and
 # run as a pytest test item.  No per-script Python shim is needed — just
-# drop a new *_test.sh file here and pytest picks it up automatically.
+# drop a new *_test.sh file in either module's tests/ directory.
 # ---------------------------------------------------------------------------
 
 class ShellScriptError(Exception):
