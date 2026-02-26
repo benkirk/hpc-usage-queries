@@ -49,6 +49,8 @@ def _get_sql_column(u, a, q, field: str):
         return q.queue_name
     elif field == "jobname":
         return Job.name
+    elif field == "priority":
+        return Job.priority
     elif field == "Exit_status":
         return Job.status
     return None

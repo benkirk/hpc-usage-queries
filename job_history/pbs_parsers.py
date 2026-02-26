@@ -360,6 +360,7 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         "vmemory": parse_pbs_memory_kb(resources_used.get("vmem")),
 
         # Resource types (PBS logs can provide these!)
+        "priority": resource_list.get("job_priority"),
         "cputype": cputype,
         "gputype": gputype,
         "resources": select_str,

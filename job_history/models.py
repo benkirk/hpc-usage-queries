@@ -239,7 +239,8 @@ class Job(LookupMixin, Base):
     job_record_obj = relationship("JobRecord", uselist=False, back_populates="job")
     job_charge_obj = relationship("JobCharge", uselist=False, back_populates="job")
 
-    # Queue and status
+    # Priority and status
+    priority = Column(Text)
     status = Column(Text, index=True)
 
     # Timestamps (stored in UTC)

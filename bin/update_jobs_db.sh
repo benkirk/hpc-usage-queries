@@ -27,6 +27,7 @@ for db in "${DB_PATHS[@]}"; do
     fi
     echo "Updating: $db"
     add_column_if_missing "$db" "job_charges" "qos_factor" "REAL DEFAULT 1.0"
+    add_column_if_missing "$db" "jobs" "priority" "TEXT"
     echo ""
 done
 

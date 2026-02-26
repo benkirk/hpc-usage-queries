@@ -364,8 +364,6 @@ def _sync_pbs_logs_single_day(
             start = record.get("start")
             end = record.get("end")
 
-            #print(record.get("record_object"))
-
             if not validate_timestamp_ordering(submit, eligible, start, end):
                 stats["errors"] += 1
                 stats["error_msg"] = "Invalid timestamp ordering"

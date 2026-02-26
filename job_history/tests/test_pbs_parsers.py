@@ -362,6 +362,32 @@ class TestParsePbsRecord:
         assert result["mpiprocs"] == 128
 
 
+    def test_parse_with_priority(self):
+        """Parse record with job_priority in Resource_List."""
+        class MockRecord:
+            id = "123.desched1"
+            short_id = "123"
+            account = '"TEST0001"'
+            user = "testuser"
+            queue = "cpu"
+            jobname = "test"
+            ctime = "1769670000"
+            etime = "1769670000"
+            start = "1769670010"
+            end = "1769670020"
+            Exit_status = "0"
+            run_count = "1"
+            Resource_List = {
+                "job_priority": "premium",
+                "select": "1:ncpus=1"
+            }
+            resources_used = {}
+
+        record = MockRecord()
+        result = parse_pbs_record(record, "derecho")
+
+        assert result["priority"] == "premium"
+
 class TestIntegrationWithSampleData:
     """Integration tests using actual sample data."""
 

@@ -35,6 +35,7 @@ class TestJobModel:
             elapsed=3600,
             numcpus=256,
             numnodes=2,
+            priority="premium",
         )
         in_memory_session.add(job)
         in_memory_session.commit()
@@ -44,6 +45,7 @@ class TestJobModel:
         assert retrieved is not None
         assert retrieved.user == "testuser"
         assert retrieved.numcpus == 256
+        assert retrieved.priority == "premium"
 
     def test_unique_constraint(self, in_memory_session):
         """Same job_id + submit should raise IntegrityError."""
