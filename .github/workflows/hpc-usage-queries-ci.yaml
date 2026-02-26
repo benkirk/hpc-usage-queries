@@ -1,4 +1,4 @@
-name: QHist Database CI
+name: HPC Usage Queries CI
 
 on:
   push:
@@ -60,3 +60,7 @@ jobs:
       - name: Run Test Suite
         run: |
           pytest -v
+
+      - name: Integration Tests Only, Capturing Output
+        run: |
+           pytest -rA */tests/*.sh
