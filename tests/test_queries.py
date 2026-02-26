@@ -103,12 +103,7 @@ def sample_jobs(in_memory_session):
     from job_history.charging import casper_charge
 
     for job in jobs:
-        charges = casper_charge({
-            'elapsed': job.elapsed or 0,
-            'numcpus': job.numcpus or 0,
-            'numgpus': job.numgpus or 0,
-            'memory': job.memory or 0,
-        })
+        charges = casper_charge(job)
         job_charge = JobCharge(
             job_id=job.id,
             cpu_hours=charges['cpu_hours'],

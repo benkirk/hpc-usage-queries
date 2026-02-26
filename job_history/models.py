@@ -315,8 +315,7 @@ class Job(LookupMixin, Base):
         """
         from .charging import casper_charge, derecho_charge
 
-        job_dict = self.to_dict()
-        return derecho_charge(job_dict) if machine == 'derecho' else casper_charge(job_dict)
+        return derecho_charge(self) if machine == 'derecho' else casper_charge(self)
 
     @property
     def pbs_record(self):

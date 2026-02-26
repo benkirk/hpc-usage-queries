@@ -1,5 +1,7 @@
 """Tests for charging calculation functions."""
 
+import types
+
 import pytest
 
 from job_history.charging import derecho_charge, casper_charge
@@ -19,14 +21,14 @@ class TestDerechoCharging:
 
     def test_gpu_production_queue(self):
         """GPU production: elapsed * numnodes * 4 / 3600."""
-        job = {
-            "elapsed": 3600,  # 1 hour
-            "numnodes": 2,
-            "numcpus": 256,
-            "numgpus": 8,
-            "memory": 107374182400,
-            "queue": "main@desched1:gpu",
-        }
+        job = types.SimpleNamespace(
+            elapsed=3600,  # 1 hour
+            numnodes=2,
+            numcpus=256,
+            numgpus=8,
+            memory=107374182400,
+            queue="main@desched1:gpu",
+        )
         result = derecho_charge(job)
 
         # GPU queue uses 4 GPUs per node for production
@@ -45,14 +47,14 @@ class TestDerechoCharging:
 
     def test_gpu_dev_queue(self):
         """GPU dev: elapsed * numgpus / 3600."""
-        job = {
-            "elapsed": 3600,
-            "numnodes": 1,
-            "numcpus": 32,
-            "numgpus": 4,
-            "memory": 32212254720,
-            "queue": "gpudev",
-        }
+        job = types.SimpleNamespace(
+            elapsed=3600,
+            numnodes=1,
+            numcpus=32,
+            numgpus=4,
+            memory=32212254720,
+            queue="gpudev",
+        )
         result = derecho_charge(job)
 
         # GPU dev uses actual GPUs: 1 hour * 4 gpus = 4 GPU-hours
@@ -69,13 +71,13 @@ class TestDerechoCharging:
 
     def test_zero_elapsed(self):
         """Zero elapsed time should result in zero charges."""
-        job = {
-            "elapsed": 0,
-            "numnodes": 2,
-            "numcpus": 256,
-            "memory": 107374182400,
-            "queue": "main",
-        }
+        job = types.SimpleNamespace(
+            elapsed=0,
+            numnodes=2,
+            numcpus=256,
+            memory=107374182400,
+            queue="main",
+        )
         result = derecho_charge(job)
 
         assert result["cpu_hours"] == 0.0
@@ -84,13 +86,13 @@ class TestDerechoCharging:
 
     def test_none_values(self):
         """None values should be treated as zero."""
-        job = {
-            "elapsed": None,
-            "numnodes": None,
-            "numcpus": None,
-            "memory": None,
-            "queue": None,
-        }
+        job = types.SimpleNamespace(
+            elapsed=None,
+            numnodes=None,
+            numcpus=None,
+            memory=None,
+            queue=None,
+        )
         result = derecho_charge(job)
 
         assert result["cpu_hours"] == 0.0
@@ -124,12 +126,12 @@ class TestCasperCharging:
 
     def test_zero_gpus(self):
         """Jobs without GPUs should have zero GPU-hours."""
-        job = {
-            "elapsed": 3600,
-            "numcpus": 8,
-            "numgpus": 0,
-            "memory": 32212254720,
-        }
+        job = types.SimpleNamespace(
+            elapsed=3600,
+            numcpus=8,
+            numgpus=0,
+            memory=32212254720,
+        )
         result = casper_charge(job)
 
         assert result["cpu_hours"] == 8.0
@@ -137,7 +139,7 @@ class TestCasperCharging:
 
     def test_none_values(self):
         """None values should be treated as zero."""
-        job = {}
+        job = types.SimpleNamespace()
         result = casper_charge(job)
 
         assert result["cpu_hours"] == 0.0
