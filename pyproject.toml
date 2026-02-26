@@ -27,10 +27,10 @@ analysis = [
 ]
 
 [project.scripts]
-# Main unified CLI
+# unified job history CLI
 jobhist = "job_history.cli:cli"
 
-# New unified CLI
+# unified filesystem scans CLI
 fs-scans = "fs_scans.cli.main:fs_scans_cli"
 
 # Convenience wrappers (allow selective deployment)
