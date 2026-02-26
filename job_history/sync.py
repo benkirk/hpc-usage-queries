@@ -365,6 +365,7 @@ def _sync_pbs_logs_single_day(
             end = record.get("end")
 
             #print(record.get("record_object"))
+            #print(record.get("priority"))
 
             if not validate_timestamp_ordering(submit, eligible, start, end):
                 stats["errors"] += 1
