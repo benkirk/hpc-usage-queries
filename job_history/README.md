@@ -217,6 +217,39 @@ session.close()
 
 See `job_history/queries.py` for complete API documentation.
 
+## Daily Summary Programmatic Access
+
+The pre-aggregated `daily_summary` table supports fast date-range queries by user, account, and queue:
+
+```python
+from datetime import date
+from job_history import get_session
+from job_history.queries import JobQueries
+
+session = get_session("derecho")
+queries = JobQueries(session)
+
+rows = queries.daily_summary_report(
+    start=date(2026, 2, 1),
+    end=date(2026, 2, 28),
+)
+
+# Each row: {'date', 'user', 'account', 'queue',
+#            'job_count', 'cpu_hours', 'gpu_hours', 'memory_hours'}
+for row in rows:
+    print(f"{row['date']}  {row['user']:15s}  {row['account']:12s}  "
+          f"{row['queue']:10s}  {row['job_count']:5d}  "
+          f"{row['cpu_hours']:10.1f} CPU-h  {row['gpu_hours']:8.1f} GPU-h")
+
+session.close()
+```
+
+CLI equivalent:
+
+```bash
+jobhist history --start-date 2026-02-01 --end-date 2026-02-28 daily-summary
+```
+
 ## qhist Frontend (bin/jobhist)
 
 `bin/jobhist` is a drop-in replacement for the `qhist` job query tool that replaces

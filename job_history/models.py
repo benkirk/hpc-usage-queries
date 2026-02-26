@@ -362,6 +362,7 @@ class JobCharge(Base):
     gpu_hours = Column(Float, nullable=False, default=0.0)
     memory_hours = Column(Float, nullable=False, default=0.0)
     charge_version = Column(Integer, default=1)
+    qos_factor = Column(Float, nullable=False, default=1.0)
 
     # Relationship back to Job
     job = relationship("Job", back_populates="job_charge_obj")
@@ -369,7 +370,7 @@ class JobCharge(Base):
     __table_args__ = (ForeignKeyConstraint(['job_id'], ['jobs.id'], ondelete='CASCADE'),)
 
     def __repr__(self):
-        return f"<JobCharge(job_id={self.job_id}, cpu={self.cpu_hours:.2f}, gpu={self.gpu_hours:.2f})>"
+        return f"<JobCharge(job_id={self.job_id}, cpu={self.cpu_hours:.2f}, gpu={self.gpu_hours:.2f}, qos={self.qos_factor:.2f})>"
 
 
 class JobRecord(Base):
