@@ -1,5 +1,7 @@
 """Shared fixtures for jobhist tests."""
 
+import types
+
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
@@ -113,48 +115,48 @@ def sample_parsed_record():
 @pytest.fixture
 def derecho_cpu_job():
     """Derecho CPU production job for charging tests."""
-    return {
-        "elapsed": 3600,  # 1 hour
-        "numnodes": 2,
-        "numcpus": 256,
-        "numgpus": 0,
-        "memory": 107374182400,  # 100 GB
-        "queue": "main",
-    }
+    return types.SimpleNamespace(
+        elapsed=3600,  # 1 hour
+        numnodes=2,
+        numcpus=256,
+        numgpus=0,
+        memory=107374182400,  # 100 GB
+        queue="main",
+    )
 
 
 @pytest.fixture
 def derecho_gpu_job():
     """Derecho GPU production job for charging tests."""
-    return {
-        "elapsed": 3600,  # 1 hour
-        "numnodes": 2,
-        "numcpus": 256,
-        "numgpus": 8,
-        "memory": 107374182400,  # 100 GB
-        "queue": "main@desched1:gpudev",
-    }
+    return types.SimpleNamespace(
+        elapsed=3600,  # 1 hour
+        numnodes=2,
+        numcpus=256,
+        numgpus=8,
+        memory=107374182400,  # 100 GB
+        queue="main@desched1:gpudev",
+    )
 
 
 @pytest.fixture
 def derecho_cpu_dev_job():
     """Derecho CPU dev job for charging tests."""
-    return {
-        "elapsed": 3600,  # 1 hour
-        "numnodes": 1,
-        "numcpus": 32,
-        "numgpus": 0,
-        "memory": 32212254720,  # 30 GB
-        "queue": "develop",
-    }
+    return types.SimpleNamespace(
+        elapsed=3600,  # 1 hour
+        numnodes=1,
+        numcpus=32,
+        numgpus=0,
+        memory=32212254720,  # 30 GB
+        queue="develop",
+    )
 
 
 @pytest.fixture
 def casper_job():
     """Casper job for charging tests."""
-    return {
-        "elapsed": 3600,  # 1 hour
-        "numcpus": 8,
-        "numgpus": 2,
-        "memory": 32212254720,  # 30 GB
-    }
+    return types.SimpleNamespace(
+        elapsed=3600,  # 1 hour
+        numcpus=8,
+        numgpus=2,
+        memory=32212254720,  # 30 GB
+    )

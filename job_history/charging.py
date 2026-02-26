@@ -6,10 +6,15 @@ has different charging rules based on queue type and resource usage.
 Charges are computed in Python during job import and stored in the job_charges table.
 """
 
-from typing import Callable
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from .models import Job
 
 # Type alias for charging function
-ChargingFunc = Callable[[dict], float]
+ChargingFunc = Callable[["Job"], dict]
 
 # ============================================================================
 # Machine-specific constants
@@ -27,10 +32,32 @@ SECONDS_PER_HOUR = 3600
 
 
 # ============================================================================
+# Helpers
+# ============================================================================
+
+def _get_pbs_record(job: "Job"):
+    """Safely retrieve the PbsRecord for a job.
+
+    pbs_record requires a live SQLAlchemy session (it lazy-loads job_record_obj
+    via a relationship).  It may be unavailable for:
+      - historical jobs imported before the JobRecord feature was added
+      - test fixtures that use SimpleNamespace rather than a real ORM object
+      - jobs accessed outside an active session (DetachedInstanceError)
+
+    Returns:
+        PbsRecord object, or None if unavailable for any reason
+    """
+    try:
+        return job.pbs_record
+    except Exception:
+        return None
+
+
+# ============================================================================
 # Python charging functions (for ad-hoc calculations)
 # ============================================================================
 
-def derecho_charge(job: dict) -> dict:
+def derecho_charge(job: "Job") -> dict:
     """Calculate charge metrics for a Derecho job.
 
     Derecho tracks CPU-hours, GPU-hours, and memory-hours.
@@ -40,17 +67,22 @@ def derecho_charge(job: dict) -> dict:
     the job_charges table.
 
     Args:
-        job: Job record dict with elapsed, numnodes, numcpus, numgpus, memory, queue
+        job: Job object with elapsed, numnodes, numcpus, numgpus, memory, queue attributes
 
     Returns:
         Dict with cpu_hours, gpu_hours, and memory_hours
     """
-    elapsed = job.get("elapsed") or 0
-    numnodes = job.get("numnodes") or 0
-    numcpus = job.get("numcpus") or 0
-    numgpus = job.get("numgpus") or 0
-    memory = job.get("memory") or 0  # in bytes
-    queue = (job.get("queue") or "").lower()
+    # Future expansion: pbs_record exposes the full original PBS accounting
+    # record and can be used to refine charging (e.g., actual node topology,
+    # exec_host breakdown, resource_list overrides).
+    _pbs_record = _get_pbs_record(job)  # noqa: F841 (unused until implemented)
+
+    elapsed = getattr(job, "elapsed", None) or 0
+    numnodes = getattr(job, "numnodes", None) or 0
+    numcpus = getattr(job, "numcpus", None) or 0
+    numgpus = getattr(job, "numgpus", None) or 0
+    memory = getattr(job, "memory", None) or 0  # in bytes
+    queue = (getattr(job, "queue", None) or "").lower()
 
     is_gpu_queue = "gpu" in queue
     is_dev_queue = "dev" in queue
@@ -80,7 +112,7 @@ def derecho_charge(job: dict) -> dict:
     }
 
 
-def casper_charge(job: dict) -> dict:
+def casper_charge(job: "Job") -> dict:
     """Calculate charge metrics for a Casper job.
 
     Casper tracks CPU-hours, memory-hours, and GPU-hours (when GPUs used).
@@ -89,15 +121,20 @@ def casper_charge(job: dict) -> dict:
     the job_charges table.
 
     Args:
-        job: Job record dict with elapsed, numcpus, numgpus, memory
+        job: Job object with elapsed, numcpus, numgpus, memory attributes
 
     Returns:
         Dict with cpu_hours, memory_hours, and gpu_hours
     """
-    elapsed = job.get("elapsed") or 0
-    numcpus = job.get("numcpus") or 0
-    numgpus = job.get("numgpus") or 0
-    memory = job.get("memory") or 0  # in bytes
+    # Future expansion: pbs_record exposes the full original PBS accounting
+    # record and can be used to refine charging (e.g., actual node topology,
+    # exec_host breakdown, resource_list overrides).
+    _pbs_record = _get_pbs_record(job)  # noqa: F841 (unused until implemented)
+
+    elapsed = getattr(job, "elapsed", None) or 0
+    numcpus = getattr(job, "numcpus", None) or 0
+    numgpus = getattr(job, "numgpus", None) or 0
+    memory = getattr(job, "memory", None) or 0  # in bytes
 
     return {
         "cpu_hours": elapsed * numcpus / SECONDS_PER_HOUR,
