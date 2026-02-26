@@ -287,7 +287,7 @@ class TestErrorHandling:
             session=test_db,
             machine="casper",
             log_dir=str(fixture_dir),
-            period="2026-01-01",  # This file doesn't exist
+            period="2099-01-01",  # This file doesn't exist
             verbose=False
         )
 

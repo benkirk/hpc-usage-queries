@@ -1,4 +1,4 @@
-name: QHist Database CI
+name: HPC Usage Queries CI
 
 on:
   push:
@@ -44,6 +44,9 @@ jobs:
       - name: Interrogate Environment
         run: |
           conda list
+          echo
+          pipdeptree --depth 3
+          echo
           df -h
           cat /etc/os-release 2>/dev/null || true
           uname -a
@@ -60,3 +63,7 @@ jobs:
       - name: Run Test Suite
         run: |
           pytest -v
+
+      - name: Integration Tests Only, Capturing Output
+        run: |
+           pytest -rA */tests/*.sh

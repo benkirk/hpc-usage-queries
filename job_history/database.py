@@ -9,8 +9,8 @@ from sqlalchemy.orm import sessionmaker
 
 from .models import Base
 
-# Default database directory
-DATA_DIR = Path(__file__).parent.parent / "data"
+# Default database directory, can be overridden by environment variable
+JOB_HISTORY_DATA_DIR = Path(os.environ.get("JOB_HISTORY_DATA_DIR", Path(__file__).parent.parent / "data"))
 
 # Valid machine names
 VALID_MACHINES = {"casper", "derecho"}
@@ -56,7 +56,7 @@ def get_db_path(machine: str) -> Path:
     if env_var in os.environ:
         return Path(os.environ[env_var])
 
-    return DATA_DIR / f"{machine}.db"
+    return JOB_HISTORY_DATA_DIR / f"{machine}.db"
 
 
 def get_engine(machine: str, echo: bool = False):
