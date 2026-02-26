@@ -44,6 +44,9 @@ jobs:
       - name: Interrogate Environment
         run: |
           conda list
+          echo
+          pipdeptree --depth 3
+          echo
           df -h
           cat /etc/os-release 2>/dev/null || true
           uname -a
