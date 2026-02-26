@@ -13,7 +13,7 @@ config_env := module load conda >/dev/null 2>&1 || true && . $(CONDA_ROOT)/etc/p
 
 PYTHON := python3
 SCRIPTS := scripts
-DATA_DIR := data
+JOB_HISTORY_DATA_DIR ?= data
 
 # Default date is today in YYYY-MM-DD format
 DATE ?= $(shell date +%Y-%m-%d)
@@ -33,8 +33,8 @@ help:
 	@echo "  make clean            Remove all database files"
 	@echo ""
 	@echo "Database files:"
-	@echo "  $(DATA_DIR)/casper.db   - Casper jobs"
-	@echo "  $(DATA_DIR)/derecho.db  - Derecho jobs"
+	@echo "  $(JOB_HISTORY_DATA_DIR)/casper.db   - Casper jobs"
+	@echo "  $(JOB_HISTORY_DATA_DIR)/derecho.db  - Derecho jobs"
 	@echo ""
 	@echo "Variables:"
 	@echo "  DATE=YYYY-MM-DD        Date to sync (default: today)"
@@ -49,8 +49,8 @@ help:
 init-db:
 	@echo "Initializing databases..."
 	@$(PYTHON) -c "from job_history import init_db; init_db()"
-	@echo "Created $(DATA_DIR)/casper.db"
-	@echo "Created $(DATA_DIR)/derecho.db"
+	@echo "Created $(JOB_HISTORY_DATA_DIR)/casper.db"
+	@echo "Created $(JOB_HISTORY_DATA_DIR)/derecho.db"
 
 sync-casper:
 ifdef START
@@ -70,7 +70,7 @@ sync-all: sync-casper sync-derecho
 
 clean:
 	@echo "Removing databases..."
-	@rm -f $(DATA_DIR)/casper.db $(DATA_DIR)/derecho.db $(DATA_DIR)/qhist.db
+	@rm -f $(JOB_HISTORY_DATA_DIR)/casper.db $(JOB_HISTORY_DATA_DIR)/derecho.db $(JOB_HISTORY_DATA_DIR)/qhist.db
 	@echo "Done."
 
 # Development targets

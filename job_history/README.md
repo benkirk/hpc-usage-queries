@@ -28,6 +28,28 @@ make sync-all START=20250801 END=20251123
 python -m job_history.queries
 ```
 
+## Configuration
+
+Database location can be configured via environment variables.
+
+| Configuration | Environment Variable | Default |
+|---------------|----------------------|---------|
+| Data directory | `JOB_HISTORY_DATA_DIR` | `data/` (relative to project root) |
+| Derecho DB file | `QHIST_DERECHO_DB` | `{data_dir}/derecho.db` |
+| Casper DB file | `QHIST_CASPER_DB` | `{data_dir}/casper.db` |
+
+### Examples
+
+```bash
+# Use custom data directory
+export JOB_HISTORY_DATA_DIR=/path/to/my/data
+make init-db
+
+# Use explicit path for a specific machine's database
+export QHIST_DERECHO_DB=/tmp/derecho_test.db
+jobhist sync -m derecho -d 2026-01-15
+```
+
 ## Project Structure
 
 ```
