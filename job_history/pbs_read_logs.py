@@ -115,12 +115,6 @@ def fetch_jobs_from_pbs_logs(
 
         # Process each record
         for pbs_record in records:
-
-            # DEBUGGING
-            #print(pbs_record)
-            #for k,v in pbs_record.__dict__.items():
-            #    print(f"  {k}: {v}")
-
             # Parse to database format
             try:
                 job_dict = parse_pbs_record(pbs_record, machine)
@@ -135,12 +129,6 @@ def fetch_jobs_from_pbs_logs(
             if not job_dict.get("job_id"):
                 logger.warning("Skipping record with missing job_id")
                 continue
-
-            # capture priority, if any (inside the record Resource List)
-            if hasattr(pbs_record, "Resource_List"):
-                job_priority = pbs_record.Resource_List.get("job_priority")
-                if job_priority:
-                    job_dict["priority"] = job_priority
 
             # Validate timestamp ordering
             submit = job_dict.get("submit")

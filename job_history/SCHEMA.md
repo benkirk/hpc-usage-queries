@@ -59,6 +59,7 @@ Core job records with foreign keys to normalized tables.
 | `id` | INTEGER | PK, AUTO | Primary key (handles scheduler ID wrap) |
 | `job_id` | TEXT | YES | Scheduler job ID (e.g., "2712367.desched1") |
 | `short_id` | INTEGER | YES | Base job number (array index stripped) |
+| `priority` | TEXT | NO | Job priority (e.g., premium, regular, economy) |
 | `user` | HYBRID | - | Username (hybrid property → user_obj.username) |
 | `account` | HYBRID | - | Account name (hybrid property → account_obj.account_name) |
 | `queue` | HYBRID | - | Queue name (hybrid property → queue_obj.queue_name) |
