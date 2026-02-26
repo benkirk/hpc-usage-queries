@@ -70,7 +70,11 @@ fs_scans/
 │   ├── access_history.py  # Access time histogram queries
 │   ├── file_size.py       # File size histogram queries
 │   └── histogram_common.py # Shared histogram utilities
-└── wrappers/               # Legacy wrapper scripts (deprecated)
+├── wrappers/               # Convenience entry points for selective deployment
+│   ├── fs_scans_import.py  # fs-scans-import → fs-scans import
+│   ├── fs_scans_query.py   # fs-scans-query  → fs-scans query
+│   └── fs_scans_analyze.py # fs-scans-analyze → fs-scans analyze
+└── tests/                  # Test suite (pytest)
 ```
 
 **Design principles:**
@@ -606,12 +610,3 @@ User Data per Bucket               Data                         # Files
 - Less accurate for mixed directories (e.g., home directories)
 - Warning displayed: `"Note: Size distribution is approximate for path-filtered queries"`
 
----
-
-## Development Branch Status
-
-This implementation is on the `histogram` branch. Key commits:
-- `8715c61` - Add histogram collection during filesystem scan import
-- `a1459f1` - Remove single-threaded fallback code from import pipeline
-
-To merge into main, ensure all databases are re-imported to populate histogram tables.

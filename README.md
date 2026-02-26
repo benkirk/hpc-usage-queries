@@ -14,17 +14,22 @@ Both tools use SQLite databases for efficient querying and provide Python APIs w
 Historical job data tracking for Casper and Derecho HPC systems.
 
 **Key Features:**
-- Optimized SQLite schema with high-performance queries.
+- Optimized SQLite schema with high-performance queries
 - Pre-computed charging calculations (CPU-hours, GPU-hours, memory-hours)
 - Daily summary tables for fast historical queries
 - Python query interface and CLI reporting tools
-- SSH-based sync with duplicate detection
+- Local PBS log sync with duplicate detection
 
 **Quick Start:**
 ```bash
 make init-db
-qhist-sync --verbose
+jobhist sync -m derecho -l ./data/pbs_logs/derecho --start 2026-01-01
 ```
+
+**Convenience wrappers** allow selective deployment:
+- `jobhist-sync` — sync only (restrict to administrators)
+- `jobhist-history` — time history reports
+- `jobhist-resource` — resource-centric reports
 
 **Common Use Cases:**
 - Track resource consumption by user, account, or queue
@@ -66,7 +71,7 @@ See [fs_scans/README.md](fs_scans/README.md) for complete documentation.
 
 - Python 3.10+
 - SQLAlchemy
-- SSH access to NCAR systems (for QHist sync)
+- Access to PBS accounting log files
 
 ## License
 
