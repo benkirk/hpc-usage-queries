@@ -38,6 +38,11 @@ fs-scans-import = "fs_scans.wrappers.fs_scans_import:main"
 fs-scans-query = "fs_scans.wrappers.fs_scans_query:main"
 fs-scans-analyze = "fs_scans.wrappers.fs_scans_analyze:main"
 
+# jobhist convenience wrappers (allow selective deployment)
+jobhist-sync = "job_history.wrappers.jobhist_sync:main"
+jobhist-history = "job_history.wrappers.jobhist_history:main"
+jobhist-resource = "job_history.wrappers.jobhist_resource:main"
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
