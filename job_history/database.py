@@ -16,11 +16,12 @@ JOB_HISTORY_DATA_DIR = Path(os.environ.get("JOB_HISTORY_DATA_DIR", Path(__file__
 VALID_MACHINES = {"casper", "derecho"}
 
 
-@event.listens_for(Engine, "connect")
-def set_sqlite_pragma(dbapi_conn, connection_record):
+def _set_sqlite_pragma(dbapi_conn, connection_record):
     """Configure SQLite for optimal performance.
 
-    This event listener runs every time a connection is established.
+    Registered per-engine (not globally) inside get_engine() so that it only
+    fires on SQLite connections and never on other database engines (e.g. MySQL).
+
     - WAL mode: Allows concurrent readers during writes
     - synchronous=NORMAL: Faster writes with acceptable durability
     - cache_size: 64MB cache for better query performance
@@ -36,6 +37,10 @@ def set_sqlite_pragma(dbapi_conn, connection_record):
     cursor.execute("PRAGMA mmap_size=268435456")  # 256MB
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
+
+
+# Keep the old name as an alias so callers that imported it directly still work.
+set_sqlite_pragma = _set_sqlite_pragma
 
 
 def get_db_path(machine: str) -> Path:
@@ -74,7 +79,9 @@ def get_engine(machine: str, echo: bool = False):
     # Ensure parent directory exists
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    return create_engine(f"sqlite:///{db_path}", echo=echo)
+    engine = create_engine(f"sqlite:///{db_path}", echo=echo)
+    event.listen(engine, "connect", _set_sqlite_pragma)
+    return engine
 
 
 def get_session(machine: str, engine=None):
