@@ -9,12 +9,17 @@ dependencies = [
     "click",
     "pbsparse",
     "pbs-qhist",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+]
+
+postgres = [
+    "psycopg2-binary",
 ]
 
 analysis = [

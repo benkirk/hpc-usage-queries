@@ -1,0 +1,88 @@
+name: HPC Usage Queries CI (PostgreSQL)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    defaults:
+      run:
+        shell: bash -el {0}
+    name: Run Test Suite (postgres backend)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      JH_DB_BACKEND: postgres
+      JH_PG_HOST: localhost
+      JH_PG_PORT: 5432
+      JH_PG_USER: postgres
+      JH_PG_PASSWORD: postgres
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: List Source Tree
+        run: |
+          pwd
+          find * ! -type d
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-activate-base: false
+          activate-environment: ./conda-env/
+          environment-file: conda-env.yaml
+
+      - name: Install Project
+        run: pip install -e ".[dev,postgres]"
+
+      - name: Interrogate Environment
+        run: |
+          conda list
+          echo
+          pipdeptree --depth 3
+          echo
+          df -h
+          cat /etc/os-release 2>/dev/null || true
+          uname -a
+          nvidia-smi 2>/dev/null || true
+          free -g
+          lscpu
+          echo && echo && echo
+          echo '----------------------------------------------------------------'
+          which python3
+          echo "CONDA_PREFIX=${CONDA_PREFIX}"
+          echo "PYTHONPATH=${PYTHONPATH}"
+          python3 --version
+          echo "JH_DB_BACKEND=${JH_DB_BACKEND}"
+          python3 -c "import psycopg2; print(f'psycopg2 {psycopg2.__version__}')"
+
+      - name: Run Test Suite
+        run: |
+          pytest -v
+
+      - name: Integration Tests Only, Capturing Output
+        run: |
+           pytest -rA */tests/*.sh

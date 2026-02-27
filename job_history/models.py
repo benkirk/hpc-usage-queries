@@ -252,7 +252,7 @@ class Job(LookupMixin, Base):
     # Time metrics (in seconds)
     elapsed = Column(Integer)
     walltime = Column(Integer)
-    cputime = Column(Integer)
+    cputime = Column(BigInteger)  # total CPU-seconds; can exceed 2^31 for large parallel jobs
 
     # Resource allocation
     numcpus = Column(Integer)

@@ -4,7 +4,7 @@ import click
 from pathlib import Path
 from datetime import datetime, timedelta
 from .common import machine_option, date_options, sync_options, validate_dates, print_sync_stats
-from ..database import get_session, init_db, get_db_path
+from ..database import get_session, init_db, get_db_url
 from ..sync import sync_pbs_logs_bulk
 
 
@@ -56,7 +56,7 @@ def sync(machine, log_path, date, start, end, batch_size, dry_run, verbose, forc
 
     # Initialize database
     if verbose:
-        click.echo(f"Initializing database: {get_db_path(machine)}")
+        click.echo(f"Initializing database: {get_db_url(machine)}")
 
     engine = init_db(machine)
     session = get_session(machine, engine)
