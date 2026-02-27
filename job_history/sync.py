@@ -1,7 +1,6 @@
 """Sync job data locally from PBS accounting logs."""
 from datetime import datetime, date, timedelta
 
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 # Optional dependency: rich
