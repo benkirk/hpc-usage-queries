@@ -318,11 +318,15 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         cputype = queue_types.get("cputype")
         gputype = queue_types.get("gputype")
 
-    # Parse account field - remove surrounding quotes
-    # PBS logs have: account="UCSD0047"
-    account = pbs_record.account
-    if account and account.startswith('"') and account.endswith('"'):
-        account = account[1:-1]
+    # very occassionally records with no account fall through.
+    try:
+        # Parse account field - remove surrounding quotes
+        # PBS logs have: account="UCSD0047"
+        account = pbs_record.account
+        if account and account.startswith('"') and account.endswith('"'):
+            account = account[1:-1]
+    except AttributeError:
+        account = "none"
 
     result = {
         # Job identification
