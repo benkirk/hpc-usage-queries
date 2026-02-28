@@ -19,28 +19,10 @@ from typing import Iterator
 
 from sqlalchemy.orm import joinedload, aliased
 
-from .database import get_db_path, get_session, VALID_MACHINES, Job, User, Account, Queue
+from .database import get_session, VALID_MACHINES, Job, User, Account, Queue
 
 logger = logging.getLogger(__name__)
 
-
-def db_available(machine: str) -> bool:
-    """Return True if a jobhist database is available for the given machine.
-
-    For the SQLite backend this checks that the .db file exists.
-    For the PostgreSQL backend this checks that credentials are configured;
-    actual connectivity is verified when the session is first opened.
-    """
-    from .database.config import JobHistoryConfig
-    if machine not in VALID_MACHINES:
-        return False
-    try:
-        if JobHistoryConfig.DB_BACKEND == 'postgres':
-            JobHistoryConfig.validate_postgres()
-            return True
-        return get_db_path(machine).exists()
-    except Exception:
-        return False
 
 
 def _get_sql_column(u, a, q, field: str):

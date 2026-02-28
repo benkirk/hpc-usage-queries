@@ -17,6 +17,7 @@ from .models import (
     LookupMixin,
 )
 from .session import (
+    db_available,
     get_db_path,
     get_db_url,
     get_engine,
@@ -37,6 +38,7 @@ __all__ = [
     "Queue",
     "LookupCache",
     "LookupMixin",
+    "db_available",
     "get_db_path",
     "get_db_url",
     "get_engine",
