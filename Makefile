@@ -20,7 +20,7 @@ DATE ?= $(shell date +%Y-%m-%d)
 # Root of locally-mirrored PBS accounting logs (see sync-logs target)
 LOG_DIR ?= ./data/sample_pbs_logs
 
-.PHONY: help init-db sync-casper sync-derecho sync-all clean
+.PHONY: help init-db sync-casper sync-derecho sync-all clean update-vendor
 
 help:
 	@echo "QHist Database Management"
@@ -31,6 +31,7 @@ help:
 	@echo "  make sync-derecho     Sync Derecho jobs for DATE"
 	@echo "  make sync-all         Sync both machines for DATE"
 	@echo "  make clean            Remove all database files"
+	@echo "  make update-vendor    Re-download vendored third-party files"
 	@echo ""
 	@echo "Database files:"
 	@echo "  $(JOB_HISTORY_DATA_DIR)/casper.db   - Casper jobs"
@@ -104,3 +105,11 @@ solve-%: %.yaml
 sync-logs:
 	rsync -axv derecho:/ncar/pbs/accounting/20* ./data/sample_pbs_logs/derecho/
 	rsync -axv casper:/ssg/pbs/casper/accounting/2026* ./data/sample_pbs_logs/casper/
+
+update-vendor:
+	@echo "Updating vendored pbs-parser-ncar/ncar.py..."
+	@curl -sSf https://raw.githubusercontent.com/NCAR/pbs-parser-ncar/main/ncar.py \
+	    -o job_history/_vendor/pbs-parser-ncar/ncar.py
+	@printf '# Vendored from https://github.com/NCAR/pbs-parser-ncar\n# %s\n# Local modifications: none\n' \
+	    "$$(date +%Y-%m-%d)" > job_history/_vendor/pbs-parser-ncar/README
+	@echo "Done. Review with: git diff job_history/_vendor/"

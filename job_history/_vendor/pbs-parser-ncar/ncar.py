@@ -1,6 +1,3 @@
-# Vendored from https://github.com/NCAR/pbs-parser-ncar
-# Commit: d0925ab1afc4ac3cbacbddbbc366d3db2db80b99
-# Local modifications: none
 from pbsparse import PbsRecord
 
 class DerechoRecord(PbsRecord):
