@@ -314,7 +314,7 @@ class Job(LookupMixin, Base):
         Returns:
             Dictionary with keys: cpu_hours, gpu_hours, memory_hours
         """
-        from .charging import casper_charge, derecho_charge
+        from ..sync.charging import casper_charge, derecho_charge
 
         return derecho_charge(self) if machine == 'derecho' else casper_charge(self)
 
@@ -434,7 +434,7 @@ class JobRecord(Base):
             decompressed = gzip.decompress(self.compressed_data)
             return pickle.loads(decompressed)
         except Exception as e:
-            from .log_config import get_logger
+            from ..log_config import get_logger
             logger = get_logger(__name__)
             logger.error(f"Failed to decompress/unpickle JobRecord for job {self.job_id}: {e}")
             return None

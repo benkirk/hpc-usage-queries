@@ -13,7 +13,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
 
-from .models import Job, DailySummary, JobCharge
+from ..database import Job, DailySummary, JobCharge
 
 
 from sqlalchemy import case
@@ -143,7 +143,7 @@ class QueryConfig:
 
         Returns as a static method to avoid issues with Job reference at import time.
         """
-        from .charging import BYTES_PER_GB
+        from ..sync.charging import BYTES_PER_GB
         BYTES_PER_MB = 1024 * 1024
 
         return {
@@ -540,7 +540,7 @@ class JobQueries:
             >>> # CPU job durations by month
             >>> queries.job_durations('cpu', start_date, end_date, period='month')
         """
-        from .query_builders import ResourceTypeResolver, PeriodGrouper
+        from .builders import ResourceTypeResolver, PeriodGrouper
 
         # Resolve resource type to queues and hours field (machine-specific)
         queues, hours_field = ResourceTypeResolver.resolve(resource_type, self.machine, JobCharge)
@@ -598,7 +598,7 @@ class JobQueries:
             >>> # GPU job memory-per-rank by month
             >>> queries.job_memory_per_rank('gpu', start_date, end_date, period='month')
         """
-        from .query_builders import ResourceTypeResolver, PeriodGrouper
+        from .builders import ResourceTypeResolver, PeriodGrouper
 
         # Resolve resource type to queues and hours field (machine-specific)
         queues, hours_field = ResourceTypeResolver.resolve(resource_type, self.machine, JobCharge)
@@ -750,7 +750,7 @@ class JobQueries:
         Returns:
             SQLAlchemy subquery for resource stats (users, projects, jobs, hours)
         """
-        from .query_builders import ResourceTypeResolver
+        from .builders import ResourceTypeResolver
 
         queues, hours_field = ResourceTypeResolver.resolve(
             resource_type, self.machine, JobCharge
@@ -846,7 +846,7 @@ class JobQueries:
             Each dict contains: Date, #-Users, #-Proj, #-CPU-Users, #-CPU-Proj,
             #-CPU-Jobs, #-CPU-Hrs, #-GPU-Users, #-GPU-Proj, #-GPU-Jobs, #-GPU-Hrs
         """
-        from .query_builders import PeriodGrouper
+        from .builders import PeriodGrouper
 
         # Get period grouping expression
         period_col = PeriodGrouper.get_period_func(period, Job.end)
@@ -1197,7 +1197,7 @@ class JobQueries:
             List of dicts with 'period', 'user', 'account', and 'job_count' keys,
             ordered by period, then primary_entity, then secondary_entity.
         """
-        from .query_builders import PeriodGrouper
+        from .builders import PeriodGrouper
 
         period_func = PeriodGrouper.get_period_func(period, Job.end)
 
@@ -1265,7 +1265,7 @@ class JobQueries:
         Returns:
             A list of dicts with 'period' and 'project_count' keys.
         """
-        from .query_builders import PeriodGrouper
+        from .builders import PeriodGrouper
 
         # Get period function
         period_func = PeriodGrouper.get_period_func(period, Job.end)
@@ -1297,7 +1297,7 @@ class JobQueries:
         Returns:
             A list of dicts with 'period' and 'user_count' keys.
         """
-        from .query_builders import PeriodGrouper
+        from .builders import PeriodGrouper
 
         # Get period function
         period_func = PeriodGrouper.get_period_func(period, Job.end)
@@ -1421,7 +1421,7 @@ class JobQueries:
             ... )
             >>> # Results contain data from both machines with 'machine' field
         """
-        from .database import get_session
+        from ..database import get_session
 
         all_results = []
 
@@ -1447,7 +1447,7 @@ if __name__ == "__main__":
     """Example usage of the JobQueries interface."""
     import sys
     from datetime import timedelta
-    from .database import get_session
+    from ..database import get_session
 
     # Check if database exists
     try:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from job_history.pbs_parsers import (
+from job_history.sync.pbs import (
     parse_pbs_time,
     parse_pbs_memory_kb,
     parse_pbs_memory_gb,
@@ -398,7 +398,7 @@ class TestIntegrationWithSampleData:
     def test_parse_sample_logs(self):
         """Parse sample PBS logs and verify record count."""
         import pbsparse
-        from job_history.pbs_parsers import parse_pbs_record
+        from job_history.sync.pbs import parse_pbs_record
 
         log_path = "./data/sample_pbs_logs/derecho/20260129"
         records = list(pbsparse.get_pbs_records(log_path, type_filter="E"))
@@ -428,7 +428,7 @@ class TestIntegrationWithSampleData:
     )
     def test_fetch_jobs_iterator(self):
         """Test the full iterator interface."""
-        from job_history.pbs_read_logs import fetch_jobs_from_pbs_logs
+        from job_history.sync.pbs import fetch_jobs_from_pbs_logs
 
         log_dir = "./data/sample_pbs_logs/derecho"
         jobs = list(fetch_jobs_from_pbs_logs(

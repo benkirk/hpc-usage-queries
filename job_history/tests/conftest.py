@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
-from job_history.models import Base
+from job_history.database import Base
 
 
 # Apply SQLite optimizations for test databases

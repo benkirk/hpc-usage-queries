@@ -1,4 +1,10 @@
-"""Sync job data locally from PBS accounting logs."""
+"""Sync job data locally from PBS accounting logs.
+
+Contains:
+- JobImporter: FK-resolution helper (unchanged)
+- SyncPBSLogs: OOP sync driver implementing SyncBase
+- sync_pbs_logs_bulk: module-level function (kept for backward compat)
+"""
 from datetime import datetime, date, timedelta
 
 from sqlalchemy.orm import Session
@@ -10,9 +16,10 @@ try:
 except ImportError:
     track = None
 
-from .database import VALID_MACHINES
-from .models import Job, LookupCache
-from .pbs_parsers import date_range, date_range_length, parse_date_string
+from ..database import VALID_MACHINES
+from ..database import Job, LookupCache
+from .base import SyncBase
+from .pbs import date_range, date_range_length, parse_date_string, fetch_jobs_from_pbs_logs
 from .utils import normalize_datetime_to_naive, validate_timestamp_ordering
 
 
@@ -48,6 +55,45 @@ class JobImporter:
             prepared['queue_id'] = self.cache.get_or_create_queue(prepared['queue']).id
 
         return prepared
+
+
+class SyncPBSLogs(SyncBase):
+    """Sync driver for PBS accounting logs."""
+
+    @classmethod
+    def scheduler_name(cls) -> str:
+        return "PBS"
+
+    def fetch_records(self, log_dir, period=None, start_date=None, end_date=None):
+        """Yield normalized job dicts from PBS log files."""
+        return fetch_jobs_from_pbs_logs(
+            log_dir=log_dir, machine=self.machine,
+            date=period, start_date=start_date, end_date=end_date,
+        )
+
+    def sync(self, log_dir, period=None, start_date=None, end_date=None,
+             dry_run=False, batch_size=1000, verbose=False,
+             force=False, generate_summary=True) -> dict:
+        """Parse → insert → charge → summarize PBS logs."""
+        return sync_pbs_logs_bulk(
+            session=self.session,
+            machine=self.machine,
+            log_dir=log_dir,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            dry_run=dry_run,
+            batch_size=batch_size,
+            verbose=verbose,
+            force=force,
+            generate_summary=generate_summary,
+        )
+
+    def _sync_single_day(self, log_dir, period, dry_run, batch_size, verbose=False) -> dict:
+        """Sync a single day of PBS logs."""
+        return _sync_pbs_logs_single_day(
+            self.session, self.machine, log_dir, period, dry_run, batch_size, verbose
+        )
 
 
 def _insert_batch(session: Session, records: list[dict], importer: JobImporter) -> int:
@@ -103,7 +149,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter) 
 
     # Calculate charges for newly inserted jobs
     if rows_inserted > 0:
-        from .models import JobCharge
+        from ..database import JobCharge
         from sqlalchemy import and_
 
         # Find jobs that were just inserted (by job_id and submit time)
@@ -149,7 +195,7 @@ def _insert_batch(session: Session, records: list[dict], importer: JobImporter) 
                 job_ids_map[(r['job_id'], submit_naive)] = r
 
         if job_ids_map:
-            from .models import JobRecord
+            from ..database import JobRecord
 
             # Query ALL newly inserted jobs (not just those without charges)
             all_new_jobs = (
@@ -219,7 +265,7 @@ def sync_pbs_logs_bulk(
     """
     from pathlib import Path
     from .summary import get_summarized_dates, generate_daily_summary
-    from .pbs_read_logs import fetch_jobs_from_pbs_logs
+    from .pbs import fetch_jobs_from_pbs_logs
 
     # Validate machine
     if machine not in VALID_MACHINES:
@@ -339,7 +385,7 @@ def _sync_pbs_logs_single_day(
     Returns:
         Dictionary with sync statistics for this day
     """
-    from .pbs_read_logs import fetch_jobs_from_pbs_logs
+    from .pbs import fetch_jobs_from_pbs_logs
 
     stats = {"fetched": 0, "inserted": 0, "errors": 0, "failed": False, "error_msg": None}
     batch = []

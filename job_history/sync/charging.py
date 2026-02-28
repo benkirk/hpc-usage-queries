@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from .models import Job
+    from ..database.models import Job
 
 # Type alias for charging function
 ChargingFunc = Callable[["Job"], dict]

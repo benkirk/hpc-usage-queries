@@ -5,8 +5,8 @@ from datetime import date, datetime, timezone
 import pytest
 from sqlalchemy import text
 
-from job_history.models import Job, DailySummary
-from job_history.summary import get_summarized_dates, generate_daily_summary
+from job_history.database import Job, DailySummary
+from job_history.sync.summary import get_summarized_dates, generate_daily_summary
 
 
 class TestGetSummarizedDates:
@@ -68,7 +68,7 @@ class TestGenerateDailySummary:
     @pytest.fixture
     def db_with_jobs_and_view(self, in_memory_engine, in_memory_session):
         """Create jobs and related records for testing."""
-        from job_history.models import User, Account, Queue, JobCharge
+        from job_history.database import User, Account, Queue, JobCharge
 
         # Create lookup records
         user1 = User(username="user1")
@@ -191,7 +191,7 @@ class TestGenerateDailySummary:
         assert result["rows_inserted"] == 1
 
         # Verify marker row was created
-        from job_history.models import DailySummary
+        from job_history.database import DailySummary
         marker = session.query(DailySummary).filter(
             DailySummary.date == date(2025, 1, 14)
         ).first()

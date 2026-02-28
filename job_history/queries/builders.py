@@ -249,7 +249,7 @@ class ResourceTypeResolver:
             >>> # queues = [queue_id_1, queue_id_2]
             >>> # hours = JobCharge.gpu_hours
         """
-        from .queries import QueryConfig
+        from .jobs import QueryConfig
 
         if resource_type == 'cpu':
             queues = QueryConfig.get_cpu_queues(machine)

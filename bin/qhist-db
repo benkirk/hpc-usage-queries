@@ -38,7 +38,7 @@ from qhist.qhist import (
     filter_help,
     ONE_DAY,
 )
-from job_history.jobhist_compat import db_available, db_get_records
+from job_history.qhist_plugin import db_available, db_get_records
 
 
 def main():
