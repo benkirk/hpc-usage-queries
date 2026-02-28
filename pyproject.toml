@@ -7,7 +7,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "rich",
     "click",
-    "pbsparse",
+    "pbsparse>=0.2.6",
     "pbs-qhist",
     "python-dotenv",
 ]
