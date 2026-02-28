@@ -320,16 +320,26 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
 def _get_record_class(machine: str) -> type:
     """Return the appropriate PbsRecord subclass for the given machine.
 
-    For Derecho, uses DerechoRecord from the optional pbs-qhist package
-    (qhist.extensions.ncar) if available, falling back to PbsRecord.
+    For Derecho, loads DerechoRecord from the vendored pbs-parser-ncar package
+    (job_history/_vendor/pbs-parser-ncar/ncar.py), falling back to PbsRecord
+    if the vendored file is absent or fails to load.
     All other machines use PbsRecord directly.
     """
     if machine == "derecho":
         try:
-            from qhist.extensions.ncar import DerechoRecord
-            return DerechoRecord
-        except ImportError:
-            logger.debug("qhist.extensions.ncar not available; using base PbsRecord for derecho")
+            import importlib.util, sys
+            _MOD_NAME = "job_history._vendor.ncar"
+            if _MOD_NAME not in sys.modules:
+                _vendor_ncar = (
+                    Path(__file__).parent.parent / "_vendor" / "pbs-parser-ncar" / "ncar.py"
+                )
+                spec = importlib.util.spec_from_file_location(_MOD_NAME, _vendor_ncar)
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[_MOD_NAME] = mod  # register before exec so pickle can find it
+                spec.loader.exec_module(mod)
+            return sys.modules[_MOD_NAME].DerechoRecord
+        except Exception as e:
+            logger.debug(f"Vendored DerechoRecord unavailable ({e}); using base PbsRecord")
     return pbsparse.PbsRecord
 
 
