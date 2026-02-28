@@ -389,7 +389,8 @@ class JobQueries:
 
         # Build range case and wait time calculation
         range_case = self._build_range_case(ranges, overflow, field)
-        wait_time_hours = (func.julianday(Job.start) - func.julianday(Job.eligible)) * 24
+        from .builders import _TimeDiffHours
+        wait_time_hours = _TimeDiffHours(Job.eligible, Job.start)
 
         # Build subquery
         subquery = self.session.query(

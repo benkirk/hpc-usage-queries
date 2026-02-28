@@ -2,56 +2,59 @@
 
 import pytest
 from sqlalchemy import func
+from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
+from sqlalchemy.dialects.postgresql import dialect as pg_dialect
 from job_history.queries.builders import PeriodGrouper, ResourceTypeResolver
+
+
+def _sql(expr, dialect_cls):
+    """Compile *expr* against *dialect_cls* and return the SQL string."""
+    return str(expr.compile(dialect=dialect_cls()))
 
 
 class TestPeriodGrouper:
     """Tests for the PeriodGrouper class."""
 
     def test_get_period_func_day(self):
-        """Test day period function generation."""
+        """Test day period function compiles correctly for both dialects."""
         from job_history.database import Job
 
         period_func = PeriodGrouper.get_period_func('day', Job.end)
 
-        # Should return a strftime function
-        assert str(period_func).startswith("strftime(")
-        # Verify it's a function with the correct name
-        assert period_func.name == 'strftime'
+        assert 'strftime' in _sql(period_func, sqlite_dialect)
+        assert 'to_char'  in _sql(period_func, pg_dialect)
 
     def test_get_period_func_month(self):
-        """Test month period function generation."""
+        """Test month period function compiles correctly for both dialects."""
         from job_history.database import Job
 
         period_func = PeriodGrouper.get_period_func('month', Job.end)
 
-        # Should return a strftime function
-        assert str(period_func).startswith("strftime(")
-        # Verify it's a function with the correct name
-        assert period_func.name == 'strftime'
+        assert 'strftime' in _sql(period_func, sqlite_dialect)
+        assert 'to_char'  in _sql(period_func, pg_dialect)
 
     def test_get_period_func_quarter(self):
-        """Test quarter returns a SQL expression for YYYY-Q#."""
+        """Test quarter returns a SQL expression for YYYY-Q# for both dialects."""
         from job_history.database import Job
 
         period_func = PeriodGrouper.get_period_func('quarter', Job.end)
 
-        # Quarter returns a complex expression (string concatenation)
-        func_str = str(period_func)
-        assert "strftime" in func_str
-        assert "CAST" in func_str
-        # It's an expression, not a single function, so no .name attribute check
+        sqlite_sql = _sql(period_func, sqlite_dialect)
+        assert 'strftime' in sqlite_sql
+        assert 'CAST' in sqlite_sql
+
+        pg_sql = _sql(period_func, pg_dialect)
+        assert 'to_char' in pg_sql
+        assert 'CAST' in pg_sql
 
     def test_get_period_func_year(self):
-        """Test year period function generation."""
+        """Test year period function compiles correctly for both dialects."""
         from job_history.database import Job
 
         period_func = PeriodGrouper.get_period_func('year', Job.end)
 
-        # Should return a strftime function
-        assert str(period_func).startswith("strftime(")
-        # Verify it's a function with the correct name
-        assert period_func.name == 'strftime'
+        assert 'strftime' in _sql(period_func, sqlite_dialect)
+        assert 'to_char'  in _sql(period_func, pg_dialect)
 
     def test_get_period_func_invalid(self):
         """Test that invalid period raises ValueError."""
