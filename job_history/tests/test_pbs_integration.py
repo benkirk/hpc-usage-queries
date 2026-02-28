@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from job_history.database import Base
-from job_history.database import Job, Account, User, Queue, JobCharge
+from job_history.database import Job, Account, User, Queue, JobCharge, JobRecord
 from job_history.sync.pbs import fetch_jobs_from_pbs_logs
 from job_history.sync import SyncPBSLogs, JobImporter
 
@@ -216,22 +216,26 @@ class TestDuplicateHandling:
         """Verify re-syncing same data doesn't create duplicates."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
+        # First sync without generating a summary so the day is not marked
+        # as summarized; the second sync then naturally re-runs the day.
         stats1 = SyncPBSLogs(test_db, "casper").sync(
             log_dir=str(fixture_dir),
             period="2026-01-30",
+            generate_summary=False,
             verbose=False
         )
 
         stats2 = SyncPBSLogs(test_db, "casper").sync(
             log_dir=str(fixture_dir),
             period="2026-01-30",
-            verbose=False,
-            force=True
+            generate_summary=False,
+            verbose=False
         )
 
         assert stats1["inserted"] == 7, "First sync should insert 7 jobs"
         assert stats2["fetched"] == 7, "Second sync should still fetch 7 jobs"
         assert stats2["inserted"] == 0, "Second sync should insert 0 (duplicates)"
+        assert stats2["updated"] == 0, "Second sync should update 0 (no --upsert)"
 
         job_count = test_db.query(Job).count()
         assert job_count == 7, "Should still have only 7 jobs (no duplicates)"
@@ -262,3 +266,190 @@ class TestErrorHandling:
                 period="2026-01-30",
                 verbose=False
             )
+
+
+class TestUpsert:
+    """Tests for upsert (update existing records) behavior."""
+
+    def test_no_upsert_skips_existing(self, test_db):
+        """Without --upsert, re-sync returns updated=0 and leaves records unchanged."""
+        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
+
+        SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            generate_summary=False, verbose=False
+        )
+
+        # Corrupt a field to confirm it is NOT restored without upsert
+        job = test_db.query(Job).first()
+        original_elapsed = job.elapsed
+        job.elapsed = -999
+        test_db.commit()
+
+        stats = SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            generate_summary=False, verbose=False
+        )
+
+        assert stats["updated"] == 0, "No upsert → updated should be 0"
+        test_db.refresh(job)
+        assert job.elapsed == -999, "Field should remain unchanged without --upsert"
+
+    def test_upsert_updates_job_fields(self, test_db):
+        """After --upsert, a manually-dirtied job field is restored to parsed value."""
+        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
+
+        SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            generate_summary=False, verbose=False
+        )
+
+        job = test_db.query(Job).first()
+        original_elapsed = job.elapsed
+        original_name = job.name
+        job.elapsed = -999
+        job.name = "CORRUPTED"
+        test_db.commit()
+
+        stats = SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            generate_summary=False, upsert=True, verbose=False
+        )
+
+        assert stats["updated"] == 7, "All 7 existing jobs should be updated"
+        assert stats["inserted"] == 0, "No new inserts expected"
+
+        test_db.refresh(job)
+        assert job.elapsed == original_elapsed, "elapsed should be restored to parsed value"
+        assert job.name == original_name, "name should be restored to parsed value"
+
+    def test_upsert_recalculates_charges(self, test_db):
+        """After --upsert, a manually-zeroed charge is restored to calculated value."""
+        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
+
+        SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            generate_summary=False, verbose=False
+        )
+
+        # Verify charges exist, then zero them out
+        charges_before = test_db.query(JobCharge).all()
+        assert len(charges_before) == 7
+        original_cpu = charges_before[0].cpu_hours
+        for c in charges_before:
+            c.cpu_hours = 0.0
+        test_db.commit()
+
+        SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            generate_summary=False, upsert=True, verbose=False
+        )
+
+        charges_after = test_db.query(JobCharge).all()
+        assert len(charges_after) == 7, "Should still have 7 charge rows"
+        assert any(c.cpu_hours > 0 for c in charges_after), "Charges should be recalculated"
+
+    def test_upsert_replaces_job_records(self, test_db):
+        """After --upsert, JobRecord rows are replaced with fresh-parsed raw records."""
+        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
+
+        SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            generate_summary=False, verbose=False
+        )
+
+        record_count_before = test_db.query(JobRecord).count()
+        assert record_count_before == 7, "Should have 7 raw records after initial sync"
+
+        SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            generate_summary=False, upsert=True, verbose=False
+        )
+
+        record_count_after = test_db.query(JobRecord).count()
+        assert record_count_after == 7, "Should still have 7 raw records after upsert"
+
+    def test_upsert_bypasses_summarized_skip(self, test_db):
+        """--upsert re-parses days even when already summarized."""
+        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
+
+        # First sync WITH summary generation
+        stats1 = SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30", verbose=False
+        )
+        assert stats1["days_summarized"] == 1
+
+        # Without upsert: day is skipped
+        stats_no_upsert = SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30", verbose=False
+        )
+        assert stats_no_upsert["days_skipped"] == 1, "Day should be skipped without upsert"
+
+        # With upsert: day is re-parsed
+        stats_upsert = SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30",
+            upsert=True, verbose=False
+        )
+        assert stats_upsert["days_skipped"] == 0, "Upsert should bypass summarized skip"
+        assert stats_upsert["fetched"] == 7, "Should re-fetch all 7 jobs"
+        assert stats_upsert["updated"] == 7, "Should update all 7 existing jobs"
+
+
+class TestResummarize:
+    """Tests for --resummarize (summary-only recompute)."""
+
+    def test_resummarize_regenerates_summary(self, test_db):
+        """--resummarize recomputes daily_summary from current Job/JobCharge data."""
+        from job_history.database import DailySummary
+        from datetime import date as dt_date
+
+        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
+
+        # Initial sync to populate jobs and a summary
+        SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30", verbose=False
+        )
+
+        summary_count = test_db.query(DailySummary).filter(
+            DailySummary.date == dt_date(2026, 1, 30)
+        ).count()
+        assert summary_count > 0, "Initial sync should create summary rows"
+
+        # Delete the summary to simulate corruption
+        test_db.query(DailySummary).filter(
+            DailySummary.date == dt_date(2026, 1, 30)
+        ).delete()
+        test_db.commit()
+
+        # Resummarize without any log path
+        stats = SyncPBSLogs(test_db, "casper").sync(
+            log_dir=None,
+            period="2026-01-30",
+            resummarize_only=True,
+            verbose=False
+        )
+
+        assert stats["days_summarized"] == 1, "Should regenerate summary for 1 day"
+        assert stats["fetched"] == 0, "Should not fetch any records"
+        assert stats["inserted"] == 0, "Should not insert any records"
+
+        restored_count = test_db.query(DailySummary).filter(
+            DailySummary.date == dt_date(2026, 1, 30)
+        ).count()
+        assert restored_count > 0, "Summary should be restored by --resummarize"
+
+    def test_resummarize_does_not_need_log_path(self, test_db):
+        """--resummarize works without a log directory."""
+        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
+        SyncPBSLogs(test_db, "casper").sync(
+            log_dir=str(fixture_dir), period="2026-01-30", verbose=False
+        )
+
+        # Pass log_dir=None — should not raise
+        stats = SyncPBSLogs(test_db, "casper").sync(
+            log_dir=None,
+            period="2026-01-30",
+            resummarize_only=True,
+            verbose=False
+        )
+        assert stats["days_summarized"] == 1

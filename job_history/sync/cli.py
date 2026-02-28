@@ -78,19 +78,26 @@ def sync_options() -> Callable:
             help="Enable verbose output"
         )(func)
         func = click.option(
-            "--force",
+            "--upsert",
             is_flag=True,
-            help="Force sync even for days already summarized"
+            help=(
+                "Re-parse and update existing records with fresh-parsed values "
+                "(recalculates charges and regenerates daily summaries). "
+                "Bypasses the already-summarized day skip automatically."
+            )
+        )(func)
+        func = click.option(
+            "--resummarize",
+            is_flag=True,
+            help=(
+                "Recompute daily summaries from current Job/JobCharge data. "
+                "No log parsing — --log-path is not required."
+            )
         )(func)
         func = click.option(
             "--no-summary",
             is_flag=True,
             help="Skip generating daily summaries after sync"
-        )(func)
-        func = click.option(
-            "--summary-only",
-            is_flag=True,
-            help="Only regenerate summaries (no data fetch)"
         )(func)
         return func
     return decorator
@@ -118,7 +125,8 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
     click.echo(f"\nSync complete for {machine}:")
     click.echo(f"  Fetched:  {stats['fetched']:,}")
     click.echo(f"  Inserted: {stats['inserted']:,}")
-    click.echo(f"  Skipped:  {stats['fetched'] - stats['inserted'] - stats['errors']:,} (duplicates)")
+    click.echo(f"  Updated:  {stats.get('updated', 0):,}")
+    click.echo(f"  Skipped:  {stats['fetched'] - stats['inserted'] - stats.get('updated', 0) - stats['errors']:,} (duplicates)")
     click.echo(f"  Errors:   {stats['errors']:,}")
 
     if stats.get("days_skipped", 0) > 0:
@@ -162,7 +170,7 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
 )
 @date_options()
 @sync_options()
-def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, verbose, force, no_summary, summary_only):
+def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, verbose, upsert, resummarize, no_summary):
     """Sync jobs from local scheduler accounting logs.
 
     Parses accounting log files from the given directory and imports them
@@ -186,8 +194,12 @@ def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, ve
       # Dry run to preview
       jobhist sync -m casper -l ./logs -d 2026-01-29 --dry-run -v
 
-      # Force re-sync already summarized dates
-      jobhist sync -m derecho -l ./logs -d 2026-01-29 --force
+      # Re-parse and update existing records (recalculates charges + summaries)
+      jobhist sync -m derecho -l ./logs -d 2026-01-29 --upsert
+
+      # Recompute daily summaries only (no log parsing required)
+      jobhist sync -m derecho -d 2026-01-29 --resummarize
+      jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
 
       # Explicit scheduler override
       jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29
@@ -210,18 +222,21 @@ def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, ve
 
     try:
         if verbose:
-            if date:
-                click.echo(f"Parsing {machine} logs for date: {date}")
+            if resummarize:
+                click.echo(f"Recomputing summaries for {machine}")
             else:
-                display_start = start or '2024-01-01'
-                display_end = end or (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
-                click.echo(f"Parsing {machine} logs from {display_start} to {display_end}")
-            if log_path:
-                click.echo(f"Log directory: {log_path}")
-            if dry_run:
-                click.echo("(DRY RUN - no data will be inserted)")
-            if force:
-                click.echo("(FORCE - will sync even if already summarized)")
+                if date:
+                    click.echo(f"Parsing {machine} logs for date: {date}")
+                else:
+                    display_start = start or '2024-01-01'
+                    display_end = end or (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+                    click.echo(f"Parsing {machine} logs from {display_start} to {display_end}")
+                if log_path:
+                    click.echo(f"Log directory: {log_path}")
+                if dry_run:
+                    click.echo("(DRY RUN - no data will be inserted)")
+                if upsert:
+                    click.echo("(UPSERT - existing records will be updated)")
 
         syncer = syncer_cls(session, machine)
         stats = syncer.sync(
@@ -232,7 +247,8 @@ def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, ve
             dry_run=dry_run,
             batch_size=batch_size,
             verbose=verbose,
-            force=force,
+            upsert=upsert,
+            resummarize_only=resummarize,
             generate_summary=not no_summary,
         )
 

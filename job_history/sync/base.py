@@ -26,6 +26,20 @@ MACHINE_SCHEDULERS = {
     "casper": "pbs",
 }
 
+# Job fields updated during an upsert (excludes identity/key columns).
+UPDATABLE_JOB_FIELDS = frozenset({
+    "start", "eligible",                                         # correctable timestamps
+    "elapsed", "walltime", "cputime",                            # timing metrics
+    "numcpus", "numgpus", "numnodes", "mpiprocs", "ompthreads",  # resources
+    "reqmem", "memory", "vmemory",                               # memory
+    "cputype", "gputype",                                        # type inference
+    "cpupercent", "avgcpu", "count",                             # performance
+    "resources", "ptargets", "priority", "status", "name",
+})
+
+# Scheduler-specific raw-record keys (used by _insert_batch and _update_batch).
+RECORD_OBJECT_KEYS = ("pbs_record_object", "slurm_record_object")
+
 
 class JobImporter:
     """Handle job imports with normalized schema and charge calculation.
@@ -65,7 +79,7 @@ class SyncBase(ABC):
     """Abstract base for scheduler log synchronization.
 
     Subclasses implement only fetch_records(); the full sync lifecycle
-    (date iteration, dedup, insert, charge, summarize) is handled here.
+    (date iteration, dedup, insert/upsert, charge, summarize) is handled here.
     """
 
     SCHEDULER_NAME: str = ""  # override in subclass
@@ -124,35 +138,37 @@ class SyncBase(ABC):
         dry_run: bool = False,
         batch_size: int = 1000,
         verbose: bool = False,
-        force: bool = False,
+        upsert: bool = False,
+        resummarize_only: bool = False,
         generate_summary: bool = True,
     ) -> dict:
-        """Parse → insert → charge → summarize scheduler logs.
+        """Parse → insert/upsert → charge → summarize scheduler logs.
 
         Args:
-            log_dir: Scheduler log directory (required for file-based schedulers)
+            log_dir: Scheduler log directory (required for file-based schedulers;
+                     not needed when resummarize_only=True)
             period: Single date in YYYY-MM-DD format (takes precedence over start/end)
             start_date: Start of date range (YYYY-MM-DD). Defaults to 2024-01-01.
             end_date: End of date range (YYYY-MM-DD). Defaults to yesterday.
             dry_run: Fetch and parse but skip all DB writes
             batch_size: Records per batch insert
             verbose: Print per-day progress
-            force: Sync even for days already summarized
+            upsert: Update existing records with fresh-parsed values and
+                    recalculate charges; also regenerates daily summaries.
+                    Bypasses the already-summarized day skip automatically.
+            resummarize_only: Skip log parsing; recompute daily_summary rows
+                    from current Job/JobCharge data only.
             generate_summary: Regenerate daily_summary after syncing
+                    (ignored when resummarize_only=True, which always regenerates)
 
         Returns:
-            dict: {fetched, inserted, errors, days_summarized,
+            dict: {fetched, inserted, updated, errors, days_summarized,
                    days_failed, failed_days, days_skipped, skipped_days}
         """
         from .summary import get_summarized_dates, generate_daily_summary
 
-        if log_dir is not None:
-            log_path = Path(log_dir)
-            if not log_path.exists():
-                raise RuntimeError(f"Log directory not found: {log_dir}")
-
         stats = {
-            "fetched": 0, "inserted": 0, "errors": 0,
+            "fetched": 0, "inserted": 0, "updated": 0, "errors": 0,
             "days_failed": 0, "failed_days": [],
             "days_skipped": 0, "skipped_days": [],
             "days_summarized": 0,
@@ -165,9 +181,38 @@ class SyncBase(ABC):
             if end_date is None:
                 end_date = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # Smart-skip: collect already-summarized dates once up front
+        # ----------------------------------------------------------------
+        # resummarize_only: skip all log I/O; just regenerate summaries
+        # ----------------------------------------------------------------
+        if resummarize_only:
+            if start_date and end_date:
+                for day in date_range(start_date, end_date):
+                    day_date = parse_date_string(day).date()
+                    generate_daily_summary(self.session, self.machine, day_date, replace=True)
+                    stats["days_summarized"] += 1
+                    if verbose:
+                        print(f"  Resummarized {day}", flush=True)
+            else:
+                target_period = period or start_date or end_date
+                if target_period:
+                    day_date = parse_date_string(target_period).date()
+                    generate_daily_summary(self.session, self.machine, day_date, replace=True)
+                    stats["days_summarized"] = 1
+                    if verbose:
+                        print(f"  Resummarized {target_period}", flush=True)
+            return stats
+
+        # ----------------------------------------------------------------
+        # Normal sync path (insert / upsert)
+        # ----------------------------------------------------------------
+        if log_dir is not None:
+            log_path = Path(log_dir)
+            if not log_path.exists():
+                raise RuntimeError(f"Log directory not found: {log_dir}")
+
+        # upsert bypasses the already-summarized skip (re-parses every day)
         summarized_dates: set = set()
-        if not force and not dry_run:
+        if not upsert and not dry_run:
             summarized_dates = get_summarized_dates(self.session)
 
         if start_date and end_date:
@@ -186,9 +231,10 @@ class SyncBase(ABC):
                     stats["skipped_days"].append(day)
                     continue
 
-                day_stats = self._sync_single_day(log_dir, day, dry_run, batch_size, verbose)
+                day_stats = self._sync_single_day(log_dir, day, dry_run, batch_size, verbose, upsert)
                 stats["fetched"] += day_stats["fetched"]
                 stats["inserted"] += day_stats["inserted"]
+                stats["updated"] += day_stats["updated"]
                 stats["errors"] += day_stats["errors"]
 
                 if day_stats.get("failed"):
@@ -196,9 +242,10 @@ class SyncBase(ABC):
                     stats["failed_days"].append(day)
                 else:
                     if verbose:
+                        updated_str = f", {day_stats['updated']:,} updated" if day_stats["updated"] else ""
                         print(
                             f"  Parsed {day} - {day_stats['fetched']:,} jobs, "
-                            f"{day_stats['inserted']:,} new",
+                            f"{day_stats['inserted']:,} new{updated_str}",
                             flush=True,
                         )
                     if generate_summary and not dry_run and day_stats["fetched"] > 0:
@@ -217,9 +264,10 @@ class SyncBase(ABC):
                     stats["skipped_days"] = [target_period]
                     return stats
 
-            day_stats = self._sync_single_day(log_dir, target_period, dry_run, batch_size, verbose)
+            day_stats = self._sync_single_day(log_dir, target_period, dry_run, batch_size, verbose, upsert)
             stats["fetched"] = day_stats["fetched"]
             stats["inserted"] = day_stats["inserted"]
+            stats["updated"] = day_stats["updated"]
             stats["errors"] = day_stats["errors"]
 
             if day_stats.get("failed"):
@@ -239,13 +287,17 @@ class SyncBase(ABC):
         dry_run: bool,
         batch_size: int,
         verbose: bool = False,
+        upsert: bool = False,
     ) -> dict:
         """Sync one day's records via self.fetch_records().
 
         Returns:
-            dict: {fetched, inserted, errors, failed, error_msg}
+            dict: {fetched, inserted, updated, errors, failed, error_msg}
         """
-        stats = {"fetched": 0, "inserted": 0, "errors": 0, "failed": False, "error_msg": None}
+        stats = {
+            "fetched": 0, "inserted": 0, "updated": 0,
+            "errors": 0, "failed": False, "error_msg": None,
+        }
         batch = []
 
         try:
@@ -267,11 +319,15 @@ class SyncBase(ABC):
 
                 if len(batch) >= batch_size:
                     if not dry_run:
-                        stats["inserted"] += self._insert_batch(batch)
+                        result = self._insert_batch(batch, upsert=upsert)
+                        stats["inserted"] += result["inserted"]
+                        stats["updated"] += result["updated"]
                     batch = []
 
             if batch and not dry_run:
-                stats["inserted"] += self._insert_batch(batch)
+                result = self._insert_batch(batch, upsert=upsert)
+                stats["inserted"] += result["inserted"]
+                stats["updated"] += result["updated"]
 
         except RuntimeError as e:
             stats["failed"] = True
@@ -287,20 +343,22 @@ class SyncBase(ABC):
 
         return stats
 
-    def _insert_batch(self, records: list[dict]) -> int:
-        """Insert a batch of job records with FK resolution and charge calculation.
+    def _insert_batch(self, records: list[dict], upsert: bool = False) -> dict:
+        """Insert (and optionally update) a batch of job records.
 
-        Handles deduplication against existing DB rows, bulk insert,
-        charge calculation, and optional raw-record storage.
+        Handles FK resolution, deduplication, bulk insert, charge calculation,
+        and raw-record storage.  When upsert=True, existing records are updated
+        via _update_batch() rather than skipped.
 
         Args:
             records: List of raw job record dicts from fetch_records()
+            upsert: If True, update existing records instead of skipping them
 
         Returns:
-            Number of records actually inserted
+            dict: {'inserted': N, 'updated': M}
         """
         if not records:
-            return 0
+            return {"inserted": 0, "updated": 0}
 
         # Resolve foreign keys (user/account/queue → IDs)
         prepared = [self.importer.prepare_record(r) for r in records]
@@ -314,14 +372,24 @@ class SyncBase(ABC):
 
         seen_keys: set = set()
         new_records = []
+        existing_records = []
         for r in prepared:
             key = (r['job_id'], normalize_datetime_to_naive(r['submit']))
-            if key not in existing_pairs and key not in seen_keys:
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if key in existing_pairs:
+                if upsert:
+                    existing_records.append(r)
+            else:
                 new_records.append(r)
-                seen_keys.add(key)
+
+        n_updated = 0
+        if upsert and existing_records:
+            n_updated = self._update_batch(existing_records)
 
         if not new_records:
-            return 0
+            return {"inserted": 0, "updated": n_updated}
 
         # Bulk-insert new rows (render_nulls=True handles NULL FK columns)
         self.session.bulk_insert_mappings(Job, new_records, render_nulls=True)
@@ -355,10 +423,7 @@ class SyncBase(ABC):
             if charge_records:
                 self.session.bulk_insert_mappings(JobCharge, charge_records)
 
-        # Store raw scheduler records when present.
-        # Each scheduler uses its own key (e.g. 'pbs_record_object',
-        # 'slurm_record_object') so the gate is: any key ending in '_record_object'.
-        RECORD_OBJECT_KEYS = ("pbs_record_object", "slurm_record_object")
+        # Store raw scheduler records when present
         record_map = {}
         for r in new_records:
             for key in RECORD_OBJECT_KEYS:
@@ -387,4 +452,98 @@ class SyncBase(ABC):
                 self.session.add_all(job_records)
 
         self.session.commit()
-        return len(new_records)
+        return {"inserted": len(new_records), "updated": n_updated}
+
+    def _update_batch(self, records: list[dict]) -> int:
+        """Update existing job records with fresh-parsed field values.
+
+        For each record that already exists in the DB (matched by job_id + submit):
+        1. Updates UPDATABLE_JOB_FIELDS on the Job row.
+        2. Deletes and re-inserts the JobCharge row (recalculates charges).
+        3. Deletes and re-inserts the JobRecord row (replaces raw record).
+
+        Args:
+            records: Prepared records (FK-resolved) for existing jobs
+
+        Returns:
+            Number of jobs updated
+        """
+        if not records:
+            return 0
+
+        from sqlalchemy import and_, delete
+
+        # Fetch existing Job rows to get their DB primary keys
+        job_id_list = [r['job_id'] for r in records]
+        existing_jobs = (
+            self.session.query(Job)
+            .filter(Job.job_id.in_(job_id_list))
+            .all()
+        )
+
+        # Build (job_id, naive_submit) → Job lookup
+        job_lookup: dict = {}
+        for job in existing_jobs:
+            key = (job.job_id, normalize_datetime_to_naive(job.submit))
+            job_lookup[key] = job
+
+        update_mappings = []
+        db_ids = []
+        raw_record_map: dict = {}
+
+        for r in records:
+            key = (r['job_id'], normalize_datetime_to_naive(r['submit']))
+            existing_job = job_lookup.get(key)
+            if existing_job is None:
+                continue
+
+            # Build update dict: primary key + all updatable fields present in r
+            mapping = {'id': existing_job.id}
+            for field in UPDATABLE_JOB_FIELDS:
+                if field in r:
+                    mapping[field] = r[field]
+            update_mappings.append(mapping)
+            db_ids.append(existing_job.id)
+
+            for key_name in RECORD_OBJECT_KEYS:
+                if key_name in r:
+                    raw_record_map[existing_job.id] = r[key_name]
+                    break
+
+        if not update_mappings:
+            return 0
+
+        # 1. Bulk-update Job fields
+        self.session.bulk_update_mappings(Job, update_mappings)
+        self.session.flush()
+
+        # 2. Delete + re-insert JobCharge (recalculate from updated Job values)
+        self.session.execute(delete(JobCharge).where(JobCharge.job_id.in_(db_ids)))
+
+        updated_jobs = self.session.query(Job).filter(Job.id.in_(db_ids)).all()
+        charge_records = []
+        for job in updated_jobs:
+            charges = job.calculate_charges(self.machine)
+            charge_records.append({
+                'job_id': job.id,
+                'cpu_hours': charges['cpu_hours'],
+                'gpu_hours': charges['gpu_hours'],
+                'memory_hours': charges['memory_hours'],
+                'charge_version': 1,
+            })
+        if charge_records:
+            self.session.bulk_insert_mappings(JobCharge, charge_records)
+
+        # 3. Delete + re-insert JobRecord (replace raw scheduler record)
+        if raw_record_map:
+            self.session.execute(delete(JobRecord).where(JobRecord.job_id.in_(db_ids)))
+            job_records = []
+            for job in updated_jobs:
+                raw = raw_record_map.get(job.id)
+                if raw is not None:
+                    job_records.append(JobRecord.from_pbs_record(job.id, raw))
+            if job_records:
+                self.session.add_all(job_records)
+
+        self.session.commit()
+        return len(update_mappings)
