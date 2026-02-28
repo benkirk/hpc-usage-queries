@@ -18,6 +18,7 @@ This project parses PBS accounting logs from NCAR's HPC systems, stores records 
 
 ## Quick Start
 
+**SQLite (default)** — no server required:
 ```bash
 # Initialize databases (creates casper.db and derecho.db)
 make init-db
@@ -30,15 +31,38 @@ jobhist history --start-date 2025-11-01 --end-date 2025-11-30 daily-summary
 jobhist resource --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-sizes
 ```
 
+**PostgreSQL** — shared server, same commands:
+```bash
+# Install the postgres extras and start a server (or use compose.yaml)
+pip install 'hpc-usage-queries[postgres]'
+docker compose up -d          # starts postgres:18 on localhost:5432
+
+# Point the tool at it (copy .env.example → .env and fill in credentials)
+export JH_DB_BACKEND=postgres
+export JH_PG_PASSWORD=...
+
+# Initialize (auto-creates derecho_jobs and casper_jobs databases)
+python -c "from job_history import init_db; init_db()"
+
+# Everything else is identical
+jobhist sync -m derecho -l ./data/pbs_logs/derecho --start 2025-08-01 --end 2025-11-23
+```
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `JOB_HISTORY_DATA_DIR` | `data/` | SQLite data directory |
-| `QHIST_DERECHO_DB` | `{data_dir}/derecho.db` | Override Derecho DB path |
-| `QHIST_CASPER_DB` | `{data_dir}/casper.db` | Override Casper DB path |
 | `JH_DB_BACKEND` | `sqlite` | `sqlite` or `postgres` |
-| `JH_PG_HOST` / `JH_PG_USER` / `JH_PG_PASSWORD` | — | PostgreSQL credentials |
+| `JOB_HISTORY_DATA_DIR` | `data/` | SQLite: directory for `{machine}.db` files |
+| `QHIST_DERECHO_DB` | `{data_dir}/derecho.db` | SQLite: override Derecho DB path |
+| `QHIST_CASPER_DB` | `{data_dir}/casper.db` | SQLite: override Casper DB path |
+| `JH_PG_HOST` | `localhost` | PostgreSQL host |
+| `JH_PG_PORT` | `5432` | PostgreSQL port |
+| `JH_PG_USER` | `postgres` | PostgreSQL user |
+| `JH_PG_PASSWORD` | — | PostgreSQL password |
+| `JH_PG_DERECHO_DB` | `derecho_jobs` | Override Derecho database name |
+| `JH_PG_CASPER_DB` | `casper_jobs` | Override Casper database name |
+| `JH_PG_REQUIRE_SSL` | `false` | Require SSL/TLS for PostgreSQL |
 
 Copy `.env.example` → `.env` for non-default configuration.
 
