@@ -277,7 +277,6 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         "end": parse_pbs_timestamp(pbs_record.end),
         "walltime": parse_pbs_time(resource_list.get("walltime")),
         "elapsed": parse_pbs_time(resources_used.get("walltime")),
-        "cputime": parse_pbs_time(resources_used.get("cput")),
         "numcpus": safe_int(resource_list.get("ncpus")),
         "numgpus": safe_int(resource_list.get("ngpus")),
         "numnodes": safe_int(resource_list.get("nodect")),
@@ -291,9 +290,6 @@ def parse_pbs_record(pbs_record, machine: str) -> dict:
         "gputype": gputype,
         "resources": select_str,
         "ptargets": resource_list.get("preempt_targets"),
-        "cpupercent": safe_float(resources_used.get("cpupercent")),
-        "avgcpu": None,  # Not available in PBS logs
-        "count": safe_int(pbs_record.run_count),
         # Full PBS record stored for charging refinement and JobRecord archival
         "pbs_record_object": pbs_record,
     }

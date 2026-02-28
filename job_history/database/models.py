@@ -252,7 +252,6 @@ class Job(LookupMixin, Base):
     # Time metrics (in seconds)
     elapsed = Column(Integer)
     walltime = Column(Integer)
-    cputime = Column(BigInteger)  # total CPU-seconds; can exceed 2^31 for large parallel jobs
 
     # Resource allocation
     numcpus = Column(Integer)
@@ -270,11 +269,6 @@ class Job(LookupMixin, Base):
     cputype = Column(Text)
     gputype = Column(Text)
     resources = Column(Text)
-
-    # Performance metrics
-    cpupercent = Column(Float)
-    avgcpu = Column(Float)
-    count = Column(Integer)
 
     __table_args__ = (
         # Unique constraint: same job_id + submit time = same job

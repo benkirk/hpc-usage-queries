@@ -67,8 +67,6 @@ def sample_job_record():
             "cput": 0.5,  # hours
             "mem": 50,  # GB
             "vmem": 60,  # GB
-            "cpupercent": 50.0,
-            "avgcpu": 45.0,
         },
         "run_count": 1,
     }
@@ -93,7 +91,6 @@ def sample_parsed_record():
         "end": datetime(2025, 1, 15, 18, 2, 0, tzinfo=timezone.utc),
         "elapsed": 3600,  # seconds
         "walltime": 7200,  # seconds
-        "cputime": 1800,  # seconds
         "numcpus": 256,
         "numgpus": 0,
         "numnodes": 2,
@@ -106,9 +103,6 @@ def sample_parsed_record():
         "gputype": None,
         "resources": "2:ncpus=128:mpiprocs=128:ompthreads=1",
         "ptargets": None,
-        "cpupercent": 50.0,
-        "avgcpu": 45.0,
-        "count": 1,
     }
 
 

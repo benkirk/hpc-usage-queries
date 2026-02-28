@@ -283,8 +283,6 @@ class TestParsePbsRecord:
                 "preempt_targets": "QUEUE=pcpu"
             }
             resources_used = {
-                "cpupercent": "31",
-                "cput": "00:00:07",
                 "mem": "172600kb",
                 "vmem": "148112kb",
                 "walltime": "00:00:24"
@@ -310,7 +308,6 @@ class TestParsePbsRecord:
         # Check time fields (in seconds)
         assert result["walltime"] == 1220  # 00:20:20
         assert result["elapsed"] == 24     # 00:00:24
-        assert result["cputime"] == 7      # 00:00:07
 
         # Check resource allocation
         assert result["numcpus"] == 128
@@ -331,8 +328,6 @@ class TestParsePbsRecord:
         # Check other fields
         assert result["resources"] == "1:ncpus=128:mpiprocs=128:mem=235GB:ompthreads=1"
         assert result["ptargets"] == "QUEUE=pcpu"
-        assert result["cpupercent"] == 31.0
-        assert result["count"] == 1
 
     def test_parse_with_cpu_type_in_select(self):
         """Parse record with cpu_type in select string."""
