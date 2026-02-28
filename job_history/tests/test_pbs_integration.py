@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from job_history.database import Base
 from job_history.database import Job, Account, User, Queue, JobCharge
 from job_history.sync.pbs import fetch_jobs_from_pbs_logs
-from job_history.sync import sync_pbs_logs_bulk, JobImporter
+from job_history.sync import SyncPBSLogs, JobImporter
 
 
 @pytest.fixture
@@ -43,16 +43,13 @@ class TestDerechodPBSParsing:
             date="2026-01-29"
         ))
 
-        # Should have parsed some jobs from 100-line sample
         assert len(jobs) > 0, "Should parse at least some jobs"
 
-        # All jobs should have required fields
         for job in jobs:
             assert job["job_id"], "All jobs should have job_id"
             assert job["user"], "All jobs should have user"
             assert job["queue"], "All jobs should have queue"
 
-        # At least some should have milan CPU type (derecho default)
         jobs_with_cputype = [j for j in jobs if j.get("cputype") == "milan"]
         assert len(jobs_with_cputype) > 0, "Should infer milan CPU type for derecho"
 
@@ -60,24 +57,19 @@ class TestDerechodPBSParsing:
         """Sync Derecho sample to database."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/derecho"
 
-        stats = sync_pbs_logs_bulk(
-            session=test_db,
-            machine="derecho",
+        stats = SyncPBSLogs(test_db, "derecho").sync(
             log_dir=str(fixture_dir),
             period="2026-01-29",
             verbose=False
         )
 
-        # Should have fetched and inserted jobs
         assert stats["fetched"] > 0, "Should fetch jobs"
         assert stats["inserted"] > 0, "Should insert new jobs"
         assert stats["inserted"] == stats["fetched"] - stats["errors"], "Inserted = fetched - errors"
 
-        # Verify jobs in database
         job_count = test_db.query(Job).count()
         assert job_count == stats["inserted"], "DB count should match inserted count"
 
-        # Verify foreign keys were created
         user_count = test_db.query(User).count()
         account_count = test_db.query(Account).count()
         queue_count = test_db.query(Queue).count()
@@ -86,7 +78,6 @@ class TestDerechodPBSParsing:
         assert account_count > 0, "Should create accounts"
         assert queue_count > 0, "Should create queues"
 
-        # Verify charges were calculated
         charge_count = test_db.query(JobCharge).count()
         assert charge_count == stats["inserted"], "Should calculate charges for all jobs"
 
@@ -104,21 +95,17 @@ class TestCasperPBSParsing:
             date="2026-01-30"
         ))
 
-        # Should have exactly 7 jobs from the sample
         assert len(jobs) == 7, "Should parse all 7 jobs from casper sample"
 
-        # Check GPU type extraction
         gpu_jobs = [j for j in jobs if j.get("gputype")]
         assert len(gpu_jobs) == 4, "Should have 4 GPU jobs"
 
-        # Verify specific GPU types
         gpu_types = {j["gputype"] for j in gpu_jobs}
         assert "a100" in gpu_types, "Should extract a100 GPU type"
         assert "v100" in gpu_types, "Should infer v100 from nvgpu queue"
         assert "h100" in gpu_types, "Should extract h100 GPU type"
         assert "l40" in gpu_types, "Should extract l40 GPU type"
 
-        # Verify CPU jobs don't have GPU type
         cpu_jobs = [j for j in jobs if not j.get("gputype")]
         assert len(cpu_jobs) == 3, "Should have 3 CPU-only jobs"
 
@@ -132,7 +119,6 @@ class TestCasperPBSParsing:
             date="2026-01-30"
         ))
 
-        # Find specific jobs by queue
         a100_job = next(j for j in jobs if j["queue"] == "a100")
         assert a100_job["gputype"] == "a100", "a100 queue should extract a100 GPU type"
         assert a100_job["numgpus"] == 1, "Should have 1 GPU"
@@ -151,20 +137,16 @@ class TestCasperPBSParsing:
         """Sync Casper sample to database."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
-        stats = sync_pbs_logs_bulk(
-            session=test_db,
-            machine="casper",
+        stats = SyncPBSLogs(test_db, "casper").sync(
             log_dir=str(fixture_dir),
             period="2026-01-30",
             verbose=False
         )
 
-        # Should have fetched and inserted all 7 jobs
         assert stats["fetched"] == 7, "Should fetch all 7 jobs"
         assert stats["inserted"] == 7, "Should insert all 7 jobs"
         assert stats["errors"] == 0, "Should have no errors"
 
-        # Verify GPU types in database
         gpu_jobs = test_db.query(Job).filter(Job.gputype.isnot(None)).all()
         assert len(gpu_jobs) == 4, "Should have 4 GPU jobs in DB"
 
@@ -179,20 +161,15 @@ class TestJobImporter:
         """Verify JobImporter creates users, accounts, queues."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
-        # Fetch jobs
         jobs = list(fetch_jobs_from_pbs_logs(
             log_dir=fixture_dir,
             machine="casper",
             date="2026-01-30"
         ))
 
-        # Use JobImporter
         importer = JobImporter(test_db, "casper")
-
-        # Prepare records
         prepared = [importer.prepare_record(j) for j in jobs]
 
-        # All should have foreign keys
         for record in prepared:
             assert "user_id" in record, "Should have user_id"
             assert "account_id" in record, "Should have account_id"
@@ -212,17 +189,13 @@ class TestJobImporter:
         ))
 
         importer = JobImporter(test_db, "casper")
-
-        # Process all jobs
         for job in jobs:
             importer.prepare_record(job)
 
-        # Count unique users/accounts/queues in database
         user_count = test_db.query(User).count()
         account_count = test_db.query(Account).count()
         queue_count = test_db.query(Queue).count()
 
-        # Should be less than number of jobs (deduplication)
         assert user_count <= len(jobs), "Should deduplicate users"
         assert account_count <= len(jobs), "Should deduplicate accounts"
         assert queue_count <= len(jobs), "Should deduplicate queues"
@@ -243,33 +216,23 @@ class TestDuplicateHandling:
         """Verify re-syncing same data doesn't create duplicates."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
-        # First sync
-        stats1 = sync_pbs_logs_bulk(
-            session=test_db,
-            machine="casper",
+        stats1 = SyncPBSLogs(test_db, "casper").sync(
             log_dir=str(fixture_dir),
             period="2026-01-30",
             verbose=False
         )
 
-        # Second sync (should be idempotent)
-        stats2 = sync_pbs_logs_bulk(
-            session=test_db,
-            machine="casper",
+        stats2 = SyncPBSLogs(test_db, "casper").sync(
             log_dir=str(fixture_dir),
             period="2026-01-30",
             verbose=False,
-            force=True  # Force re-sync
+            force=True
         )
 
-        # First sync should insert jobs
         assert stats1["inserted"] == 7, "First sync should insert 7 jobs"
-
-        # Second sync should insert 0 (duplicates detected)
         assert stats2["fetched"] == 7, "Second sync should still fetch 7 jobs"
         assert stats2["inserted"] == 0, "Second sync should insert 0 (duplicates)"
 
-        # Database should still have only 7 jobs
         job_count = test_db.query(Job).count()
         assert job_count == 7, "Should still have only 7 jobs (no duplicates)"
 
@@ -281,27 +244,20 @@ class TestErrorHandling:
         """Verify graceful handling of missing log files."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
-        # Try to sync a date that doesn't exist
-        # Should handle gracefully by marking day as failed
-        stats = sync_pbs_logs_bulk(
-            session=test_db,
-            machine="casper",
+        stats = SyncPBSLogs(test_db, "casper").sync(
             log_dir=str(fixture_dir),
             period="2099-01-01",  # This file doesn't exist
             verbose=False
         )
 
-        # Should mark the day as failed
         assert stats["days_failed"] == 1, "Should mark day as failed"
         assert stats["fetched"] == 0, "Should not fetch any jobs"
         assert stats["inserted"] == 0, "Should not insert any jobs"
 
     def test_invalid_log_directory(self, test_db):
         """Verify error for non-existent log directory."""
-        with pytest.raises(RuntimeError, match="PBS log directory not found"):
-            sync_pbs_logs_bulk(
-                session=test_db,
-                machine="casper",
+        with pytest.raises(RuntimeError, match="Log directory not found"):
+            SyncPBSLogs(test_db, "casper").sync(
                 log_dir="/nonexistent/path",
                 period="2026-01-30",
                 verbose=False

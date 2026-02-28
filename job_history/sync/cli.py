@@ -1,4 +1,4 @@
-"""CLI command and shared options for syncing PBS accounting logs."""
+"""CLI command for syncing scheduler accounting logs into the job history database."""
 
 import click
 from pathlib import Path
@@ -6,19 +6,24 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from ..database import get_session, init_db, get_db_url
-from . import sync_pbs_logs_bulk
+from .base import MACHINE_SCHEDULERS
+from .pbs import SyncPBSLogs
+from .slurm import SyncSLURMLogs
+
+
+# Registry: scheduler name → SyncBase subclass
+SCHEDULER_REGISTRY = {
+    "pbs": SyncPBSLogs,
+    "slurm": SyncSLURMLogs,
+}
 
 
 # ---------------------------------------------------------------------------
-# Shared Click option decorators (from sync_cli/common.py)
+# Shared Click option decorators
 # ---------------------------------------------------------------------------
 
 def machine_option(allow_all: bool = True) -> Callable:
-    """Machine selection option decorator.
-
-    Args:
-        allow_all: If True, include 'all' choice for syncing both machines
-    """
+    """Machine selection option decorator."""
     choices = ["casper", "derecho", "all"] if allow_all else ["casper", "derecho"]
     default = "all" if allow_all else "derecho"
     return click.option(
@@ -125,7 +130,6 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
     if stats.get("days_summarized", 0) > 0:
         click.echo(f"  Days summarized: {stats['days_summarized']}")
 
-    # Per-machine breakdown if machine='all'
     if machine == "all" and "machines" in stats:
         click.echo("\nPer-machine breakdown:")
         for m, mstats in stats["machines"].items():
@@ -136,26 +140,34 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# sync Click command (from sync_cli/sync.py)
+# sync Click command
 # ---------------------------------------------------------------------------
 
 @click.command()
 @machine_option(allow_all=False)
 @click.option(
+    "--scheduler",
+    type=click.Choice(list(SCHEDULER_REGISTRY)),
+    default=None,
+    help=(
+        "Scheduler type (default: inferred from machine via MACHINE_SCHEDULERS). "
+        f"Known schedulers: {', '.join(SCHEDULER_REGISTRY)}."
+    ),
+)
+@click.option(
     "-l", "--log-path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-    help="Path to PBS log directory (containing YYYYMMDD files)"
+    default=None,
+    type=click.Path(exists=False, file_okay=False, dir_okay=True, path_type=Path),
+    help="Path to scheduler log directory (e.g. directory of YYYYMMDD files for PBS)"
 )
 @date_options()
 @sync_options()
-def sync(machine, log_path, date, start, end, batch_size, dry_run, verbose, force, no_summary, summary_only):
-    """Sync jobs from local PBS accounting logs.
+def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, verbose, force, no_summary, summary_only):
+    """Sync jobs from local scheduler accounting logs.
 
-    Parses PBS accounting log files (named YYYYMMDD) from the given directory
-    and imports them into the local SQLite database.  PBS logs contain
-    cpu_type and gpu_type in select strings which are not available from
-    other sources.
+    Parses accounting log files from the given directory and imports them
+    into the local database.  The scheduler is inferred from the machine
+    name unless overridden with --scheduler.
 
     \b
     Date Selection (all optional):
@@ -165,7 +177,7 @@ def sync(machine, log_path, date, start, end, batch_size, dry_run, verbose, forc
 
     \b
     Examples:
-      # Single day
+      # Single day (PBS inferred for derecho)
       jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29
 
       # Date range
@@ -176,24 +188,27 @@ def sync(machine, log_path, date, start, end, batch_size, dry_run, verbose, forc
 
       # Force re-sync already summarized dates
       jobhist sync -m derecho -l ./logs -d 2026-01-29 --force
+
+      # Explicit scheduler override
+      jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29
     """
-    # Validate dates
     validate_dates(date, start, end)
 
-    # Validate log directory
-    if not log_path.exists():
-        click.echo(f"Error: PBS log directory not found: {log_path}", err=True)
+    # Resolve scheduler: explicit flag > machine default
+    resolved_scheduler = scheduler or MACHINE_SCHEDULERS.get(machine, "pbs")
+    syncer_cls = SCHEDULER_REGISTRY.get(resolved_scheduler)
+    if syncer_cls is None:
+        click.echo(f"Error: unknown scheduler '{resolved_scheduler}'", err=True)
         raise click.Abort()
 
-    # Initialize database
     if verbose:
         click.echo(f"Initializing database: {get_db_url(machine)}")
+        click.echo(f"Scheduler: {syncer_cls.SCHEDULER_NAME}")
 
     engine = init_db(machine)
     session = get_session(machine, engine)
 
     try:
-        # Print info
         if verbose:
             if date:
                 click.echo(f"Parsing {machine} logs for date: {date}")
@@ -201,17 +216,16 @@ def sync(machine, log_path, date, start, end, batch_size, dry_run, verbose, forc
                 display_start = start or '2024-01-01'
                 display_end = end or (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
                 click.echo(f"Parsing {machine} logs from {display_start} to {display_end}")
-            click.echo(f"Log directory: {log_path}")
+            if log_path:
+                click.echo(f"Log directory: {log_path}")
             if dry_run:
                 click.echo("(DRY RUN - no data will be inserted)")
             if force:
                 click.echo("(FORCE - will sync even if already summarized)")
 
-        # Run sync
-        stats = sync_pbs_logs_bulk(
-            session=session,
-            machine=machine,
-            log_dir=str(log_path),
+        syncer = syncer_cls(session, machine)
+        stats = syncer.sync(
+            log_dir=str(log_path) if log_path else None,
             period=date,
             start_date=start,
             end_date=end,
@@ -222,7 +236,6 @@ def sync(machine, log_path, date, start, end, batch_size, dry_run, verbose, forc
             generate_summary=not no_summary,
         )
 
-        # Print results
         print_sync_stats(stats, machine, verbose)
 
     except Exception as e:
