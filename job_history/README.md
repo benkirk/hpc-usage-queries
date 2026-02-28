@@ -84,14 +84,21 @@ job_history/
                              LookupCache, LookupMixin
     session.py             Engine/session factory, PRAGMA tuning, init_db
 
+  _vendor/                 ── vendored third-party code ─────────────────
+    pbs-parser-ncar/ncar.py  DerechoRecord (PbsRecord + power metrics)
+
   sync/                    ── data ingestion ────────────────────────────
-    __init__.py            Re-exports + sync_pbs_logs_bulk compat wrapper
-    base.py                SyncBase ABC
-    importer.py            SyncPBSLogs, JobImporter
-    pbs.py                 PBS parsers + log-file reader (merged)
+    __init__.py            Re-exports SyncBase, SyncPBSLogs, JobImporter,
+                             SyncSLURMLogs, MACHINE_SCHEDULERS
+    base.py                SyncBase ABC + JobImporter; owns full sync
+                             lifecycle: insert, upsert, resummarize.
+                             MACHINE_SCHEDULERS, UPDATABLE_JOB_FIELDS
+    pbs.py                 PBS field parsers, fetch_jobs_from_pbs_logs(),
+                             SyncPBSLogs driver, DerechoRecord loader
     charging.py            derecho_charge(), casper_charge()
     summary.py             generate_daily_summary(), get_summarized_dates()
-    utils.py               normalize_datetime_to_naive(), safe_int/float, …
+    utils.py               date_range(), parse_date_string(),
+                             normalize_datetime_to_naive(), safe_int/float, …
     cli.py                 `jobhist sync` Click command + shared decorators
     slurm.py               SyncSLURMLogs stub (future)
 
@@ -108,7 +115,7 @@ job_history/
   tests/                   ── test suite ────────────────────────────────
     conftest.py            Shared fixtures (in-memory DB, job data)
     fixtures/              PBS log fixtures for integration tests
-    test_*.py              163 tests, run with pytest
+    test_*.py              170 tests, run with pytest
 
 bin/
   qhist-db                 qhist-compatible frontend, DB-backed via qhist_plugin
@@ -165,38 +172,60 @@ jobhist sync -m casper -l ./data/pbs_logs/casper --start 2026-01-01 --end 2026-0
 # Dry run (parse, don't insert)
 jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 --dry-run -v
 
-# Force re-sync of already-summarized dates
-jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 --force
+# Re-parse and update existing records (recalculates charges + summaries)
+# Bypasses the already-summarized day skip automatically
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 --upsert
+
+# Recompute daily summaries from current DB state (no log parsing; --log-path not needed)
+jobhist sync -m derecho -d 2026-01-29 --resummarize
+jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
+
+# Explicit scheduler override (scheduler inferred from machine by default)
+jobhist sync -m derecho --scheduler pbs -l ./data/pbs_logs/derecho -d 2026-01-29
 ```
 
 PBS log sync populates `cpu_type` and `gpu_type` from PBS select strings — these fields are unavailable from other sources.
+
+`--scheduler` is inferred from machine name via `MACHINE_SCHEDULERS` in `sync/base.py`; currently both `derecho` and `casper` map to `pbs`. A future SLURM implementation would add a new entry and implement `SyncSLURMLogs.fetch_records()`.
 
 ### Python API
 
 ```python
 from job_history import get_session, init_db
-from job_history.sync import SyncPBSLogs, sync_pbs_logs_bulk
+from job_history.sync import SyncPBSLogs
 
-# OOP interface (preferred)
 engine = init_db("derecho")
 session = get_session("derecho", engine)
 syncer = SyncPBSLogs(session, "derecho")
+
+# Normal sync
 stats = syncer.sync("./data/pbs_logs/derecho", start_date="2026-01-01", end_date="2026-01-31")
 
-# Backward-compat function wrapper
-stats = sync_pbs_logs_bulk(session, "derecho", "./data/pbs_logs/derecho",
-                           start_date="2026-01-01", end_date="2026-01-31")
-# stats: {fetched, inserted, errors, days_summarized, days_failed, days_skipped}
+# Upsert — update existing records with re-parsed values + recalculate charges
+stats = syncer.sync("./data/pbs_logs/derecho", period="2026-01-29", upsert=True)
+
+# Resummarize — recompute daily_summary from current DB state, no log dir needed
+stats = syncer.sync(None, start_date="2026-01-01", end_date="2026-01-31", resummarize_only=True)
+
+# stats: {fetched, inserted, updated, errors, days_summarized, days_failed, days_skipped}
 ```
 
 ### Sync pipeline (per day)
 
-1. Parse PBS accounting log → stream `PbsRecord` objects
+**Normal sync (insert-only):**
+1. Parse scheduler log → stream record objects (`DerechoRecord`/`PbsRecord`)
 2. Resolve FKs (get-or-create user/account/queue via `LookupCache`)
-3. Bulk-insert new jobs (duplicate detection via unique constraint)
+3. Bulk-insert new jobs, skip `(job_id, submit)` pairs already in DB
 4. Calculate and store charges in `job_charges`
-5. Compress-pickle raw `PbsRecord` into `job_records`
+5. Compress-pickle raw record into `job_records`
 6. Generate `daily_summary` aggregation
+
+**Upsert (`--upsert`):** skips step 3 for existing records; instead calls
+`_update_batch()` which bulk-updates `UPDATABLE_JOB_FIELDS`, deletes+reinserts
+`job_charges` (recalculated), and replaces `job_records`. Bypasses the
+already-summarized day skip. Summaries regenerated after each day.
+
+**Resummarize (`--resummarize`):** skips all log I/O; only step 6 runs.
 
 ## Charging Rules
 
@@ -307,7 +336,7 @@ bin/qhist-db -p 20260115 -H dec0001  # host filter (Python phase, post-decompres
 
 Two-phase filtering: SQL-translatable fields (date, job ID, user, account, queue, jobname, exit status) are pushed into WHERE clauses; everything else (host, intra-day time, numeric operators) is applied in Python after decompressing the stored `PbsRecord`.
 
-Key file: `job_history/qhist_plugin.py` — `db_available()` + `db_get_records()` generator.
+Key files: `job_history/database/session.py` — `db_available()`; `job_history/qhist_plugin.py` — `db_get_records()` generator.
 
 ## Requirements
 
