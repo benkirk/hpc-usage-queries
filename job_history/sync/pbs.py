@@ -324,7 +324,7 @@ def _get_record_class(machine: str) -> type:
     """
     if machine == "derecho":
         try:
-            from job_history._vendor.ncar import DerechoRecord
+            from job_history._vendor.pbs_parser_ncar.ncar import DerechoRecord
             return DerechoRecord
         except Exception as e:
             logger.debug(f"DerechoRecord unavailable ({e}); using base PbsRecord")

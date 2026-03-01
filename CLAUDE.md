@@ -76,10 +76,10 @@ Normalize before comparing: `dt.replace(tzinfo=None)`.
 (via `SyncBase._update_batch()`); bypasses the summarized-day skip automatically.
 `--resummarize` recomputes `daily_summary` from current DB state, no logs needed.
 
-**`DerechoRecord`** — loaded from `job_history/_vendor/pbs-parser-ncar/ncar.py`
-via `importlib.util.spec_from_file_location` (hyphenated dir can't use dotted
-import syntax). Module registered in `sys.modules` before `exec_module` so pickle
-round-trips work. See `SyncBase._get_record_class()` in `sync/pbs.py`.
+**`DerechoRecord`** — vendored at `job_history/_vendor/pbs_parser_ncar/ncar.py`
+(underscore rename makes it a proper Python package). Imported via standard dotted
+path `job_history._vendor.pbs_parser_ncar.ncar`; pickle round-trips work without
+any shims. See `_get_record_class()` in `sync/pbs.py`.
 
 ### Key files
 | File | Role |
@@ -93,7 +93,7 @@ round-trips work. See `SyncBase._get_record_class()` in `sync/pbs.py`.
 | `job_history/sync/summary.py` | `generate_daily_summary()` — aggregates jobs → daily_summary |
 | `job_history/sync/cli.py` | `jobhist sync` Click command (`--upsert`, `--resummarize`) |
 | `job_history/cli.py` | `history` and `resource` Click groups + all subcommands |
-| `job_history/_vendor/pbs-parser-ncar/ncar.py` | Vendored `DerechoRecord` (extends `PbsRecord` with power metrics) |
+| `job_history/_vendor/pbs_parser_ncar/ncar.py` | Vendored `DerechoRecord` (extends `PbsRecord` with power metrics) |
 | `job_history/SCHEMA.md` | Full schema documentation |
 
 ## fs_scans Architecture

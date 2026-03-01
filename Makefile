@@ -107,9 +107,9 @@ sync-logs:
 	rsync -axv casper:/ssg/pbs/casper/accounting/2026* ./data/sample_pbs_logs/casper/
 
 update-vendor:
-	@echo "Updating vendored pbs-parser-ncar/ncar.py..."
-	@curl -sSf https://raw.githubusercontent.com/NCAR/pbs-parser-ncar/main/ncar.py \
-	    -o job_history/_vendor/pbs-parser-ncar/ncar.py
-	@printf '# Vendored from https://github.com/NCAR/pbs-parser-ncar\n# %s\n# Local modifications: none\n' \
-	    "$$(date +%Y-%m-%d)" > job_history/_vendor/pbs-parser-ncar/README
+	@echo "Updating vendored pbs_parser_ncar/ncar.py..."
+	@curl -sSf https://raw.githubusercontent.com/NCAR/pbs_parser_ncar/main/ncar.py \
+	    -o job_history/_vendor/pbs_parser_ncar/ncar.py
+	@printf '# Vendored from https://github.com/NCAR/pbs_parser_ncar\n# %s\n# Local modifications: none\n' \
+	    "$$(date +%Y-%m-%d)" > job_history/_vendor/pbs_parser_ncar/README
 	@echo "Done. Review with: git diff job_history/_vendor/"

@@ -23,7 +23,7 @@ postgres = [
 ]
 
 analysis = [
-         "hpc-usage-queries[dev]",
+         "hpc-usage-queries[dev,postgres]",
          "jupyterlab",
          "numpy",
          "matplotlib",
