@@ -6,7 +6,106 @@ common query patterns like period-based grouping and resource type resolution.
 
 from typing import Tuple, Dict, Any, List
 from sqlalchemy import func, cast, Integer, String
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.expression import FunctionElement
 
+
+# ---------------------------------------------------------------------------
+# Dialect-agnostic SQL expressions (compiled differently per database)
+# ---------------------------------------------------------------------------
+
+class _PeriodFunc(FunctionElement):
+    """Date period formatting that compiles per dialect.
+
+    SQLite:     strftime(sqlite_fmt, col)
+    PostgreSQL: to_char(col, pg_fmt)
+    """
+    inherit_cache = True
+    name = 'strftime'  # used by generic string representation
+
+    def __init__(self, date_column, sqlite_fmt, pg_fmt):
+        self.date_column = date_column
+        self.sqlite_fmt = sqlite_fmt
+        self.pg_fmt = pg_fmt
+        super().__init__(date_column)
+
+
+@compiles(_PeriodFunc)
+def _compile_period_func_default(element, compiler, **kw):
+    """Default (SQLite): strftime(fmt, col)"""
+    return compiler.process(
+        func.strftime(element.sqlite_fmt, element.date_column), **kw
+    )
+
+
+@compiles(_PeriodFunc, 'postgresql')
+def _compile_period_func_pg(element, compiler, **kw):
+    """PostgreSQL: to_char(col, fmt)"""
+    return compiler.process(
+        func.to_char(element.date_column, element.pg_fmt), **kw
+    )
+
+
+class _QuarterFunc(FunctionElement):
+    """Quarter period extraction (YYYY-Q#) that compiles per dialect."""
+    inherit_cache = True
+    name = 'quarter_func'
+
+    def __init__(self, date_column):
+        self.date_column = date_column
+        super().__init__(date_column)
+
+
+@compiles(_QuarterFunc)
+def _compile_quarter_default(element, compiler, **kw):
+    """Default (SQLite): strftime('%Y', col) + '-Q' + CAST(...)"""
+    date_col = element.date_column
+    quarter_num = (cast(func.strftime('%m', date_col), Integer) - 1) // 3 + 1
+    expr = func.strftime('%Y', date_col) + '-Q' + cast(quarter_num, String)
+    return compiler.process(expr, **kw)
+
+
+@compiles(_QuarterFunc, 'postgresql')
+def _compile_quarter_pg(element, compiler, **kw):
+    """PostgreSQL: to_char(col, 'YYYY') + '-Q' + CAST(...)"""
+    date_col = element.date_column
+    # EXTRACT returns float in PG; cast to Integer for integer division
+    month_int = cast(func.extract('month', date_col), Integer)
+    quarter_num = (month_int - 1) // 3 + 1
+    expr = func.to_char(date_col, 'YYYY') + '-Q' + cast(quarter_num, String)
+    return compiler.process(expr, **kw)
+
+
+class _TimeDiffHours(FunctionElement):
+    """Difference between two timestamp columns, expressed in hours.
+
+    SQLite:     (julianday(col2) - julianday(col1)) * 24
+    PostgreSQL: EXTRACT(EPOCH FROM (col2 - col1)) / 3600
+    """
+    inherit_cache = True
+    name = 'time_diff_hours'
+
+    def __init__(self, col_start, col_end):
+        self.col_start = col_start
+        self.col_end = col_end
+        super().__init__(col_start, col_end)
+
+
+@compiles(_TimeDiffHours)
+def _compile_time_diff_hours_default(element, compiler, **kw):
+    """Default (SQLite): (julianday(end) - julianday(start)) * 24"""
+    expr = (func.julianday(element.col_end) - func.julianday(element.col_start)) * 24
+    return compiler.process(expr, **kw)
+
+
+@compiles(_TimeDiffHours, 'postgresql')
+def _compile_time_diff_hours_pg(element, compiler, **kw):
+    """PostgreSQL: EXTRACT(EPOCH FROM (end - start)) / 3600"""
+    expr = func.extract('epoch', element.col_end - element.col_start) / 3600
+    return compiler.process(expr, **kw)
+
+
+# ---------------------------------------------------------------------------
 
 class PeriodGrouper:
     """Handles period-based grouping (day/month/quarter/year) for queries.
@@ -30,47 +129,50 @@ class PeriodGrouper:
         >>> # Returns: [{'period': '2025-Q1', 'job_count': 450}]
     """
 
-    # Period format strings for strftime
-    PERIODS = {
+    _SQLITE_FORMATS = {
         'day': '%Y-%m-%d',
         'month': '%Y-%m',
         'year': '%Y',
     }
+    _PG_FORMATS = {
+        'day': 'YYYY-MM-DD',
+        'month': 'YYYY-MM',
+        'year': 'YYYY',
+    }
 
     @staticmethod
     def get_period_func(period: str, date_column):
-        """Get SQLAlchemy function for period grouping.
+        """Get a dialect-agnostic SQLAlchemy expression for period grouping.
+
+        The returned expression compiles to the correct SQL function for the
+        connected database: strftime() for SQLite, to_char() for PostgreSQL.
+        The dialect is resolved at query-execution time, not at build time,
+        so this works correctly regardless of the configured backend.
 
         Args:
             period: Grouping period ('day', 'month', 'quarter', or 'year')
             date_column: SQLAlchemy column to group by (e.g., Job.end)
 
         Returns:
-            SQLAlchemy function expression for grouping
+            SQLAlchemy expression for grouping (compiles per dialect)
 
         Raises:
             ValueError: If period is not 'day', 'month', 'quarter', or 'year'
 
         Examples:
             >>> from job_history.models import Job
-            >>> # Day grouping
             >>> func_day = PeriodGrouper.get_period_func('day', Job.end)
-            >>> # Month grouping
             >>> func_month = PeriodGrouper.get_period_func('month', Job.end)
-            >>> # Quarter grouping (returns expression like '2025-Q1')
             >>> func_quarter = PeriodGrouper.get_period_func('quarter', Job.end)
         """
-        if period in PeriodGrouper.PERIODS:
-            return func.strftime(PeriodGrouper.PERIODS[period], date_column)
+        if period in PeriodGrouper._SQLITE_FORMATS:
+            return _PeriodFunc(
+                date_column,
+                PeriodGrouper._SQLITE_FORMATS[period],
+                PeriodGrouper._PG_FORMATS[period],
+            )
         elif period == 'quarter':
-            # Generate YYYY-Q# string using SQL expression
-            # Formula: year + '-Q' + ((month - 1) // 3 + 1)
-            quarter_num = (cast(func.strftime('%m', date_column), Integer) - 1) / 3 + 1
-            # Note: / operator in SQLAlchemy with Integer cast typically results in integer division in SQLite
-            # but to be safe and consistent with tests we rely on implicit or explicit behavior
-            # The test showed (cast(...) - 1) // 3 + 1 works in Python-SQLAlchemy-SQLite mapping
-            quarter_num = (cast(func.strftime('%m', date_column), Integer) - 1) // 3 + 1
-            return func.strftime('%Y', date_column) + '-Q' + cast(quarter_num, String)
+            return _QuarterFunc(date_column)
         else:
             raise ValueError(
                 f"Invalid period: {period}. Must be 'day', 'month', 'quarter', or 'year'."
@@ -249,7 +351,7 @@ class ResourceTypeResolver:
             >>> # queues = [queue_id_1, queue_id_2]
             >>> # hours = JobCharge.gpu_hours
         """
-        from .queries import QueryConfig
+        from .jobs import QueryConfig
 
         if resource_type == 'cpu':
             queues = QueryConfig.get_cpu_queues(machine)

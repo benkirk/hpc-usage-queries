@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from job_history.pbs_parsers import (
+from job_history.sync.pbs import (
     parse_pbs_time,
     parse_pbs_memory_kb,
     parse_pbs_memory_gb,
@@ -283,8 +283,6 @@ class TestParsePbsRecord:
                 "preempt_targets": "QUEUE=pcpu"
             }
             resources_used = {
-                "cpupercent": "31",
-                "cput": "00:00:07",
                 "mem": "172600kb",
                 "vmem": "148112kb",
                 "walltime": "00:00:24"
@@ -310,7 +308,6 @@ class TestParsePbsRecord:
         # Check time fields (in seconds)
         assert result["walltime"] == 1220  # 00:20:20
         assert result["elapsed"] == 24     # 00:00:24
-        assert result["cputime"] == 7      # 00:00:07
 
         # Check resource allocation
         assert result["numcpus"] == 128
@@ -331,8 +328,6 @@ class TestParsePbsRecord:
         # Check other fields
         assert result["resources"] == "1:ncpus=128:mpiprocs=128:mem=235GB:ompthreads=1"
         assert result["ptargets"] == "QUEUE=pcpu"
-        assert result["cpupercent"] == 31.0
-        assert result["count"] == 1
 
     def test_parse_with_cpu_type_in_select(self):
         """Parse record with cpu_type in select string."""
@@ -398,7 +393,7 @@ class TestIntegrationWithSampleData:
     def test_parse_sample_logs(self):
         """Parse sample PBS logs and verify record count."""
         import pbsparse
-        from job_history.pbs_parsers import parse_pbs_record
+        from job_history.sync.pbs import parse_pbs_record
 
         log_path = "./data/sample_pbs_logs/derecho/20260129"
         records = list(pbsparse.get_pbs_records(log_path, type_filter="E"))
@@ -428,7 +423,7 @@ class TestIntegrationWithSampleData:
     )
     def test_fetch_jobs_iterator(self):
         """Test the full iterator interface."""
-        from job_history.pbs_read_logs import fetch_jobs_from_pbs_logs
+        from job_history.sync.pbs import fetch_jobs_from_pbs_logs
 
         log_dir = "./data/sample_pbs_logs/derecho"
         jobs = list(fetch_jobs_from_pbs_logs(

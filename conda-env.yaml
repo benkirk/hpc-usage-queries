@@ -11,5 +11,3 @@ dependencies:
   - postgresql=18.*
   - pip:
       - pipdeptree
-      - python-dotenv
-      - psycopg2-binary

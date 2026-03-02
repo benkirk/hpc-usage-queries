@@ -20,7 +20,7 @@ from dotenv import find_dotenv, load_dotenv
 load_dotenv(find_dotenv())
 
 # Default SQLite data directory (relative to project root)
-_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
+_DEFAULT_DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
 
 class JobHistoryConfig:
