@@ -14,10 +14,7 @@ from typing import Iterator
 import pbsparse
 
 from .base import SyncBase
-from .utils import (
-    parse_date_string,
-    safe_int, safe_float, validate_timestamp_ordering,
-)
+from .utils import parse_date_string, safe_int, safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -415,16 +412,5 @@ class SyncPBSLogs(SyncBase):
             if not job_dict.get("job_id"):
                 logger.warning("Skipping record with missing job_id")
                 continue
-
-            if not validate_timestamp_ordering(
-                job_dict.get("submit"), job_dict.get("eligible"),
-                job_dict.get("start"), job_dict.get("end"),
-            ):
-                logger.warning(
-                    f"Invalid timestamp ordering for job {job_dict['job_id']}: "
-                    f"submit={job_dict.get('submit')}, eligible={job_dict.get('eligible')}, "
-                    f"start={job_dict.get('start')}, end={job_dict.get('end')}"
-                )
-                # Still yield — _sync_single_day re-validates and skips if needed
 
             yield job_dict

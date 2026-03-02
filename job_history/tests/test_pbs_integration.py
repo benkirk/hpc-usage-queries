@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from job_history.database import Base
 from job_history.database import Job, Account, User, Queue, JobCharge, JobRecord
-from job_history.sync import SyncPBSLogs, JobImporter
+from job_history.sync import SyncPBSLogs
 
 
 @pytest.fixture
@@ -145,57 +145,6 @@ class TestCasperPBSParsing:
 
         gpu_types_in_db = {j.gputype for j in gpu_jobs}
         assert gpu_types_in_db == {"a100", "v100", "h100", "l40"}, "All GPU types should be preserved"
-
-
-class TestJobImporter:
-    """Tests for JobImporter with PBS data."""
-
-    def test_importer_creates_normalized_records(self, test_db):
-        """Verify JobImporter creates users, accounts, queues."""
-        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
-
-        jobs = list(SyncPBSLogs(test_db, "casper").fetch_records(
-            str(fixture_dir), "2026-01-30"
-        ))
-
-        importer = JobImporter(test_db, "casper")
-        prepared = [importer.prepare_record(j) for j in jobs]
-
-        for record in prepared:
-            assert "user_id" in record, "Should have user_id"
-            assert "account_id" in record, "Should have account_id"
-            assert "queue_id" in record, "Should have queue_id"
-            assert record["user_id"] is not None, "user_id should be set"
-            assert record["account_id"] is not None, "account_id should be set"
-            assert record["queue_id"] is not None, "queue_id should be set"
-
-    def test_importer_deduplicates_lookups(self, test_db):
-        """Verify JobImporter caches users/accounts/queues."""
-        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
-
-        jobs = list(SyncPBSLogs(test_db, "casper").fetch_records(
-            str(fixture_dir), "2026-01-30"
-        ))
-
-        importer = JobImporter(test_db, "casper")
-        for job in jobs:
-            importer.prepare_record(job)
-
-        user_count = test_db.query(User).count()
-        account_count = test_db.query(Account).count()
-        queue_count = test_db.query(Queue).count()
-
-        assert user_count <= len(jobs), "Should deduplicate users"
-        assert account_count <= len(jobs), "Should deduplicate accounts"
-        assert queue_count <= len(jobs), "Should deduplicate queues"
-
-        # Specifically for this sample:
-        # 6 unique users (testuser1 appears twice)
-        # 6 unique accounts
-        # 5 unique queues (cpu, a100, nvgpu, h100, l40)
-        assert user_count == 6, "Sample has 6 unique users"
-        assert account_count == 6, "Sample has 6 unique accounts"
-        assert queue_count == 5, "Sample has 5 unique queues"
 
 
 class TestDuplicateHandling:

@@ -36,43 +36,6 @@ UPDATABLE_JOB_FIELDS = frozenset({
     "resources", "ptargets", "priority", "status", "name",
 })
 
-# Scheduler-specific raw-record keys (used by _insert_batch and _update_batch).
-RECORD_OBJECT_KEYS = ("pbs_record_object", "slurm_record_object")
-
-
-class JobImporter:
-    """Handle job imports with normalized schema and charge calculation.
-
-    Delegates lookup-table caching and get-or-create to LookupCache.
-    """
-
-    def __init__(self, session: Session, machine: str):
-        self.session = session
-        self.machine = machine
-        self.cache = LookupCache(session)
-
-    def prepare_record(self, record: dict) -> dict:
-        """Prepare record for insertion by resolving foreign keys.
-
-        Args:
-            record: Raw job record dictionary
-
-        Returns:
-            Prepared record with foreign keys resolved
-        """
-        prepared = record.copy()
-
-        if prepared.get('user'):
-            prepared['user_id'] = self.cache.get_or_create_user(prepared['user']).id
-
-        if prepared.get('account'):
-            prepared['account_id'] = self.cache.get_or_create_account(prepared['account']).id
-
-        if prepared.get('queue'):
-            prepared['queue_id'] = self.cache.get_or_create_queue(prepared['queue']).id
-
-        return prepared
-
 
 class SyncBase(ABC):
     """Abstract base for scheduler log synchronization.
@@ -88,18 +51,7 @@ class SyncBase(ABC):
             raise ValueError(f"Invalid machine: {machine}. Must be one of {VALID_MACHINES}")
         self.session = session
         self.machine = machine
-        self._importer: JobImporter | None = None
-
-    @property
-    def importer(self) -> JobImporter:
-        """Lazy-initialised FK resolver."""
-        if self._importer is None:
-            self._importer = JobImporter(self.session, self.machine)
-        return self._importer
-
-    @classmethod
-    def scheduler_name(cls) -> str:
-        return cls.SCHEDULER_NAME or cls.__name__
+        self.cache = LookupCache(session)
 
     # ------------------------------------------------------------------
     # Abstract interface — implement in each scheduler subclass
@@ -360,7 +312,16 @@ class SyncBase(ABC):
             return {"inserted": 0, "updated": 0}
 
         # Resolve foreign keys (user/account/queue → IDs)
-        prepared = [self.importer.prepare_record(r) for r in records]
+        prepared = []
+        for r in records:
+            rec = r.copy()
+            if rec.get('user'):
+                rec['user_id'] = self.cache.get_or_create_user(rec['user']).id
+            if rec.get('account'):
+                rec['account_id'] = self.cache.get_or_create_account(rec['account']).id
+            if rec.get('queue'):
+                rec['queue_id'] = self.cache.get_or_create_queue(rec['queue']).id
+            prepared.append(rec)
 
         # Detect duplicates: check (job_id, submit) pairs already in the DB
         existing_pairs: set = set()
@@ -425,11 +386,9 @@ class SyncBase(ABC):
         # Store raw scheduler records when present
         record_map = {}
         for r in new_records:
-            for key in RECORD_OBJECT_KEYS:
-                if key in r:
-                    submit_naive = normalize_datetime_to_naive(r['submit'])
-                    record_map[(r['job_id'], submit_naive)] = r[key]
-                    break
+            raw = r.get('pbs_record_object') or r.get('slurm_record_object')
+            if raw is not None:
+                record_map[(r['job_id'], normalize_datetime_to_naive(r['submit']))] = raw
 
         if record_map:
             jobs_without_record = (
@@ -442,8 +401,7 @@ class SyncBase(ABC):
 
             job_records = []
             for job in jobs_without_record:
-                submit_naive = normalize_datetime_to_naive(job.submit)
-                raw = record_map.get((job.job_id, submit_naive))
+                raw = record_map.get((job.job_id, normalize_datetime_to_naive(job.submit)))
                 if raw is not None:
                     job_records.append(JobRecord.from_pbs_record(job.id, raw))
 
@@ -462,7 +420,7 @@ class SyncBase(ABC):
         3. Deletes and re-inserts the JobRecord row (replaces raw record).
 
         Args:
-            records: Prepared records (FK-resolved) for existing jobs
+            records: FK-resolved records for existing jobs
 
         Returns:
             Number of jobs updated
@@ -496,7 +454,6 @@ class SyncBase(ABC):
             if existing_job is None:
                 continue
 
-            # Build update dict: primary key + all updatable fields present in r
             mapping = {'id': existing_job.id}
             for field in UPDATABLE_JOB_FIELDS:
                 if field in r:
@@ -504,10 +461,9 @@ class SyncBase(ABC):
             update_mappings.append(mapping)
             db_ids.append(existing_job.id)
 
-            for key_name in RECORD_OBJECT_KEYS:
-                if key_name in r:
-                    raw_record_map[existing_job.id] = r[key_name]
-                    break
+            raw = r.get('pbs_record_object') or r.get('slurm_record_object')
+            if raw is not None:
+                raw_record_map[existing_job.id] = raw
 
         if not update_mappings:
             return 0

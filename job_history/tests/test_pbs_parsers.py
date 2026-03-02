@@ -425,10 +425,12 @@ class TestIntegrationWithSampleData:
         """Test the full iterator interface."""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import Session
+        from job_history.database import Base
         from job_history.sync import SyncPBSLogs
 
         log_dir = "./data/sample_pbs_logs/derecho"
         engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
         with Session(engine) as session:
             jobs = list(SyncPBSLogs(session, "derecho").fetch_records(
                 log_dir, "2026-01-29"
