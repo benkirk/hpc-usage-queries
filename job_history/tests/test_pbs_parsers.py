@@ -423,14 +423,16 @@ class TestIntegrationWithSampleData:
     )
     def test_fetch_jobs_iterator(self):
         """Test the full iterator interface."""
-        from job_history.sync.pbs import fetch_jobs_from_pbs_logs
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+        from job_history.sync import SyncPBSLogs
 
         log_dir = "./data/sample_pbs_logs/derecho"
-        jobs = list(fetch_jobs_from_pbs_logs(
-            log_dir=log_dir,
-            machine="derecho",
-            date="2026-01-29"
-        ))
+        engine = create_engine("sqlite:///:memory:")
+        with Session(engine) as session:
+            jobs = list(SyncPBSLogs(session, "derecho").fetch_records(
+                log_dir, "2026-01-29"
+            ))
 
         assert len(jobs) > 0, "Should fetch some jobs"
 

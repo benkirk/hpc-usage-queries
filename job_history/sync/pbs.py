@@ -15,7 +15,7 @@ import pbsparse
 
 from .base import SyncBase
 from .utils import (
-    parse_date_string, date_range,
+    parse_date_string,
     safe_int, safe_float, validate_timestamp_ordering,
 )
 
@@ -352,47 +352,43 @@ def get_log_file_path(log_dir: Path, date_str: str) -> Path:
     return log_dir / filename
 
 
-def fetch_jobs_from_pbs_logs(
-    log_dir: str | Path,
-    machine: str,
-    date: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> Iterator[dict]:
-    """Scan PBS log files and yield parsed job dictionaries.
+# ---------------------------------------------------------------------------
+# PBS sync driver
+# ---------------------------------------------------------------------------
 
-    Streams job records from local PBS accounting logs without loading
-    everything into memory.
+class SyncPBSLogs(SyncBase):
+    """Sync driver for PBS accounting logs.
 
-    Args:
-        log_dir: Directory containing PBS log files (named YYYYMMDD)
-        machine: Machine name for type inference fallback (e.g., "derecho", "casper")
-        date: Single date to process (YYYY-MM-DD format)
-        start_date: Start of date range (YYYY-MM-DD format)
-        end_date: End of date range (YYYY-MM-DD format)
-
-    Yields:
-        Normalized job dictionaries ready for database insertion
-
-    Raises:
-        RuntimeError: If log file doesn't exist or can't be parsed
+    Implements fetch_records() using local YYYYMMDD-named PBS accounting files.
+    All sync orchestration (date iteration, insert, charge, summarize) is
+    inherited from SyncBase.
     """
-    log_dir = Path(log_dir)
 
-    if date:
-        dates = [date]
-    elif start_date and end_date:
-        dates = list(date_range(start_date, end_date))
-    else:
-        raise ValueError("Must provide either 'date' or 'start_date' and 'end_date'")
+    SCHEDULER_NAME = "PBS"
 
-    for date_str in dates:
-        log_path = get_log_file_path(log_dir, date_str)
+    def fetch_records(self, log_dir: str | Path | None, period: str) -> Iterator[dict]:
+        """Yield normalized job dicts for one day from PBS accounting logs.
+
+        Args:
+            log_dir: Directory containing YYYYMMDD-named PBS log files
+            period:  Date in YYYY-MM-DD format (single day; range iteration
+                     is handled by SyncBase.sync())
+
+        Yields:
+            Normalized job dictionaries (includes 'pbs_record_object' key)
+
+        Raises:
+            RuntimeError: If log_dir is None, file is missing, or parse fails
+        """
+        if log_dir is None:
+            raise RuntimeError("PBS sync requires a log directory (--log-path)")
+
+        log_path = get_log_file_path(Path(log_dir), period)
 
         if not log_path.exists():
             raise RuntimeError(
                 f"PBS log file not found: {log_path}\n"
-                f"Expected log file for date {date_str}"
+                f"Expected log file for date {period}"
             )
 
         logger.info(f"Scanning PBS log: {log_path}")
@@ -400,7 +396,7 @@ def fetch_jobs_from_pbs_logs(
         try:
             records = pbsparse.get_pbs_records(
                 str(log_path),
-                CustomRecord=_get_record_class(machine),
+                CustomRecord=_get_record_class(self.machine),
                 type_filter="E",
             )
         except Exception as e:
@@ -408,7 +404,7 @@ def fetch_jobs_from_pbs_logs(
 
         for pbs_record in records:
             try:
-                job_dict = parse_pbs_record(pbs_record, machine)
+                job_dict = parse_pbs_record(pbs_record, self.machine)
             except Exception as e:
                 logger.warning(
                     f"Failed to parse PBS record {pbs_record.id}: {e}",
@@ -432,37 +428,3 @@ def fetch_jobs_from_pbs_logs(
                 # Still yield — _sync_single_day re-validates and skips if needed
 
             yield job_dict
-
-
-# ---------------------------------------------------------------------------
-# PBS sync driver
-# ---------------------------------------------------------------------------
-
-class SyncPBSLogs(SyncBase):
-    """Sync driver for PBS accounting logs.
-
-    Implements fetch_records() using local YYYYMMDD-named PBS accounting files.
-    All sync orchestration (date iteration, insert, charge, summarize) is
-    inherited from SyncBase.
-    """
-
-    SCHEDULER_NAME = "PBS"
-
-    def fetch_records(self, log_dir: str | Path | None, period: str) -> Iterator[dict]:
-        """Yield normalized job dicts for one day from PBS accounting logs.
-
-        Args:
-            log_dir: Directory containing YYYYMMDD-named PBS log files
-            period:  Date in YYYY-MM-DD format
-
-        Yields:
-            Normalized job dictionaries (includes 'pbs_record_object' key)
-
-        Raises:
-            RuntimeError: If log_dir is None, file is missing, or parse fails
-        """
-        if log_dir is None:
-            raise RuntimeError("PBS sync requires a log directory (--log-path)")
-        return fetch_jobs_from_pbs_logs(
-            log_dir=log_dir, machine=self.machine, date=period
-        )

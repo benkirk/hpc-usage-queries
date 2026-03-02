@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 
 from job_history.database import Base
 from job_history.database import Job, Account, User, Queue, JobCharge, JobRecord
-from job_history.sync.pbs import fetch_jobs_from_pbs_logs
 from job_history.sync import SyncPBSLogs, JobImporter
 
 
@@ -33,14 +32,12 @@ def test_db():
 class TestDerechodPBSParsing:
     """Tests for Derecho PBS log parsing."""
 
-    def test_fetch_derecho_sample(self):
+    def test_fetch_derecho_sample(self, test_db):
         """Fetch and parse small Derecho sample log."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/derecho"
 
-        jobs = list(fetch_jobs_from_pbs_logs(
-            log_dir=fixture_dir,
-            machine="derecho",
-            date="2026-01-29"
+        jobs = list(SyncPBSLogs(test_db, "derecho").fetch_records(
+            str(fixture_dir), "2026-01-29"
         ))
 
         assert len(jobs) > 0, "Should parse at least some jobs"
@@ -85,14 +82,12 @@ class TestDerechodPBSParsing:
 class TestCasperPBSParsing:
     """Tests for Casper PBS log parsing."""
 
-    def test_fetch_casper_sample(self):
+    def test_fetch_casper_sample(self, test_db):
         """Fetch and parse small Casper sample log."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
-        jobs = list(fetch_jobs_from_pbs_logs(
-            log_dir=fixture_dir,
-            machine="casper",
-            date="2026-01-30"
+        jobs = list(SyncPBSLogs(test_db, "casper").fetch_records(
+            str(fixture_dir), "2026-01-30"
         ))
 
         assert len(jobs) == 7, "Should parse all 7 jobs from casper sample"
@@ -109,14 +104,12 @@ class TestCasperPBSParsing:
         cpu_jobs = [j for j in jobs if not j.get("gputype")]
         assert len(cpu_jobs) == 3, "Should have 3 CPU-only jobs"
 
-    def test_casper_gpu_type_extraction(self):
+    def test_casper_gpu_type_extraction(self, test_db):
         """Verify GPU type extraction from select strings and queues."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
-        jobs = list(fetch_jobs_from_pbs_logs(
-            log_dir=fixture_dir,
-            machine="casper",
-            date="2026-01-30"
+        jobs = list(SyncPBSLogs(test_db, "casper").fetch_records(
+            str(fixture_dir), "2026-01-30"
         ))
 
         a100_job = next(j for j in jobs if j["queue"] == "a100")
@@ -161,10 +154,8 @@ class TestJobImporter:
         """Verify JobImporter creates users, accounts, queues."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
-        jobs = list(fetch_jobs_from_pbs_logs(
-            log_dir=fixture_dir,
-            machine="casper",
-            date="2026-01-30"
+        jobs = list(SyncPBSLogs(test_db, "casper").fetch_records(
+            str(fixture_dir), "2026-01-30"
         ))
 
         importer = JobImporter(test_db, "casper")
@@ -182,10 +173,8 @@ class TestJobImporter:
         """Verify JobImporter caches users/accounts/queues."""
         fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/casper"
 
-        jobs = list(fetch_jobs_from_pbs_logs(
-            log_dir=fixture_dir,
-            machine="casper",
-            date="2026-01-30"
+        jobs = list(SyncPBSLogs(test_db, "casper").fetch_records(
+            str(fixture_dir), "2026-01-30"
         ))
 
         importer = JobImporter(test_db, "casper")
