@@ -3,8 +3,8 @@
 Provides db_available() and db_get_records() as drop-in replacements
 for the get_pbs_records() log-scanning call in qhist's main loop.
 
-Usage in bin/jobhist:
-    from job_history.jobhist_compat import db_available, db_get_records
+Usage in bin/qhist-db:
+    from job_history.qhist_plugin import db_available, db_get_records
 
     if machine and db_available(machine):
         jobs = db_get_records(machine, bounds[0], bounds[1], ...)
@@ -19,20 +19,10 @@ from typing import Iterator
 
 from sqlalchemy.orm import joinedload, aliased
 
-from .database import get_db_path, get_session, VALID_MACHINES
-from .models import Job, User, Account, Queue
+from .database import get_session, VALID_MACHINES, Job, User, Account, Queue
 
 logger = logging.getLogger(__name__)
 
-
-def db_available(machine: str) -> bool:
-    """Return True if a jobhist SQLite database exists for the given machine."""
-    if machine not in VALID_MACHINES:
-        return False
-    try:
-        return get_db_path(machine).exists()
-    except Exception:
-        return False
 
 
 def _get_sql_column(u, a, q, field: str):

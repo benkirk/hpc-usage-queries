@@ -3,7 +3,7 @@
 import pytest
 from datetime import date, datetime, timedelta, timezone
 
-from job_history.models import Job, DailySummary, JobCharge
+from job_history.database import Job, DailySummary, JobCharge
 from job_history.queries import JobQueries
 
 
@@ -100,7 +100,7 @@ def sample_jobs(in_memory_session):
     in_memory_session.commit()
 
     # Create job_charges for each job (using casper charging rules for tests)
-    from job_history.charging import casper_charge
+    from job_history.sync.charging import casper_charge
 
     for job in jobs:
         charges = casper_charge(job)

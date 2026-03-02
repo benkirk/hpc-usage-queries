@@ -7,8 +7,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "rich",
     "click",
-    "pbsparse",
-    "pbs-qhist",
+    "pbsparse>=0.2.6",
     "python-dotenv",
 ]
 
@@ -23,7 +22,7 @@ postgres = [
 ]
 
 analysis = [
-         "hpc-usage-queries[dev]",
+         "hpc-usage-queries[dev,postgres]",
          "jupyterlab",
          "numpy",
          "matplotlib",

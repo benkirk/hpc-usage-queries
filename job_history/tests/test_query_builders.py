@@ -2,60 +2,63 @@
 
 import pytest
 from sqlalchemy import func
-from job_history.query_builders import PeriodGrouper, ResourceTypeResolver
+from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
+from sqlalchemy.dialects.postgresql import dialect as pg_dialect
+from job_history.queries.builders import PeriodGrouper, ResourceTypeResolver
+
+
+def _sql(expr, dialect_cls):
+    """Compile *expr* against *dialect_cls* and return the SQL string."""
+    return str(expr.compile(dialect=dialect_cls()))
 
 
 class TestPeriodGrouper:
     """Tests for the PeriodGrouper class."""
 
     def test_get_period_func_day(self):
-        """Test day period function generation."""
-        from job_history.models import Job
+        """Test day period function compiles correctly for both dialects."""
+        from job_history.database import Job
 
         period_func = PeriodGrouper.get_period_func('day', Job.end)
 
-        # Should return a strftime function
-        assert str(period_func).startswith("strftime(")
-        # Verify it's a function with the correct name
-        assert period_func.name == 'strftime'
+        assert 'strftime' in _sql(period_func, sqlite_dialect)
+        assert 'to_char'  in _sql(period_func, pg_dialect)
 
     def test_get_period_func_month(self):
-        """Test month period function generation."""
-        from job_history.models import Job
+        """Test month period function compiles correctly for both dialects."""
+        from job_history.database import Job
 
         period_func = PeriodGrouper.get_period_func('month', Job.end)
 
-        # Should return a strftime function
-        assert str(period_func).startswith("strftime(")
-        # Verify it's a function with the correct name
-        assert period_func.name == 'strftime'
+        assert 'strftime' in _sql(period_func, sqlite_dialect)
+        assert 'to_char'  in _sql(period_func, pg_dialect)
 
     def test_get_period_func_quarter(self):
-        """Test quarter returns a SQL expression for YYYY-Q#."""
-        from job_history.models import Job
+        """Test quarter returns a SQL expression for YYYY-Q# for both dialects."""
+        from job_history.database import Job
 
         period_func = PeriodGrouper.get_period_func('quarter', Job.end)
 
-        # Quarter returns a complex expression (string concatenation)
-        func_str = str(period_func)
-        assert "strftime" in func_str
-        assert "CAST" in func_str
-        # It's an expression, not a single function, so no .name attribute check
+        sqlite_sql = _sql(period_func, sqlite_dialect)
+        assert 'strftime' in sqlite_sql
+        assert 'CAST' in sqlite_sql
+
+        pg_sql = _sql(period_func, pg_dialect)
+        assert 'to_char' in pg_sql
+        assert 'CAST' in pg_sql
 
     def test_get_period_func_year(self):
-        """Test year period function generation."""
-        from job_history.models import Job
+        """Test year period function compiles correctly for both dialects."""
+        from job_history.database import Job
 
         period_func = PeriodGrouper.get_period_func('year', Job.end)
 
-        # Should return a strftime function
-        assert str(period_func).startswith("strftime(")
-        # Verify it's a function with the correct name
-        assert period_func.name == 'strftime'
+        assert 'strftime' in _sql(period_func, sqlite_dialect)
+        assert 'to_char'  in _sql(period_func, pg_dialect)
 
     def test_get_period_func_invalid(self):
         """Test that invalid period raises ValueError."""
-        from job_history.models import Job
+        from job_history.database import Job
 
         with pytest.raises(ValueError) as exc_info:
             PeriodGrouper.get_period_func('invalid', Job.end)
@@ -260,7 +263,7 @@ class TestResourceTypeResolver:
 
     def test_resolve_cpu_derecho(self):
         """Test CPU resource type resolution for Derecho."""
-        from job_history.models import JobCharge
+        from job_history.database import JobCharge
 
         queues, hours_field = ResourceTypeResolver.resolve('cpu', 'derecho', JobCharge)
 
@@ -271,7 +274,7 @@ class TestResourceTypeResolver:
 
     def test_resolve_gpu_derecho(self):
         """Test GPU resource type resolution for Derecho."""
-        from job_history.models import JobCharge
+        from job_history.database import JobCharge
 
         queues, hours_field = ResourceTypeResolver.resolve('gpu', 'derecho', JobCharge)
 
@@ -283,7 +286,7 @@ class TestResourceTypeResolver:
 
     def test_resolve_all_derecho(self):
         """Test 'all' resource type resolution for Derecho."""
-        from job_history.models import JobCharge
+        from job_history.database import JobCharge
 
         queues, hours_field = ResourceTypeResolver.resolve('all', 'derecho', JobCharge)
 
@@ -302,7 +305,7 @@ class TestResourceTypeResolver:
 
     def test_resolve_cpu_casper(self):
         """Test CPU resource type resolution for Casper."""
-        from job_history.models import JobCharge
+        from job_history.database import JobCharge
 
         queues, hours_field = ResourceTypeResolver.resolve('cpu', 'casper', JobCharge)
 
@@ -315,7 +318,7 @@ class TestResourceTypeResolver:
 
     def test_resolve_gpu_casper(self):
         """Test GPU resource type resolution for Casper."""
-        from job_history.models import JobCharge
+        from job_history.database import JobCharge
 
         queues, hours_field = ResourceTypeResolver.resolve('gpu', 'casper', JobCharge)
 
@@ -324,7 +327,7 @@ class TestResourceTypeResolver:
 
     def test_resolve_invalid_resource_type(self):
         """Test that invalid resource type raises ValueError."""
-        from job_history.models import JobCharge
+        from job_history.database import JobCharge
 
         with pytest.raises(ValueError) as exc_info:
             ResourceTypeResolver.resolve('invalid', 'derecho', JobCharge)
@@ -336,7 +339,7 @@ class TestResourceTypeResolver:
 
     def test_resolve_case_insensitive_machine(self):
         """Test that machine names are case-insensitive."""
-        from job_history.models import JobCharge
+        from job_history.database import JobCharge
 
         # Test uppercase
         queues_upper, _ = ResourceTypeResolver.resolve('cpu', 'DERECHO', JobCharge)

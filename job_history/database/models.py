@@ -252,7 +252,6 @@ class Job(LookupMixin, Base):
     # Time metrics (in seconds)
     elapsed = Column(Integer)
     walltime = Column(Integer)
-    cputime = Column(BigInteger)  # total CPU-seconds; can exceed 2^31 for large parallel jobs
 
     # Resource allocation
     numcpus = Column(Integer)
@@ -270,11 +269,6 @@ class Job(LookupMixin, Base):
     cputype = Column(Text)
     gputype = Column(Text)
     resources = Column(Text)
-
-    # Performance metrics
-    cpupercent = Column(Float)
-    avgcpu = Column(Float)
-    count = Column(Integer)
 
     __table_args__ = (
         # Unique constraint: same job_id + submit time = same job
@@ -314,7 +308,7 @@ class Job(LookupMixin, Base):
         Returns:
             Dictionary with keys: cpu_hours, gpu_hours, memory_hours
         """
-        from .charging import casper_charge, derecho_charge
+        from ..sync.charging import casper_charge, derecho_charge
 
         return derecho_charge(self) if machine == 'derecho' else casper_charge(self)
 
@@ -434,7 +428,7 @@ class JobRecord(Base):
             decompressed = gzip.decompress(self.compressed_data)
             return pickle.loads(decompressed)
         except Exception as e:
-            from .log_config import get_logger
+            from ..log_config import get_logger
             logger = get_logger(__name__)
             logger.error(f"Failed to decompress/unpickle JobRecord for job {self.job_id}: {e}")
             return None

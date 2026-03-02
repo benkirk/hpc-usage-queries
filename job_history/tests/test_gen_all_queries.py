@@ -32,9 +32,9 @@ Subcommand → query method mapping (from cli.py RESOURCE_REPORTS):
 import pytest
 from datetime import date, datetime, timedelta, timezone
 
-from job_history.models import Job, JobCharge
+from job_history.database import Job, JobCharge
 from job_history.queries import JobQueries
-from job_history.charging import casper_charge
+from job_history.sync.charging import casper_charge
 
 
 # ---------------------------------------------------------------------------

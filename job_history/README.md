@@ -1,419 +1,348 @@
 # QHist Queries
 
-A SQLite database and Python toolkit for collecting and analyzing historical job data from NCAR's Casper and Derecho supercomputing resources.
+A SQLite/PostgreSQL database and Python toolkit for collecting and analyzing historical job data from NCAR's Casper and Derecho supercomputing resources.
 
 ## Overview
 
-This project parses PBS accounting logs from NCAR's HPC systems, stores records in local SQLite databases, and provides a foundation for usage analysis.
+This project parses PBS accounting logs from NCAR's HPC systems, stores records in local databases, and provides a foundation for usage analysis.
 
 **Features:**
-- Optimized schema with 5-10x query performance via normalization and composite indexes
+- Optimized schema with normalization and composite indexes (5-10× query speed)
 - Separate database per machine for independent management
 - Pre-computed charging calculations in materialized table (`qos_factor` support built in)
 - Bulk sync with duplicate detection and foreign key resolution
 - Handles job arrays (e.g., `6049117[28]`)
 - Python query interface for common usage analysis patterns
 - Daily summary tables for fast historical queries
+- SQLite (default) and PostgreSQL backends
 
 ## Quick Start
 
+**SQLite (default)** — no server required:
 ```bash
-# Initialize databases (creates both casper.db and derecho.db)
+# Initialize databases (creates casper.db and derecho.db)
 make init-db
 
 # Sync a date range
-make sync-all START=20250801 END=20251123
+jobhist sync -m derecho -l ./data/pbs_logs/derecho --start 2025-08-01 --end 2025-11-23
 
-# Run the built-in examples with your database
-python -m job_history.queries
+# Run history/resource reports
+jobhist history --start-date 2025-11-01 --end-date 2025-11-30 daily-summary
+jobhist resource --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-sizes
+```
+
+**PostgreSQL** — shared server, same commands:
+```bash
+# Install the postgres extras and start a server (or use compose.yaml)
+pip install 'hpc-usage-queries[postgres]'
+docker compose up -d          # starts postgres:18 on localhost:5432
+
+# Point the tool at it (copy .env.example → .env and fill in credentials)
+export JH_DB_BACKEND=postgres
+export JH_PG_PASSWORD=...
+
+# Initialize (auto-creates derecho_jobs and casper_jobs databases)
+python -c "from job_history import init_db; init_db()"
+
+# Everything else is identical
+jobhist sync -m derecho -l ./data/pbs_logs/derecho --start 2025-08-01 --end 2025-11-23
 ```
 
 ## Configuration
 
-Database location can be configured via environment variables.
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `JH_DB_BACKEND` | `sqlite` | `sqlite` or `postgres` |
+| `JOB_HISTORY_DATA_DIR` | `data/` | SQLite: directory for `{machine}.db` files |
+| `QHIST_DERECHO_DB` | `{data_dir}/derecho.db` | SQLite: override Derecho DB path |
+| `QHIST_CASPER_DB` | `{data_dir}/casper.db` | SQLite: override Casper DB path |
+| `JH_PG_HOST` | `localhost` | PostgreSQL host |
+| `JH_PG_PORT` | `5432` | PostgreSQL port |
+| `JH_PG_USER` | `postgres` | PostgreSQL user |
+| `JH_PG_PASSWORD` | — | PostgreSQL password |
+| `JH_PG_DERECHO_DB` | `derecho_jobs` | Override Derecho database name |
+| `JH_PG_CASPER_DB` | `casper_jobs` | Override Casper database name |
+| `JH_PG_REQUIRE_SSL` | `false` | Require SSL/TLS for PostgreSQL |
 
-| Configuration | Environment Variable | Default |
-|---------------|----------------------|---------|
-| Data directory | `JOB_HISTORY_DATA_DIR` | `data/` (relative to project root) |
-| Derecho DB file | `QHIST_DERECHO_DB` | `{data_dir}/derecho.db` |
-| Casper DB file | `QHIST_CASPER_DB` | `{data_dir}/casper.db` |
-
-### Examples
-
-```bash
-# Use custom data directory
-export JOB_HISTORY_DATA_DIR=/path/to/my/data
-make init-db
-
-# Use explicit path for a specific machine's database
-export QHIST_DERECHO_DB=/tmp/derecho_test.db
-jobhist sync -m derecho -d 2026-01-15
-```
+Copy `.env.example` → `.env` for non-default configuration.
 
 ## Project Structure
 
 ```
-hpc-usage-queries/
-├── bin/
-│   └── jobhist              # qhist-compatible job query frontend (DB-backed)
-├── job_history/             # Python package
-│   ├── cli.py               # Main CLI entry point (Click-based)
-│   ├── sync_cli/            # Sync command implementations
-│   │   ├── common.py        # Shared Click decorators/utilities
-│   │   └── sync.py          # jobhist sync command
-│   ├── wrappers/            # Convenience entry points for selective deployment
-│   │   ├── jobhist_sync.py      # jobhist-sync → jobhist sync
-│   │   ├── jobhist_history.py   # jobhist-history → jobhist history
-│   │   └── jobhist_resource.py  # jobhist-resource → jobhist resource
-│   ├── tests/               # Test suite (pytest)
-│   │   ├── conftest.py      # Shared fixtures (in-memory DB, job data)
-│   │   └── fixtures/        # PBS log fixtures for integration tests
-│   ├── models.py            # SQLAlchemy ORM models
-│   ├── database.py          # Engine/session management with PRAGMA optimizations
-│   ├── jobhist_compat.py    # DB-backed record retrieval for qhist frontend
-│   ├── sync.py              # FK resolution, charge calculation
-│   ├── queries.py           # High-level query interface
-│   ├── charging.py          # Machine-specific charging rules
-│   ├── summary.py           # Daily summary generation
-│   ├── pbs_parsers.py       # PBS field/date parsers and record transformation
-│   ├── pbs_read_logs.py     # Local PBS log file scanning and streaming
-│   ├── exporters.py         # Data export formats (JSON, CSV, markdown)
-│   ├── SCHEMA.md            # Complete schema documentation
-│   └── log_config.py        # Logging configuration
-├── data/
-│   ├── casper.db            # Casper jobs (gitignored)
-│   └── derecho.db           # Derecho jobs (gitignored)
-└── Makefile                 # Convenience targets
+job_history/
+  __init__.py              Public API surface
+  cli.py                   Unified jobhist CLI (Click)
+  exporters.py             Data export formats (JSON, CSV, markdown, dat)
+  log_config.py            Logging helpers
+  qhist_plugin.py          DB-backed record retrieval for bin/qhist-db
+
+  database/                ── database management ──────────────────────
+    __init__.py            Re-exports all public names
+    config.py              JobHistoryConfig — env-var / dotenv loading
+    models.py              ORM models: Job, JobCharge, JobRecord,
+                             DailySummary, User, Account, Queue,
+                             LookupCache, LookupMixin
+    session.py             Engine/session factory, PRAGMA tuning, init_db
+
+  _vendor/                 ── vendored third-party code ─────────────────
+    pbs-parser-ncar/ncar.py  DerechoRecord (PbsRecord + power metrics)
+
+  sync/                    ── data ingestion ────────────────────────────
+    __init__.py            Re-exports SyncBase, SyncPBSLogs, JobImporter,
+                             SyncSLURMLogs, MACHINE_SCHEDULERS
+    base.py                SyncBase ABC + JobImporter; owns full sync
+                             lifecycle: insert, upsert, resummarize.
+                             MACHINE_SCHEDULERS, UPDATABLE_JOB_FIELDS
+    pbs.py                 PBS field parsers, fetch_jobs_from_pbs_logs(),
+                             SyncPBSLogs driver, DerechoRecord loader
+    charging.py            derecho_charge(), casper_charge()
+    summary.py             generate_daily_summary(), get_summarized_dates()
+    utils.py               date_range(), parse_date_string(),
+                             normalize_datetime_to_naive(), safe_int/float, …
+    cli.py                 `jobhist sync` Click command + shared decorators
+    slurm.py               SyncSLURMLogs stub (future)
+
+  queries/                 ── analytics ─────────────────────────────────
+    __init__.py            Re-exports JobQueries, QueryConfig, builders
+    jobs.py                JobQueries — high-level query API
+    builders.py            PeriodGrouper, ResourceTypeResolver
+
+  wrappers/                ── selective-deployment entry points ─────────
+    jobhist_sync.py        jobhist-sync  → jobhist sync
+    jobhist_history.py     jobhist-history → jobhist history
+    jobhist_resource.py    jobhist-resource → jobhist resource
+
+  tests/                   ── test suite ────────────────────────────────
+    conftest.py            Shared fixtures (in-memory DB, job data)
+    fixtures/              PBS log fixtures for integration tests
+    test_*.py              170 tests, run with pytest
+
+bin/
+  qhist-db                 qhist-compatible frontend, DB-backed via qhist_plugin
+data/
+  casper.db                Casper jobs (gitignored)
+  derecho.db               Derecho jobs (gitignored)
 ```
 
 ## Database Schema
 
 ### Core Tables
 
-**jobs**: Job records with foreign keys to normalized lookup tables
-- Auto-increment primary key (handles scheduler ID wrap-around)
-- Foreign keys: `user_id`, `account_id`, `queue_id`
-- Hybrid properties: `user`, `account`, `queue` (transparently fetch from lookup tables)
-- Resource allocations: `numcpus`, `numgpus`, `numnodes`, `memory`
-- Timestamps in UTC: `submit`, `start`, `end`, `elapsed`
+**jobs** — Job records with FK lookups
+- Auto-increment PK (handles scheduler ID wrap-around)
+- FKs: `user_id`, `account_id`, `queue_id` → lookup tables
+- Hybrid properties `user`, `account`, `queue` — read/write text transparently
+- Resource fields: `numcpus`, `numgpus`, `numnodes`, `memory`, `cputype`, `gputype`
+- UTC timestamps: `submit`, `eligible`, `start`, `end`, `elapsed`
 - Unique constraint on `(job_id, submit)` prevents duplicates
 
-**users, accounts, queues**: Normalized lookup tables
-- Map IDs to names for efficient integer-based joins
-- ~3,500 users, ~1,300 accounts, ~150 queues
+**users / accounts / queues** — Normalized lookup tables (integer FK joins)
 
-**job_charges**: Materialized charging calculations
+**job_charges** — Materialized charging calculations (1:1 with jobs)
 - Pre-computed: `cpu_hours`, `gpu_hours`, `memory_hours`
-- `qos_factor` (default 1.0) reserved for future QoS-based scaling
-- 1:1 with jobs table for instant charge lookups
-- Eliminates on-the-fly calculation overhead
+- `qos_factor` (default 1.0) reserved for future QoS scaling
 
-**daily_summary**: Aggregated usage by date/user/account/queue
-- Fast historical queries without scanning full jobs table
-- Uses foreign keys with hybrid properties for backward compatibility
-- NULL FKs represent 'NO_JOBS' markers for empty days
+**job_records** — Gzip-compressed pickled `PbsRecord` objects (1:1 with jobs)
+- Enables `bin/qhist-db` to return original PBS records without re-scanning logs
 
-### Performance Optimizations
+**daily_summary** — Pre-aggregated by `(date, user_id, account_id, queue_id)`
+- NULL FKs = NO_JOBS marker rows for empty days
+- Fast historical queries without scanning the full jobs table
 
-**Composite indexes** for common query patterns:
-- `ix_jobs_queue_end` - Primary query: filter by queue and date range
-- `ix_jobs_queue_user_end`, `ix_jobs_queue_account_end` - User/account filtering
-- `ix_daily_summary_*_date` - Fast daily summary lookups
+### Performance
 
-**SQLite PRAGMA settings**:
-- WAL mode for concurrent reads during writes
-- 64MB cache, 256MB memory-mapped I/O
-- Foreign key enforcement enabled
+**SQLite PRAGMA settings** (per-engine, registered in `database/session.py`):
+- WAL mode, 64 MB cache, 256 MB memory-mapped I/O, foreign key enforcement
 
-See [SCHEMA.md](SCHEMA.md) for complete details.
+**Composite indexes**: `ix_jobs_user_account`, `ix_jobs_submit_end`, `ix_jobs_{user,account,queue}_submit`, `ix_daily_summary_date`, `ix_daily_summary_user_account`
 
-## SQL Query Examples
+See [SCHEMA.md](SCHEMA.md) for full schema documentation.
 
-```sql
--- Top users by CPU hours in date range
-SELECT u.username, SUM(jc.cpu_hours) as total_cpu_hours
-FROM jobs j
-JOIN users u ON j.user_id = u.id
-JOIN job_charges jc ON j.id = jc.job_id
-JOIN queues q ON j.queue_id = q.id
-WHERE q.queue_name IN ('cpu', 'cpudev')
-  AND j.end >= '2025-01-01' AND j.end < '2025-02-01'
-GROUP BY u.username
-ORDER BY total_cpu_hours DESC
-LIMIT 10;
+## Sync
 
--- GPU usage by account with job counts
-SELECT a.account_name,
-       COUNT(*) as job_count,
-       SUM(jc.gpu_hours) as total_gpu_hours
-FROM jobs j
-JOIN accounts a ON j.account_id = a.id
-JOIN job_charges jc ON j.id = jc.job_id
-JOIN queues q ON j.queue_id = q.id
-WHERE q.queue_name IN ('gpu', 'gpudev')
-  AND j.end >= '2025-01-01'
-GROUP BY a.account_name;
-
--- Average wait time by queue
-SELECT q.queue_name,
-       AVG(strftime('%s', j.start) - strftime('%s', j.submit))/60.0 as avg_wait_min
-FROM jobs j
-JOIN queues q ON j.queue_id = q.id
-WHERE j.start IS NOT NULL
-GROUP BY q.queue_name;
-```
-
-## CLI Sync Usage
-
-The `jobhist sync` command parses PBS accounting logs into the local database:
+### CLI
 
 ```bash
-# Sync a single date
-jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 -v
+# Single date
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 -v
 
-# Sync a date range
-jobhist sync -m casper -l ./data/pbs_logs/casper --start 2025-11-01 --end 2025-11-30 -v
+# Date range
+jobhist sync -m casper -l ./data/pbs_logs/casper --start 2026-01-01 --end 2026-01-31
 
-# Dry run (parse but don't insert)
-jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --dry-run -v
+# Dry run (parse, don't insert)
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 --dry-run -v
 
-# Force re-sync of already-summarized dates
-jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2025-11-21 --force -v
+# Re-parse and update existing records (recalculates charges + summaries)
+# Bypasses the already-summarized day skip automatically
+jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 --upsert
+
+# Recompute daily summaries from current DB state (no log parsing; --log-path not needed)
+jobhist sync -m derecho -d 2026-01-29 --resummarize
+jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
+
+# Explicit scheduler override (scheduler inferred from machine by default)
+jobhist sync -m derecho --scheduler pbs -l ./data/pbs_logs/derecho -d 2026-01-29
 ```
 
-**Note:** PBS log parsing populates `cpu_type` and `gpu_type` fields from PBS select strings.
+PBS log sync populates `cpu_type` and `gpu_type` from PBS select strings — these fields are unavailable from other sources.
 
-During sync, the system:
-1. Parses job data from local PBS accounting logs
-2. Resolves foreign keys (creates new users/accounts/queues as needed)
-3. Inserts jobs with duplicate detection
-4. Calculates and stores charges immediately
-5. Updates daily summary table
+`--scheduler` is inferred from machine name via `MACHINE_SCHEDULERS` in `sync/base.py`; currently both `derecho` and `casper` map to `pbs`. A future SLURM implementation would add a new entry and implement `SyncSLURMLogs.fetch_records()`.
+
+### Python API
+
+```python
+from job_history import get_session, init_db
+from job_history.sync import SyncPBSLogs
+
+engine = init_db("derecho")
+session = get_session("derecho", engine)
+syncer = SyncPBSLogs(session, "derecho")
+
+# Normal sync
+stats = syncer.sync("./data/pbs_logs/derecho", start_date="2026-01-01", end_date="2026-01-31")
+
+# Upsert — update existing records with re-parsed values + recalculate charges
+stats = syncer.sync("./data/pbs_logs/derecho", period="2026-01-29", upsert=True)
+
+# Resummarize — recompute daily_summary from current DB state, no log dir needed
+stats = syncer.sync(None, start_date="2026-01-01", end_date="2026-01-31", resummarize_only=True)
+
+# stats: {fetched, inserted, updated, errors, days_summarized, days_failed, days_skipped}
+```
+
+### Sync pipeline (per day)
+
+**Normal sync (insert-only):**
+1. Parse scheduler log → stream record objects (`DerechoRecord`/`PbsRecord`)
+2. Resolve FKs (get-or-create user/account/queue via `LookupCache`)
+3. Bulk-insert new jobs, skip `(job_id, submit)` pairs already in DB
+4. Calculate and store charges in `job_charges`
+5. Compress-pickle raw record into `job_records`
+6. Generate `daily_summary` aggregation
+
+**Upsert (`--upsert`):** skips step 3 for existing records; instead calls
+`_update_batch()` which bulk-updates `UPDATABLE_JOB_FIELDS`, deletes+reinserts
+`job_charges` (recalculated), and replaces `job_records`. Bypasses the
+already-summarized day skip. Summaries regenerated after each day.
+
+**Resummarize (`--resummarize`):** skips all log I/O; only step 6 runs.
 
 ## Charging Rules
 
-Charges are computed during import using machine-specific rules and stored in the `job_charges` table.
+Computed at import time by `sync/charging.py`, stored in `job_charges`.
 
 **Derecho:**
-- Production CPU queues: `numnodes × 128 cores/node × elapsed_hours`
-- Production GPU queues: `numnodes × 4 GPUs/node × elapsed_hours`
-- Dev queues: actual resources used (not full-node)
-- Memory-hours: `memory_gb × elapsed_hours`
+- Production CPU: `numnodes × 128 cores/node × elapsed_hours`
+- Production GPU: `numnodes × 4 GPUs/node × elapsed_hours`
+- Dev queues: actual resources (`numcpus` / `numgpus`)
+- Memory: `memory_gb × elapsed_hours`
 
 **Casper:**
-- CPU-hours: `numcpus × elapsed_hours`
-- GPU-hours: `numgpus × elapsed_hours`
-- Memory-hours: `memory_gb × elapsed_hours`
+- CPU: `numcpus × elapsed_hours`
+- GPU: `numgpus × elapsed_hours`
+- Memory: `memory_gb × elapsed_hours`
 
-## Python Query Interface
-
-The `JobQueries` class provides a high-level Python API:
+## Query API
 
 ```python
 from datetime import date, timedelta
 from job_history import get_session, JobQueries
 
-# Connect to database
 session = get_session("derecho")
 queries = JobQueries(session, "derecho")
 
-# Usage by group (user, account, or queue)
 end = date.today()
 start = end - timedelta(days=30)
+
+# Usage by group (user / account / queue)
 cpu_by_user = queries.usage_by_group('cpu', 'user', start, end)
+# [{'label': username, 'usage_hours': float, 'job_count': int}, ...]
 
-# Each result: {'label': username, 'usage_hours': float, 'job_count': int}
-for result in sorted(cpu_by_user, key=lambda x: x['usage_hours'], reverse=True)[:5]:
-    print(f"{result['label']}: {result['usage_hours']:,.0f} CPU-hours ({result['job_count']:,} jobs)")
+# Job size / wait distributions
+job_sizes = queries.job_sizes_by_resource('cpu', 'node', start, end)
+job_waits = queries.job_waits_by_resource('gpu', 'gpu', start, end)
 
-# Job size/wait distributions
-job_sizes = queries.job_sizes_by_resource('cpu', start, end)
-job_waits = queries.job_waits_by_resource('gpu', start, end)
+# Duration histograms, usage history time series
+durations = queries.job_durations('gpu', start, end, period='month')
+history   = queries.usage_history(start, end, period='quarter')
+
+# Daily summary
+rows = queries.daily_summary_report(start=start, end=end)
+# [{'date', 'user', 'account', 'queue', 'job_count', 'cpu_hours', 'gpu_hours', 'memory_hours'}, ...]
 
 session.close()
 ```
 
-**Available methods:**
-- `usage_by_group(resource, group_by, start, end)` - Aggregate usage by user/account/queue
-- `job_sizes_by_resource(resource, start, end)` - Job size distributions
-- `job_waits_by_resource(resource, start, end)` - Queue wait time distributions
-- `job_durations(resource, start, end)` - Runtime distributions
-- `usage_history(resource, group_by, start, end, period)` - Time series data
+Key methods: `usage_by_group`, `job_sizes_by_resource`, `job_waits_by_resource`, `job_durations`, `job_memory_per_rank`, `usage_history`, `daily_summary_report`, `jobs_by_entity_period`, `unique_users_by_period`, `unique_projects_by_period`.
 
-See `job_history/queries.py` for complete API documentation.
+See `queries/jobs.py` for complete API.
 
-## Daily Summary Programmatic Access
-
-The pre-aggregated `daily_summary` table supports fast date-range queries by user, account, and queue:
+### Period helpers (`queries/builders.py`)
 
 ```python
-from datetime import date
-from job_history import get_session
-from job_history.queries import JobQueries
+from job_history.queries.builders import PeriodGrouper, ResourceTypeResolver
 
-session = get_session("derecho")
-queries = JobQueries(session)
+# Day / month / quarter / year grouping for SQLAlchemy queries
+func = PeriodGrouper.get_period_func('quarter', Job.end)
 
-rows = queries.daily_summary_report(
-    start=date(2026, 2, 1),
-    end=date(2026, 2, 28),
-)
+# Aggregate monthly→quarterly in Python
+quarterly = PeriodGrouper.aggregate_quarters(monthly_rows, 'job_count')
 
-# Each row: {'date', 'user', 'account', 'queue',
-#            'job_count', 'cpu_hours', 'gpu_hours', 'memory_hours'}
-for row in rows:
-    print(f"{row['date']}  {row['user']:15s}  {row['account']:12s}  "
-          f"{row['queue']:10s}  {row['job_count']:5d}  "
-          f"{row['cpu_hours']:10.1f} CPU-h  {row['gpu_hours']:8.1f} GPU-h")
-
-session.close()
+# Resolve 'cpu'/'gpu'/'all' to queue names + charge field
+queues, hours_field = ResourceTypeResolver.resolve('gpu', 'derecho', JobCharge)
 ```
 
-CLI equivalent:
+## History and Resource Reports (CLI)
 
 ```bash
-jobhist history --start-date 2026-02-01 --end-date 2026-02-28 daily-summary
+# History subcommands
+jobhist history -m derecho --start-date 2026-01-01 --end-date 2026-01-31 \
+    [daily-summary | jobs-per-user | jobs-per-project | unique-users | unique-projects]
+
+# Resource subcommands  (writes .dat/.json/.csv/.md files)
+jobhist resource -m derecho --start-date 2026-01-01 --end-date 2026-01-31 \
+    [cpu-job-sizes | gpu-job-sizes | job-sizes
+     cpu-job-waits | gpu-job-waits | job-waits | memory-job-waits
+     cpu-job-durations | gpu-job-durations
+     cpu-job-memory-per-rank | gpu-job-memory-per-rank
+     pie-user-cpu | pie-user-gpu | pie-proj-cpu | pie-proj-gpu
+     pie-group-cpu | pie-group-gpu | usage-history | memory-job-sizes]
+
+# Output format (default: dat)
+jobhist resource --format json --start-date … pie-user-cpu
 ```
-
-## qhist Frontend (bin/jobhist)
-
-`bin/jobhist` is a drop-in replacement for the `qhist` job query tool that replaces
-day-by-day PBS log scanning with a single, memory-bounded SQLAlchemy streaming query.
-When the database is unavailable it falls back transparently to standard log scanning.
-
-### Machine selection
-
-```bash
-export QHIST_MACHINE=derecho   # or casper
-```
-
-With `QHIST_MACHINE` set and the corresponding `.db` file present, all queries go to
-the database.  Without it (or when the DB is missing) the tool falls back to log
-scanning with a stderr warning.
-
-### Usage
-
-```bash
-# Same flags as qhist — DB used when QHIST_MACHINE is set
-QHIST_MACHINE=derecho bin/jobhist -p 20250115             # single day, tabular
-QHIST_MACHINE=derecho bin/jobhist -p 20250101-20250131    # date range
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 -u jsmith   # user filter
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 -q gpu -A PROJ0001  # queue + account
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 -r          # reverse order
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 -l          # list mode
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 --csv       # CSV output
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 -J          # JSON output
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 -j 7362988  # specific job ID
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 -H dec0001  # host filter (Python phase)
-QHIST_MACHINE=derecho bin/jobhist -p 20250115 -w -a       # wide + averages
-```
-
-### Two-phase filtering
-
-| Phase | Filters | How |
-|-------|---------|-----|
-| SQL (pre-decompression) | date range, job ID, user, account, queue, jobname, Exit_status | WHERE clauses on indexed columns |
-| Python (post-decompression) | host (`-H`), waittime (`-W`), numeric `--filter` ops, exotic fields | Applied to the live PbsRecord after `to_pbs_record()` |
-
-The stored `PbsRecord`/`DerechoRecord` is returned directly — no adapter class —
-so qhist's output functions receive the same object type they always expect.
-
-### Key implementation files
-
-| File | Role |
-|------|------|
-| `bin/jobhist` | Entrypoint: arg parsing, config loading, output dispatch, DB/fallback routing |
-| `job_history/jobhist_compat.py` | `db_available()`, `db_get_records()` generator with two-phase filtering |
-| `job_history/models.py` | `JobRecord.to_pbs_record()` — decompress + unpickle stored record |
-
----
-
-## CLI Tool
-
-The `jobhist` command-line tool provides a unified interface for syncing data and generating reports:
-
-```bash
-jobhist --help
-
-Commands:
-  history   Time history view of job data
-  resource  Resource-centric view of job data
-  sync      Sync jobs from local PBS accounting logs
-```
-
-### History Reports
-
-```bash
-# Unique users/projects over time
-jobhist history --start-date 2025-11-01 --end-date 2025-11-30 unique-users
-jobhist history --group-by quarter unique-projects
-
-# Jobs per user per account
-jobhist history --start-date 2025-11-01 --end-date 2025-11-07 jobs-per-user
-
-# Daily usage summary (user × account × queue; end-date defaults to today)
-jobhist history --start-date 2026-02-01 daily-summary
-jobhist history --start-date 2026-02-01 --end-date 2026-02-28 daily-summary
-```
-
-### Resource Reports
-
-```bash
-# Job size/wait distributions
-jobhist resource --start-date 2025-11-01 --end-date 2025-11-30 cpu-job-sizes
-jobhist resource --start-date 2025-11-01 --end-date 2025-11-30 gpu-job-waits
-
-# Usage summaries (multiple formats)
-jobhist resource --format json pie-user-cpu
-jobhist resource --format csv pie-proj-gpu
-jobhist resource --format md usage-history
-
-# Available subcommands:
-# - job-sizes, job-waits, job-durations (generic)
-# - cpu-job-{sizes,waits,durations}, gpu-job-{sizes,waits,durations}
-# - memory-job-{sizes,waits}
-# - pie-user-{cpu,gpu}, pie-proj-{cpu,gpu}, pie-group-{cpu,gpu}
-# - usage-history
-```
-
 
 ## Convenience Wrappers
 
-Three thin entry points expose each subcommand group independently, mirroring the
-`fs-scans-{import,query,analyze}` pattern. This allows selective deployment — for
-example, restricting `jobhist-sync` to administrators while making `jobhist-history`
-and `jobhist-resource` available to all users.
+Thin entry points for selective deployment (e.g., restrict sync to admins):
 
-| Command | Equivalent to | Defined in |
-|---------|--------------|------------|
-| `jobhist-sync` | `jobhist sync` | `job_history/wrappers/jobhist_sync.py` |
-| `jobhist-history` | `jobhist history` | `job_history/wrappers/jobhist_history.py` |
-| `jobhist-resource` | `jobhist resource` | `job_history/wrappers/jobhist_resource.py` |
+| Command | Equivalent |
+|---------|-----------|
+| `jobhist-sync` | `jobhist sync` |
+| `jobhist-history` | `jobhist history` |
+| `jobhist-resource` | `jobhist resource` |
+
+## `bin/qhist-db` Frontend
+
+Drop-in replacement for `qhist` that replaces day-by-day PBS log scanning with a single memory-bounded SQLAlchemy streaming query. Transparent fallback to log scanning when no DB exists.
 
 ```bash
-# These are equivalent:
-jobhist history --start-date 2026-02-01 daily-summary
-jobhist-history --start-date 2026-02-01 daily-summary
-
-jobhist resource --start-date 2026-01-01 pie-user-cpu
-jobhist-resource --start-date 2026-01-01 pie-user-cpu
+export QHIST_MACHINE=derecho   # enables DB mode
+bin/qhist-db -p 20260115             # tabular, single day
+bin/qhist-db -p 20260101-20260131    # date range
+bin/qhist-db -p 20260115 -u jsmith   # user filter (SQL phase)
+bin/qhist-db -p 20260115 -H dec0001  # host filter (Python phase, post-decompression)
 ```
+
+Two-phase filtering: SQL-translatable fields (date, job ID, user, account, queue, jobname, exit status) are pushed into WHERE clauses; everything else (host, intra-day time, numeric operators) is applied in Python after decompressing the stored `PbsRecord`.
+
+Key files: `job_history/database/session.py` — `db_available()`; `job_history/qhist_plugin.py` — `db_get_records()` generator.
 
 ## Requirements
 
 - Python 3.10+
-- SQLAlchemy
-- Access to PBS accounting log files
-
-## Performance
-
-Query performance improvements from normalized schema:
-- **GPU queries**: ~0.2s for full-year aggregations
-- **CPU queries**: ~3-4s for full-year aggregations across thousands of users
-- **Daily summaries**: Instant lookups via pre-aggregated table
-- **Complex joins**: 0.1-0.2s with composite index usage verified
-
-Database size: ~24% larger than denormalized schema due to materialized charges and indexes, but eliminates runtime computation overhead.
+- SQLAlchemy, click, rich, python-dotenv, pbsparse
+- PostgreSQL extras: `pip install 'job_history[postgres]'`
 
 ## License
 

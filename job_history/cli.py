@@ -7,7 +7,7 @@ from datetime import date, datetime
 from typing import List, Dict, Any
 
 # Import sync command
-from .sync_cli.sync import sync
+from .sync.cli import sync
 
 @dataclass
 class ColumnSpec:

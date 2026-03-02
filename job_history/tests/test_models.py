@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from job_history.models import Job, DailySummary, JobRecord
+from job_history.database import Job, DailySummary, JobRecord
 
 
 # Mock PbsRecord class for testing (must be module-level to be pickleable)

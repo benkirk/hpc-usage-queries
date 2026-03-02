@@ -114,6 +114,38 @@ def get_db_url(machine: str) -> str:
         return str(get_db_path(machine))
 
 
+def db_available(machine: str) -> bool:
+    """Return True if a jobhist database is available for the given machine.
+
+    For the SQLite backend this checks that the .db file exists.
+    For the PostgreSQL backend this validates credentials AND opens a test
+    connection (SELECT 1), so transient network failures or a down server
+    are correctly reported as unavailable.
+
+    Args:
+        machine: Machine name ('casper' or 'derecho')
+
+    Returns:
+        True if the database is accessible, False otherwise
+    """
+    if machine not in VALID_MACHINES:
+        return False
+    try:
+        if JobHistoryConfig.DB_BACKEND == 'postgres':
+            JobHistoryConfig.validate_postgres()
+            engine = get_engine(machine)
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+            finally:
+                engine.dispose()
+        else:
+            return get_db_path(machine).exists()
+        return True
+    except Exception:
+        return False
+
+
 def get_engine(machine: str, echo: bool = False):
     """Create and return a SQLAlchemy engine for *machine*.
 

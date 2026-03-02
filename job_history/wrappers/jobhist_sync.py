@@ -9,7 +9,7 @@ jobhist-history and jobhist-resource are available to all users.
 
 def main():
     """Convenience wrapper that calls sync command directly."""
-    from job_history.sync_cli.sync import sync
+    from job_history.sync.cli import sync
 
     sync()
 

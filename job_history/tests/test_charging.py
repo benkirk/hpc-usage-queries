@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from job_history.charging import derecho_charge, casper_charge
+from job_history.sync.charging import derecho_charge, casper_charge
 
 
 class TestDerechoCharging:

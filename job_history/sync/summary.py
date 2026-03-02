@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from .models import DailySummary, Job
+from ..database.models import DailySummary, Job
 
 
 def get_summarized_dates(session: Session) -> Set[date]:

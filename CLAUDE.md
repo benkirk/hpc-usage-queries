@@ -12,8 +12,8 @@ Two **wholly independent** modules in one repo. Never mix their concerns.
 ## Tests
 
 ```bash
-pytest                        # both suites (283 tests)
-pytest job_history/tests/     # job_history only
+pytest                        # both suites (293 tests)
+pytest job_history/tests/     # job_history only (170 tests)
 pytest fs_scans/tests/        # fs_scans only
 ```
 
@@ -69,16 +69,31 @@ missing tables gracefully).
 **Datetime comparison** — SQLite stores naive datetimes; parsers produce UTC-aware.
 Normalize before comparing: `dt.replace(tzinfo=None)`.
 
+**`db_available(machine)`** — lives in `job_history.database` (not `qhist_plugin`).
+
+**`--upsert` / `--resummarize`** — `jobhist sync` flags for retroactive updates.
+`--upsert` re-parses logs and updates existing Job/JobCharge/JobRecord rows
+(via `SyncBase._update_batch()`); bypasses the summarized-day skip automatically.
+`--resummarize` recomputes `daily_summary` from current DB state, no logs needed.
+
+**`DerechoRecord`** — vendored at `job_history/_vendor/pbs_parser_ncar/ncar.py`
+(underscore rename makes it a proper Python package). Imported via standard dotted
+path `job_history._vendor.pbs_parser_ncar.ncar`; pickle round-trips work without
+any shims. See `_get_record_class()` in `sync/pbs.py`.
+
 ### Key files
 | File | Role |
 |------|------|
-| `job_history/models.py` | ORM models: Job, JobCharge, DailySummary, JobRecord, lookup tables |
-| `job_history/queries.py` | `JobQueries` class — high-level query API |
-| `job_history/charging.py` | `derecho_charge()`, `casper_charge()` — machine-specific rules |
-| `job_history/summary.py` | `generate_daily_summary()` — aggregates jobs → daily_summary |
-| `job_history/sync.py` | Import pipeline: FK resolution, charge calculation |
-| `job_history/sync_cli/sync.py` | `jobhist sync` Click command |
+| `job_history/database/models.py` | ORM models: Job, JobCharge, DailySummary, JobRecord, lookup tables |
+| `job_history/database/session.py` | Engine/session factory, `db_available()`, PRAGMA tuning, `init_db` |
+| `job_history/queries/jobs.py` | `JobQueries` class — high-level query API |
+| `job_history/sync/base.py` | `SyncBase` ABC + `JobImporter`; owns full sync lifecycle (insert, upsert, resummarize); `MACHINE_SCHEDULERS`, `UPDATABLE_JOB_FIELDS` |
+| `job_history/sync/pbs.py` | PBS field parsers, `fetch_jobs_from_pbs_logs()`, `SyncPBSLogs` driver |
+| `job_history/sync/charging.py` | `derecho_charge()`, `casper_charge()` — machine-specific rules |
+| `job_history/sync/summary.py` | `generate_daily_summary()` — aggregates jobs → daily_summary |
+| `job_history/sync/cli.py` | `jobhist sync` Click command (`--upsert`, `--resummarize`) |
 | `job_history/cli.py` | `history` and `resource` Click groups + all subcommands |
+| `job_history/_vendor/pbs_parser_ncar/ncar.py` | Vendored `DerechoRecord` (extends `PbsRecord` with power metrics) |
 | `job_history/SCHEMA.md` | Full schema documentation |
 
 ## fs_scans Architecture

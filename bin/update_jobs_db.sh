@@ -20,6 +20,17 @@ add_column_if_missing() {
     fi
 }
 
+drop_column_if_exists() {
+    local db="$1" table="$2" column="$3"
+    if sqlite3 "$db" "SELECT $column FROM $table LIMIT 1;" 2>/dev/null; then
+        echo "  Dropping $table.$column ..."
+        sqlite3 "$db" "ALTER TABLE $table DROP COLUMN $column;"
+        echo "  Done."
+    else
+        echo "  $table.$column not found — skipping"
+    fi
+}
+
 for db in "${DB_PATHS[@]}"; do
     if [[ ! -f "$db" ]]; then
         echo "WARNING: $db not found — skipping"
@@ -28,6 +39,10 @@ for db in "${DB_PATHS[@]}"; do
     echo "Updating: $db"
     add_column_if_missing "$db" "job_charges" "qos_factor" "REAL DEFAULT 1.0"
     add_column_if_missing "$db" "jobs" "priority" "TEXT"
+    drop_column_if_exists "$db" "jobs" "cputime"
+    drop_column_if_exists "$db" "jobs" "cpupercent"
+    drop_column_if_exists "$db" "jobs" "avgcpu"
+    drop_column_if_exists "$db" "jobs" "count"
     echo ""
 done
 

@@ -74,7 +74,6 @@ Core job records with foreign keys to normalized tables.
 | `end` | DATETIME | YES | End time (UTC) |
 | `elapsed` | INTEGER | NO | Runtime (seconds) |
 | `walltime` | INTEGER | NO | Requested walltime (seconds) |
-| `cputime` | INTEGER | NO | CPU time used (seconds) |
 | `numcpus` | INTEGER | NO | CPUs allocated |
 | `numgpus` | INTEGER | NO | GPUs allocated |
 | `numnodes` | INTEGER | NO | Nodes allocated |
@@ -86,9 +85,6 @@ Core job records with foreign keys to normalized tables.
 | `cputype` | TEXT | NO | CPU type (e.g., milan) |
 | `gputype` | TEXT | NO | GPU type (e.g., a100) |
 | `resources` | TEXT | NO | Resource specification |
-| `cpupercent` | REAL | NO | CPU utilization % |
-| `avgcpu` | REAL | NO | Average CPU usage |
-| `count` | INTEGER | NO | Job array count |
 
 **Constraints:**
 - Unique: `(job_id, submit)` - prevents duplicate imports
