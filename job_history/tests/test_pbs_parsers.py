@@ -5,15 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from job_history.sync.pbs import (
-    parse_pbs_time,
-    parse_pbs_memory_kb,
-    parse_pbs_memory_gb,
-    parse_pbs_timestamp,
-    parse_select_string,
-    infer_types_from_queue,
-    parse_pbs_record,
-)
+from job_history.sync.pbs import SyncPBSLogs
+
+parse_pbs_time        = SyncPBSLogs.parse_pbs_time
+parse_pbs_memory_kb   = SyncPBSLogs.parse_pbs_memory_kb
+parse_pbs_memory_gb   = SyncPBSLogs.parse_pbs_memory_gb
+parse_pbs_timestamp   = SyncPBSLogs.parse_pbs_timestamp
+parse_select_string   = SyncPBSLogs.parse_select_string
+infer_types_from_queue = SyncPBSLogs.infer_types_from_queue
+parse_pbs_record      = SyncPBSLogs.parse_pbs_record
 
 
 class TestPbsTime:
@@ -393,7 +393,8 @@ class TestIntegrationWithSampleData:
     def test_parse_sample_logs(self):
         """Parse sample PBS logs and verify record count."""
         import pbsparse
-        from job_history.sync.pbs import parse_pbs_record
+        from job_history.sync.pbs import SyncPBSLogs as _PBS
+        parse_pbs_record = _PBS.parse_pbs_record
 
         log_path = "./data/sample_pbs_logs/derecho/20260129"
         records = list(pbsparse.get_pbs_records(log_path, type_filter="E"))
