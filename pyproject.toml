@@ -8,7 +8,6 @@ dependencies = [
     "rich",
     "click",
     "pbsparse>=0.2.6",
-    "pbs-qhist",
     "python-dotenv",
 ]
 
