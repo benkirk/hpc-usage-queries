@@ -1,6 +1,6 @@
 db:
-  name: my-database                       # Database cluster name, also used as hostname
-  group: my-database                      # Group label for related resources
+  name: csg-postgres                      # Database cluster name, also used as hostname
+  group: csg-postgres                     # Group label for related resources
   instances: 2                            # Number of PostgreSQL servers in the cluster
   size: 512Gi                             # Storage size for the database
   superUser:
