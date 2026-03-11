@@ -1,0 +1,33 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ .Values.db.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.db.name }}
+    group: {{ .Values.db.group }}
+spec:
+  instances: {{ .Values.db.instances }}
+  storage:
+    size: {{ .Values.db.size }}
+
+  certificates:
+    serverTLSSecret: {{ .Values.db.name }}-server-cert
+    serverCASecret: {{ .Values.db.name }}-server-cert
+
+  postgresql:
+    pg_hba:
+      - "host all all 0.0.0.0/0 md5"
+
+  {{- if .Values.db.superUser.enabled }}
+  enableSuperuserAccess: true
+
+  superuserSecret:
+    name: "{{ .Values.db.name }}-superuser"
+  {{- end }}
+
+  bootstrap:
+    initdb:
+      database: {{ .Values.db.app.name }}
+      secret:
+        name: "{{ .Values.db.name }}-app-user"

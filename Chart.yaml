@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cirrus-csg-postgres                 # Name of this Helm chart
+description: A Helm chart for deploying a CloudNativePG database cluster to CIRRUS for various CSG applications
+type: application                         # Application chart (not a library)
+version: 0.1.0                            # Chart version, increment when you change templates
+appVersion: "1.0.0"                       # Your application version, increment when you update your image
