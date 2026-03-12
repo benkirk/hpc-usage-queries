@@ -3,13 +3,27 @@ db:
   group: csg-postgres                     # Group label for related resources
   instances: 2                            # Number of PostgreSQL servers in the cluster
   size: 512Gi                             # Storage size for the database
+  resource:
+    limits:
+      cpu: '16'
+      memory: 128Gi
   superUser:
     enabled: true                         # Enable superuser access to the database
-    usernameKey: csg-pg-rootuser          # Key in OpenBao for superuser username
-    passwordKey: csg-pg-rootpasswd        # Key in OpenBao for superuser password
+    usernameKey: username                 # Key in OpenBao for superuser username
+    passwordKey: password                 # Key in OpenBao for superuser password
     secretPath: csg/pg-superuser          # Path in OpenBao where superuser credentials are stored
   app:
     name: csg-pg                          # Database name to create during bootstrap
-    usernameKey: csg-pg-user              # Key in OpenBao for app user username
-    passwordKey: csg-pg-passwd            # Key in OpenBao for app user password
-    secretPath: csg/pg-appuser            # Path in OpenBao where app user credentials are stored
+    usernameKey: username                 # Key in OpenBao for app user username
+    passwordKey: password                 # Key in OpenBao for app user password
+    secretPath: csg/pg-appuser            # Path in OpenBao where app user credentials are stored  resource:
+  backups:
+    volumeSnapshot:
+      enabled: true
+      snapshotClassName: csi-rbdplugin-snapclass
+    s3:
+      enabled: false
+      secretName: csg-postgres-backup-s3-creds
+      endpointURL: https://boreas.hpc.ucar.edu:6443
+      destinationPath: s3://csg
+      secretPath: csg/boreas

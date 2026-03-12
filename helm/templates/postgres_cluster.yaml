@@ -10,24 +10,122 @@ spec:
   instances: {{ .Values.db.instances }}
   storage:
     size: {{ .Values.db.size }}
+  resources:
+    limits:
+      cpu: {{ .Values.db.resource.limits.cpu | quote }}
+      memory: {{ .Values.db.resource.limits.memory }}
 
+  {{- if .Values.db.backups }}
+  backup:
+    {{- if .Values.db.backups.volumeSnapshot }}
+    volumeSnapshot:
+      className: {{ .Values.db.backups.volumeSnapshot.snapshotClassName }}
+    {{- end }}
+    {{- if .Values.db.backups.s3.enabled }}
+    barmanObjectStore:
+      wal:
+        compression: bzip2
+      data:
+        compression: bzip2
+      destinationPath: {{ .Values.db.backups.s3.destinationPath }}
+      endpointURL: {{ .Values.db.backups.s3.endpointURL }}
+      s3Credentials:
+          accessKeyId:
+            name: {{ .Values.db.backups.s3.secretName }}
+            key: access_key
+          secretAccessKey:
+            name: {{ .Values.db.backups.s3.secretName }}
+            key: secret_key
+    {{- end }}
+  {{- end }}
+
+  # Add TLS certificates for encrypted communication
   certificates:
     serverTLSSecret: {{ .Values.db.name }}-server-cert
     serverCASecret: {{ .Values.db.name }}-server-cert
 
-  postgresql:
-    pg_hba:
-      - "host all all 0.0.0.0/0 md5"
-
-  {{- if .Values.db.superUser.enabled }}
+  # Enable superuser access
   enableSuperuserAccess: true
 
+  # Configure postgres superuser from su_external_secret
   superuserSecret:
     name: "{{ .Values.db.name }}-superuser"
-  {{- end }}
 
-  bootstrap:
-    initdb:
-      database: {{ .Values.db.app.name }}
-      secret:
-        name: "{{ .Values.db.name }}-app-user"
+  postgresql:
+    parameters:
+      # Connection settings
+      max_connections: "500"
+
+      # SSL Configuration
+      ssl_ciphers: "HIGH:!aNULL"
+      ssl_min_protocol_version: "TLSv1.3"
+
+      # Memory settings
+      shared_buffers: "32GB"
+      temp_buffers: "64MB"
+      work_mem: "32MB"
+      maintenance_work_mem: "128MB"
+      dynamic_shared_memory_type: "posix"
+
+      # Resource limits
+      max_files_per_process: "2000"
+
+      # WAL settings
+      wal_level: "replica"
+      checkpoint_timeout: "15min"
+      checkpoint_completion_target: "0.9"
+      max_wal_size: "20GB"
+      min_wal_size: "1GB"
+
+      # Replication settings
+      max_wal_senders: "6"
+      max_replication_slots: "6"
+      wal_keep_size: "1024MB"
+      max_slot_wal_keep_size: "100GB"
+      max_standby_archive_delay: "-1"
+      max_standby_streaming_delay: "-1"
+
+      # Logging settings
+      logging_collector: "on"
+      log_rotation_age: "0"
+      log_min_duration_statement: "120000"
+      log_line_prefix: "%t %a [%p] "
+      log_timezone: "America/Denver"
+
+      # Locale and timezone settings
+      datestyle: "iso, mdy"
+      timezone: "America/Denver"
+      lc_messages: "en_US.UTF-8"
+      lc_monetary: "en_US.UTF-8"
+      lc_numeric: "en_US.UTF-8"
+      lc_time: "en_US.UTF-8"
+      default_text_search_config: "pg_catalog.english"
+
+      # Lock management
+      max_locks_per_transaction: "1024"
+
+    pg_hba:
+      ## Local connections with md5 authentication
+      #- local all root md5
+      #- local all all md5
+      #
+      ## IPv4 local connections with md5
+      #- host all all 127.0.0.1/32 md5
+      #
+      ## IPv6 local connections with md5
+      #- host all all ::1/128 md5
+      #
+      ## IPv4 remote connections for UCAR network
+      #- host all all 128.117.0.0/16 md5
+      #
+      ## Replication connections
+      #- local replication all md5
+      #- host replication all 127.0.0.1/32 md5
+      #
+      ## Remote replication
+      #- host replication all 128.117.0.0/16 trust
+      #
+      ## Remote replication from Kubernetes pod network
+      #- host replication all 10.0.0.0/16 trust
+
+      - "host all all 0.0.0.0/0 md5"
