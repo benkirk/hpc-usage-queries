@@ -7,6 +7,7 @@ metadata:
     app: {{ .Values.db.name }}
     group: {{ .Values.db.group }}
 spec:
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.3
   instances: {{ .Values.db.instances }}
   storage:
     size: {{ .Values.db.size }}
@@ -21,6 +22,10 @@ spec:
     volumeSnapshot:
       className: {{ .Values.db.backups.volumeSnapshot.snapshotClassName }}
     {{- end }}
+
+    # Keep 4 weekly backups
+    retentionPolicy: "4w"
+
     {{- if .Values.db.backups.s3.enabled }}
     barmanObjectStore:
       wal:
