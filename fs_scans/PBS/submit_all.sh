@@ -35,14 +35,25 @@ labels=$(
        | sort -u
 )
 
+
+# build up jobids for dependencies
+unset all_ids
+
 for label in ${labels}; do
 
     file=$(realpath ${scans_logdir}/${latest_date}*${label}*.list_all.log)
 
     ls -lh ${file}
-
-    qsub \
-        -N fs_scan_${label} \
-        -v SCAN_LOG_FILE="${file}" \
-        ${SCRIPT_DIR}/fs_scan.pbs
+    jobid=$(qsub \
+                -N fs_scan_${label} \
+                -v SCAN_LOG_FILE="${file}" \
+                ${SCRIPT_DIR}/fs_scan.pbs)
+    all_ids=${jobid}:${all_ids}
 done
+
+
+echo all_ids=${all_ids}
+set -x
+qsub -W depend=afterany:${all_ids} \
+     -N collect_results \
+     ${SCRIPT_DIR}/rsync_results.pbs
