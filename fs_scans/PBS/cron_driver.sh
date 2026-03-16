@@ -14,6 +14,6 @@ TOP_DIR=$(git rev-parse --show-toplevel)
 
 set -e
 
-cd ${SCRIPT_PATH}
+cd ${SCRIPT_DIR}
 git clean -xdf .
 ./submit_all.sh > submit_all.log 2>&1
