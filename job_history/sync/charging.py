@@ -83,6 +83,7 @@ def derecho_charge(job: "Job") -> dict:
     numgpus = getattr(job, "numgpus", None) or 0
     memory = getattr(job, "memory", None) or 0  # in bytes
     queue = (getattr(job, "queue", None) or "").lower()
+    priority = (getattr(job, "priority", None) or "").lower()
 
     is_gpu_queue = "gpu" in queue
     is_dev_queue = "dev" in queue
@@ -105,10 +106,22 @@ def derecho_charge(job: "Job") -> dict:
     # Memory hours: GB-hours based on actual memory used
     memory_hours = elapsed * memory / (SECONDS_PER_HOUR * BYTES_PER_GB)
 
+    # job priority / QoS:
+    #print(f"priority={priority}")
+    qos_factor = 1.0
+
+    if priority == "regular":
+        qos_factor = 1.0
+    elif priority == "premium":
+        qos_factor = 1.5
+    elif priority == "economy":
+        qos_factor = 0.7
+
     return {
         "cpu_hours": cpu_hours,
         "gpu_hours": gpu_hours,
         "memory_hours": memory_hours,
+        "qos_factor": qos_factor,
     }
 
 
@@ -135,9 +148,28 @@ def casper_charge(job: "Job") -> dict:
     numcpus = getattr(job, "numcpus", None) or 0
     numgpus = getattr(job, "numgpus", None) or 0
     memory = getattr(job, "memory", None) or 0  # in bytes
+    queue = (getattr(job, "queue", None) or "").lower()
+    priority = (getattr(job, "priority", None) or "").lower()
+    #print(f"priority={priority}")
+
+    cpu_hours = elapsed * numcpus / SECONDS_PER_HOUR
+    gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
+    memory_hours = elapsed * memory / (SECONDS_PER_HOUR * BYTES_PER_GB)
+
+    # job priority / QoS:
+    #print(f"priority={priority}")
+    qos_factor = 1.0
+
+    if priority == "regular":
+        qos_factor = 1.0
+    elif priority == "premium":
+        qos_factor = 1.5
+    elif priority == "economy":
+        qos_factor = 0.7
 
     return {
-        "cpu_hours": elapsed * numcpus / SECONDS_PER_HOUR,
-        "gpu_hours": elapsed * numgpus / SECONDS_PER_HOUR,
-        "memory_hours": elapsed * memory / (SECONDS_PER_HOUR * BYTES_PER_GB),
+        "cpu_hours": cpu_hours,
+        "gpu_hours": gpu_hours,
+        "memory_hours": memory_hours,
+        "qos_factor": qos_factor,
     }
