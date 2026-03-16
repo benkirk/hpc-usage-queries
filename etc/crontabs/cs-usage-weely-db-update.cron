@@ -1,0 +1,2 @@
+# cs-usage scans->db
+00 20 * * SUN ssh -tt casper.hpc.ucar.edu "cd /glade/u/home/benkirk/repos/hpc-usage-queries/fs_scans/PBS && ./cron_driver.sh &>>casper.log"
