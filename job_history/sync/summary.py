@@ -86,9 +86,9 @@ def generate_daily_summary(
             j.account_id,
             j.queue_id,
             COUNT(*) as job_count,
-            SUM(jc.cpu_hours) as cpu_hours,
-            SUM(jc.gpu_hours) as gpu_hours,
-            SUM(jc.memory_hours) as memory_hours
+            SUM(jc.cpu_hours    * jc.qos_factor) as cpu_hours,
+            SUM(jc.gpu_hours    * jc.qos_factor) as gpu_hours,
+            SUM(jc.memory_hours * jc.qos_factor) as memory_hours
         FROM jobs j
         JOIN job_charges jc ON j.id = jc.job_id
         WHERE j.end >= :start_utc AND j.end < :end_utc
