@@ -124,6 +124,16 @@ def sync_options() -> Callable:
             )
         )(func)
         func = click.option(
+            "--incremental",
+            is_flag=True,
+            help=(
+                "Insert new records only; skip existing ones. "
+                "Re-summarizes the day only when new records were added. "
+                "Intended for frequent intra-day syncs. "
+                "Mutually exclusive with --upsert."
+            )
+        )(func)
+        func = click.option(
             "--no-summary",
             is_flag=True,
             help="Skip generating daily summaries after sync"
@@ -209,7 +219,7 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
 )
 @date_options()
 @sync_options()
-def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch_size, dry_run, verbose, upsert, resummarize, no_summary):
+def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch_size, dry_run, verbose, upsert, incremental, resummarize, no_summary):
     """Sync jobs from local scheduler accounting logs.
 
     Parses accounting log files from the given directory and imports them
@@ -232,12 +242,18 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
       jobhist sync -m derecho -l ./pbs_logs --start 2026-01-01 --end 2026-01-31        # date range
       jobhist sync -m casper  -l ./logs -d 2026-01-29 --dry-run -v                     # dry run
       jobhist sync -m derecho -l ./logs -d 2026-01-29 --upsert                         # re-parse + update
+      jobhist sync -m derecho -l ./logs --today --incremental                          # intra-day refresh
+      jobhist sync -m derecho -l ./logs --last 3d --incremental                        # incremental last 3 days
       jobhist sync -m derecho -d 2026-01-29 --resummarize                              # re-summarize only
       jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
       jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29                  # explicit scheduler
     """
     # Validate user-supplied flags before any resolution
     validate_dates(date, start, end, today_flag, last)
+
+    if incremental and upsert:
+        click.echo("Error: --incremental and --upsert are mutually exclusive", err=True)
+        raise click.Abort()
 
     # Resolve --today and --last into date / start+end
     today_str = datetime.now().date().strftime("%Y-%m-%d")
@@ -282,6 +298,8 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
                     click.echo("(DRY RUN - no data will be inserted)")
                 if upsert:
                     click.echo("(UPSERT - existing records will be updated)")
+                if incremental:
+                    click.echo("(INCREMENTAL - insert new records only; re-summarizes only if new records found)")
 
         syncer = syncer_cls(session, machine)
         stats = syncer.sync(
@@ -293,6 +311,7 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
             batch_size=batch_size,
             verbose=verbose,
             upsert=upsert,
+            incremental=incremental,
             resummarize_only=resummarize,
             generate_summary=not no_summary,
         )
