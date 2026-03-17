@@ -8,168 +8,203 @@ Charges are computed in Python during job import and stored in the job_charges t
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..database.models import Job
 
-# Type alias for charging function
-ChargingFunc = Callable[["Job"], dict]
-
 # ============================================================================
-# Machine-specific constants
+# Module-level constants (also available as class attributes on SystemCharging)
 # ============================================================================
 
-# Derecho cluster
-DERECHO_CORES_PER_NODE = 128  # CPU cores per compute node
-DERECHO_GPUS_PER_NODE = 4     # GPUs per GPU node
-
-# Memory conversion
 BYTES_PER_GB = 1024 * 1024 * 1024  # 1 GB in bytes
-
-# Time conversion
 SECONDS_PER_HOUR = 3600
 
+# Registry populated automatically via __init_subclass__
+_REGISTRY: dict[str, type["SystemCharging"]] = {}
+
 
 # ============================================================================
-# Helpers
+# Base class
 # ============================================================================
 
-def _get_pbs_record(job: "Job"):
-    """Safely retrieve the PbsRecord for a job.
+class SystemCharging(ABC):
+    """Abstract base class for machine-specific HPC charging calculations.
 
-    pbs_record requires a live SQLAlchemy session (it lazy-loads job_record_obj
-    via a relationship).  It may be unavailable for:
-      - historical jobs imported before the JobRecord feature was added
-      - test fixtures that use SimpleNamespace rather than a real ORM object
-      - jobs accessed outside an active session (DetachedInstanceError)
+    Subclasses set MACHINE_NAME and implement calculate().  The shared helpers
+    (_get_elapsed, _get_memory, _get_qos_factor, _get_memory_hours) cover the
+    logic that is identical on every machine; only machine-specific formulas
+    belong in the subclass.
 
-    Returns:
-        PbsRecord object, or None if unavailable for any reason
+    Usage:
+        SystemCharging.charge("derecho", job)   # dispatch by machine name
+        DerechoCharging.calculate(job)           # direct call
     """
-    try:
-        return job.pbs_record
-    except Exception:
-        return None
+
+    MACHINE_NAME: str = ""
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        if cls.MACHINE_NAME:
+            _REGISTRY[cls.MACHINE_NAME] = cls
+
+    # ── Abstract ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    @abstractmethod
+    def calculate(cls, job: "Job") -> dict:
+        """Calculate charge metrics for a job on this machine.
+
+        Returns:
+            Dict with cpu_hours, gpu_hours, memory_hours, qos_factor
+        """
+
+    # ── Factory dispatch ──────────────────────────────────────────────────────
+
+    @classmethod
+    def charge(cls, machine: str, job: "Job") -> dict:
+        """Dispatch to the correct subclass based on machine name.
+
+        Args:
+            machine: Registered machine name (e.g. 'derecho', 'casper')
+            job: Job object to calculate charges for
+
+        Raises:
+            ValueError: if machine is not registered
+        """
+        if machine not in _REGISTRY:
+            raise ValueError(f"Unknown machine: {machine!r}. Known machines: {sorted(_REGISTRY)}")
+        return _REGISTRY[machine].calculate(job)
+
+    # ── Shared helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_pbs_record(job: "Job"):
+        """Safely retrieve the PbsRecord for a job.
+
+        pbs_record requires a live SQLAlchemy session (it lazy-loads job_record_obj
+        via a relationship).  It may be unavailable for:
+          - historical jobs imported before the JobRecord feature was added
+          - test fixtures that use SimpleNamespace rather than a real ORM object
+          - jobs accessed outside an active session (DetachedInstanceError)
+
+        Returns:
+            PbsRecord object, or None if unavailable for any reason
+        """
+        try:
+            return job.pbs_record
+        except Exception:
+            return None
+
+    @staticmethod
+    def _get_elapsed(job: "Job") -> float:
+        return getattr(job, "elapsed", None) or 0
+
+    @staticmethod
+    def _get_memory(job: "Job") -> float:
+        return getattr(job, "memory", None) or 0  # in bytes
+
+    @staticmethod
+    def _get_qos_factor(job: "Job") -> float:
+        """Return the QoS multiplier based on job priority."""
+        priority = (getattr(job, "priority", None) or "").lower()
+        if priority == "premium":
+            return 1.5
+        if priority == "economy":
+            return 0.7
+        return 1.0  # regular or unset
+
+    @classmethod
+    def _get_memory_hours(cls, job: "Job") -> float:
+        """Memory hours: GB-hours based on actual memory used."""
+        return cls._get_elapsed(job) * cls._get_memory(job) / (SECONDS_PER_HOUR * BYTES_PER_GB)
 
 
 # ============================================================================
-# Python charging functions (for ad-hoc calculations)
+# Derecho
 # ============================================================================
 
-def derecho_charge(job: "Job") -> dict:
-    """Calculate charge metrics for a Derecho job.
+class DerechoCharging(SystemCharging):
+    """Charging rules for the Derecho cluster.
 
-    Derecho tracks CPU-hours, GPU-hours, and memory-hours.
-    CPU/GPU hours depend on queue type (dev vs production).
-
-    This function is called by Job.calculate_charges() during import to populate
-    the job_charges table.
-
-    Args:
-        job: Job object with elapsed, numnodes, numcpus, numgpus, memory, queue attributes
-
-    Returns:
-        Dict with cpu_hours, gpu_hours, and memory_hours
+    CPU/GPU hours depend on queue type (dev vs production):
+      - Production: charge by node (cores/GPUs per node * numnodes)
+      - Dev:        charge by actual allocated CPUs/GPUs
+    Memory hours use actual memory consumed.
     """
-    # Future expansion: pbs_record exposes the full original PBS accounting
-    # record and can be used to refine charging (e.g., actual node topology,
-    # exec_host breakdown, resource_list overrides).
-    _pbs_record = _get_pbs_record(job)  # noqa: F841 (unused until implemented)
 
-    elapsed = getattr(job, "elapsed", None) or 0
-    numnodes = getattr(job, "numnodes", None) or 0
-    numcpus = getattr(job, "numcpus", None) or 0
-    numgpus = getattr(job, "numgpus", None) or 0
-    memory = getattr(job, "memory", None) or 0  # in bytes
-    queue = (getattr(job, "queue", None) or "").lower()
-    priority = (getattr(job, "priority", None) or "").lower()
+    MACHINE_NAME = "derecho"
 
-    is_gpu_queue = "gpu" in queue
-    is_dev_queue = "dev" in queue
+    CORES_PER_NODE = 128  # CPU cores per compute node
+    GPUS_PER_NODE = 4     # GPUs per GPU node
 
-    # CPU hours: dev queues use actual CPUs, production uses cores per node
-    if is_dev_queue:
-        cpu_hours = elapsed * numcpus / SECONDS_PER_HOUR
-    else:
-        cpu_hours = elapsed * numnodes * DERECHO_CORES_PER_NODE / SECONDS_PER_HOUR
+    @classmethod
+    def calculate(cls, job: "Job") -> dict:
+        # Future expansion: pbs_record exposes the full original PBS accounting
+        # record and can be used to refine charging (e.g., actual node topology,
+        # exec_host breakdown, resource_list overrides).
+        _pbs_record = cls._get_pbs_record(job)  # noqa: F841 (unused until implemented)
 
-    # GPU hours: only for GPU queues; dev uses actual GPUs, production uses GPUs per node
-    if is_gpu_queue:
+        elapsed = cls._get_elapsed(job)
+        numnodes = getattr(job, "numnodes", None) or 0
+        numcpus  = getattr(job, "numcpus",  None) or 0
+        numgpus  = getattr(job, "numgpus",  None) or 0
+        queue    = (getattr(job, "queue",   None) or "").lower()
+
+        is_gpu_queue = "gpu" in queue
+        is_dev_queue = "dev" in queue
+
+        # CPU hours: dev queues use actual CPUs, production uses cores per node
         if is_dev_queue:
-            gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
+            cpu_hours = elapsed * numcpus / SECONDS_PER_HOUR
         else:
-            gpu_hours = elapsed * numnodes * DERECHO_GPUS_PER_NODE / SECONDS_PER_HOUR
-    else:
-        gpu_hours = 0.0
+            cpu_hours = elapsed * numnodes * cls.CORES_PER_NODE / SECONDS_PER_HOUR
 
-    # Memory hours: GB-hours based on actual memory used
-    memory_hours = elapsed * memory / (SECONDS_PER_HOUR * BYTES_PER_GB)
+        # GPU hours: only for GPU queues; dev uses actual GPUs, production uses GPUs per node
+        if is_gpu_queue:
+            if is_dev_queue:
+                gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
+            else:
+                gpu_hours = elapsed * numnodes * cls.GPUS_PER_NODE / SECONDS_PER_HOUR
+        else:
+            gpu_hours = 0.0
 
-    # job priority / QoS:
-    #print(f"priority={priority}")
-    qos_factor = 1.0
-
-    if priority == "regular":
-        qos_factor = 1.0
-    elif priority == "premium":
-        qos_factor = 1.5
-    elif priority == "economy":
-        qos_factor = 0.7
-
-    return {
-        "cpu_hours": cpu_hours,
-        "gpu_hours": gpu_hours,
-        "memory_hours": memory_hours,
-        "qos_factor": qos_factor,
-    }
+        return {
+            "cpu_hours":    cpu_hours,
+            "gpu_hours":    gpu_hours,
+            "memory_hours": cls._get_memory_hours(job),
+            "qos_factor":   cls._get_qos_factor(job),
+        }
 
 
-def casper_charge(job: "Job") -> dict:
-    """Calculate charge metrics for a Casper job.
+# ============================================================================
+# Casper
+# ============================================================================
 
-    Casper tracks CPU-hours, memory-hours, and GPU-hours (when GPUs used).
+class CasperCharging(SystemCharging):
+    """Charging rules for the Casper cluster.
 
-    This function is called by Job.calculate_charges() during import to populate
-    the job_charges table.
-
-    Args:
-        job: Job object with elapsed, numcpus, numgpus, memory attributes
-
-    Returns:
-        Dict with cpu_hours, memory_hours, and gpu_hours
+    Casper charges directly by allocated CPUs and GPUs (no node-based scaling).
+    Memory hours use actual memory consumed.
     """
-    # Future expansion: pbs_record exposes the full original PBS accounting
-    # record and can be used to refine charging (e.g., actual node topology,
-    # exec_host breakdown, resource_list overrides).
-    _pbs_record = _get_pbs_record(job)  # noqa: F841 (unused until implemented)
 
-    elapsed = getattr(job, "elapsed", None) or 0
-    numcpus = getattr(job, "numcpus", None) or 0
-    numgpus = getattr(job, "numgpus", None) or 0
-    memory = getattr(job, "memory", None) or 0  # in bytes
-    queue = (getattr(job, "queue", None) or "").lower()
-    priority = (getattr(job, "priority", None) or "").lower()
-    #print(f"priority={priority}")
+    MACHINE_NAME = "casper"
 
-    cpu_hours = elapsed * numcpus / SECONDS_PER_HOUR
-    gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
-    memory_hours = elapsed * memory / (SECONDS_PER_HOUR * BYTES_PER_GB)
+    @classmethod
+    def calculate(cls, job: "Job") -> dict:
+        # Future expansion: pbs_record exposes the full original PBS accounting
+        # record and can be used to refine charging (e.g., actual node topology,
+        # exec_host breakdown, resource_list overrides).
+        _pbs_record = cls._get_pbs_record(job)  # noqa: F841 (unused until implemented)
 
-    # job priority / QoS:
-    #print(f"priority={priority}")
-    qos_factor = 1.0
+        elapsed = cls._get_elapsed(job)
+        numcpus = getattr(job, "numcpus", None) or 0
+        numgpus = getattr(job, "numgpus", None) or 0
 
-    if priority == "regular":
-        qos_factor = 1.0
-    elif priority == "premium":
-        qos_factor = 1.5
-    elif priority == "economy":
-        qos_factor = 0.7
-
-    return {
-        "cpu_hours": cpu_hours,
-        "gpu_hours": gpu_hours,
-        "memory_hours": memory_hours,
-        "qos_factor": qos_factor,
-    }
+        return {
+            "cpu_hours":    elapsed * numcpus / SECONDS_PER_HOUR,
+            "gpu_hours":    elapsed * numgpus / SECONDS_PER_HOUR,
+            "memory_hours": cls._get_memory_hours(job),
+            "qos_factor":   cls._get_qos_factor(job),
+        }

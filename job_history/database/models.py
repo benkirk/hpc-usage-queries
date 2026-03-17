@@ -306,11 +306,11 @@ class Job(LookupMixin, Base):
             machine: Either 'derecho' or 'casper'
 
         Returns:
-            Dictionary with keys: cpu_hours, gpu_hours, memory_hours
+            Dictionary with keys: cpu_hours, gpu_hours, memory_hours, qos_factor
         """
-        from ..sync.charging import casper_charge, derecho_charge
+        from ..sync.charging import SystemCharging
 
-        return derecho_charge(self) if machine == 'derecho' else casper_charge(self)
+        return SystemCharging.charge(machine, self)
 
     @property
     def pbs_record(self):
