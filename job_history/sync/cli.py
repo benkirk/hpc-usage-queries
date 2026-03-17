@@ -236,7 +236,10 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
       jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
       jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29                  # explicit scheduler
     """
-    # Resolve --today and --last into date / start+end before validation
+    # Validate user-supplied flags before any resolution
+    validate_dates(date, start, end, today_flag, last)
+
+    # Resolve --today and --last into date / start+end
     today_str = datetime.now().date().strftime("%Y-%m-%d")
     if today_flag:
         date = today_str
@@ -245,8 +248,6 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
         from datetime import date as _date, timedelta as _td
         start = (_date.today() - _td(days=n - 1)).strftime("%Y-%m-%d")
         end = today_str
-
-    validate_dates(date, start, end, today_flag, last)
 
     # Resolve scheduler: explicit flag > machine default
     resolved_scheduler = scheduler or MACHINE_SCHEDULERS.get(machine, "pbs")
