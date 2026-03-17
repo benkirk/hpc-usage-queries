@@ -190,7 +190,7 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
 # sync Click command
 # ---------------------------------------------------------------------------
 
-@click.command()
+@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
 @machine_option(allow_all=False)
 @click.option(
     "--scheduler",
@@ -226,30 +226,15 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
 
     \b
     Examples:
-      # Single day (PBS inferred for derecho)
-      jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29
-
-      # Sync today
-      jobhist sync -m derecho -l ./logs --today
-
-      # Sync the last 3 days (including today)
-      jobhist sync -m derecho -l ./logs --last 3d
-
-      # Date range
-      jobhist sync -m derecho -l ./data/pbs_logs --start 2026-01-01 --end 2026-01-31
-
-      # Dry run to preview
-      jobhist sync -m casper -l ./logs -d 2026-01-29 --dry-run -v
-
-      # Re-parse and update existing records (recalculates charges + summaries)
-      jobhist sync -m derecho -l ./logs -d 2026-01-29 --upsert
-
-      # Recompute daily summaries only (no log parsing required)
-      jobhist sync -m derecho -d 2026-01-29 --resummarize
+      jobhist sync -m derecho -l ./pbs_logs -d 2026-01-29                              # single day
+      jobhist sync -m derecho -l ./logs --today                                         # today
+      jobhist sync -m derecho -l ./logs --last 3d                                       # last 3 days
+      jobhist sync -m derecho -l ./pbs_logs --start 2026-01-01 --end 2026-01-31        # date range
+      jobhist sync -m casper  -l ./logs -d 2026-01-29 --dry-run -v                     # dry run
+      jobhist sync -m derecho -l ./logs -d 2026-01-29 --upsert                         # re-parse + update
+      jobhist sync -m derecho -d 2026-01-29 --resummarize                              # re-summarize only
       jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
-
-      # Explicit scheduler override
-      jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29
+      jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29                  # explicit scheduler
     """
     # Resolve --today and --last into date / start+end before validation
     today_str = datetime.now().date().strftime("%Y-%m-%d")
