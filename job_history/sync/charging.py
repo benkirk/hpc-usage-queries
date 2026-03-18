@@ -152,23 +152,19 @@ class DerechoCharging(SystemCharging):
         numgpus  = getattr(job, "numgpus",  None) or 0
         queue    = (getattr(job, "queue",   None) or "").lower()
 
-        is_gpu_queue = "gpu" in queue
         is_dev_queue = "dev" in queue
+        is_gpu_queue = "gpu" in queue
 
-        # CPU hours: dev queues use actual CPUs, production uses cores per node
+        # dev queues use actual CPUs/GPUs, production uses cores/GPU per node
         if is_dev_queue:
             cpu_hours = elapsed * numcpus / SECONDS_PER_HOUR
+            gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
         else:
             cpu_hours = elapsed * numnodes * cls.CORES_PER_NODE / SECONDS_PER_HOUR
+            gpu_hours = elapsed * numnodes * cls.GPUS_PER_NODE / SECONDS_PER_HOUR
 
-        # GPU hours: only for GPU queues; dev uses actual GPUs, production uses GPUs per node
-        if is_gpu_queue:
-            if is_dev_queue:
-                gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
-            else:
-                gpu_hours = elapsed * numnodes * cls.GPUS_PER_NODE / SECONDS_PER_HOUR
-        else:
-            gpu_hours = 0.0
+        if not is_gpu_queue:
+            gpu_hours = 0
 
         return {
             "cpu_hours":    cpu_hours,
