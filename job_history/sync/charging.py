@@ -107,8 +107,11 @@ class SystemCharging(ABC):
 
     @staticmethod
     def _get_qos_factor(job: "Job") -> float:
-        """Return the QoS multiplier based on job priority."""
+        """Return the QoS multiplier based on job priority or for particular queues."""
         priority = (getattr(job, "priority", None) or "").lower()
+        queue    = (getattr(job, "queue",   None) or "").lower()
+        if queue == "jhublogin":
+            return 0.0
         if priority == "premium":
             return 1.5
         if priority == "economy":
