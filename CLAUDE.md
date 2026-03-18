@@ -44,7 +44,7 @@ fs-scans-analyze        # → fs-scans analyze
 - `data/casper.db`, `data/derecho.db` — gitignored, per-machine SQLite
 - `get_session("derecho")` / `get_session("casper")` from `job_history.database`
 - Machine name passed via `-m`/`--machine` on all CLI commands
-- Migration script: `bin/update_jobs_db.sh` — adds new columns idempotently
+- Migration script: `bin/update_jobs_db.py` — adds new columns idempotently (SQLite + PostgreSQL)
 
 ## job_history Architecture
 
