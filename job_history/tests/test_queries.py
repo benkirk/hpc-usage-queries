@@ -100,10 +100,10 @@ def sample_jobs(in_memory_session):
     in_memory_session.commit()
 
     # Create job_charges for each job (using casper charging rules for tests)
-    from job_history.sync.charging import casper_charge
+    from job_history.sync.charging import CasperCharging
 
     for job in jobs:
-        charges = casper_charge(job)
+        charges = CasperCharging.calculate(job)
         job_charge = JobCharge(
             job_id=job.id,
             cpu_hours=charges['cpu_hours'],

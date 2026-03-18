@@ -49,13 +49,13 @@ def generate_daily_summary(
 
     # Mountain Time zone (handles MST/MDT automatically)
     mountain = ZoneInfo("America/Denver")
-    
+
     # Calculate UTC range for the local day
     # target_date 00:00:00 MT
     start_dt = datetime.combine(target_date, time.min).replace(tzinfo=mountain)
     # target_date + 1 00:00:00 MT
     end_dt = datetime.combine(target_date + timedelta(days=1), time.min).replace(tzinfo=mountain)
-    
+
     start_utc = start_dt.astimezone(timezone.utc)
     end_utc = end_dt.astimezone(timezone.utc)
 
@@ -79,16 +79,20 @@ def generate_daily_summary(
     sql = text(
         """
         INSERT INTO daily_summary (date, user_id, account_id, queue_id,
-                                 job_count, cpu_hours, gpu_hours, memory_hours)
+                                 job_count, cpu_hours, gpu_hours, memory_hours,
+                                 cpu_charges, gpu_charges, memory_charges)
         SELECT
             :target_date as date,
             j.user_id,
             j.account_id,
             j.queue_id,
             COUNT(*) as job_count,
-            SUM(jc.cpu_hours) as cpu_hours,
-            SUM(jc.gpu_hours) as gpu_hours,
-            SUM(jc.memory_hours) as memory_hours
+            SUM(jc.cpu_hours   ) as cpu_hours,
+            SUM(jc.gpu_hours   ) as gpu_hours,
+            SUM(jc.memory_hours) as memory_hours,
+            SUM(jc.cpu_hours    * jc.qos_factor) as cpu_charges,
+            SUM(jc.gpu_hours    * jc.qos_factor) as gpu_charges,
+            SUM(jc.memory_hours * jc.qos_factor) as memory_charges
         FROM jobs j
         JOIN job_charges jc ON j.id = jc.job_id
         WHERE j.end >= :start_utc AND j.end < :end_utc
@@ -114,8 +118,9 @@ def generate_daily_summary(
         marker_sql = text(
             """
             INSERT INTO daily_summary (date, user_id, account_id, queue_id,
-                                      job_count, cpu_hours, gpu_hours, memory_hours)
-            VALUES (:target_date, NULL, NULL, NULL, 0, 0.0, 0.0, 0.0)
+                                      job_count, cpu_hours, gpu_hours, memory_hours,
+                                      cpu_charges, gpu_charges, memory_charges)
+            VALUES (:target_date, NULL, NULL, NULL, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             """
         )
         session.execute(marker_sql, {"target_date": target_date.isoformat()})

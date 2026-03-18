@@ -90,6 +90,7 @@ class SyncBase(ABC):
         batch_size: int = 1000,
         verbose: bool = False,
         upsert: bool = False,
+        incremental: bool = False,
         resummarize_only: bool = False,
         generate_summary: bool = True,
     ) -> dict:
@@ -107,6 +108,10 @@ class SyncBase(ABC):
             upsert: Update existing records with fresh-parsed values and
                     recalculate charges; also regenerates daily summaries.
                     Bypasses the already-summarized day skip automatically.
+            incremental: Insert new records only; skip existing ones.
+                    Re-summarizes only when new records were actually inserted.
+                    Bypasses the already-summarized day skip. Mutually exclusive
+                    with upsert.
             resummarize_only: Skip log parsing; recompute daily_summary rows
                     from current Job/JobCharge data only.
             generate_summary: Regenerate daily_summary after syncing
@@ -116,6 +121,9 @@ class SyncBase(ABC):
             dict: {fetched, inserted, updated, errors, days_summarized,
                    days_failed, failed_days, days_skipped, skipped_days}
         """
+        if incremental and upsert:
+            raise ValueError("incremental and upsert are mutually exclusive")
+
         from .summary import get_summarized_dates, generate_daily_summary
 
         stats = {
@@ -161,9 +169,9 @@ class SyncBase(ABC):
             if not log_path.exists():
                 raise RuntimeError(f"Log directory not found: {log_dir}")
 
-        # upsert bypasses the already-summarized skip (re-parses every day)
+        # upsert and incremental both bypass the already-summarized skip
         summarized_dates: set = set()
-        if not upsert and not dry_run:
+        if not upsert and not incremental and not dry_run:
             summarized_dates = get_summarized_dates(self.session)
 
         if start_date and end_date:
@@ -199,7 +207,8 @@ class SyncBase(ABC):
                             f"{day_stats['inserted']:,} new{updated_str}",
                             flush=True,
                         )
-                    if generate_summary and not dry_run and day_stats["fetched"] > 0:
+                    should_summarize = day_stats["inserted"] > 0 if incremental else day_stats["fetched"] > 0
+                    if generate_summary and not dry_run and should_summarize:
                         generate_daily_summary(self.session, self.machine, day_date, replace=True)
                         stats["days_summarized"] += 1
 
@@ -224,10 +233,12 @@ class SyncBase(ABC):
             if day_stats.get("failed"):
                 stats["days_failed"] = 1
                 stats["failed_days"] = [target_period]
-            elif generate_summary and not dry_run and target_period and day_stats["fetched"] > 0:
-                day_date = parse_date_string(target_period).date()
-                generate_daily_summary(self.session, self.machine, day_date, replace=True)
-                stats["days_summarized"] = 1
+            else:
+                should_summarize = day_stats["inserted"] > 0 if incremental else day_stats["fetched"] > 0
+                if generate_summary and not dry_run and target_period and should_summarize:
+                    day_date = parse_date_string(target_period).date()
+                    generate_daily_summary(self.session, self.machine, day_date, replace=True)
+                    stats["days_summarized"] = 1
 
         return stats
 

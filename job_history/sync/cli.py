@@ -36,7 +36,7 @@ def machine_option(allow_all: bool = True) -> Callable:
 
 
 def date_options() -> Callable:
-    """Decorator that adds --date, --start, --end options."""
+    """Decorator that adds --date, --start, --end, --today, --last options."""
     def decorator(func):
         func = click.option(
             "-d", "--date",
@@ -53,8 +53,37 @@ def date_options() -> Callable:
             type=str,
             help="End date for range (YYYY-MM-DD, default: yesterday)"
         )(func)
+        func = click.option(
+            "--today",
+            "today_flag",
+            is_flag=True,
+            help="Sync jobs for today (shorthand for --date <today>)"
+        )(func)
+        func = click.option(
+            "--last",
+            type=str,
+            default=None,
+            metavar="N[d]",
+            help="Sync the last N days including today (e.g. --last 3d)"
+        )(func)
         return func
     return decorator
+
+
+def parse_last_spec(spec: str) -> int:
+    """Parse --last spec: '3d' or '3' → 3.
+
+    Raises:
+        click.BadParameter: if spec is not a positive integer optionally followed by 'd'
+    """
+    s = spec.strip().lower().rstrip("d")
+    try:
+        n = int(s)
+    except ValueError:
+        raise click.BadParameter(f"--last must be in the form Nd (e.g., 3d), got: {spec!r}")
+    if n < 1:
+        raise click.BadParameter("--last N must be >= 1")
+    return n
 
 
 def sync_options() -> Callable:
@@ -95,6 +124,16 @@ def sync_options() -> Callable:
             )
         )(func)
         func = click.option(
+            "--incremental",
+            is_flag=True,
+            help=(
+                "Insert new records only; skip existing ones. "
+                "Re-summarizes the day only when new records were added. "
+                "Intended for frequent intra-day syncs. "
+                "Mutually exclusive with --upsert."
+            )
+        )(func)
+        func = click.option(
             "--no-summary",
             is_flag=True,
             help="Skip generating daily summaries after sync"
@@ -103,12 +142,22 @@ def sync_options() -> Callable:
     return decorator
 
 
-def validate_dates(date: str | None, start: str | None, end: str | None) -> None:
+def validate_dates(
+    date: str | None,
+    start: str | None,
+    end: str | None,
+    today_flag: bool = False,
+    last: str | None = None,
+) -> None:
     """Validate date arguments.
 
     Raises:
         click.BadParameter: If dates are invalid or conflicting
     """
+    if today_flag and (date or start or end or last):
+        raise click.BadParameter("--today cannot be combined with --date, --start, --end, or --last")
+    if last and (date or start or end or today_flag):
+        raise click.BadParameter("--last cannot be combined with --date, --start, --end, or --today")
     if date and (start or end):
         raise click.BadParameter("Cannot use --date with --start/--end")
 
@@ -151,7 +200,7 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
 # sync Click command
 # ---------------------------------------------------------------------------
 
-@click.command()
+@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
 @machine_option(allow_all=False)
 @click.option(
     "--scheduler",
@@ -170,7 +219,7 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
 )
 @date_options()
 @sync_options()
-def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, verbose, upsert, resummarize, no_summary):
+def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch_size, dry_run, verbose, upsert, incremental, resummarize, no_summary):
     """Sync jobs from local scheduler accounting logs.
 
     Parses accounting log files from the given directory and imports them
@@ -180,31 +229,41 @@ def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, ve
     \b
     Date Selection (all optional):
       --date:         Sync a single date
+      --today:        Sync today (shorthand for --date <today>)
+      --last N[d]:    Sync the last N days including today (e.g. --last 3d)
       --start --end:  Sync a date range (defaults: 2024-01-01 to yesterday)
       (no dates):     Sync from 2024-01-01 to yesterday
 
     \b
     Examples:
-      # Single day (PBS inferred for derecho)
-      jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29
-
-      # Date range
-      jobhist sync -m derecho -l ./data/pbs_logs --start 2026-01-01 --end 2026-01-31
-
-      # Dry run to preview
-      jobhist sync -m casper -l ./logs -d 2026-01-29 --dry-run -v
-
-      # Re-parse and update existing records (recalculates charges + summaries)
-      jobhist sync -m derecho -l ./logs -d 2026-01-29 --upsert
-
-      # Recompute daily summaries only (no log parsing required)
-      jobhist sync -m derecho -d 2026-01-29 --resummarize
+      jobhist sync -m derecho -l ./pbs_logs -d 2026-01-29                              # single day
+      jobhist sync -m derecho -l ./logs --today                                         # today
+      jobhist sync -m derecho -l ./logs --last 3d                                       # last 3 days
+      jobhist sync -m derecho -l ./pbs_logs --start 2026-01-01 --end 2026-01-31        # date range
+      jobhist sync -m casper  -l ./logs -d 2026-01-29 --dry-run -v                     # dry run
+      jobhist sync -m derecho -l ./logs -d 2026-01-29 --upsert                         # re-parse + update
+      jobhist sync -m derecho -l ./logs --today --incremental                          # intra-day refresh
+      jobhist sync -m derecho -l ./logs --last 3d --incremental                        # incremental last 3 days
+      jobhist sync -m derecho -d 2026-01-29 --resummarize                              # re-summarize only
       jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
-
-      # Explicit scheduler override
-      jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29
+      jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29                  # explicit scheduler
     """
-    validate_dates(date, start, end)
+    # Validate user-supplied flags before any resolution
+    validate_dates(date, start, end, today_flag, last)
+
+    if incremental and upsert:
+        click.echo("Error: --incremental and --upsert are mutually exclusive", err=True)
+        raise click.Abort()
+
+    # Resolve --today and --last into date / start+end
+    today_str = datetime.now().date().strftime("%Y-%m-%d")
+    if today_flag:
+        date = today_str
+    if last:
+        n = parse_last_spec(last)
+        from datetime import date as _date, timedelta as _td
+        start = (_date.today() - _td(days=n - 1)).strftime("%Y-%m-%d")
+        end = today_str
 
     # Resolve scheduler: explicit flag > machine default
     resolved_scheduler = scheduler or MACHINE_SCHEDULERS.get(machine, "pbs")
@@ -231,12 +290,16 @@ def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, ve
                     display_start = start or '2024-01-01'
                     display_end = end or (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
                     click.echo(f"Parsing {machine} logs from {display_start} to {display_end}")
+                    if last:
+                        click.echo(f"  (--last {last}: last {parse_last_spec(last)} days including today)")
                 if log_path:
                     click.echo(f"Log directory: {log_path}")
                 if dry_run:
                     click.echo("(DRY RUN - no data will be inserted)")
                 if upsert:
                     click.echo("(UPSERT - existing records will be updated)")
+                if incremental:
+                    click.echo("(INCREMENTAL - insert new records only; re-summarizes only if new records found)")
 
         syncer = syncer_cls(session, machine)
         stats = syncer.sync(
@@ -248,6 +311,7 @@ def sync(machine, scheduler, log_path, date, start, end, batch_size, dry_run, ve
             batch_size=batch_size,
             verbose=verbose,
             upsert=upsert,
+            incremental=incremental,
             resummarize_only=resummarize,
             generate_summary=not no_summary,
         )

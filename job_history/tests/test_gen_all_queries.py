@@ -34,7 +34,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from job_history.database import Job, JobCharge
 from job_history.queries import JobQueries
-from job_history.sync.charging import casper_charge
+from job_history.sync.charging import CasperCharging
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +127,7 @@ def derecho_jobs(in_memory_session):
     # Create job_charges (use casper_charge helper — values don't matter for
     # query structure tests, only that charges exist per job)
     for job in jobs:
-        charges = casper_charge({
-            "elapsed": job.elapsed or 0,
-            "numcpus": job.numcpus or 0,
-            "numgpus": job.numgpus or 0,
-            "memory": job.memory or 0,
-        })
+        charges = CasperCharging.calculate(job)
         in_memory_session.add(JobCharge(
             job_id=job.id,
             cpu_hours=charges["cpu_hours"],

@@ -42,7 +42,7 @@ def parse_date(ctx, param, value):
     except ValueError:
         raise click.BadParameter("Date must be in YYYY-MM-DD format.")
 
-@click.group()
+@click.group(context_settings=dict(help_option_names=["-h", "--help"]))
 def cli():
     """A CLI for querying HPC job history."""
     pass
@@ -52,7 +52,7 @@ from .queries import JobQueries
 from .exporters import get_exporter
 
 
-@click.group(invoke_without_command=True)
+@click.group(invoke_without_command=True, context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("--start-date", type=str, callback=parse_date, help="Start date for analysis (YYYY-MM-DD).")
 @click.option("--end-date", type=str, callback=parse_date, help="End date for analysis (YYYY-MM-DD).")
 @click.option("--group-by", type=click.Choice(["day", "month", "quarter", "year"]), default="day", help="Group results by day, month, quarter, or year.")
@@ -643,7 +643,7 @@ def create_resource_command(config: ReportConfig):
 
     return command_func
 
-@click.group(invoke_without_command=True)
+@click.group(invoke_without_command=True, context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("--start-date", type=str, callback=parse_date, help="Start date for analysis (YYYY-MM-DD).")
 @click.option("--end-date", type=str, callback=parse_date, help="End date for analysis (YYYY-MM-DD).")
 @click.option("-m", "--machine", type=click.Choice(["casper", "derecho", "all"]), default="derecho", help="The machine to query (use 'all' for both).")

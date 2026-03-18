@@ -182,6 +182,90 @@ class TestGenerateDailySummary:
         result = generate_daily_summary(session, "derecho", date(2025, 1, 15), replace=False)
         assert result["rows_inserted"] == 0
 
+    def test_qos_factor_applied(self, in_memory_session):
+        """cpu/gpu/memory_hours in summary must be weighted by qos_factor."""
+        from job_history.database import User, Account, Queue, JobCharge
+
+        user = User(username="userQ")
+        acct = Account(account_name="NCARQ")
+        queue = Queue(queue_name="main")
+        in_memory_session.add_all([user, acct, queue])
+        in_memory_session.flush()
+
+        job1 = Job(
+            job_id="q1.desched1",
+            user="userQ", account="NCARQ", queue="main",
+            user_id=user.id, account_id=acct.id, queue_id=queue.id,
+            end=datetime(2025, 3, 10, 18, 0, 0, tzinfo=timezone.utc),
+            elapsed=3600,
+        )
+        job2 = Job(
+            job_id="q2.desched1",
+            user="userQ", account="NCARQ", queue="main",
+            user_id=user.id, account_id=acct.id, queue_id=queue.id,
+            end=datetime(2025, 3, 10, 19, 0, 0, tzinfo=timezone.utc),
+            elapsed=3600,
+        )
+        in_memory_session.add_all([job1, job2])
+        in_memory_session.flush()
+
+        # premium (1.5) and economy (0.7) — raw hours are 10.0 each
+        charge1 = JobCharge(job_id=job1.id, cpu_hours=10.0, gpu_hours=0.0, memory_hours=10.0, qos_factor=1.5)
+        charge2 = JobCharge(job_id=job2.id, cpu_hours=10.0, gpu_hours=0.0, memory_hours=10.0, qos_factor=0.7)
+        in_memory_session.add_all([charge1, charge2])
+        in_memory_session.commit()
+
+        generate_daily_summary(in_memory_session, "derecho", date(2025, 3, 10))
+
+        summary = in_memory_session.query(DailySummary).filter_by(
+            user="userQ", account="NCARQ"
+        ).first()
+        assert summary is not None
+        assert summary.job_count == 2
+        # raw hours: 10 + 10 = 20.0 (unweighted)
+        assert summary.cpu_hours    == pytest.approx(20.0)
+        assert summary.memory_hours == pytest.approx(20.0)
+        # charges (qos-weighted): 10*1.5 + 10*0.7 = 22.0
+        assert summary.cpu_charges    == pytest.approx(22.0)
+        assert summary.memory_charges == pytest.approx(22.0)
+        # charges must differ from hours when qos_factor != 1
+        assert summary.cpu_charges != summary.cpu_hours
+        assert summary.memory_charges != summary.memory_hours
+
+    def test_charges_equal_hours_when_qos_is_one(self, in_memory_session):
+        """When qos_factor=1.0 (default), *_charges must equal *_hours."""
+        from job_history.database import User, Account, Queue, JobCharge
+
+        user = User(username="userD")
+        acct = Account(account_name="NCARD")
+        queue = Queue(queue_name="main")
+        in_memory_session.add_all([user, acct, queue])
+        in_memory_session.flush()
+
+        job = Job(
+            job_id="d1.desched1",
+            user="userD", account="NCARD", queue="main",
+            user_id=user.id, account_id=acct.id, queue_id=queue.id,
+            end=datetime(2025, 4, 1, 18, 0, 0, tzinfo=timezone.utc),
+            elapsed=3600,
+        )
+        in_memory_session.add(job)
+        in_memory_session.flush()
+
+        # qos_factor defaults to 1.0
+        charge = JobCharge(job_id=job.id, cpu_hours=15.0, gpu_hours=0.0, memory_hours=8.0, qos_factor=1.0)
+        in_memory_session.add(charge)
+        in_memory_session.commit()
+
+        generate_daily_summary(in_memory_session, "derecho", date(2025, 4, 1))
+
+        summary = in_memory_session.query(DailySummary).filter_by(
+            user="userD", account="NCARD"
+        ).first()
+        assert summary is not None
+        assert summary.cpu_charges    == pytest.approx(summary.cpu_hours)
+        assert summary.memory_charges == pytest.approx(summary.memory_hours)
+
     def test_no_jobs_on_date(self, db_with_jobs_and_view):
         """Should insert marker row when no jobs on date."""
         session = db_with_jobs_and_view

@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from job_history.sync.charging import derecho_charge, casper_charge
+from job_history.sync.charging import CasperCharging, DerechoCharging
 
 
 class TestDerechoCharging:
@@ -12,7 +12,7 @@ class TestDerechoCharging:
 
     def test_cpu_production_queue(self, derecho_cpu_job):
         """CPU production: elapsed * numnodes * 128 / 3600."""
-        result = derecho_charge(derecho_cpu_job)
+        result = DerechoCharging.calculate(derecho_cpu_job)
 
         # 1 hour * 2 nodes * 128 cores = 256 CPU-hours
         assert result["cpu_hours"] == 256.0
@@ -29,7 +29,7 @@ class TestDerechoCharging:
             memory=107374182400,
             queue="main@desched1:gpu",
         )
-        result = derecho_charge(job)
+        result = DerechoCharging.calculate(job)
 
         # GPU queue uses 4 GPUs per node for production
         # 1 hour * 2 nodes * 4 = 8 GPU-hours
@@ -39,7 +39,7 @@ class TestDerechoCharging:
 
     def test_cpu_dev_queue(self, derecho_cpu_dev_job):
         """CPU dev: elapsed * numcpus / 3600."""
-        result = derecho_charge(derecho_cpu_dev_job)
+        result = DerechoCharging.calculate(derecho_cpu_dev_job)
 
         # Dev queue uses actual CPUs: 1 hour * 32 cpus = 32 CPU-hours
         assert result["cpu_hours"] == 32.0
@@ -55,7 +55,7 @@ class TestDerechoCharging:
             memory=32212254720,
             queue="gpudev",
         )
-        result = derecho_charge(job)
+        result = DerechoCharging.calculate(job)
 
         # GPU dev uses actual GPUs: 1 hour * 4 gpus = 4 GPU-hours
         assert result["gpu_hours"] == 4.0
@@ -64,7 +64,7 @@ class TestDerechoCharging:
 
     def test_memory_hours(self, derecho_cpu_job):
         """Memory hours: elapsed * memory_gb / 3600."""
-        result = derecho_charge(derecho_cpu_job)
+        result = DerechoCharging.calculate(derecho_cpu_job)
 
         # 1 hour * 100 GB = 100 GB-hours
         assert result["memory_hours"] == pytest.approx(100.0, rel=0.01)
@@ -78,7 +78,7 @@ class TestDerechoCharging:
             memory=107374182400,
             queue="main",
         )
-        result = derecho_charge(job)
+        result = DerechoCharging.calculate(job)
 
         assert result["cpu_hours"] == 0.0
         assert result["gpu_hours"] == 0.0
@@ -93,7 +93,7 @@ class TestDerechoCharging:
             memory=None,
             queue=None,
         )
-        result = derecho_charge(job)
+        result = DerechoCharging.calculate(job)
 
         assert result["cpu_hours"] == 0.0
         assert result["gpu_hours"] == 0.0
@@ -105,21 +105,21 @@ class TestCasperCharging:
 
     def test_cpu_hours(self, casper_job):
         """CPU hours: elapsed * numcpus / 3600."""
-        result = casper_charge(casper_job)
+        result = CasperCharging.calculate(casper_job)
 
         # 1 hour * 8 cpus = 8 CPU-hours
         assert result["cpu_hours"] == 8.0
 
     def test_gpu_hours(self, casper_job):
         """GPU hours: elapsed * numgpus / 3600."""
-        result = casper_charge(casper_job)
+        result = CasperCharging.calculate(casper_job)
 
         # 1 hour * 2 gpus = 2 GPU-hours
         assert result["gpu_hours"] == 2.0
 
     def test_memory_hours(self, casper_job):
         """Memory hours: elapsed * memory_gb / 3600."""
-        result = casper_charge(casper_job)
+        result = CasperCharging.calculate(casper_job)
 
         # 1 hour * 30 GB = 30 GB-hours
         assert result["memory_hours"] == pytest.approx(30.0, rel=0.01)
@@ -132,7 +132,7 @@ class TestCasperCharging:
             numgpus=0,
             memory=32212254720,
         )
-        result = casper_charge(job)
+        result = CasperCharging.calculate(job)
 
         assert result["cpu_hours"] == 8.0
         assert result["gpu_hours"] == 0.0
@@ -140,7 +140,7 @@ class TestCasperCharging:
     def test_none_values(self):
         """None values should be treated as zero."""
         job = types.SimpleNamespace()
-        result = casper_charge(job)
+        result = CasperCharging.calculate(job)
 
         assert result["cpu_hours"] == 0.0
         assert result["gpu_hours"] == 0.0

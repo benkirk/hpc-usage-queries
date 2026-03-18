@@ -15,6 +15,8 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+    "pytest-xdist",
+    "pytest-timeout",
 ]
 
 postgres = [
@@ -58,7 +60,7 @@ include = ["job_history*", "scripts*", "fs_scans*"]
 testpaths = ["job_history/tests", "fs_scans/tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -n auto --timeout=300"
 filterwarnings = [
     # Ignore SQLAlchemy datetime adapter deprecation warnings in Python 3.12+
     # These are internal SQLAlchemy issues that will be fixed in future releases

@@ -306,11 +306,11 @@ class Job(LookupMixin, Base):
             machine: Either 'derecho' or 'casper'
 
         Returns:
-            Dictionary with keys: cpu_hours, gpu_hours, memory_hours
+            Dictionary with keys: cpu_hours, gpu_hours, memory_hours, qos_factor
         """
-        from ..sync.charging import casper_charge, derecho_charge
+        from ..sync.charging import SystemCharging
 
-        return derecho_charge(self) if machine == 'derecho' else casper_charge(self)
+        return SystemCharging.charge(machine, self)
 
     @property
     def pbs_record(self):
@@ -459,10 +459,15 @@ class DailySummary(LookupMixin, Base):
     # Derecho uses charge_hours (core-hours or GPU-hours depending on queue)
     charge_hours = Column(Float, default=0)
 
-    # Casper tracks CPU, GPU, and memory hours
+    # CPU, GPU, and memory hours
     cpu_hours = Column(Float, default=0)
     gpu_hours = Column(Float, default=0)
     memory_hours = Column(Float, default=0)
+
+    # CPU, GPU, and memory charges
+    cpu_charges = Column(Float, default=0)
+    gpu_charges = Column(Float, default=0)
+    memory_charges = Column(Float, default=0)
 
     __table_args__ = (
         # Each (date, user_id, account_id, queue_id) combination is unique
