@@ -390,6 +390,7 @@ class SyncBase(ABC):
                     'cpu_hours': charges['cpu_hours'],
                     'gpu_hours': charges['gpu_hours'],
                     'memory_hours': charges['memory_hours'],
+                    'qos_factor': charges['qos_factor'],
                     'charge_version': 1,
                 })
             if charge_records:
@@ -530,6 +531,7 @@ class SyncBase(ABC):
                 'cpu_hours': charges['cpu_hours'],
                 'gpu_hours': charges['gpu_hours'],
                 'memory_hours': charges['memory_hours'],
+                'qos_factor': charges['qos_factor'],
                 'charge_version': 1,
             })
         if charge_records:

@@ -99,6 +99,27 @@ class TestDerechoCharging:
         assert result["gpu_hours"] == 0.0
         assert result["memory_hours"] == 0.0
 
+    def test_jhublogin_queue(self):
+        """jhublogin queue: hours tracked but qos_factor=0.0 so effective charge is zero."""
+        job = types.SimpleNamespace(
+            elapsed=3600,  # 1 hour
+            numnodes=1,
+            numcpus=128,
+            numgpus=0,
+            memory=107374182400,  # 100 GB
+            queue="jhublogin",
+            priority="regular",
+        )
+        result = DerechoCharging.calculate(job)
+
+        # Resource hours are tracked (non-zero)
+        assert result["cpu_hours"] > 0
+        assert result["memory_hours"] > 0
+        # qos_factor is 0.0 — effective charge is zero
+        assert result["qos_factor"] == 0.0
+        assert result["cpu_hours"] * result["qos_factor"] == 0.0
+        assert result["memory_hours"] * result["qos_factor"] == 0.0
+
 
 class TestCasperCharging:
     """Tests for Casper charging calculations."""
@@ -145,3 +166,23 @@ class TestCasperCharging:
         assert result["cpu_hours"] == 0.0
         assert result["gpu_hours"] == 0.0
         assert result["memory_hours"] == 0.0
+
+    def test_jhublogin_queue(self):
+        """jhublogin queue: hours tracked but qos_factor=0.0 so effective charge is zero."""
+        job = types.SimpleNamespace(
+            elapsed=3600,  # 1 hour
+            numcpus=8,
+            numgpus=0,
+            memory=32212254720,  # 30 GB
+            queue="jhublogin",
+            priority="regular",
+        )
+        result = CasperCharging.calculate(job)
+
+        # Resource hours are tracked (non-zero)
+        assert result["cpu_hours"] > 0
+        assert result["memory_hours"] > 0
+        # qos_factor is 0.0 — effective charge is zero
+        assert result["qos_factor"] == 0.0
+        assert result["cpu_hours"] * result["qos_factor"] == 0.0
+        assert result["memory_hours"] * result["qos_factor"] == 0.0
