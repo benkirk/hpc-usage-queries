@@ -52,4 +52,4 @@ esac
 cd ${log_path} && cd -
 
 time peak_memusage \
-     jobhist-sync -m ${machine} -l ${log_path} --start 2026-01-01 --verbose
+     jobhist-sync -m ${machine} -l ${log_path} --last 30d --verbose --incremental
