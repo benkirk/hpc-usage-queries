@@ -42,7 +42,7 @@ while true; do
     # Stop at the filesystem root
     if [[ "$dir" == "/" ]]; then
         echo "No .env found in any parent directory!"
-        exit 1
+        break
     fi
 
     # Go up one directory
