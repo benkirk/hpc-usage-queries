@@ -1144,6 +1144,9 @@ class JobQueries:
                 "cpu_hours": row.cpu_hours or 0.0,
                 "gpu_hours": row.gpu_hours or 0.0,
                 "memory_hours": row.memory_hours or 0.0,
+                "cpu_charges": row.cpu_charges or 0.0,
+                "gpu_charges": row.gpu_charges or 0.0,
+                "memory_charges": row.memory_charges or 0.0,
             }
             for row in rows
         ]
