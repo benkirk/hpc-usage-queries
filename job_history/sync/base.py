@@ -362,15 +362,16 @@ class SyncBase(ABC):
         if not new_records:
             return {"inserted": 0, "updated": n_updated}
 
-        # Bulk-insert new rows (render_nulls=True handles NULL FK columns)
-        self.session.bulk_insert_mappings(Job, new_records, render_nulls=True)
-        self.session.flush()
+        # Bulk-insert new rows; ON CONFLICT DO NOTHING handles any duplicates
+        # that slipped through the Python-side dedup (e.g. tz-mismatch on
+        # remote PostgreSQL servers with non-UTC DateStyle).
+        n_inserted = self._bulk_insert_jobs(new_records)
 
         # Calculate charges for the newly inserted jobs
         from sqlalchemy import and_
 
         job_ids = [r['job_id'] for r in new_records]
-        submit_times = [r['submit'] for r in new_records]
+        submit_times = [normalize_datetime_to_naive(r['submit']) for r in new_records]
 
         uncharged_jobs = (
             self.session.query(Job)
@@ -420,7 +421,41 @@ class SyncBase(ABC):
                 self.session.add_all(job_records)
 
         self.session.commit()
-        return {"inserted": len(new_records), "updated": n_updated}
+        return {"inserted": n_inserted, "updated": n_updated}
+
+    def _bulk_insert_jobs(self, records: list[dict]) -> int:
+        """Dialect-safe bulk insert with conflict handling.
+
+        Uses INSERT OR IGNORE (SQLite) / INSERT ON CONFLICT DO NOTHING
+        (PostgreSQL) so that pre-existing rows are silently skipped rather
+        than raising a UniqueViolation error.
+
+        Args:
+            records: FK-resolved job dicts (extra keys such as
+                     pbs_record_object are stripped before insert)
+
+        Returns:
+            Number of rows actually inserted (0 for skipped conflicts)
+        """
+        if not records:
+            return 0
+
+        col_names = {c.name for c in Job.__table__.columns}
+        clean = [{k: v for k, v in r.items() if k in col_names} for r in records]
+
+        dialect = self.session.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+            stmt = pg_insert(Job.__table__).values(clean).on_conflict_do_nothing(
+                constraint="uq_jobs_job_id_submit"
+            )
+        else:  # sqlite (and any other dialect fallback)
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+            stmt = sqlite_insert(Job.__table__).values(clean).on_conflict_do_nothing()
+
+        result = self.session.execute(stmt)
+        self.session.flush()
+        return result.rowcount
 
     def _update_batch(self, records: list[dict]) -> int:
         """Update existing job records with fresh-parsed field values.
