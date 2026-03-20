@@ -16,9 +16,11 @@ TOP_DIR=$(git rev-parse --show-toplevel)
 sep="#----------------------------------------------------------------------------"
 
 # Argument parsing
-env_file=""
-backend_label=""
+# Default to Cirrus PostgreSQL if no backend specified
+env_file="${TOP_DIR}/.env.cirrus"
+backend_label="Cirrus PostgreSQL (default)"
 
+jobhist_args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sqlite)
@@ -32,32 +34,20 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            break
+            jobhist_args+=("$1")
+            shift
             ;;
     esac
 done
 
-# Default to Cirrus PostgreSQL if no backend specified
-if [[ -z "${env_file}" ]]; then
-    env_file="${TOP_DIR}/.env.cirrus"
-    backend_label="Cirrus PostgreSQL (default)"
-fi
-
-# Remaining args passed through to jobhist-sync; default if none provided
-jobhist_args=("$@")
+# Default jobhist-sync args if none provided
 if [[ ${#jobhist_args[@]} -eq 0 ]]; then
     jobhist_args=(--last 30d --verbose --incremental)
 fi
 
 source ${TOP_DIR}/etc/config_env.sh
-which python3
-which jobhist-sync
-module load peak-memusage conda
-#hostname
-#w
-#free -g
-
-#pwd
+#which python3
+#which jobhist-sync
 
 # Source backend-specific env file (overrides any .env settings)
 if [[ -f "${env_file}" ]]; then
@@ -92,5 +82,5 @@ esac
 
 cd ${log_path} && cd -
 
-time peak_memusage \
+time \
      jobhist-sync -m ${machine} -l ${log_path} "${jobhist_args[@]}"
