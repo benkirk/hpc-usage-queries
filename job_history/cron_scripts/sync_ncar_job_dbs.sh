@@ -32,17 +32,21 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            echo "Unknown argument: $1"
-            echo "Usage: $0 [--sqlite | --cirrus-postgres]"
-            exit 1
+            break
             ;;
     esac
 done
 
+# Default to Cirrus PostgreSQL if no backend specified
 if [[ -z "${env_file}" ]]; then
-    echo "ERROR: must specify --sqlite or --cirrus-postgres"
-    echo "Usage: $0 [--sqlite | --cirrus-postgres]"
-    exit 1
+    env_file="${TOP_DIR}/.env.cirrus"
+    backend_label="Cirrus PostgreSQL (default)"
+fi
+
+# Remaining args passed through to jobhist-sync; default if none provided
+jobhist_args=("$@")
+if [[ ${#jobhist_args[@]} -eq 0 ]]; then
+    jobhist_args=(--last 30d --verbose --incremental)
 fi
 
 source ${TOP_DIR}/etc/config_env.sh
@@ -89,4 +93,4 @@ esac
 cd ${log_path} && cd -
 
 time peak_memusage \
-     jobhist-sync -m ${machine} -l ${log_path} --last 30d --verbose --incremental
+     jobhist-sync -m ${machine} -l ${log_path} "${jobhist_args[@]}"
