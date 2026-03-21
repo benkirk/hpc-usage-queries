@@ -1,0 +1,8 @@
+# jobhist-sync database processes
+# rapid sync every 5 minutes
+*/5 * * * *   ssh -tt casper.hpc.ucar.edu  "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./rapid.sh &> casper-rapid.log"
+*/5 * * * *   ssh -tt derecho.hpc.ucar.edu "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./rapid.sh &> derecho-rapid.log"
+
+# multi-day once a week (would capture multi-day downtime)
+15 20 * * SAT ssh -tt casper.hpc.ucar.edu  "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./weekly.sh &>> casper-weekly.log"
+45 20 * * SAT ssh -tt derecho.hpc.ucar.edu "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./weekly.sh &>> derecho-weekly.log"

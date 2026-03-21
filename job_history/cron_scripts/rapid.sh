@@ -13,6 +13,4 @@ SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
 TOP_DIR=$(git rev-parse --show-toplevel)
 #----------------------------------------------------------------------------
 
-sep="#----------------------------------------------------------------------------"
-
-${SCRIPT_DIR}/sync_ncar_job_dbs.sh --verbose  --today --incremental
+${SCRIPT_DIR}/sync_ncar_job_dbs.sh --verbose  --today --incremental ${@}

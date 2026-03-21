@@ -13,4 +13,4 @@ SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
 TOP_DIR=$(git rev-parse --show-toplevel)
 #----------------------------------------------------------------------------
 
-${SCRIPT_DIR}/sync_ncar_job_dbs.sh --verbose  --last 7d --incremental ${@}
+${SCRIPT_DIR}/sync_ncar_job_dbs.sh --verbose --last 14d --upsert ${@}
