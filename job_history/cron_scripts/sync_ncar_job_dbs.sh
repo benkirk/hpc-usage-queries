@@ -14,6 +14,7 @@ TOP_DIR=$(git rev-parse --show-toplevel)
 #----------------------------------------------------------------------------
 
 sep="#----------------------------------------------------------------------------"
+TIMEFORMAT='(%3R seconds elapsed)'
 
 # Argument parsing
 # Default to Cirrus PostgreSQL if no backend specified
@@ -55,6 +56,7 @@ if [[ -f "${env_file}" ]]; then
     source "${env_file}" || { echo "Could not source ${env_file}!"; exit 1; }
     set +a
     echo "${sep}"
+    echo "# $(date)"
     echo "# Backend: ${backend_label}  (${env_file})"
     echo "${sep}"
 else
