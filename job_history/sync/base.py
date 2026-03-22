@@ -367,23 +367,24 @@ class SyncBase(ABC):
         # remote PostgreSQL servers with non-UTC DateStyle).
         n_inserted = self._bulk_insert_jobs(new_records)
 
-        # Calculate charges for the newly inserted jobs
+        # Calculate and upsert charges for all newly inserted jobs.
+        # The DB trigger (trg_ensure_job_charge) already created a placeholder
+        # row (charge_version=0) for each job, so we must UPSERT rather than
+        # plain INSERT to overwrite those placeholders with the real values.
         from sqlalchemy import and_
 
         job_ids = [r['job_id'] for r in new_records]
         submit_times = [normalize_datetime_to_naive(r['submit']) for r in new_records]
 
-        uncharged_jobs = (
+        new_jobs = (
             self.session.query(Job)
             .filter(and_(Job.job_id.in_(job_ids), Job.submit.in_(submit_times)))
-            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
-            .filter(JobCharge.job_id.is_(None))
             .all()
         )
 
-        if uncharged_jobs:
+        if new_jobs:
             charge_records = []
-            for job in uncharged_jobs:
+            for job in new_jobs:
                 charges = job.calculate_charges(self.machine)
                 charge_records.append({
                     'job_id': job.id,
@@ -394,7 +395,7 @@ class SyncBase(ABC):
                     'charge_version': 1,
                 })
             if charge_records:
-                self.session.bulk_insert_mappings(JobCharge, charge_records)
+                self._upsert_charges(charge_records)
 
         # Store raw scheduler records when present
         record_map = {}
@@ -423,6 +424,43 @@ class SyncBase(ABC):
 
         self.session.commit()
         return {"inserted": n_inserted, "updated": n_updated}
+
+    def _upsert_charges(self, charge_records: list[dict]) -> None:
+        """Dialect-aware upsert for job_charges rows.
+
+        Uses INSERT ... ON CONFLICT (job_id) DO UPDATE so that:
+        - New jobs: overwrites the zero-value placeholder created by the
+          trg_ensure_job_charge trigger with real calculated values.
+        - Existing jobs: replaces stale charge values (e.g. after an upsert
+          refreshes the job's resource field values).
+
+        Args:
+            charge_records: List of dicts with job_id, cpu_hours, gpu_hours,
+                            memory_hours, qos_factor, charge_version keys.
+        """
+        if not charge_records:
+            return
+
+        dialect = self.session.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _pg_insert
+            insert_fn = _pg_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as _sqlite_insert
+            insert_fn = _sqlite_insert
+
+        stmt = insert_fn(JobCharge.__table__).values(charge_records)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["job_id"],
+            set_={
+                "cpu_hours":    stmt.excluded.cpu_hours,
+                "gpu_hours":    stmt.excluded.gpu_hours,
+                "memory_hours": stmt.excluded.memory_hours,
+                "qos_factor":   stmt.excluded.qos_factor,
+                "charge_version": stmt.excluded.charge_version,
+            },
+        )
+        self.session.execute(stmt)
 
     def _bulk_insert_jobs(self, records: list[dict]) -> int:
         """Dialect-safe bulk insert with conflict handling.
@@ -512,19 +550,27 @@ class SyncBase(ABC):
             if raw is not None:
                 raw_record_map[existing_job.id] = raw
 
-        if not update_mappings:
+        # No matched jobs at all — nothing to do.
+        if not db_ids:
             return 0
 
-        # 1. Bulk-update Job fields
-        self.session.bulk_update_mappings(Job, update_mappings)
-        self.session.flush()
+        # 1. Bulk-update Job fields (only when there are actual field changes).
+        if update_mappings:
+            self.session.bulk_update_mappings(Job, update_mappings)
+            self.session.flush()
 
-        # 2. Delete + re-insert JobCharge (recalculate from updated Job values)
-        self.session.execute(delete(JobCharge).where(JobCharge.job_id.in_(db_ids)))
+        # 2. Recalculate charges for ALL matched jobs (field-updated or not).
+        #    For field-updated jobs: delete existing charges first so the fresh
+        #    values (e.g. corrected numcpus/numgpus) are used in the recalc.
+        #    For unmatched/missing charges: _upsert_charges inserts them without
+        #    touching existing correct rows (ON CONFLICT DO UPDATE).
+        if update_mappings:
+            # Wipe and fully recalculate for jobs whose fields changed.
+            self.session.execute(delete(JobCharge).where(JobCharge.job_id.in_(db_ids)))
 
-        updated_jobs = self.session.query(Job).filter(Job.id.in_(db_ids)).all()
+        matched_jobs = self.session.query(Job).filter(Job.id.in_(db_ids)).all()
         charge_records = []
-        for job in updated_jobs:
+        for job in matched_jobs:
             charges = job.calculate_charges(self.machine)
             charge_records.append({
                 'job_id': job.id,
@@ -535,13 +581,13 @@ class SyncBase(ABC):
                 'charge_version': 1,
             })
         if charge_records:
-            self.session.bulk_insert_mappings(JobCharge, charge_records)
+            self._upsert_charges(charge_records)
 
         # 3. Delete + re-insert JobRecord (replace raw scheduler record)
         if raw_record_map:
             self.session.execute(delete(JobRecord).where(JobRecord.job_id.in_(db_ids)))
             job_records = []
-            for job in updated_jobs:
+            for job in matched_jobs:
                 raw = raw_record_map.get(job.id)
                 if raw is not None:
                     job_records.append(JobRecord.from_pbs_record(job.id, raw))

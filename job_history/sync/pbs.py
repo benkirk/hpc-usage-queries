@@ -101,16 +101,35 @@ class SyncPBSLogs(SyncBase):
 
     @staticmethod
     def parse_pbs_timestamp(unix_time: int | str) -> datetime | None:
-        """Convert Unix timestamp to UTC datetime.
+        """Convert Unix timestamp to a naive UTC datetime.
+
+        Returns a timezone-naive datetime representing UTC.  Naive (rather
+        than timezone-aware) is intentional:
+
+        - SQLite stores all datetimes as naive strings.
+        - PostgreSQL's ``TIMESTAMP WITHOUT TIME ZONE`` columns have no tz
+          concept; psycopg2 converts *aware* datetimes to the server's local
+          timezone before writing, causing a skew when the PG server is not
+          UTC (e.g. America/Denver).  Passing a *naive* value bypasses that
+          conversion and stores exactly what we computed.
+        - Using UTC (not system-local) avoids DST ambiguity: every Unix
+          epoch maps to exactly one UTC instant.
+        - ``generate_daily_summary()`` compares ``j.end`` against UTC
+          boundaries derived from Mountain Time midnight; since psycopg2
+          also converts those aware boundary parameters to the server local
+          time before comparison, the math remains consistent.
+
+        This approach is portable across PostgreSQL servers in any timezone
+        and across SQLite.
 
         Examples:
-            >>> SyncPBSLogs.parse_pbs_timestamp(1769670016)
-            datetime.datetime(2026, 1, 29, 0, 0, 16, tzinfo=datetime.timezone.utc)
+            >>> SyncPBSLogs.parse_pbs_timestamp(1774072812)
+            datetime.datetime(2026, 3, 21, 6, 0, 12)  # naive UTC
         """
         if not unix_time:
             return None
         try:
-            return datetime.fromtimestamp(int(unix_time), tz=timezone.utc)
+            return datetime.fromtimestamp(int(unix_time), tz=timezone.utc).replace(tzinfo=None)
         except (ValueError, TypeError, OSError):
             return None
 

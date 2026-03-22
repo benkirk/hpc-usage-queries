@@ -127,13 +127,13 @@ class TestPbsTimestamp:
     def test_parse_integer_timestamp(self):
         """Parse Unix timestamp as integer."""
         result = parse_pbs_timestamp(1769670016)
-        expected = datetime(2026, 1, 29, 7, 0, 16, tzinfo=timezone.utc)
+        expected = datetime(2026, 1, 29, 7, 0, 16)  # naive UTC
         assert result == expected
 
     def test_parse_string_timestamp(self):
         """Parse Unix timestamp as string."""
         result = parse_pbs_timestamp("1769670016")
-        expected = datetime(2026, 1, 29, 7, 0, 16, tzinfo=timezone.utc)
+        expected = datetime(2026, 1, 29, 7, 0, 16)  # naive UTC
         assert result == expected
 
     def test_parse_none(self):
@@ -301,9 +301,9 @@ class TestParsePbsRecord:
         assert result["status"] == "0"
 
         # Check timestamps
-        assert result["submit"] == datetime(2026, 1, 29, 6, 59, 2, tzinfo=timezone.utc)
-        assert result["start"] == datetime(2026, 1, 29, 6, 59, 44, tzinfo=timezone.utc)
-        assert result["end"] == datetime(2026, 1, 29, 7, 0, 16, tzinfo=timezone.utc)
+        assert result["submit"] == datetime(2026, 1, 29, 6, 59, 2)   # naive UTC
+        assert result["start"] == datetime(2026, 1, 29, 6, 59, 44)  # naive UTC
+        assert result["end"] == datetime(2026, 1, 29, 7, 0, 16)     # naive UTC
 
         # Check time fields (in seconds)
         assert result["walltime"] == 1220  # 00:20:20
