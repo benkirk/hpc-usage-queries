@@ -49,15 +49,15 @@ def generate_daily_summary(
     stats = {"rows_deleted": 0, "rows_inserted": 0}
 
     # Site timezone (configured via JH_SITE_TIMEZONE, default "America/Denver")
-    mountain = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
+    site_timezone = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
 
     # Calculate UTC range for the site-local day (JH_SITE_TIMEZONE).
     # Jobs are stored with naive UTC timestamps (epoch → UTC, tzinfo stripped).
     # We must compare against naive UTC boundaries so that psycopg2 does not
     # perform a local-timezone conversion when binding the parameters to a
     # TIMESTAMP WITHOUT TIME ZONE column.
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=mountain)
-    end_dt = datetime.combine(target_date + timedelta(days=1), time.min).replace(tzinfo=mountain)
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=site_timezone)
+    end_dt = datetime.combine(target_date + timedelta(days=1), time.min).replace(tzinfo=site_timezone)
 
     # Naive UTC: strip tzinfo so psycopg2 stores/compares as-is (no conversion)
     start_utc = start_dt.astimezone(timezone.utc).replace(tzinfo=None)

@@ -559,7 +559,7 @@ class SyncBase(ABC):
             "days_skipped": 0, "skipped_days": [],
         }
 
-        mountain = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
+        site_timezone = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
 
         for day in date_range(start_date, end_date):
             day_date = parse_date_string(day).date()
@@ -568,13 +568,13 @@ class SyncBase(ABC):
             # (matches the boundary logic in generate_daily_summary)
             start_utc = (
                 datetime.combine(day_date, time.min)
-                .replace(tzinfo=mountain)
+                .replace(tzinfo=site_timezone)
                 .astimezone(timezone.utc)
                 .replace(tzinfo=None)
             )
             end_utc = (
                 datetime.combine(day_date + timedelta(days=1), time.min)
-                .replace(tzinfo=mountain)
+                .replace(tzinfo=site_timezone)
                 .astimezone(timezone.utc)
                 .replace(tzinfo=None)
             )
