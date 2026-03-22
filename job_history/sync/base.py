@@ -93,17 +93,18 @@ class SyncBase(ABC):
         incremental: bool = False,
         resummarize_only: bool = False,
         generate_summary: bool = True,
+        recalculate: bool = False,
     ) -> dict:
         """Parse → insert/upsert → charge → summarize scheduler logs.
 
         Args:
             log_dir: Scheduler log directory (required for file-based schedulers;
-                     not needed when resummarize_only=True)
+                     not needed when resummarize_only=True or recalculate=True)
             period: Single date in YYYY-MM-DD format (takes precedence over start/end)
             start_date: Start of date range (YYYY-MM-DD). Defaults to 2024-01-01.
             end_date: End of date range (YYYY-MM-DD). Defaults to yesterday.
             dry_run: Fetch and parse but skip all DB writes
-            batch_size: Records per batch insert
+            batch_size: Records per batch insert (also used by recalculate batching)
             verbose: Print per-day progress
             upsert: Update existing records with fresh-parsed values and
                     recalculate charges; also regenerates daily summaries.
@@ -115,26 +116,38 @@ class SyncBase(ABC):
             resummarize_only: Skip log parsing; recompute daily_summary rows
                     from current Job/JobCharge data only.
             generate_summary: Regenerate daily_summary after syncing
-                    (ignored when resummarize_only=True, which always regenerates)
+                    (ignored when resummarize_only=True or recalculate=True,
+                    which always regenerate summaries)
+            recalculate: Recompute charges for all DB jobs in the date range
+                    without re-parsing log files.  No job fields are changed.
+                    Regenerates daily summaries.  Mutually exclusive with
+                    upsert, incremental, and resummarize_only.
 
         Returns:
-            dict: {fetched, inserted, updated, errors, days_summarized,
-                   days_failed, failed_days, days_skipped, skipped_days}
+            dict: {fetched, inserted, updated, errors, recalculated,
+                   days_summarized, days_failed, failed_days,
+                   days_skipped, skipped_days}
         """
-        if incremental and upsert:
-            raise ValueError("incremental and upsert are mutually exclusive")
+        exclusive_flags = sum([bool(upsert), bool(incremental), bool(resummarize_only), bool(recalculate)])
+        if exclusive_flags > 1:
+            raise ValueError("upsert, incremental, resummarize_only, and recalculate are mutually exclusive")
 
         from .summary import get_summarized_dates, generate_daily_summary
 
         stats = {
             "fetched": 0, "inserted": 0, "updated": 0, "errors": 0,
+            "recalculated": 0,
             "days_failed": 0, "failed_days": [],
             "days_skipped": 0, "skipped_days": [],
             "days_summarized": 0,
         }
 
-        # Apply default date range when no single period is requested
-        if period is None:
+        # Normalize: treat a single period as a degenerate start==end range so
+        # all downstream paths share one unified iteration loop.
+        if period is not None:
+            start_date = period
+            end_date = period
+        else:
             if start_date is None:
                 start_date = "2024-01-01"
             if end_date is None:
@@ -144,25 +157,31 @@ class SyncBase(ABC):
         # resummarize_only: skip all log I/O; just regenerate summaries
         # ----------------------------------------------------------------
         if resummarize_only:
-            if start_date and end_date:
-                for day in date_range(start_date, end_date):
-                    day_date = parse_date_string(day).date()
-                    generate_daily_summary(self.session, self.machine, day_date, replace=True)
-                    stats["days_summarized"] += 1
-                    if verbose:
-                        print(f"  Resummarized {day}", flush=True)
-            else:
-                target_period = period or start_date or end_date
-                if target_period:
-                    day_date = parse_date_string(target_period).date()
-                    generate_daily_summary(self.session, self.machine, day_date, replace=True)
-                    stats["days_summarized"] = 1
-                    if verbose:
-                        print(f"  Resummarized {target_period}", flush=True)
+            for day in date_range(start_date, end_date):
+                day_date = parse_date_string(day).date()
+                generate_daily_summary(self.session, self.machine, day_date, replace=True)
+                stats["days_summarized"] += 1
+                if verbose:
+                    print(f"  Resummarized {day}", flush=True)
             return stats
 
         # ----------------------------------------------------------------
-        # Normal sync path (insert / upsert)
+        # recalculate: recompute charges from DB job rows; no log I/O
+        # ----------------------------------------------------------------
+        if recalculate:
+            recalc_stats = self._recalculate_charges(
+                start_date=start_date,
+                end_date=end_date,
+                dry_run=dry_run,
+                batch_size=batch_size,
+                verbose=verbose,
+                generate_summary=generate_summary,
+            )
+            stats.update(recalc_stats)
+            return stats
+
+        # ----------------------------------------------------------------
+        # Normal sync path (insert / upsert / incremental)
         # ----------------------------------------------------------------
         if log_dir is not None:
             log_path = Path(log_dir)
@@ -174,71 +193,42 @@ class SyncBase(ABC):
         if not upsert and not incremental and not dry_run:
             summarized_dates = get_summarized_dates(self.session)
 
-        if start_date and end_date:
-            # Multi-day range
-            days = date_range(start_date, end_date)
-            ndays = date_range_length(start_date, end_date)
-            iterator = track(days, total=ndays, description="Processing...") if track and verbose else days
+        # Unified single-day / multi-day iteration
+        days = date_range(start_date, end_date)
+        ndays = date_range_length(start_date, end_date)
+        iterator = track(days, total=ndays, description="Processing...") if track and verbose else days
 
-            for day in iterator:
-                day_date = parse_date_string(day).date()
+        for day in iterator:
+            day_date = parse_date_string(day).date()
 
-                if day_date in summarized_dates:
-                    if verbose:
-                        print(f"  Skipping {day}... (already summarized)")
-                    stats["days_skipped"] += 1
-                    stats["skipped_days"].append(day)
-                    continue
+            if day_date in summarized_dates:
+                if verbose:
+                    print(f"  Skipping {day}... (already summarized)")
+                stats["days_skipped"] += 1
+                stats["skipped_days"].append(day)
+                continue
 
-                day_stats = self._sync_single_day(log_dir, day, dry_run, batch_size, verbose, upsert)
-                stats["fetched"] += day_stats["fetched"]
-                stats["inserted"] += day_stats["inserted"]
-                stats["updated"] += day_stats["updated"]
-                stats["errors"] += day_stats["errors"]
-
-                if day_stats.get("failed"):
-                    stats["days_failed"] += 1
-                    stats["failed_days"].append(day)
-                else:
-                    if verbose:
-                        updated_str = f", {day_stats['updated']:,} updated" if day_stats["updated"] else ""
-                        print(
-                            f"  Parsed {day} - {day_stats['fetched']:,} jobs, "
-                            f"{day_stats['inserted']:,} new{updated_str}",
-                            flush=True,
-                        )
-                    should_summarize = day_stats["inserted"] > 0 if incremental else day_stats["fetched"] > 0
-                    if generate_summary and not dry_run and should_summarize:
-                        generate_daily_summary(self.session, self.machine, day_date, replace=True)
-                        stats["days_summarized"] += 1
-
-        else:
-            # Single day
-            target_period = period or start_date or end_date
-            if target_period:
-                day_date = parse_date_string(target_period).date()
-                if day_date in summarized_dates:
-                    if verbose:
-                        print(f"  Skipping {target_period}... (already summarized)")
-                    stats["days_skipped"] = 1
-                    stats["skipped_days"] = [target_period]
-                    return stats
-
-            day_stats = self._sync_single_day(log_dir, target_period, dry_run, batch_size, verbose, upsert)
-            stats["fetched"] = day_stats["fetched"]
-            stats["inserted"] = day_stats["inserted"]
-            stats["updated"] = day_stats["updated"]
-            stats["errors"] = day_stats["errors"]
+            day_stats = self._sync_single_day(log_dir, day, dry_run, batch_size, verbose, upsert)
+            stats["fetched"] += day_stats["fetched"]
+            stats["inserted"] += day_stats["inserted"]
+            stats["updated"] += day_stats["updated"]
+            stats["errors"] += day_stats["errors"]
 
             if day_stats.get("failed"):
-                stats["days_failed"] = 1
-                stats["failed_days"] = [target_period]
+                stats["days_failed"] += 1
+                stats["failed_days"].append(day)
             else:
+                if verbose:
+                    updated_str = f", {day_stats['updated']:,} updated" if day_stats["updated"] else ""
+                    print(
+                        f"  Parsed {day} - {day_stats['fetched']:,} jobs, "
+                        f"{day_stats['inserted']:,} new{updated_str}",
+                        flush=True,
+                    )
                 should_summarize = day_stats["inserted"] > 0 if incremental else day_stats["fetched"] > 0
-                if generate_summary and not dry_run and target_period and should_summarize:
-                    day_date = parse_date_string(target_period).date()
+                if generate_summary and not dry_run and should_summarize:
                     generate_daily_summary(self.session, self.machine, day_date, replace=True)
-                    stats["days_summarized"] = 1
+                    stats["days_summarized"] += 1
 
         return stats
 
@@ -350,14 +340,16 @@ class SyncBase(ABC):
                 continue
             seen_keys.add(key)
             if key in existing_pairs:
-                if upsert:
-                    existing_records.append(r)
+                existing_records.append(r)  # always collect; dispatch below
             else:
                 new_records.append(r)
 
         n_updated = 0
         if upsert and existing_records:
             n_updated = self._update_batch(existing_records)
+        elif existing_records:
+            # plain / incremental: fill charges for any existing jobs that lack them
+            self._fill_missing_charges(existing_records)
 
         if not new_records:
             return {"inserted": 0, "updated": n_updated}
@@ -383,17 +375,7 @@ class SyncBase(ABC):
         )
 
         if new_jobs:
-            charge_records = []
-            for job in new_jobs:
-                charges = job.calculate_charges(self.machine)
-                charge_records.append({
-                    'job_id': job.id,
-                    'cpu_hours': charges['cpu_hours'],
-                    'gpu_hours': charges['gpu_hours'],
-                    'memory_hours': charges['memory_hours'],
-                    'qos_factor': charges['qos_factor'],
-                    'charge_version': 1,
-                })
+            charge_records = self._compute_charges_for_jobs(new_jobs)
             if charge_records:
                 self._upsert_charges(charge_records)
 
@@ -461,6 +443,182 @@ class SyncBase(ABC):
             },
         )
         self.session.execute(stmt)
+
+    def _compute_charges_for_jobs(self, jobs: list) -> list[dict]:
+        """Build charge_records dicts from a list of Job ORM objects.
+
+        Shared by _insert_batch(), _update_batch(), and _recalculate_charges()
+        to avoid duplicating the charge-calculation loop.
+
+        Args:
+            jobs: List of Job ORM objects with job.id populated.
+
+        Returns:
+            List of dicts ready to pass to _upsert_charges().
+        """
+        charge_records = []
+        for job in jobs:
+            charges = job.calculate_charges(self.machine)
+            charge_records.append({
+                'job_id':         job.id,
+                'cpu_hours':      charges['cpu_hours'],
+                'gpu_hours':      charges['gpu_hours'],
+                'memory_hours':   charges['memory_hours'],
+                'qos_factor':     charges['qos_factor'],
+                'charge_version': 1,
+            })
+        return charge_records
+
+    def _fill_missing_charges(self, records: list[dict]) -> int:
+        """Insert charges for existing jobs that lack a real charge row.
+
+        Called during plain and incremental sync for records that are already
+        in the DB.  Runs a cheap outerjoin query — returns immediately when all
+        jobs already have charge_version=1 (the common case for a current DB).
+        Does NOT modify Job fields or JobRecord rows.
+
+        Note: only matches jobs whose naive-UTC submit timestamp is correctly
+        stored in the DB.  Historical jobs bulk-loaded with Mountain-Time
+        timestamps will not be matched here; use --recalculate for those.
+
+        Args:
+            records: FK-resolved dicts for jobs already in the DB.
+
+        Returns:
+            Number of jobs that received backfilled charges.
+        """
+        if not records:
+            return 0
+
+        from sqlalchemy import and_, or_
+
+        job_id_list = [r['job_id'] for r in records]
+        submit_list = [normalize_datetime_to_naive(r['submit']) for r in records]
+
+        uncharged = (
+            self.session.query(Job)
+            .filter(and_(Job.job_id.in_(job_id_list), Job.submit.in_(submit_list)))
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+            .filter(or_(JobCharge.job_id.is_(None), JobCharge.charge_version == 0))
+            .all()
+        )
+
+        if not uncharged:
+            return 0
+
+        charge_records = self._compute_charges_for_jobs(uncharged)
+        if charge_records:
+            self._upsert_charges(charge_records)
+            self.session.commit()
+
+        return len(uncharged)
+
+    def _recalculate_charges(
+        self,
+        start_date: str,
+        end_date: str,
+        dry_run: bool = False,
+        batch_size: int = 1000,
+        verbose: bool = False,
+        generate_summary: bool = True,
+    ) -> dict:
+        """Recompute charges for all DB jobs in a date range — no log parsing.
+
+        Queries the jobs table by Mountain-Time day boundaries, upserts
+        job_charges for every job found, and optionally regenerates
+        daily_summary rows.  Job fields and JobRecord rows are never modified.
+
+        Designed for:
+        - Historical backfill after a bulk-load that skipped charge calculation
+        - Re-running after charging-rule changes
+        - Recovery after DB issues
+
+        Args:
+            start_date: Start date YYYY-MM-DD (inclusive, Mountain Time day)
+            end_date:   End date YYYY-MM-DD (inclusive, Mountain Time day)
+            dry_run:    If True, compute charges but skip all DB writes
+            batch_size: Jobs per query batch (LIMIT/OFFSET pagination)
+            verbose:    Print per-day progress
+            generate_summary: If True, regenerate daily_summary after each day
+
+        Returns:
+            dict: {fetched, recalculated, days_summarized, days_failed, failed_days,
+                   inserted, updated, errors, days_skipped, skipped_days}
+        """
+        from datetime import datetime, time, timedelta, timezone
+        from zoneinfo import ZoneInfo
+
+        from .summary import generate_daily_summary
+        from .utils import date_range, parse_date_string
+
+        stats = {
+            "fetched": 0, "inserted": 0, "updated": 0, "errors": 0,
+            "recalculated": 0,
+            "days_summarized": 0, "days_failed": 0, "failed_days": [],
+            "days_skipped": 0, "skipped_days": [],
+        }
+
+        mountain = ZoneInfo("America/Denver")
+
+        for day in date_range(start_date, end_date):
+            day_date = parse_date_string(day).date()
+
+            # Compute naive UTC window for this Mountain-Time day
+            # (matches the boundary logic in generate_daily_summary)
+            start_utc = (
+                datetime.combine(day_date, time.min)
+                .replace(tzinfo=mountain)
+                .astimezone(timezone.utc)
+                .replace(tzinfo=None)
+            )
+            end_utc = (
+                datetime.combine(day_date + timedelta(days=1), time.min)
+                .replace(tzinfo=mountain)
+                .astimezone(timezone.utc)
+                .replace(tzinfo=None)
+            )
+
+            # Stream jobs in batches to avoid loading the whole table at once
+            from sqlalchemy import and_
+            day_count = 0
+            offset = 0
+            while True:
+                batch_jobs = (
+                    self.session.query(Job)
+                    .filter(and_(Job.end >= start_utc, Job.end < end_utc))
+                    .order_by(Job.id)
+                    .limit(batch_size)
+                    .offset(offset)
+                    .all()
+                )
+                if not batch_jobs:
+                    break
+
+                stats["fetched"] += len(batch_jobs)
+                day_count += len(batch_jobs)
+
+                if not dry_run:
+                    charge_records = self._compute_charges_for_jobs(batch_jobs)
+                    if charge_records:
+                        self._upsert_charges(charge_records)
+                        self.session.commit()
+                        stats["recalculated"] += len(charge_records)
+
+                # Expire loaded objects so SQLAlchemy releases their memory
+                for job in batch_jobs:
+                    self.session.expire(job)
+
+                offset += batch_size
+
+            if verbose:
+                action = "(dry run)" if dry_run else f"{day_count:,} jobs"
+                print(f"  Recalculated {day}: {action}", flush=True)
+
+            if not dry_run and generate_summary and day_count > 0:
+                generate_daily_summary(self.session, self.machine, day_date, replace=True)
+                stats["days_summarized"] += 1
+
+        return stats
 
     def _bulk_insert_jobs(self, records: list[dict]) -> int:
         """Dialect-safe bulk insert with conflict handling.
@@ -569,17 +727,7 @@ class SyncBase(ABC):
             self.session.execute(delete(JobCharge).where(JobCharge.job_id.in_(db_ids)))
 
         matched_jobs = self.session.query(Job).filter(Job.id.in_(db_ids)).all()
-        charge_records = []
-        for job in matched_jobs:
-            charges = job.calculate_charges(self.machine)
-            charge_records.append({
-                'job_id': job.id,
-                'cpu_hours': charges['cpu_hours'],
-                'gpu_hours': charges['gpu_hours'],
-                'memory_hours': charges['memory_hours'],
-                'qos_factor': charges['qos_factor'],
-                'charge_version': 1,
-            })
+        charge_records = self._compute_charges_for_jobs(matched_jobs)
         if charge_records:
             self._upsert_charges(charge_records)
 
