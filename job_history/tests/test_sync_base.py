@@ -1,11 +1,15 @@
 """Tests for SyncBase._insert_batch and _bulk_insert_jobs conflict handling."""
 
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 
+from sqlalchemy.exc import IntegrityError
+
 from job_history.sync.base import SyncBase
 from job_history.database import Job
+from job_history.database.models import LookupCache, User, Account, Queue
 
 
 # ---------------------------------------------------------------------------
@@ -123,3 +127,88 @@ class TestInsertBatchConflictEndToEnd:
         # Python-side dedup catches this; inserted=0 regardless of DB path
         assert stats["inserted"] == 0
         assert in_memory_session.query(Job).filter_by(job_id="idem.1").count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for LookupCache concurrent-insert race condition
+# ---------------------------------------------------------------------------
+
+class TestLookupCacheConcurrentInsert:
+    """LookupCache must survive concurrent inserts from another process.
+
+    Scenario: a long-running sync and a rapid daily sync share the same
+    PostgreSQL DB.  The daily sync inserts a new user between the time the
+    long-running sync loads its LookupCache and the time it tries to insert
+    that same user.  Without the savepoint fix this raises UniqueViolation
+    and kills the entire long-running sync.
+    """
+
+    def _simulate_external_insert(self, session, model, field, value):
+        """Insert a lookup row directly, simulating another process."""
+        obj = model(**{field: value})
+        session.add(obj)
+        session.flush()
+        return obj
+
+    def test_get_or_create_user_survives_concurrent_insert(self, in_memory_session):
+        """If another process inserts the user first, get_or_create_user must
+        return the existing row rather than raising IntegrityError."""
+        cache = LookupCache(in_memory_session)
+
+        # Simulate the external insert AFTER cache was loaded (empty at that point)
+        self._simulate_external_insert(in_memory_session, User, "username", "prao")
+        in_memory_session.commit()
+
+        # Cache doesn't know about "prao" yet — this is the race condition
+        assert "prao" not in cache._users
+
+        # Must not raise; must return the row that the "other process" inserted
+        user = cache.get_or_create_user("prao")
+        assert user.username == "prao"
+        assert user.id is not None
+
+        # Cache is now primed; second call is a no-op hit
+        user2 = cache.get_or_create_user("prao")
+        assert user2.id == user.id
+        assert in_memory_session.query(User).filter_by(username="prao").count() == 1
+
+    def test_get_or_create_account_survives_concurrent_insert(self, in_memory_session):
+        """Same race-condition protection for accounts."""
+        cache = LookupCache(in_memory_session)
+        self._simulate_external_insert(in_memory_session, Account, "account_name", "RACE0001")
+        in_memory_session.commit()
+
+        acct = cache.get_or_create_account("RACE0001")
+        assert acct.account_name == "RACE0001"
+        assert in_memory_session.query(Account).filter_by(account_name="RACE0001").count() == 1
+
+    def test_get_or_create_queue_survives_concurrent_insert(self, in_memory_session):
+        """Same race-condition protection for queues."""
+        cache = LookupCache(in_memory_session)
+        self._simulate_external_insert(in_memory_session, Queue, "queue_name", "raceq")
+        in_memory_session.commit()
+
+        queue = cache.get_or_create_queue("raceq")
+        assert queue.queue_name == "raceq"
+        assert in_memory_session.query(Queue).filter_by(queue_name="raceq").count() == 1
+
+    def test_full_sync_survives_concurrent_user_insert(self, in_memory_session):
+        """End-to-end: a sync that encounters a user already inserted by another
+        process mid-batch must complete without error."""
+        # First, get a clean cache state
+        cache = LookupCache(in_memory_session)
+        assert "newuser" not in cache._users
+
+        # Simulate another process inserting "newuser" into the DB
+        self._simulate_external_insert(in_memory_session, User, "username", "newuser")
+        in_memory_session.commit()
+
+        # Now a sync batch arrives with records attributed to "newuser"
+        rec = _make_record("race.job.1", TARGET_DT)
+        rec["user"] = "newuser"
+
+        syncer = StubSyncer(in_memory_session, "derecho", [rec])
+        # This must not raise UniqueViolation
+        stats = syncer.sync(log_dir=None, period=TARGET_DATE)
+        assert stats["inserted"] == 1
+        assert in_memory_session.query(Job).filter_by(job_id="race.job.1").count() == 1
