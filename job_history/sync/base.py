@@ -534,8 +534,8 @@ class SyncBase(ABC):
         - Recovery after DB issues
 
         Args:
-            start_date: Start date YYYY-MM-DD (inclusive, Mountain Time day)
-            end_date:   End date YYYY-MM-DD (inclusive, Mountain Time day)
+            start_date: Start date YYYY-MM-DD (inclusive, site-local day per JH_SITE_TIMEZONE)
+            end_date:   End date YYYY-MM-DD (inclusive, site-local day per JH_SITE_TIMEZONE)
             dry_run:    If True, compute charges but skip all DB writes
             batch_size: Jobs per query batch (LIMIT/OFFSET pagination)
             verbose:    Print per-day progress
@@ -548,6 +548,7 @@ class SyncBase(ABC):
         from datetime import datetime, time, timedelta, timezone
         from zoneinfo import ZoneInfo
 
+        from ..database.config import JobHistoryConfig
         from .summary import generate_daily_summary
         from .utils import date_range, parse_date_string
 
@@ -558,12 +559,12 @@ class SyncBase(ABC):
             "days_skipped": 0, "skipped_days": [],
         }
 
-        mountain = ZoneInfo("America/Denver")
+        mountain = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
 
         for day in date_range(start_date, end_date):
             day_date = parse_date_string(day).date()
 
-            # Compute naive UTC window for this Mountain-Time day
+            # Compute naive UTC window for this site-local day
             # (matches the boundary logic in generate_daily_summary)
             start_utc = (
                 datetime.combine(day_date, time.min)

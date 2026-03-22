@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
+from ..database.config import JobHistoryConfig
 from ..database.models import DailySummary, Job
 
 
@@ -47,10 +48,10 @@ def generate_daily_summary(
     _ = machine  # All machines now use same summary structure
     stats = {"rows_deleted": 0, "rows_inserted": 0}
 
-    # Mountain Time zone (handles MST/MDT automatically)
-    mountain = ZoneInfo("America/Denver")
+    # Site timezone (configured via JH_SITE_TIMEZONE, default "America/Denver")
+    mountain = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
 
-    # Calculate UTC range for the Mountain Time day.
+    # Calculate UTC range for the site-local day (JH_SITE_TIMEZONE).
     # Jobs are stored with naive UTC timestamps (epoch → UTC, tzinfo stripped).
     # We must compare against naive UTC boundaries so that psycopg2 does not
     # perform a local-timezone conversion when binding the parameters to a

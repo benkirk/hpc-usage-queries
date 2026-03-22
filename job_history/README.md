@@ -63,6 +63,7 @@ jobhist sync -m derecho -l ./data/pbs_logs/derecho --start 2025-08-01 --end 2025
 | `JH_PG_DERECHO_DB` | `derecho_jobs` | Override Derecho database name |
 | `JH_PG_CASPER_DB` | `casper_jobs` | Override Casper database name |
 | `JH_PG_REQUIRE_SSL` | `false` | Require SSL/TLS for PostgreSQL |
+| `JH_SITE_TIMEZONE` | `America/Denver` | IANA timezone for day boundaries in daily_summary and --recalculate |
 
 Copy `.env.example` → `.env` for non-default configuration.
 
