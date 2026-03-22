@@ -4,10 +4,11 @@ This document describes the optimized database schema for NCAR's Casper and Dere
 
 ## Overview
 
-- **Databases**: Separate SQLite files per machine (`data/casper.db`, `data/derecho.db`)
+- **Databases**: Separate SQLite files per machine (`data/casper.db`, `data/derecho.db`), or per-machine PostgreSQL databases (`casper_jobs`, `derecho_jobs`)
 - **Schema**: Normalized with foreign keys and composite indexes
-- **Timestamps**: UTC
+- **Timestamps**: Naive UTC — epoch seconds converted to UTC then stored without timezone info so they round-trip correctly through both PostgreSQL (any server timezone) and SQLite
 - **Performance**: 5-10x query speedup via optimization
+- **1:1 invariant**: Every `jobs` row is guaranteed to have a `job_charges` row, enforced by the `trg_ensure_job_charge` database trigger
 
 ## Schema Design
 
@@ -68,10 +69,10 @@ Core job records with foreign keys to normalized tables.
 | `queue_id` | INTEGER | FK, YES | → queues.id |
 | `name` | TEXT | NO | Job name |
 | `status` | TEXT | YES | Completion status |
-| `submit` | DATETIME | YES | Submission time (UTC) |
-| `eligible` | DATETIME | NO | Eligible time (UTC) |
-| `start` | DATETIME | YES | Start time (UTC) |
-| `end` | DATETIME | YES | End time (UTC) |
+| `submit` | DATETIME | YES | Submission time (naive UTC — see note below) |
+| `eligible` | DATETIME | NO | Eligible time (naive UTC) |
+| `start` | DATETIME | YES | Start time (naive UTC) |
+| `end` | DATETIME | YES | End time (naive UTC) |
 | `elapsed` | INTEGER | NO | Runtime (seconds) |
 | `walltime` | INTEGER | NO | Requested walltime (seconds) |
 | `numcpus` | INTEGER | NO | CPUs allocated |
@@ -89,6 +90,15 @@ Core job records with foreign keys to normalized tables.
 **Constraints:**
 - Unique: `(job_id, submit)` - prevents duplicate imports
 - Foreign keys enforce referential integrity
+
+> **Timestamp note**: All datetime columns store **naive UTC** (no `tzinfo`).
+> PBS accounting logs contain Unix epoch values (`ctime`, `start`, `end`, etc.);
+> `parse_pbs_timestamp()` converts these to UTC then strips the timezone before
+> storing.  This is critical for PostgreSQL: if a timezone-aware datetime is
+> written to a `TIMESTAMP WITHOUT TIME ZONE` column, psycopg2 converts it to
+> the server's local timezone first, causing a skew (e.g., 6 hours on a
+> Mountain-Time server).  Naive values are stored and compared as-is on both
+> SQLite and PostgreSQL regardless of server timezone.
 
 ### users, accounts, queues
 
@@ -108,28 +118,63 @@ Normalized lookup tables for efficient joins.
 
 ### job_charges
 
-Materialized charging calculations for instant lookups.
+Materialized charging calculations — **1:1 with jobs**, enforced by DB trigger.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `job_id` | INTEGER | PK, FK → jobs.id |
+| `job_id` | INTEGER | PK, FK → jobs.id (CASCADE DELETE) |
 | `cpu_hours` | FLOAT | CPU-hours charged |
 | `gpu_hours` | FLOAT | GPU-hours charged |
 | `memory_hours` | FLOAT | Memory GB-hours charged |
-| `charge_version` | INTEGER | Algorithm version (for future changes) |
-| `qos_factor` | FLOAT | QoS scaling factor (default 1.0, reserved for future use) |
+| `charge_version` | INTEGER | 0 = trigger placeholder, 1 = calculated value |
+| `qos_factor` | FLOAT | QoS multiplier applied to hours for charge totals |
 
-**Charging rules:**
+**`charge_version` semantics:**
+- `0`: inserted by `trg_ensure_job_charge` trigger immediately on job INSERT;
+  all charge values are zero. Indicates charges have not yet been calculated.
+- `1`: real calculated charges written by the sync code.
 
-*Derecho:*
+**QoS factors** (applied in `daily_summary` as `cpu_hours × qos_factor`):
+
+| Priority / Queue | `qos_factor` |
+|---|---|
+| `premium` | 1.5 |
+| regular / unset | 1.0 |
+| `economy` | 0.7 |
+| `jhublogin` | 0.0 (free) |
+
+**Charging rules** (implemented in `sync/charging.py`):
+
+*Derecho (`DerechoCharging`):*
 - Production CPU: `numnodes × 128 cores/node × elapsed_hours`
 - Production GPU: `numnodes × 4 GPUs/node × elapsed_hours`
-- Dev queues: actual resources (not full-node allocation)
+- Dev queues (queue name contains `dev`): actual `numcpus` / `numgpus`
+- GPU hours only charged for queues with `gpu` in the name
 
-*Casper:*
+*Casper (`CasperCharging`):*
 - CPU: `numcpus × elapsed_hours`
 - GPU: `numgpus × elapsed_hours`
-- Memory: `memory_gb × elapsed_hours`
+- Memory: `memory_gb × elapsed_hours` (all machines)
+
+**DB trigger (PostgreSQL and SQLite):**
+```sql
+-- PostgreSQL
+CREATE TRIGGER trg_ensure_job_charge
+AFTER INSERT ON jobs FOR EACH ROW
+EXECUTE FUNCTION fn_ensure_job_charge();
+-- fn_ensure_job_charge inserts (job_id, 0.0, 0.0, 0.0, 1.0, charge_version=0)
+-- ON CONFLICT (job_id) DO NOTHING
+
+-- SQLite equivalent
+CREATE TRIGGER IF NOT EXISTS trg_ensure_job_charge
+AFTER INSERT ON jobs
+BEGIN
+    INSERT OR IGNORE INTO job_charges (...) VALUES (NEW.id, 0.0, 0.0, 0.0, 1.0, 0);
+END;
+```
+
+Created by `_ensure_db_triggers()` in `database/session.py`, called from `init_db()`.
+Safe to re-run (uses `CREATE OR REPLACE` / `IF NOT EXISTS`).
 
 ### daily_summary
 
@@ -139,7 +184,7 @@ All three dimensions (user, account, queue) are fully supported for aggregation 
 | Column | Type | Index | Description |
 |--------|------|-------|-------------|
 | `id` | INTEGER | PK, AUTO | Primary key |
-| `date` | DATE | YES | Summary date |
+| `date` | DATE | YES | Summary date (Mountain Time day) |
 | `user` | HYBRID | - | Username (hybrid property, 'NO_JOBS' if NULL FK) |
 | `account` | HYBRID | - | Account name (hybrid property, 'NO_JOBS' if NULL FK) |
 | `queue` | HYBRID | - | Queue name (hybrid property, 'NO_JOBS' if NULL FK) |
@@ -147,12 +192,25 @@ All three dimensions (user, account, queue) are fully supported for aggregation 
 | `account_id` | INTEGER | FK, YES | → accounts.id (NULL for empty day markers) |
 | `queue_id` | INTEGER | FK, YES | → queues.id (NULL for empty day markers) |
 | `job_count` | INTEGER | NO | Number of jobs |
-| `cpu_hours` | FLOAT | NO | Total CPU-hours |
-| `gpu_hours` | FLOAT | NO | Total GPU-hours |
-| `memory_hours` | FLOAT | NO | Total memory GB-hours |
+| `cpu_hours` | FLOAT | NO | Total raw CPU-hours |
+| `gpu_hours` | FLOAT | NO | Total raw GPU-hours |
+| `memory_hours` | FLOAT | NO | Total raw memory GB-hours |
+| `cpu_charges` | FLOAT | NO | `SUM(cpu_hours × qos_factor)` |
+| `gpu_charges` | FLOAT | NO | `SUM(gpu_hours × qos_factor)` |
+| `memory_charges` | FLOAT | NO | `SUM(memory_hours × qos_factor)` |
 
 **Constraints:**
 - Unique: `(date, user_id, account_id, queue_id)`
+
+**Day boundaries:** `generate_daily_summary()` uses Mountain Time midnight as the day
+boundary, computing a naive UTC range (`America/Denver` midnight → next midnight, converted
+to naive UTC) for the `WHERE j.end >= :start_utc AND j.end < :end_utc` filter.  Both the
+stored `end` values and the boundary parameters are naive UTC, so comparisons are consistent
+regardless of PostgreSQL server timezone.
+
+**Marker rows:** When a date has no jobs, a row with `user_id=NULL`, `account_id=NULL`,
+`queue_id=NULL`, and `job_count=0` is inserted to prevent the summarizer from repeatedly
+re-scanning the same empty day.
 
 ## Composite Indexes
 
@@ -254,20 +312,26 @@ ORDER BY avg_wait_min DESC;
 
 ## Data Flow
 
-1. **Import** (sync.py)
-   - Parse local PBS accounting logs
-   - Resolve FKs (create new users/accounts/queues as needed)
-   - Insert jobs with duplicate detection
-   - Calculate and insert charges
+1. **Import** (`sync/base.py`, `sync/pbs.py`)
+   - Parse local PBS accounting logs; `parse_pbs_timestamp()` converts Unix epoch → naive UTC
+   - Resolve FKs (get-or-create users/accounts/queues via `LookupCache`)
+   - Bulk-insert new jobs (`ON CONFLICT DO NOTHING` on `uq_jobs_job_id_submit`)
+   - DB trigger fires → zero-value `job_charges` placeholder inserted for each new job
+   - Calculate real charges via `_compute_charges_for_jobs()` + `_upsert_charges()`
+     (overwrites placeholder `charge_version=0` with `charge_version=1`)
+   - For existing records encountered during plain/incremental sync, `_fill_missing_charges()`
+     backfills any still at `charge_version=0`
+   - Compress-pickle raw `PbsRecord` into `job_records`
 
-2. **Aggregation** (summary.py)
-   - Generate daily_summary from jobs + job_charges
-   - Uses 4-way JOIN: jobs → job_charges → users/accounts/queues
+2. **Aggregation** (`sync/summary.py`)
+   - `generate_daily_summary()` uses naive UTC Mountain-Time day boundaries
+   - `JOIN jobs j ON j.id = jc.job_id` — relies on 1:1 invariant being satisfied
+   - Inserts both raw hours and QoS-weighted charges per `(date, user, account, queue)`
 
-3. **Query** (queries.py)
+3. **Query** (`queries/jobs.py`)
    - High-level API uses composite indexes automatically
-   - Prefers job_charges table over on-the-fly calculation
-   - Falls back to daily_summary for historical queries
+   - `daily_summary_report()` reads from `daily_summary` (fast path)
+   - Other queries join `jobs` + `job_charges` directly
 
 ## Schema Evolution
 

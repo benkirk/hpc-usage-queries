@@ -12,8 +12,8 @@ Two **wholly independent** modules in one repo. Never mix their concerns.
 ## Tests
 
 ```bash
-pytest                        # both suites (293 tests)
-pytest job_history/tests/     # job_history only (170 tests)
+pytest                        # both suites (340+ tests)
+pytest job_history/tests/     # job_history only (217 tests)
 pytest fs_scans/tests/        # fs_scans only
 ```
 
@@ -51,8 +51,16 @@ fs-scans-analyze        # → fs-scans analyze
 ### Schema key points
 - `jobs` table: normalized FKs (`user_id`, `account_id`, `queue_id`) to lookup tables
 - `user`, `account`, `queue` are **`@hybrid_property`** — look like text columns to app code but use integer FK joins
-- `job_charges`: pre-computed `cpu_hours`, `gpu_hours`, `memory_hours`, `qos_factor` (default 1.0)
-- `daily_summary`: pre-aggregated by `(date, user_id, account_id, queue_id)`; NULL FKs = NO_JOBS marker rows
+- **Timestamps are naive UTC** — Unix epoch → UTC then `tzinfo=None` stripped before storage.
+  psycopg2 converts tz-aware datetimes to the PG server's local timezone when writing to
+  `TIMESTAMP WITHOUT TIME ZONE`; naive values bypass that conversion and are portable across
+  any PG server timezone and SQLite.
+- `job_charges`: pre-computed `cpu_hours`, `gpu_hours`, `memory_hours`, `qos_factor`;
+  **1:1 with jobs enforced by `trg_ensure_job_charge` trigger** (fires AFTER INSERT ON jobs,
+  inserts placeholder with `charge_version=0`; sync overwrites with `charge_version=1`)
+- `daily_summary`: pre-aggregated by `(date, user_id, account_id, queue_id)`; NULL FKs = NO_JOBS marker rows;
+  stores both raw hours (`cpu_hours`) and QoS-weighted charges (`cpu_charges = cpu_hours × qos_factor`)
+- Day boundaries use Mountain Time midnight → naive UTC for comparisons (matches stored `end` timestamps)
 
 ### Critical patterns
 
@@ -66,15 +74,22 @@ session.bulk_insert_mappings(Model, list_of_dicts, render_nulls=True)
 `before_flush` Session event listener resolves them (builds lookup cache, handles
 missing tables gracefully).
 
-**Datetime comparison** — SQLite stores naive datetimes; parsers produce UTC-aware.
-Normalize before comparing: `dt.replace(tzinfo=None)`.
+**Datetime comparison** — all datetimes stored as naive UTC. Parsers call
+`normalize_datetime_to_naive(dt)` before comparing against DB values.
 
 **`db_available(machine)`** — lives in `job_history.database` (not `qhist_plugin`).
 
-**`--upsert` / `--resummarize`** — `jobhist sync` flags for retroactive updates.
-`--upsert` re-parses logs and updates existing Job/JobCharge/JobRecord rows
-(via `SyncBase._update_batch()`); bypasses the summarized-day skip automatically.
-`--resummarize` recomputes `daily_summary` from current DB state, no logs needed.
+**Sync flags** — `jobhist sync` supports five modes, mutually exclusive:
+- `--incremental`: insert new records only; fills missing charges for existing records; re-summarizes only if new records inserted. Safe for frequent intra-day crons.
+- `--upsert`: re-parse logs, update existing Job/JobCharge/JobRecord rows (via `_update_batch()`); bypasses summarized-day skip; always regenerates summaries.
+- `--recalculate`: recompute charges from DB jobs without re-parsing logs (uses `_recalculate_charges()` querying by Mountain-Time day boundaries); regenerates summaries. Use for historical backfill or charging-rule changes.
+- `--resummarize`: recompute `daily_summary` only from current DB state, no logs needed.
+- plain (default): insert new records, fill missing charges for existing records, summarize if any fetched.
+
+**Charge invariant** — every job row is guaranteed to have a `job_charges` row. Enforced
+at DB level by `trg_ensure_job_charge` trigger (created by `_ensure_db_triggers()` in
+`session.py`, called from `init_db()`). Application code uses `_upsert_charges()` to
+overwrite placeholders. Live on `casper_jobs` and `derecho_jobs` PostgreSQL DBs.
 
 **`DerechoRecord`** — vendored at `job_history/_vendor/pbs_parser_ncar/ncar.py`
 (underscore rename makes it a proper Python package). Imported via standard dotted
@@ -87,11 +102,12 @@ any shims. See `_get_record_class()` in `sync/pbs.py`.
 | `job_history/database/models.py` | ORM models: Job, JobCharge, DailySummary, JobRecord, lookup tables |
 | `job_history/database/session.py` | Engine/session factory, `db_available()`, PRAGMA tuning, `init_db` |
 | `job_history/queries/jobs.py` | `JobQueries` class — high-level query API |
-| `job_history/sync/base.py` | `SyncBase` ABC + `JobImporter`; owns full sync lifecycle (insert, upsert, resummarize); `MACHINE_SCHEDULERS`, `UPDATABLE_JOB_FIELDS` |
-| `job_history/sync/pbs.py` | PBS field parsers, `fetch_jobs_from_pbs_logs()`, `SyncPBSLogs` driver |
-| `job_history/sync/charging.py` | `derecho_charge()`, `casper_charge()` — machine-specific rules |
-| `job_history/sync/summary.py` | `generate_daily_summary()` — aggregates jobs → daily_summary |
-| `job_history/sync/cli.py` | `jobhist sync` Click command (`--upsert`, `--resummarize`) |
+| `job_history/database/session.py` | Engine/session factory, `_ensure_db_triggers()`, `init_db()` |
+| `job_history/sync/base.py` | `SyncBase` ABC; full sync lifecycle; `_compute_charges_for_jobs()`, `_upsert_charges()`, `_fill_missing_charges()`, `_recalculate_charges()`; `UPDATABLE_JOB_FIELDS` |
+| `job_history/sync/pbs.py` | PBS field parsers, `SyncPBSLogs` driver; `parse_pbs_timestamp()` → naive UTC |
+| `job_history/sync/charging.py` | `SystemCharging` ABC + `DerechoCharging`, `CasperCharging` |
+| `job_history/sync/summary.py` | `generate_daily_summary()` — naive UTC bounds, QoS-weighted charges |
+| `job_history/sync/cli.py` | `jobhist sync` Click command (`--upsert`, `--incremental`, `--recalculate`, `--resummarize`) |
 | `job_history/cli.py` | `history` and `resource` Click groups + all subcommands |
 | `job_history/_vendor/pbs_parser_ncar/ncar.py` | Vendored `DerechoRecord` (extends `PbsRecord` with power metrics) |
 | `job_history/SCHEMA.md` | Full schema documentation |
