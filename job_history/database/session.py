@@ -229,6 +229,57 @@ def _ensure_pg_database(machine: str, config: type) -> None:
         admin_engine.dispose()
 
 
+def _ensure_db_triggers(engine) -> None:
+    """Create database triggers that enforce the 1:1 jobs ↔ job_charges invariant.
+
+    After any INSERT on the ``jobs`` table a zero-value placeholder row is
+    immediately inserted into ``job_charges`` (charge_version=0 signals a
+    placeholder; the sync code overwrites it with version=1 after calculation).
+
+    This prevents the historical situation where jobs were bulk-loaded without
+    corresponding charge records, which caused daily_summary to be nearly empty.
+
+    Idempotent: safe to call on every startup (uses CREATE OR REPLACE / IF NOT
+    EXISTS semantics).
+    """
+    dialect = engine.dialect.name
+
+    with engine.connect() as conn:
+        if dialect == "postgresql":
+            conn.execute(text("""
+                CREATE OR REPLACE FUNCTION fn_ensure_job_charge()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    INSERT INTO job_charges
+                        (job_id, cpu_hours, gpu_hours, memory_hours, qos_factor, charge_version)
+                    VALUES (NEW.id, 0.0, 0.0, 0.0, 1.0, 0)
+                    ON CONFLICT (job_id) DO NOTHING;
+                    RETURN NEW;
+                END;
+                $$;
+            """))
+            conn.execute(text("""
+                DROP TRIGGER IF EXISTS trg_ensure_job_charge ON jobs;
+            """))
+            conn.execute(text("""
+                CREATE TRIGGER trg_ensure_job_charge
+                AFTER INSERT ON jobs
+                FOR EACH ROW
+                EXECUTE FUNCTION fn_ensure_job_charge();
+            """))
+        else:  # SQLite
+            conn.execute(text("""
+                CREATE TRIGGER IF NOT EXISTS trg_ensure_job_charge
+                AFTER INSERT ON jobs
+                BEGIN
+                    INSERT OR IGNORE INTO job_charges
+                        (job_id, cpu_hours, gpu_hours, memory_hours, qos_factor, charge_version)
+                    VALUES (NEW.id, 0.0, 0.0, 0.0, 1.0, 0);
+                END;
+            """))
+        conn.commit()
+
+
 def init_db(machine: str | None = None, echo: bool = False):
     """Initialize database(s) by creating all tables.
 
@@ -249,6 +300,7 @@ def init_db(machine: str | None = None, echo: bool = False):
             _ensure_pg_database(machine, config)
         engine = get_engine(machine, echo=echo)
         Base.metadata.create_all(engine)
+        _ensure_db_triggers(engine)
         return engine
 
     # Initialize all machines
@@ -258,4 +310,5 @@ def init_db(machine: str | None = None, echo: bool = False):
             _ensure_pg_database(m, config)
         engines[m] = get_engine(m, echo=echo)
         Base.metadata.create_all(engines[m])
+        _ensure_db_triggers(engines[m])
     return engines

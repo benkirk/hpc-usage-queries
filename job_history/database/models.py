@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, Text, UniqueConstraint, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import declarative_base, declared_attr, relationship
 
@@ -66,30 +67,47 @@ class LookupCache:
 
     def get_or_create_user(self, username):
         if username not in self._users:
-            obj = User(username=username)
-            self._session.add(obj)
-            if self._auto_flush:
-                self._session.flush()
+            obj = self._get_or_create(User, "username", username)
             self._users[username] = obj
         return self._users[username]
 
     def get_or_create_account(self, account_name):
         if account_name not in self._accounts:
-            obj = Account(account_name=account_name)
-            self._session.add(obj)
-            if self._auto_flush:
-                self._session.flush()
+            obj = self._get_or_create(Account, "account_name", account_name)
             self._accounts[account_name] = obj
         return self._accounts[account_name]
 
     def get_or_create_queue(self, queue_name):
         if queue_name not in self._queues:
-            obj = Queue(queue_name=queue_name)
-            self._session.add(obj)
-            if self._auto_flush:
-                self._session.flush()
+            obj = self._get_or_create(Queue, "queue_name", queue_name)
             self._queues[queue_name] = obj
         return self._queues[queue_name]
+
+    def _get_or_create(self, model, field: str, value: str):
+        """Insert a lookup row, handling concurrent inserts from other processes.
+
+        Wraps the INSERT in a savepoint (``begin_nested()``) so that a
+        ``UniqueViolation`` from a concurrent process only rolls back the one
+        failed INSERT rather than aborting the whole transaction.  After the
+        rollback the existing row is fetched with a SELECT.
+
+        This is the standard "try-insert / fall-back-to-select" pattern for
+        PostgreSQL when multiple processes share the same database.
+        """
+        try:
+            with self._session.begin_nested():
+                obj = model(**{field: value})
+                self._session.add(obj)
+                if self._auto_flush:
+                    self._session.flush()
+        except IntegrityError:
+            # Another process inserted this row between our cache load and our
+            # INSERT.  The savepoint rollback above undid the failed statement;
+            # the outer transaction is still intact.  Re-fetch the existing row.
+            obj = self._session.query(model).filter(
+                getattr(model, field) == value
+            ).one()
+        return obj
 
 
 class LookupMixin:

@@ -49,6 +49,12 @@ class JobHistoryConfig:
         env_var = f"JH_PG_{machine.upper()}_DB"
         return os.getenv(env_var, f"{machine}_jobs")
 
+    # --------------------------------------------------- Site timezone
+    # Used to determine day boundaries for daily_summary generation and
+    # for --recalculate date-range queries.  Must be a valid IANA timezone
+    # name (e.g. "America/Denver", "America/New_York", "UTC").
+    SITE_TIMEZONE = os.getenv("JH_SITE_TIMEZONE", "America/Denver")
+
     # ------------------------------------------------------------ Validate
     @classmethod
     def validate_postgres(cls):

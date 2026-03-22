@@ -63,6 +63,7 @@ jobhist sync -m derecho -l ./data/pbs_logs/derecho --start 2025-08-01 --end 2025
 | `JH_PG_DERECHO_DB` | `derecho_jobs` | Override Derecho database name |
 | `JH_PG_CASPER_DB` | `casper_jobs` | Override Casper database name |
 | `JH_PG_REQUIRE_SSL` | `false` | Require SSL/TLS for PostgreSQL |
+| `JH_SITE_TIMEZONE` | `America/Denver` | IANA timezone for day boundaries in daily_summary and --recalculate |
 
 Copy `.env.example` → `.env` for non-default configuration.
 
@@ -90,12 +91,15 @@ job_history/
   sync/                    ── data ingestion ────────────────────────────
     __init__.py            Re-exports SyncBase, SyncPBSLogs, JobImporter,
                              SyncSLURMLogs, MACHINE_SCHEDULERS
-    base.py                SyncBase ABC + JobImporter; owns full sync
-                             lifecycle: insert, upsert, resummarize.
-                             MACHINE_SCHEDULERS, UPDATABLE_JOB_FIELDS
-    pbs.py                 PBS field parsers, fetch_jobs_from_pbs_logs(),
-                             SyncPBSLogs driver, DerechoRecord loader
-    charging.py            derecho_charge(), casper_charge()
+    base.py                SyncBase ABC; owns full sync lifecycle:
+                             insert, upsert, incremental, recalculate,
+                             resummarize. MACHINE_SCHEDULERS,
+                             UPDATABLE_JOB_FIELDS. Key helpers:
+                             _compute_charges_for_jobs(), _upsert_charges(),
+                             _fill_missing_charges(), _recalculate_charges()
+    pbs.py                 PBS field parsers, SyncPBSLogs driver.
+                             parse_pbs_timestamp() returns naive UTC.
+    charging.py            SystemCharging ABC + DerechoCharging, CasperCharging
     summary.py             generate_daily_summary(), get_summarized_dates()
     utils.py               date_range(), parse_date_string(),
                              normalize_datetime_to_naive(), safe_int/float, …
@@ -115,7 +119,7 @@ job_history/
   tests/                   ── test suite ────────────────────────────────
     conftest.py            Shared fixtures (in-memory DB, job data)
     fixtures/              PBS log fixtures for integration tests
-    test_*.py              170 tests, run with pytest
+    test_*.py              217 tests, run with pytest
 
 bin/
   qhist-db                 qhist-compatible frontend, DB-backed via qhist_plugin
@@ -133,14 +137,19 @@ data/
 - FKs: `user_id`, `account_id`, `queue_id` → lookup tables
 - Hybrid properties `user`, `account`, `queue` — read/write text transparently
 - Resource fields: `numcpus`, `numgpus`, `numnodes`, `memory`, `cputype`, `gputype`
-- UTC timestamps: `submit`, `eligible`, `start`, `end`, `elapsed`
+- **Naive UTC timestamps**: `submit`, `eligible`, `start`, `end` stored as timezone-naive
+  UTC datetimes so they round-trip correctly through both PostgreSQL (any server timezone)
+  and SQLite without conversion skew
 - Unique constraint on `(job_id, submit)` prevents duplicates
 
 **users / accounts / queues** — Normalized lookup tables (integer FK joins)
 
-**job_charges** — Materialized charging calculations (1:1 with jobs)
+**job_charges** — Materialized charging calculations (1:1 with jobs, enforced by DB trigger)
 - Pre-computed: `cpu_hours`, `gpu_hours`, `memory_hours`
-- `qos_factor` (default 1.0) reserved for future QoS scaling
+- `qos_factor`: QoS multiplier (1.5 premium, 0.7 economy, 0.0 jhublogin, 1.0 regular)
+- `charge_version`: 0 = trigger placeholder awaiting calculation, 1 = real calculated value
+- DB trigger `trg_ensure_job_charge` inserts a zero placeholder on every job INSERT,
+  guaranteeing the 1:1 invariant at the database level regardless of application code path
 
 **job_records** — Gzip-compressed pickled `PbsRecord` objects (1:1 with jobs)
 - Enables `bin/qhist-db` to return original PBS records without re-scanning logs
@@ -160,6 +169,18 @@ See [SCHEMA.md](SCHEMA.md) for full schema documentation.
 
 ## Sync
 
+### Sync modes
+
+| Mode | Reads logs? | Inserts new? | Updates fields? | Fills missing charges? | Recalculates charges? | Summary? |
+|---|---|---|---|---|---|---|
+| plain (default) | ✓ | ✓ | — | ✓ existing w/o charge | new only | if fetched > 0 |
+| `--incremental` | ✓ | ✓ new only | — | ✓ existing w/o charge | new only | if inserted > 0 |
+| `--upsert` | ✓ | ✓ | ✓ all fields | ✓ | ✓ all processed | if fetched > 0 |
+| `--recalculate` | — | — | — | ✓ | ✓ all in range | ✓ always |
+| `--resummarize` | — | — | — | — | — | ✓ always |
+
+`--upsert`, `--incremental`, `--recalculate`, and `--resummarize` are mutually exclusive.
+
 ### CLI
 
 ```bash
@@ -169,14 +190,25 @@ jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 -v
 # Date range
 jobhist sync -m casper -l ./data/pbs_logs/casper --start 2026-01-01 --end 2026-01-31
 
+# Last N days (including today)
+jobhist sync -m casper -l ./data/pbs_logs/casper --last 3d
+
 # Dry run (parse, don't insert)
 jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 --dry-run -v
 
-# Re-parse and update existing records (recalculates charges + summaries)
-# Bypasses the already-summarized day skip automatically
+# Incremental: insert new records only; re-summarize only when new records found
+# Ideal for frequent intra-day cron syncs
+jobhist sync -m casper -l ./data/pbs_logs/casper --today --incremental
+
+# Upsert: re-parse and update existing records, recalculate charges + summaries
 jobhist sync -m derecho -l ./data/pbs_logs/derecho -d 2026-01-29 --upsert
 
-# Recompute daily summaries from current DB state (no log parsing; --log-path not needed)
+# Recalculate charges from DB jobs without re-parsing logs
+# Use for: historical backfill, charging-rule changes, missing-charges recovery
+jobhist sync -m casper -d 2026-03-21 --recalculate
+jobhist sync -m casper --start 2021-01-01 --end 2026-03-21 --recalculate
+
+# Recompute daily summaries from current DB state (no log parsing)
 jobhist sync -m derecho -d 2026-01-29 --resummarize
 jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
 
@@ -201,31 +233,41 @@ syncer = SyncPBSLogs(session, "derecho")
 # Normal sync
 stats = syncer.sync("./data/pbs_logs/derecho", start_date="2026-01-01", end_date="2026-01-31")
 
+# Incremental — insert new records only, bypasses already-summarized skip
+stats = syncer.sync("./data/pbs_logs/derecho", period="2026-01-29", incremental=True)
+
 # Upsert — update existing records with re-parsed values + recalculate charges
 stats = syncer.sync("./data/pbs_logs/derecho", period="2026-01-29", upsert=True)
+
+# Recalculate — recompute charges from DB jobs, no log dir needed
+stats = syncer.sync(None, start_date="2026-01-01", end_date="2026-01-31", recalculate=True)
 
 # Resummarize — recompute daily_summary from current DB state, no log dir needed
 stats = syncer.sync(None, start_date="2026-01-01", end_date="2026-01-31", resummarize_only=True)
 
-# stats: {fetched, inserted, updated, errors, days_summarized, days_failed, days_skipped}
+# stats keys: fetched, inserted, updated, recalculated, errors,
+#             days_summarized, days_failed, failed_days, days_skipped, skipped_days
 ```
 
 ### Sync pipeline (per day)
 
-**Normal sync (insert-only):**
+**Plain sync (insert-only, default):**
 1. Parse scheduler log → stream record objects (`DerechoRecord`/`PbsRecord`)
 2. Resolve FKs (get-or-create user/account/queue via `LookupCache`)
-3. Bulk-insert new jobs, skip `(job_id, submit)` pairs already in DB
-4. Calculate and store charges in `job_charges`
-5. Compress-pickle raw record into `job_records`
-6. Generate `daily_summary` aggregation
+3. Deduplicate by `(job_id, submit)`; split into new vs existing records
+4. Bulk-insert new jobs (`ON CONFLICT DO NOTHING`)
+5. Calculate and upsert charges for new jobs (`_upsert_charges`)
+6. For any existing records encountered that lack charges, fill them (`_fill_missing_charges`)
+7. Compress-pickle raw record into `job_records`
+8. Generate `daily_summary` aggregation if any jobs were fetched
 
-**Upsert (`--upsert`):** skips step 3 for existing records; instead calls
-`_update_batch()` which bulk-updates `UPDATABLE_JOB_FIELDS`, deletes+reinserts
-`job_charges` (recalculated), and replaces `job_records`. Bypasses the
-already-summarized day skip. Summaries regenerated after each day.
+**Incremental (`--incremental`):** same as plain but step 8 only runs if new records were inserted. Bypasses the already-summarized day skip so frequent intra-day syncs are safe.
 
-**Resummarize (`--resummarize`):** skips all log I/O; only step 6 runs.
+**Upsert (`--upsert`):** existing records are passed to `_update_batch()` which bulk-updates `UPDATABLE_JOB_FIELDS`, deletes+reinserts `job_charges` (recalculated from fresh field values), and replaces `job_records`. Bypasses already-summarized skip. Summaries always regenerated.
+
+**Recalculate (`--recalculate`):** skips all log I/O. Queries `jobs` by Mountain-Time day boundaries, computes charges via `_compute_charges_for_jobs()`, upserts results, regenerates `daily_summary`. No job fields modified. Processes in configurable batches for memory efficiency.
+
+**Resummarize (`--resummarize`):** skips all log I/O; only step 8 runs (always replace=True).
 
 ## Charging Rules
 

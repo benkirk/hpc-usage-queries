@@ -134,6 +134,16 @@ def sync_options() -> Callable:
             )
         )(func)
         func = click.option(
+            "--recalculate",
+            is_flag=True,
+            help=(
+                "Recompute charges for all jobs in the given date range directly "
+                "from the database — no log parsing required. "
+                "Updates job_charges and regenerates daily summaries. "
+                "Mutually exclusive with --upsert, --incremental, --resummarize."
+            )
+        )(func)
+        func = click.option(
             "--no-summary",
             is_flag=True,
             help="Skip generating daily summaries after sync"
@@ -177,6 +187,8 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
     click.echo(f"  Updated:  {stats.get('updated', 0):,}")
     click.echo(f"  Skipped:  {stats['fetched'] - stats['inserted'] - stats.get('updated', 0) - stats['errors']:,} (duplicates)")
     click.echo(f"  Errors:   {stats['errors']:,}")
+    if stats.get("recalculated", 0) > 0:
+        click.echo(f"  Recalculated: {stats['recalculated']:,} (charges recomputed from DB)")
 
     if stats.get("days_skipped", 0) > 0:
         click.echo(f"  Days skipped: {stats['days_skipped']} (already summarized)")
@@ -219,7 +231,7 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
 )
 @date_options()
 @sync_options()
-def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch_size, dry_run, verbose, upsert, incremental, resummarize, no_summary):
+def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch_size, dry_run, verbose, upsert, incremental, resummarize, recalculate, no_summary):
     """Sync jobs from local scheduler accounting logs.
 
     Parses accounting log files from the given directory and imports them
@@ -246,13 +258,15 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
       jobhist sync -m derecho -l ./logs --last 3d --incremental                        # incremental last 3 days
       jobhist sync -m derecho -d 2026-01-29 --resummarize                              # re-summarize only
       jobhist sync -m derecho --start 2026-01-01 --end 2026-01-31 --resummarize
+      jobhist sync -m casper -d 2026-03-21 --recalculate                               # recalculate charges from DB
+      jobhist sync -m casper --start 2021-01-01 --end 2026-03-21 --recalculate         # full historical backfill
       jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29                  # explicit scheduler
     """
     # Validate user-supplied flags before any resolution
     validate_dates(date, start, end, today_flag, last)
 
-    if incremental and upsert:
-        click.echo("Error: --incremental and --upsert are mutually exclusive", err=True)
+    if sum([bool(upsert), bool(incremental), bool(resummarize), bool(recalculate)]) > 1:
+        click.echo("Error: --upsert, --incremental, --resummarize, and --recalculate are mutually exclusive", err=True)
         raise click.Abort()
 
     # Resolve --today and --last into date / start+end
@@ -300,6 +314,8 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
                     click.echo("(UPSERT - existing records will be updated)")
                 if incremental:
                     click.echo("(INCREMENTAL - insert new records only; re-summarizes only if new records found)")
+                if recalculate:
+                    click.echo("(RECALCULATE - recomputing charges from DB, no log parsing)")
 
         syncer = syncer_cls(session, machine)
         stats = syncer.sync(
@@ -314,6 +330,7 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
             incremental=incremental,
             resummarize_only=resummarize,
             generate_summary=not no_summary,
+            recalculate=recalculate,
         )
 
         print_sync_stats(stats, machine, verbose)
