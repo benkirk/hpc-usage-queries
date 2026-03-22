@@ -474,9 +474,6 @@ class DailySummary(LookupMixin, Base):
     # Aggregated metrics
     job_count = Column(Integer, default=0)
 
-    # Derecho uses charge_hours (core-hours or GPU-hours depending on queue)
-    charge_hours = Column(Float, default=0)
-
     # CPU, GPU, and memory hours
     cpu_hours = Column(Float, default=0)
     gpu_hours = Column(Float, default=0)
