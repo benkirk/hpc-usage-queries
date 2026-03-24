@@ -14,6 +14,7 @@ db:
     secretPath: csg/pg-superuser          # Path in OpenBao where superuser credentials are stored
   app:
     name: csg-pg                          # Database name to create during bootstrap
+    owner: pguser
     usernameKey: username                 # Key in OpenBao for app user username
     passwordKey: password                 # Key in OpenBao for app user password
     secretPath: csg/pg-appuser            # Path in OpenBao where app user credentials are stored  resource:

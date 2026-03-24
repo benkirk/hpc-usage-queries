@@ -55,16 +55,16 @@ init-db:
 
 sync-casper:
 ifdef START
-	jobhist sync -m casper -l $(LOG_DIR)/casper --start $(START) $(if $(END),--end $(END)) -v
+	jobhist sync -m casper -l $(LOG_DIR)/casper --start $(START) $(if $(END),--end $(END)) -v --upsert
 else
-	jobhist sync -m casper -l $(LOG_DIR)/casper -d $(DATE) -v
+	jobhist sync -m casper -l $(LOG_DIR)/casper -d $(DATE) -v --incremental
 endif
 
 sync-derecho:
 ifdef START
-	jobhist sync -m derecho -l $(LOG_DIR)/derecho --start $(START) $(if $(END),--end $(END)) -v
+	jobhist sync -m derecho -l $(LOG_DIR)/derecho --start $(START) $(if $(END),--end $(END)) -v --upsert
 else
-	jobhist sync -m derecho -l $(LOG_DIR)/derecho -d $(DATE) -v
+	jobhist sync -m derecho -l $(LOG_DIR)/derecho -d $(DATE) -v --incremental
 endif
 
 sync-all: sync-casper sync-derecho
