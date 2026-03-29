@@ -38,8 +38,8 @@ pip install 'hpc-usage-queries[postgres]'
 docker compose up -d          # starts postgres:18 on localhost:5432
 
 # Point the tool at it (copy .env.example → .env and fill in credentials)
-export JH_DB_BACKEND=postgres
-export JH_PG_PASSWORD=...
+export JOB_HISTORY_DB_BACKEND=postgres
+export JOB_HISTORY_PG_PASSWORD=...
 
 # Initialize (auto-creates derecho_jobs and casper_jobs databases)
 python -c "from job_history import init_db; init_db()"
@@ -52,18 +52,18 @@ jobhist sync -m derecho -l ./data/pbs_logs/derecho --start 2025-08-01 --end 2025
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `JH_DB_BACKEND` | `sqlite` | `sqlite` or `postgres` |
+| `JOB_HISTORY_DB_BACKEND` | `sqlite` | `sqlite` or `postgres` |
 | `JOB_HISTORY_DATA_DIR` | `data/` | SQLite: directory for `{machine}.db` files |
 | `QHIST_DERECHO_DB` | `{data_dir}/derecho.db` | SQLite: override Derecho DB path |
 | `QHIST_CASPER_DB` | `{data_dir}/casper.db` | SQLite: override Casper DB path |
-| `JH_PG_HOST` | `localhost` | PostgreSQL host |
-| `JH_PG_PORT` | `5432` | PostgreSQL port |
-| `JH_PG_USER` | `postgres` | PostgreSQL user |
-| `JH_PG_PASSWORD` | — | PostgreSQL password |
-| `JH_PG_DERECHO_DB` | `derecho_jobs` | Override Derecho database name |
-| `JH_PG_CASPER_DB` | `casper_jobs` | Override Casper database name |
-| `JH_PG_REQUIRE_SSL` | `false` | Require SSL/TLS for PostgreSQL |
-| `JH_SITE_TIMEZONE` | `America/Denver` | IANA timezone for day boundaries in daily_summary and --recalculate |
+| `JOB_HISTORY_PG_HOST` | `localhost` | PostgreSQL host |
+| `JOB_HISTORY_PG_PORT` | `5432` | PostgreSQL port |
+| `JOB_HISTORY_PG_USER` | `postgres` | PostgreSQL user |
+| `JOB_HISTORY_PG_PASSWORD` | — | PostgreSQL password |
+| `JOB_HISTORY_PG_DERECHO_DB` | `derecho_jobs` | Override Derecho database name |
+| `JOB_HISTORY_PG_CASPER_DB` | `casper_jobs` | Override Casper database name |
+| `JOB_HISTORY_PG_REQUIRE_SSL` | `false` | Require SSL/TLS for PostgreSQL |
+| `JOB_HISTORY_SITE_TIMEZONE` | `America/Denver` | IANA timezone for day boundaries in daily_summary and --recalculate |
 
 Copy `.env.example` → `.env` for non-default configuration.
 

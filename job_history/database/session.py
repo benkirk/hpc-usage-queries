@@ -1,6 +1,6 @@
 """Database connection and session management.
 
-Supports two backends, selected by the ``JH_DB_BACKEND`` environment variable
+Supports two backends, selected by the ``JOB_HISTORY_DB_BACKEND`` environment variable
 (or a ``.env`` file loaded via python-dotenv):
 
   sqlite   (default) — individual .db files under ``SQLITE_DATA_DIR``

@@ -48,10 +48,10 @@ def generate_daily_summary(
     _ = machine  # All machines now use same summary structure
     stats = {"rows_deleted": 0, "rows_inserted": 0}
 
-    # Site timezone (configured via JH_SITE_TIMEZONE, default "America/Denver")
+    # Site timezone (configured via JOB_HISTORY_SITE_TIMEZONE, default "America/Denver")
     site_timezone = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
 
-    # Calculate UTC range for the site-local day (JH_SITE_TIMEZONE).
+    # Calculate UTC range for the site-local day (JOB_HISTORY_SITE_TIMEZONE).
     # Jobs are stored with naive UTC timestamps (epoch → UTC, tzinfo stripped).
     # We must compare against naive UTC boundaries so that psycopg2 does not
     # perform a local-timezone conversion when binding the parameters to a

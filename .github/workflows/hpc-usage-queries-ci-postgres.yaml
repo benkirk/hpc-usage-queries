@@ -34,11 +34,11 @@ jobs:
           --health-retries 5
 
     env:
-      JH_DB_BACKEND: postgres
-      JH_PG_HOST: localhost
-      JH_PG_PORT: 5432
-      JH_PG_USER: postgres
-      JH_PG_PASSWORD: postgres
+      JOB_HISTORY_DB_BACKEND: postgres
+      JOB_HISTORY_PG_HOST: localhost
+      JOB_HISTORY_PG_PORT: 5432
+      JOB_HISTORY_PG_USER: postgres
+      JOB_HISTORY_PG_PASSWORD: postgres
 
     steps:
       - name: Checkout code
@@ -76,7 +76,7 @@ jobs:
           echo "CONDA_PREFIX=${CONDA_PREFIX}"
           echo "PYTHONPATH=${PYTHONPATH}"
           python3 --version
-          echo "JH_DB_BACKEND=${JH_DB_BACKEND}"
+          echo "JOB_HISTORY_DB_BACKEND=${JOB_HISTORY_DB_BACKEND}"
           python3 -c "import psycopg2; print(f'psycopg2 {psycopg2.__version__}')"
 
       - name: Run Test Suite

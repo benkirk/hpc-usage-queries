@@ -534,8 +534,8 @@ class SyncBase(ABC):
         - Recovery after DB issues
 
         Args:
-            start_date: Start date YYYY-MM-DD (inclusive, site-local day per JH_SITE_TIMEZONE)
-            end_date:   End date YYYY-MM-DD (inclusive, site-local day per JH_SITE_TIMEZONE)
+            start_date: Start date YYYY-MM-DD (inclusive, site-local day per JOB_HISTORY_SITE_TIMEZONE)
+            end_date:   End date YYYY-MM-DD (inclusive, site-local day per JOB_HISTORY_SITE_TIMEZONE)
             dry_run:    If True, compute charges but skip all DB writes
             batch_size: Jobs per query batch (LIMIT/OFFSET pagination)
             verbose:    Print per-day progress

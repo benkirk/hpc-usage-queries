@@ -8,7 +8,7 @@ Supported backends:
   postgres           — per-machine databases on a shared PostgreSQL server
 
 Quickstart:
-  Copy .env.example → .env and set JH_DB_BACKEND plus the appropriate vars.
+  Copy .env.example → .env and set JOB_HISTORY_DB_BACKEND plus the appropriate vars.
 """
 
 import os
@@ -26,17 +26,17 @@ _DEFAULT_DATA_DIR = Path(__file__).parent.parent.parent / "data"
 class JobHistoryConfig:
     # ------------------------------------------------------------ Backend
     # "sqlite" or "postgres"
-    DB_BACKEND = os.getenv("JH_DB_BACKEND", "sqlite").lower()
+    DB_BACKEND = os.getenv("JOB_HISTORY_DB_BACKEND", "sqlite").lower()
 
     # ------------------------------------------------------------ SQLite
     SQLITE_DATA_DIR = Path(os.getenv("JOB_HISTORY_DATA_DIR", _DEFAULT_DATA_DIR))
 
     # ---------------------------------------------------------- PostgreSQL
-    PG_HOST = os.getenv("JH_PG_HOST", "localhost")
-    PG_PORT = int(os.getenv("JH_PG_PORT", "5432"))
-    PG_USER = os.getenv("JH_PG_USER", "postgres")
-    PG_PASSWORD = os.getenv("JH_PG_PASSWORD", "")
-    PG_REQUIRE_SSL = os.getenv("JH_PG_REQUIRE_SSL", "false").lower() in ("true", "1", "yes")
+    PG_HOST = os.getenv("JOB_HISTORY_PG_HOST", "localhost")
+    PG_PORT = int(os.getenv("JOB_HISTORY_PG_PORT", "5432"))
+    PG_USER = os.getenv("JOB_HISTORY_PG_USER", "postgres")
+    PG_PASSWORD = os.getenv("JOB_HISTORY_PG_PASSWORD", "")
+    PG_REQUIRE_SSL = os.getenv("JOB_HISTORY_PG_REQUIRE_SSL", "false").lower() in ("true", "1", "yes")
 
     # ------------------------------------------------- Per-machine DB names
     @classmethod
@@ -44,25 +44,25 @@ class JobHistoryConfig:
         """Return the PostgreSQL database name for *machine*.
 
         Defaults to ``{machine}_jobs`` (e.g. ``derecho_jobs``).
-        Override per-machine via ``JH_PG_{MACHINE}_DB`` environment variable.
+        Override per-machine via ``JOB_HISTORY_PG_{MACHINE}_DB`` environment variable.
         """
-        env_var = f"JH_PG_{machine.upper()}_DB"
+        env_var = f"JOB_HISTORY_PG_{machine.upper()}_DB"
         return os.getenv(env_var, f"{machine}_jobs")
 
     # --------------------------------------------------- Site timezone
     # Used to determine day boundaries for daily_summary generation and
     # for --recalculate date-range queries.  Must be a valid IANA timezone
     # name (e.g. "America/Denver", "America/New_York", "UTC").
-    SITE_TIMEZONE = os.getenv("JH_SITE_TIMEZONE", "America/Denver")
+    SITE_TIMEZONE = os.getenv("JOB_HISTORY_SITE_TIMEZONE", "America/Denver")
 
     # ------------------------------------------------------------ Validate
     @classmethod
     def validate_postgres(cls):
         """Fail fast at startup if postgres backend is selected but credentials missing."""
         required = {
-            "JH_PG_HOST": cls.PG_HOST,
-            "JH_PG_USER": cls.PG_USER,
-            "JH_PG_PASSWORD": cls.PG_PASSWORD,
+            "JOB_HISTORY_PG_HOST": cls.PG_HOST,
+            "JOB_HISTORY_PG_USER": cls.PG_USER,
+            "JOB_HISTORY_PG_PASSWORD": cls.PG_PASSWORD,
         }
         missing = [k for k, v in required.items() if not v]
         if missing:

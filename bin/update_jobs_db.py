@@ -6,7 +6,7 @@ Usage:
     bin/update_jobs_db.py casper           # single machine
     bin/update_jobs_db.py casper derecho   # explicit list
 
-The active backend (SQLite or PostgreSQL) is determined by JH_DB_BACKEND in
+The active backend (SQLite or PostgreSQL) is determined by JOB_HISTORY_DB_BACKEND in
 your .env file — no manual configuration needed here.
 """
 import sys
