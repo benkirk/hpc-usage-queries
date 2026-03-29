@@ -12,18 +12,18 @@ SCRIPTDIR="$(cd "$(dirname "$(realpath "${SCRIPT_PATH}")")" >/dev/null 2>&1 && p
 
 set -e
 
-JH_DB_BACKEND="${JH_DB_BACKEND:-sqlite}"
-echo "Integration test backend: ${JH_DB_BACKEND}"
+JOB_HISTORY_DB_BACKEND="${JOB_HISTORY_DB_BACKEND:-sqlite}"
+echo "Integration test backend: ${JOB_HISTORY_DB_BACKEND}"
 
 # SQLite: point at a temporary directory so we don't touch production data.
-if [ "${JH_DB_BACKEND}" = "sqlite" ]; then
+if [ "${JOB_HISTORY_DB_BACKEND}" = "sqlite" ]; then
     export JOB_HISTORY_DATA_DIR=$(mktemp -d)
 fi
 
 python3 -c "from job_history import init_db; init_db()"
 
 # Show what was created
-if [ "${JH_DB_BACKEND}" = "sqlite" ]; then
+if [ "${JOB_HISTORY_DB_BACKEND}" = "sqlite" ]; then
     ls -lh ${JOB_HISTORY_DATA_DIR}/*.db
 else
     python3 -c "
@@ -40,7 +40,7 @@ for machine in casper derecho; do
 done
 
 # Show final state
-if [ "${JH_DB_BACKEND}" = "sqlite" ]; then
+if [ "${JOB_HISTORY_DB_BACKEND}" = "sqlite" ]; then
     ls -lh ${JOB_HISTORY_DATA_DIR}/*.db
     rm -rf ${JOB_HISTORY_DATA_DIR}
 else

@@ -1,7 +1,7 @@
 """Tests for timezone-aware day boundary binning.
 
 The 'day' used for daily_summary and --recalculate is defined by the site
-timezone (JH_SITE_TIMEZONE, default America/Denver), not by UTC.  A job
+timezone (JOB_HISTORY_SITE_TIMEZONE, default America/Denver), not by UTC.  A job
 whose UTC end-time falls before midnight UTC but after midnight in the site
 timezone must be assigned to the *previous* local day, not the UTC day.
 
@@ -243,7 +243,7 @@ class TestGenerateDailySummaryTimezone:
 # ---------------------------------------------------------------------------
 
 class TestRecalculateChargesTimezone:
-    """--recalculate must use JH_SITE_TIMEZONE when selecting jobs by date."""
+    """--recalculate must use JOB_HISTORY_SITE_TIMEZONE when selecting jobs by date."""
 
     def _strip_charges(self, session):
         session.query(JobCharge).delete()
