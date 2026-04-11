@@ -1,8 +1,14 @@
+#--------------------------------
 # jobhist-sync database processes
 # rapid sync every 5 minutes
-*/5 * * * *   ssh -tt casper.hpc.ucar.edu  "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./rapid.sh &> casper-rapid.log"
-*/5 * * * *   ssh -tt derecho.hpc.ucar.edu "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./rapid.sh &> derecho-rapid.log"
+*/5 * * * * flock -xn /tmp/benkirk-casper-jobs-rapid.lock  ssh -tt casper.hpc.ucar.edu  "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./rapid.sh 1>casper-rapid.log  2>casper-rapid.err"
+*/5 * * * * flock -xn /tmp/benkirk-derecho-jobs-rapid.lock ssh -tt derecho.hpc.ucar.edu "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./rapid.sh 1>derecho-rapid.log 2>derecho-rapid.err"
+
+# the rapid introduced a hole betweek 23:55 and 24:00 (midnight) where we can miss the last batch of a days
+# jobs.  daily sync to get those
+07 0 * * * flock -xn /tmp/benkirk-casper-jobs-daily.lock  ssh -tt casper.hpc.ucar.edu  "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./daily.sh 1>casper-daily.log  2>casper-daily.err"
+07 0 * * * flock -xn /tmp/benkirk-derecho-jobs-daily.lock ssh -tt derecho.hpc.ucar.edu "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./daily.sh 1>derecho-daily.log 2>derecho-daily.err"
 
 # multi-day once a week (would capture multi-day downtime)
-15 20 * * SAT ssh -tt casper.hpc.ucar.edu  "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./weekly.sh &>> casper-weekly.log"
-45 20 * * SAT ssh -tt derecho.hpc.ucar.edu "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./weekly.sh &>> derecho-weekly.log"
+15 20 * * SAT ssh -tt casper.hpc.ucar.edu  "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./weekly.sh 1>casper-weekly.log  2>casper-weekly.err"
+45 20 * * SAT ssh -tt derecho.hpc.ucar.edu "cd /glade/work/benkirk/repos/hpc-usage-queries/job_history/cron_scripts && ./weekly.sh 1>derecho-weekly.log 2>derecho-weekly.err"
