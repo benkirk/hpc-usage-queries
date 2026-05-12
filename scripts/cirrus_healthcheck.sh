@@ -173,8 +173,37 @@ if helm status -n "$NAMESPACE" "$RELEASE" >/dev/null 2>&1; then
     pass "helm release '$RELEASE' present in '$NAMESPACE'"
 else
     HAS_HELM_RELEASE=0
-    warn "helm release '$RELEASE' not tracked in '$NAMESPACE' — chart was likely applied via 'helm template | kubectl apply' or raw manifests"
-    explain "helm-tracked releases support 'helm upgrade'/'rollback'. Untracked deploys require re-applying manifests by hand."
+fi
+
+# Detect deployment manager. ArgoCD renders Helm via 'helm template' and applies
+# the rendered manifests as plain k8s objects; no helm release Secret is ever
+# created. Argo tracks ownership via the 'app.kubernetes.io/instance' label.
+ARGO_INSTANCE=$("${KCTL_NS[@]}" get pods -l "cnpg.io/cluster=$CLUSTER" \
+                -o jsonpath='{.items[0].metadata.labels.app\.kubernetes\.io/instance}' 2>/dev/null || echo "")
+# Robust check: try to look up the Application CRD by name. Forbidden also
+# counts as "present" since it means the CRD is installed but we can't read it.
+crd_probe=$("${KCTL[@]}" get crd applications.argoproj.io 2>&1 || true)
+if echo "$crd_probe" | grep -qiE 'NAME|forbidden|^applications.argoproj.io'; then
+    ARGO_PRESENT=1
+else
+    ARGO_PRESENT=0
+fi
+
+if [[ -n "$ARGO_INSTANCE" && $ARGO_PRESENT -eq 1 ]]; then
+    pass "deployment managed by ArgoCD (app.kubernetes.io/instance='$ARGO_INSTANCE'; Application CRD installed cluster-wide)"
+    explain "Argo renders Helm via 'helm template' then applies as plain manifests — 'helm list' is empty by design. Use the Argo WebUI for sync/health/last-sync."
+    if [[ $HAS_HELM_RELEASE -eq 0 ]]; then
+        info "expected: no helm-tracked release in '$NAMESPACE' (Argo is the owner)"
+    fi
+    tenant_out=$("${KCTL[@]}" get tenant --no-headers 2>/dev/null || true)
+    if [[ -n "$tenant_out" ]]; then
+        info "Capsule multi-tenancy active (tenants: $(echo "$tenant_out" | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')) — cluster-scoped resources (Application CR, VolumeSnapshots, etc.) live outside your tenant scope; use the WebUI for those"
+    fi
+elif [[ $HAS_HELM_RELEASE -eq 1 ]]; then
+    :  # already PASSed above
+else
+    warn "no helm release and no ArgoCD tracking label detected — chart may have been applied as raw manifests"
+    explain "Neither 'helm list' nor the app.kubernetes.io/instance label found this deployment; ownership is unclear."
 fi
 
 crd_err=$("${KCTL[@]}" get crd clusters.postgresql.cnpg.io 2>&1 >/dev/null || true)
@@ -204,6 +233,10 @@ if [[ $HAS_HELM_RELEASE -eq 1 ]]; then
         run helm get values -n "$NAMESPACE" "$RELEASE"
     fi
     pass "helm release inspected"
+elif [[ -n "$ARGO_INSTANCE" ]]; then
+    info "deployment is Argo-managed; sync/health/history live in the Argo WebUI"
+    info "search for Application name (or label): ${BOLD}${ARGO_INSTANCE}${NC}"
+    explain "Things to check in the WebUI: Sync Status (Synced), Health Status (Healthy), Last Sync timestamp, and Source repo+path+revision (which branch is the source of truth)."
 else
     info "no helm release named '$RELEASE' — skipping"
 fi
