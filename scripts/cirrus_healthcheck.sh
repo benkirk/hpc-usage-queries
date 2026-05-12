@@ -94,6 +94,15 @@ pg_query() {
         psql -U postgres -d "$DATABASE" -tAXqc "$sql" 2>/dev/null
 }
 
+# Same, but against an arbitrary database name (for cross-DB introspection).
+pg_query_db() {
+    local db="$1"
+    local sql="$2"
+    local pod="${PRIMARY_POD:-${CLUSTER}-1}"
+    "${KCTL_NS[@]}" exec "$pod" -c postgres -- \
+        psql -U postgres -d "$db" -tAXqc "$sql" 2>/dev/null
+}
+
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || { fail "$1 not found in PATH"; exit 1; }
 }
@@ -463,6 +472,97 @@ else
     pg_query "SELECT datname || '  ' || pg_size_pretty(pg_database_size(datname)) FROM pg_database WHERE datistemplate=false ORDER BY pg_database_size(datname) DESC;" \
         | sed 's/^/    /'
     explain "Total bytes on disk per database. Compare against PVC size from section 5."
+
+    # Per-DB history span: scan every timestamp/date column and report earliest record.
+    echo
+    echo "  history span per database (oldest → newest record, per timestamp column):"
+    explain "Tells you how many days/years of history each DB retains. Built by introspecting information_schema for every timestamp/date column and running MIN/MAX."
+
+    SPAN_SQL=$(cat <<'PLSQL'
+DO $$
+DECLARE
+    rec RECORD;
+    min_ts timestamp; max_ts timestamp; n bigint;
+BEGIN
+    CREATE TEMP TABLE IF NOT EXISTS _hist(
+        schema_name text, table_name text, column_name text,
+        oldest timestamp, newest timestamp, n bigint
+    );
+    DELETE FROM _hist;
+    FOR rec IN
+        SELECT c.table_schema, c.table_name, c.column_name
+        FROM information_schema.columns c
+        JOIN information_schema.tables t
+          ON t.table_schema=c.table_schema AND t.table_name=c.table_name
+        WHERE (c.data_type LIKE 'timestamp%' OR c.data_type='date')
+          AND c.table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+          AND t.table_type='BASE TABLE'
+    LOOP
+        BEGIN
+            EXECUTE format(
+                'SELECT MIN(%I)::timestamp, MAX(%I)::timestamp, COUNT(*) FROM %I.%I WHERE %I IS NOT NULL',
+                rec.column_name, rec.column_name,
+                rec.table_schema, rec.table_name, rec.column_name)
+              INTO min_ts, max_ts, n;
+            IF min_ts IS NOT NULL THEN
+                INSERT INTO _hist VALUES (rec.table_schema, rec.table_name, rec.column_name, min_ts, max_ts, n);
+            END IF;
+        EXCEPTION WHEN OTHERS THEN NULL;
+        END;
+    END LOOP;
+END $$;
+SELECT  schema_name
+     || E'\t' || table_name || '.' || column_name
+     || E'\t' || to_char(oldest,'YYYY-MM-DD')
+     || E'\t' || to_char(newest,'YYYY-MM-DD')
+     || E'\t' || EXTRACT(EPOCH FROM (newest - oldest))::bigint
+     || E'\t' || n
+FROM _hist
+ORDER BY oldest ASC, n DESC;
+PLSQL
+)
+
+    DBS=$(pg_query "SELECT datname FROM pg_database WHERE datistemplate=false AND datname<>'postgres' ORDER BY pg_database_size(datname) DESC;")
+    while read -r db; do
+        [[ -z "$db" ]] && continue
+        echo "    ${BOLD}${db}${NC}"
+        rows=$(pg_query_db "$db" "$SPAN_SQL")
+        if [[ -z "$rows" ]]; then
+            echo "      (no timestamp/date columns with data)"
+            continue
+        fi
+        printed_oldest=""
+        row_idx=0
+        total_rows=$(echo "$rows" | grep -c .)
+        while IFS=$'\t' read -r schema tabcol oldest newest secs nrows; do
+            [[ -z "$tabcol" ]] && continue
+            row_idx=$((row_idx+1))
+            if [[ $VERBOSE -eq 0 && $row_idx -gt 5 ]]; then
+                if [[ $row_idx -eq 6 ]]; then
+                    echo "      … $((total_rows-5)) more column(s) — re-run with --verbose to see all"
+                fi
+                continue
+            fi
+            # Format span: years if >=365 days, else days
+            span_str=$(awk -v s="$secs" 'BEGIN{
+                d=s/86400;
+                if (d>=365) printf "%.2fy", d/365.25;
+                else        printf "%.1fd",  d
+            }')
+            qual=""
+            if [[ "$schema" != "public" ]]; then qual="${schema}."; fi
+            printf "      %-32s  %s → %s  (%s, %s rows)\n" \
+                "${qual}${tabcol}" "$oldest" "$newest" "$span_str" "$nrows"
+            if [[ -z "$printed_oldest" ]]; then
+                printed_oldest="$oldest"
+                # Surface the earliest-overall date for this DB as a tuning hint candidate
+                age_y=$(awk -v s="$secs" 'BEGIN{printf "%.2f", (s/86400)/365.25}')
+                if awk -v y="$age_y" 'BEGIN{exit !(y>5)}'; then
+                    hint "$db retains ${age_y}y of history (oldest=${oldest} via ${qual}${tabcol}) — consider archiving rows older than your retention policy"
+                fi
+            fi
+        done <<< "$rows"
+    done <<< "$DBS"
 
     # Replication
     echo
