@@ -5,8 +5,8 @@ db:
   size: 512Gi                             # Storage size for the database
   resource:
     limits:
-      cpu: '16'
-      memory: 128Gi
+      cpu: '8'
+      memory: 64Gi
   superUser:
     enabled: true                         # Enable superuser access to the database
     usernameKey: username                 # Key in OpenBao for superuser username
