@@ -26,6 +26,8 @@ Subcommand → query method mapping (from cli.py RESOURCE_REPORTS):
   pie-proj-gpu           usage_by_group('gpu', 'account')
   pie-group-cpu          usage_by_group('cpu', 'account')   (same query)
   pie-group-gpu          usage_by_group('gpu', 'account')   (same query)
+  pie-facility-cpu       usage_by_facility('cpu')
+  pie-facility-gpu       usage_by_facility('gpu')
   usage-history          usage_history()
 """
 
@@ -384,6 +386,29 @@ class TestGenAllSubcommands:
         for row in results:
             assert {"label", "usage_hours", "job_count"} <= row.keys()
 
+    FACILITIES = {"UNIV", "WNA", "CSL", "CISL", "NCAR"}
+
+    def test_usage_by_facility_cpu(self, in_memory_session, derecho_jobs):
+        """pie-facility-cpu: usage_by_facility('cpu')"""
+        results = self._q(in_memory_session).usage_by_facility(
+            "cpu", self.START, self.END
+        )
+        assert isinstance(results, list)
+        for row in results:
+            assert {"label", "usage_hours", "job_count"} <= row.keys()
+            assert row["label"] in self.FACILITIES
+        hours = [r["usage_hours"] for r in results]
+        assert hours == sorted(hours, reverse=True)
+
+    def test_usage_by_facility_gpu(self, in_memory_session, derecho_jobs):
+        """pie-facility-gpu: usage_by_facility('gpu')"""
+        results = self._q(in_memory_session).usage_by_facility(
+            "gpu", self.START, self.END
+        )
+        assert isinstance(results, list)
+        for row in results:
+            assert row["label"] in self.FACILITIES
+
     # ------------------------------------------------------------------
     # usage_history — group_by day and month
     # ------------------------------------------------------------------
@@ -448,4 +473,21 @@ class TestGenAllSubcommands:
         assert q.job_memory_per_rank("gpu", empty_start, empty_end) == []
         assert q.usage_by_group("cpu", "user", empty_start, empty_end) == []
         assert q.usage_by_group("gpu", "user", empty_start, empty_end) == []
+        assert q.usage_by_facility("cpu", empty_start, empty_end) == []
+        assert q.usage_by_facility("gpu", empty_start, empty_end) == []
         assert q.usage_history(empty_start, empty_end) == []
+
+
+def test_account_to_facility_mapping():
+    """Prefix rules for the facility bucketing (independent of DB)."""
+    from job_history.queries.jobs import _account_to_facility
+    assert _account_to_facility("UMSS0001")  == "UNIV"
+    assert _account_to_facility("P35000000") == "UNIV"
+    assert _account_to_facility("WCAS0001")  == "WNA"
+    assert _account_to_facility("CESM0001")  == "CSL"
+    assert _account_to_facility("P93300000") == "CSL"
+    assert _account_to_facility("SCSG0001")  == "CISL"
+    assert _account_to_facility("NCAR0001")  == "NCAR"
+    assert _account_to_facility("P12345678") == "NCAR"
+    assert _account_to_facility(None)        == "NCAR"
+    assert _account_to_facility("")          == "NCAR"

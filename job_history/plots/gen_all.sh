@@ -50,8 +50,8 @@ subcommands=(
   pie-user-gpu
   pie-proj-cpu
   pie-proj-gpu
-  pie-group-cpu
-  pie-group-gpu
+  pie-facility-cpu
+  pie-facility-gpu
   usage-history
 )
 

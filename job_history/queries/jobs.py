@@ -19,6 +19,25 @@ from ..database import Job, DailySummary, JobCharge
 from sqlalchemy import case
 
 
+def _account_to_facility(account):
+    """Map an NCAR project/account code to its facility bucket.
+
+    Buckets: UNIV, WNA, CSL, CISL, NCAR (default).
+    Returns 'NCAR' for None / empty / unmatched.
+    """
+    if not account:
+        return "NCAR"
+    if account.startswith("U") or account.startswith("P35"):
+        return "UNIV"
+    if account.startswith("W"):
+        return "WNA"
+    if account.startswith("C") or account.startswith("P933"):
+        return "CSL"
+    if account.startswith("S"):
+        return "CISL"
+    return "NCAR"
+
+
 class QueryConfig:
     """Centralized configuration for query patterns and constants."""
 
@@ -333,6 +352,31 @@ class JobQueries:
             }
             for row in results
         ]
+
+    def usage_by_facility(
+        self,
+        resource_type: str,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Resource usage aggregated into facility buckets.
+
+        Post-aggregates `usage_by_group(resource_type, 'account', ...)` by
+        mapping each account through `_account_to_facility()` and summing
+        per-bucket. Returns rows sorted DESC by usage_hours.
+        """
+        rows = self.usage_by_group(resource_type, "account", start, end)
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            fac = _account_to_facility(row["label"])
+            b = buckets.setdefault(fac, {"usage_hours": 0.0, "job_count": 0})
+            b["usage_hours"] += row["usage_hours"] or 0.0
+            b["job_count"] += row["job_count"] or 0
+        return sorted(
+            [{"label": k, **v} for k, v in buckets.items()],
+            key=lambda r: r["usage_hours"],
+            reverse=True,
+        )
 
     def job_waits_by_resource(
         self,
