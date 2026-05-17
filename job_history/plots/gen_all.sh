@@ -10,19 +10,30 @@ if date -v-1d > /dev/null 2>&1; then
     month_start=$(date -v-1m -v1d +%Y-%m-%d)
     month_end=$(date -v-1m -v1d -v+1m -v-1d +%Y-%m-%d)
     year_start=$(date -v-12m -v1d +%Y-%m-%d)
-    year_end=$(date -v-1m -v1d -v+1m -v-1d +%Y-%m-%d)
+    year_end=${month_end}
 else
     # GNU/Linux
     month_start=$(date -d "$(date +%Y-%m-01) -1 month" +%Y-%m-%d)
     month_end=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m-%d)
     year_start=$(date -d "$(date +%Y-%m-01) -12 months" +%Y-%m-%d)
-    year_end=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m-%d)
+    year_end=${month_end}
 fi
 
 echo "Generating reports for:"
 echo "  Past month: ${month_start} to ${month_end}"
 echo "  Past year:  ${year_start} to ${year_end}"
 echo
+
+make_symlink() {
+    local start=$1 end=$2 tag=$3
+    local f stem
+    shopt -s nullglob
+    for f in *_"${start}"_"${end}".dat; do
+        stem=${f%_"${start}"_"${end}".dat}
+        ln -sfn "$f" "${stem}_${tag}.dat"
+    done
+    shopt -u nullglob
+}
 
 subcommands=(
   job-sizes
@@ -45,7 +56,9 @@ subcommands=(
 )
 
 for cmd in "${subcommands[@]}"; do
-    echo $cmd
-    jobhist resource --machine derecho --start-date ${month_start} --end-date ${month_end} --group-by day ${cmd}
-    jobhist resource --machine derecho --start-date ${year_start} --end-date ${year_end} --group-by month ${cmd}
+    echo "$cmd"
+    jobhist resource --machine derecho --start-date "${month_start}" --end-date "${month_end}" --group-by day   "${cmd}"
+    make_symlink "${month_start}" "${month_end}" lastmonth
+    jobhist resource --machine derecho --start-date "${year_start}"  --end-date "${year_end}"  --group-by month "${cmd}"
+    make_symlink "${year_start}"  "${year_end}"  lastyear
 done
