@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Calculate dates for past full month and past full year
 # Past month: first to last day of previous month
@@ -67,4 +67,24 @@ for cmd in "${subcommands[@]}"; do
 
     jobhist resource --machine derecho --start-date "${twenty5_start}" --end-date "${year_end}"  --group-by month "${cmd}"
     make_symlink "${twenty5_start}"  "${year_end}" multiyear
+done
+
+./plot_usage_history.py ./derecho.yaml
+
+declare -A label_transforms
+
+label_transforms[lastmonth]="${month_start}_${month_end}"
+label_transforms[lastyear]="${year_start}_${year_end}"
+label_transforms[multiyear]="${twenty5_start}_${year_end}"
+
+for key in "${!label_transforms[@]}"; do
+    val=${label_transforms[${key}]}
+
+    for type in png pdf; do
+        while IFS= read -r -d '' file; do
+            linkedfile=${file//"${val}"/"${key}"}
+            ln -sf ${file} ${linkedfile}
+            ls -l ${linkedfile}
+        done < <(find . -type f -name "*${val}.${type}" -print0)
+    done
 done

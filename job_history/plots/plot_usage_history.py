@@ -83,7 +83,7 @@ def plot_hours_history(filename,type):
     x = data.index.to_numpy()
     xl = data['Date']
 
-    period = 'monthly' if 12 == len(xl) else 'daily'
+    period = 'daily' if 28 >= len(xl) else 'monthly'
     set_norm_factors(type, period)
 
     y = data['#-{}-Hrs'.format(hrtype)]
@@ -581,7 +581,7 @@ def plot_usage_pie(filename):
         plt.setp(autotexts, **{'color':'white', 'weight':'bold', 'fontsize':8})
         plt.setp(texts, **{'fontsize':8})
         plt.legend(patches, labels, loc='center left', bbox_to_anchor=(-0.3, .5), fontsize=8)
-        plt.tight_layout(pad=2)
+        plt.tight_layout(pad=0)
         plt.savefig(outfname,dpi=mach['dpi'])
         plt.savefig(outfname.replace('.png','.pdf'))
     return
