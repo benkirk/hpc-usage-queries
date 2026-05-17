@@ -5,6 +5,8 @@
 # Past year: 12 months ending with the past full month
 
 # macOS date commands (use -v for relative dates)
+twenty5_start="2025-01-01"
+
 if date -v-1d > /dev/null 2>&1; then
     # macOS
     month_start=$(date -v-1m -v1d +%Y-%m-%d)
@@ -59,6 +61,10 @@ for cmd in "${subcommands[@]}"; do
     echo "$cmd"
     jobhist resource --machine derecho --start-date "${month_start}" --end-date "${month_end}" --group-by day   "${cmd}"
     make_symlink "${month_start}" "${month_end}" lastmonth
-    jobhist resource --machine derecho --start-date "${year_start}"  --end-date "${year_end}"  --group-by month "${cmd}"
-    make_symlink "${year_start}"  "${year_end}"  lastyear
+
+    jobhist resource --machine derecho --start-date "${year_start}" --end-date "${year_end}"  --group-by month "${cmd}"
+    make_symlink "${year_start}"  "${year_end}" lastyear
+
+    jobhist resource --machine derecho --start-date "${twenty5_start}" --end-date "${year_end}"  --group-by month "${cmd}"
+    make_symlink "${twenty5_start}"  "${year_end}" multiyear
 done
