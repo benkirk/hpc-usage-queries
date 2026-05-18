@@ -129,7 +129,7 @@ docker-up: ## Start docker containers (waits until every service reports healthy
 	@echo "✅ Containers ready!"
 
 docker-down: ## Stop docker containers
-	docker compose down --remove-orphans
+	docker compose down
 
 docker-restart: ## Rebuild and restart docker containers
 	@$(MAKE) docker-down
