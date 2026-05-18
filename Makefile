@@ -58,14 +58,14 @@ init-db: ## Create database tables (both machines)
 
 sync-casper: ## Sync Casper jobs for DATE (or START..END range)
 ifdef START
-	jobhist sync -m casper -l $(LOG_DIR)/casper --start $(START) $(if $(END),--end $(END)) -v --upsert
+	jobhist sync -m casper -l $(LOG_DIR)/casper --start $(START) $(if $(END),--end $(END)) -v #--upsert
 else
 	jobhist sync -m casper -l $(LOG_DIR)/casper -d $(DATE) -v --incremental
 endif
 
 sync-derecho: ## Sync Derecho jobs for DATE (or START..END range)
 ifdef START
-	jobhist sync -m derecho -l $(LOG_DIR)/derecho --start $(START) $(if $(END),--end $(END)) -v --upsert
+	jobhist sync -m derecho -l $(LOG_DIR)/derecho --start $(START) $(if $(END),--end $(END)) -v #--upsert
 else
 	jobhist sync -m derecho -l $(LOG_DIR)/derecho -d $(DATE) -v --incremental
 endif
