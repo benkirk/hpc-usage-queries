@@ -83,7 +83,9 @@ def plot_hours_history(filename,type):
     x = data.index.to_numpy()
     xl = data['Date']
 
-    period = 'daily' if 28 >= len(xl) else 'monthly'
+    period = 'monthly'
+    if  28 <= len(xl) and 31 >= len(xl): 
+        period = 'daily'
     set_norm_factors(type, period)
 
     y = data['#-{}-Hrs'.format(hrtype)]
@@ -137,7 +139,9 @@ def co_plot_hours_history(filename):
     x = data.index.to_numpy()
     xl = data['Date']
 
-    period = 'monthly' if 12 == len(xl) else 'daily'
+    period = 'monthly'
+    if  28 <= len(xl) and 31 >= len(xl): 
+        period = 'daily'
     set_norm_factors(type, period)
 
     y = data['#-CPU-Hrs']
@@ -203,7 +207,9 @@ def plot_usage_history(filename,type):
     x = data.index.to_numpy()
     xl = data['Date']
 
-    period = 'monthly' if 12 == len(xl) else 'daily'
+    period = 'monthly'
+    if  28 <= len(xl) and 31 >= len(xl): 
+        period = 'daily'
     set_norm_factors(type, period)
 
     y1 = data['#-{}-Jobs'.format(hrtype)]
@@ -271,7 +277,9 @@ def plot_user_history(filename,type):
     x = data.index.to_numpy()
     xl = data['Date']
 
-    period = 'monthly' if 12 == len(xl) else 'daily'
+    period = 'monthly'
+    if  28 <= len(xl) and 31 >= len(xl): 
+        period = 'daily'
     set_norm_factors(type, period)
 
     y1 = data['#-{}-Users'.format(hrtype)]
