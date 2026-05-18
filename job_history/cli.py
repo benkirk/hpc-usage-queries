@@ -431,6 +431,22 @@ RESOURCE_REPORTS = [
         filename_base="pie_group_cpu",
         columns=ColumnSpecs.usage_counts(label="Accounts")
     ),
+    ReportConfig(
+        command_name="pie-facility-cpu",
+        description="CPU usage by facility (UNIV/WNA/CSL/CISL/NCAR)",
+        query_method="usage_by_facility",
+        query_params={"resource_type": "cpu"},
+        filename_base="pie_facility_cpu",
+        columns=ColumnSpecs.usage_counts(label="Facility")
+    ),
+    ReportConfig(
+        command_name="pie-facility-gpu",
+        description="GPU usage by facility (UNIV/WNA/CSL/CISL/NCAR)",
+        query_method="usage_by_facility",
+        query_params={"resource_type": "gpu"},
+        filename_base="pie_facility_gpu",
+        columns=ColumnSpecs.usage_counts(label="Facility")
+    ),
 
     # Duration reports
     ReportConfig(
