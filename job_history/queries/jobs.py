@@ -1002,8 +1002,19 @@ class JobQueries:
     ) -> List[Dict[str, Any]]:
         """Search individual job records — unified, dict-row contract.
 
-        Mirrors the shape of :meth:`daily_summary_report` (list of dicts)
-        so callers can consume rows directly. Filters compose via AND.
+        Returns a ``list[dict]`` with one entry per matching job; the dict
+        keys are controlled by the ``columns`` parameter and default to
+        :data:`job_history.cli.search.columns.DEFAULT_COLUMNS`. Filters
+        compose via AND.
+
+        This is the job-level companion to :meth:`daily_summary_report`,
+        which returns per-day *aggregated* rows. The two row shapes share
+        a handful of keys (``user``, ``account``, ``queue``, ``cpu_hours``,
+        ``gpu_hours``) but are otherwise different — ``jobs_search`` adds
+        per-job identifiers and resource fields (``job_id``, ``start``,
+        ``end``, ``elapsed``, ``numnodes``, ``numcpus``, ``numgpus``, …)
+        and ``daily_summary_report`` adds aggregate fields (``date``,
+        ``job_count``, ``memory_hours``, ``*_charges``).
 
         Args:
             start: Optional start date (inclusive) — filters on ``Job.end``
