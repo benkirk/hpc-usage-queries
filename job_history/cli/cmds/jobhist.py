@@ -24,6 +24,7 @@ from job_history.cli.history import (
     DailySummaryCommand,
 )
 from job_history.cli.resource import RESOURCE_REPORTS, ResourceCommand
+from job_history.cli.search import SearchCommand
 from job_history.cli.sync import sync as sync_command
 
 
@@ -189,6 +190,44 @@ def unique_users(jh_ctx: Context, group_by):
 def daily_summary(jh_ctx: Context):
     """Daily breakdown by user/account/queue (jobs, CPU-h, GPU-h, mem-h)."""
     code = DailySummaryCommand(jh_ctx).execute()
+    _close_session(jh_ctx)
+    sys.exit(code)
+
+
+@cli.command("search", context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option("--start-date", type=str, callback=parse_date,
+              help="Start date for the search window (YYYY-MM-DD); filters on Job.end.")
+@click.option("--end-date", type=str, callback=parse_date,
+              help="End date for the search window (YYYY-MM-DD); filters on Job.end.")
+@click.option("-m", "--machine", type=MACHINE_CHOICES_HISTORY, default="derecho", show_default=True,
+              help="The machine to query.")
+@click.option("--user", default=None, help="Filter by username.")
+@click.option("--project", "account", default=None,
+              help="Filter by project (account) code.")
+@click.option("--queue", default=None, help="Filter by queue name.")
+@click.option("--status", default=None,
+              help="Filter by job status (e.g. 'F' for finished).")
+@click.option("-v", "--verbose", is_flag=True, default=False,
+              help="Show all columns instead of the default subset.")
+@click.option("--display", default=None,
+              help="Comma-separated list of columns to display (overrides --verbose).")
+@click.option("--limit", type=click.IntRange(min=1), default=None,
+              help="Truncate results to at most N rows (SQL LIMIT, server-side).")
+@click.pass_obj
+def search(jh_ctx: Context, start_date, end_date, machine,
+           user, account, queue, status, verbose, display, limit):
+    """List individual job records matching the filters."""
+    jh_ctx.start_date = start_date
+    jh_ctx.end_date = end_date
+    jh_ctx.machine = machine
+    if jh_ctx.output_format is None:
+        jh_ctx.output_format = "rich"
+    from job_history.database import get_session
+    jh_ctx.session = get_session(machine)
+    code = SearchCommand(jh_ctx).execute(
+        user=user, account=account, queue=queue, status=status,
+        verbose=verbose, display=display, limit=limit,
+    )
     _close_session(jh_ctx)
     sys.exit(code)
 

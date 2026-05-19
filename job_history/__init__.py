@@ -2,12 +2,14 @@
 
 from .database import (
     JobHistoryConfig,
+    clear_engine_cache,
     get_db_path, get_db_url, get_engine, get_session, init_db, VALID_MACHINES,
     Job, DailySummary, JobCharge, JobRecord,
 )
 from .queries import JobQueries
 
 __all__ = [
+    "clear_engine_cache",
     "get_db_path",
     "get_db_url",
     "get_engine",
