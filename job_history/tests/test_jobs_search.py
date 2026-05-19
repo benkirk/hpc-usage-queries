@@ -92,6 +92,29 @@ class TestJobsSearchFilters:
         rows = JobQueries(in_memory_session).jobs_search(account="NCAR0002")
         assert [r["user"] for r in rows] == ["bob"]
 
+    def test_project_filter_accepts_sequence(self, in_memory_session, search_jobs):
+        # Multi-projcode form lets webapp callers pass an entire project
+        # tree (parent + descendants) in one query — see SAM jobs route.
+        rows = JobQueries(in_memory_session).jobs_search(
+            account=["NCAR0001", "NCAR0002"]
+        )
+        # Union of single-account results: 2 alice jobs + 1 bob job.
+        assert {r["job_id"] for r in rows} == {
+            "100.desched1", "101.desched1", "102.desched1",
+        }
+
+    def test_project_filter_single_item_sequence(self, in_memory_session, search_jobs):
+        # A 1-element sequence should behave identically to passing the
+        # bare projcode string.
+        rows = JobQueries(in_memory_session).jobs_search(account=["NCAR0002"])
+        assert [r["user"] for r in rows] == ["bob"]
+
+    def test_project_filter_empty_sequence(self, in_memory_session, search_jobs):
+        # Empty sequence → `IN ()` → no rows. Sanity check that we don't
+        # silently fall through to "no filter".
+        rows = JobQueries(in_memory_session).jobs_search(account=[])
+        assert rows == []
+
     def test_queue_filter(self, in_memory_session, search_jobs):
         rows = JobQueries(in_memory_session).jobs_search(queue="gpudev")
         assert [r["job_id"] for r in rows] == ["102.desched1"]
@@ -329,6 +352,13 @@ class TestJobsCount:
         assert q.jobs_count(account="NCAR0002") == 1
         assert q.jobs_count(has_gpus=True) == 1
         assert q.jobs_count(has_gpus=False) == 2
+
+    def test_count_accepts_account_sequence(self, in_memory_session, search_jobs):
+        q = JobQueries(in_memory_session)
+        # Union of NCAR0001 (2) + NCAR0002 (1) = 3 — matches jobs_search.
+        assert q.jobs_count(account=["NCAR0001", "NCAR0002"]) == 3
+        # Empty sequence is "no rows", not "no filter".
+        assert q.jobs_count(account=[]) == 0
 
     def test_count_empty_when_no_match(self, in_memory_session, search_jobs):
         assert JobQueries(in_memory_session).jobs_count(user="nobody") == 0

@@ -8,7 +8,7 @@ database. It wraps SQLAlchemy queries with a convenient interface for:
 """
 
 from datetime import date, datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple, Sequence
+from typing import Optional, List, Dict, Any, Tuple, Sequence, Union
 
 from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
@@ -1021,7 +1021,7 @@ class JobQueries:
         start: Optional[date] = None,
         end: Optional[date] = None,
         user: Optional[str] = None,
-        account: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
         queue: Optional[str] = None,
         status: Optional[str] = None,
         has_gpus: Optional[bool] = None,
@@ -1051,7 +1051,12 @@ class JobQueries:
             start: Optional start date (inclusive) — filters on ``Job.end``
             end: Optional end date (inclusive) — filters on ``Job.end``
             user: Optional username filter (text; resolved via FK hybrid)
-            account: Optional project/account filter (text; resolved via FK hybrid)
+            account: Optional project/account filter. Accepts either a
+                single projcode (``"NCAR0002"``) or a sequence of
+                projcodes (``["NCAR0002", "NCAR0002_a", "NCAR0002_b"]``)
+                — a sequence applies ``Job.account IN (...)`` so callers
+                can pull every projcode in a project tree in one query.
+                Resolved via FK hybrid.
             queue: Optional queue filter (text; resolved via FK hybrid)
             status: Optional job-status filter (e.g. 'F' for finished)
             has_gpus: ``None`` ignore; ``True`` → ``Job.numgpus > 0`` (GPU jobs
@@ -1128,7 +1133,7 @@ class JobQueries:
         start: Optional[date] = None,
         end: Optional[date] = None,
         user: Optional[str] = None,
-        account: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
         queue: Optional[str] = None,
         status: Optional[str] = None,
         has_gpus: Optional[bool] = None,
@@ -1138,7 +1143,8 @@ class JobQueries:
         Companion to :meth:`jobs_search` for paginated UIs: callers fetch
         one page via ``jobs_search(limit=…, offset=…)`` and the total via
         this method. Filter shape mirrors ``jobs_search`` exactly; ``columns``,
-        ``limit``, ``offset``, and sort args do not apply.
+        ``limit``, ``offset``, and sort args do not apply. ``account``
+        accepts a single projcode or a sequence (see :meth:`jobs_search`).
         """
         query = self.session.query(func.count(Job.id))
         query = self._apply_jobs_search_filters(
@@ -1154,8 +1160,18 @@ class JobQueries:
         query = self._apply_date_filter(query, start, end)
         if user:
             query = query.filter(Job.user == user)
-        if account:
-            query = query.filter(Job.account == account)
+        if account is not None:
+            # `account` accepts a single projcode or a sequence — sequence
+            # form lets callers pull every projcode in a project tree
+            # (parent + descendants) in one query. `str` is iterable so it
+            # has to be detected first. An empty sequence is treated as
+            # "no rows" (`IN ()`), not "no filter" — callers asking for an
+            # empty tree get an empty result, not the whole table.
+            if isinstance(account, str):
+                if account:
+                    query = query.filter(Job.account == account)
+            else:
+                query = query.filter(Job.account.in_(account))
         if queue:
             query = query.filter(Job.queue == queue)
         if status:
