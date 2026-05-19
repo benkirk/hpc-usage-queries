@@ -9,11 +9,21 @@ Two **wholly independent** modules in one repo. Never mix their concerns.
 | `job_history/` | PBS job history, charging, daily summaries | `jobhist` |
 | `fs_scans/` | Filesystem metadata analysis (GPFS/Lustre) | `fs-scans` |
 
+## Related projects
+
+This repo is consumed by **project_samuel** (`/Users/benkirk/codes/project_samuel/devel`, aka SAM)
+as an optional plugin, loaded via `require_plugin(HPC_USAGE_QUERIES)` in
+SAM's `src/cli/core/base.py`. Architectural conventions in `job_history/cli/`
+(Context, BaseCommand hierarchy, EXIT_* codes, ExporterRegistry, JSON envelope
+shape with `kind=…`) deliberately mirror SAM's `src/cli/`. If you change the
+shape of the JSON envelope or the Exporter ABC here, check SAM consumers
+before merging.
+
 ## Tests
 
 ```bash
-pytest                        # both suites (340+ tests)
-pytest job_history/tests/     # job_history only (217 tests)
+pytest                        # both suites (~360 tests)
+pytest job_history/tests/     # job_history only (~289 tests)
 pytest fs_scans/tests/        # fs_scans only
 ```
 
@@ -108,7 +118,7 @@ any shims. See `_get_record_class()` in `sync/pbs.py`.
 | `job_history/sync/charging.py` | `SystemCharging` ABC + `DerechoCharging`, `CasperCharging` |
 | `job_history/sync/summary.py` | `generate_daily_summary()` — naive UTC bounds, QoS-weighted charges |
 | `job_history/sync/cli.py` | `jobhist sync` Click command (`--upsert`, `--incremental`, `--recalculate`, `--resummarize`) |
-| `job_history/cli.py` | `history` and `resource` Click groups + all subcommands |
+| `job_history/cli/` | SAM-aligned CLI package (Context, BaseCommand hierarchy, builders, ExporterRegistry, declarative resource reports). See `job_history/README.md` § *CLI Architecture* for the full recipe; key entry: `cli/cmds/jobhist.py` |
 | `job_history/_vendor/pbs_parser_ncar/ncar.py` | Vendored `DerechoRecord` (extends `PbsRecord` with power metrics) |
 | `job_history/SCHEMA.md` | Full schema documentation |
 

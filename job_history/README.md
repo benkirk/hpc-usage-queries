@@ -72,10 +72,50 @@ Copy `.env.example` → `.env` for non-default configuration.
 ```
 job_history/
   __init__.py              Public API surface
-  cli.py                   Unified jobhist CLI (Click)
-  exporters.py             Data export formats (JSON, CSV, markdown, dat)
+  exporters.py             Legacy file-format writers (DAT/JSON/CSV/MD).
+                             Wrapped by cli/core/file_exporters.py to keep
+                             on-disk output byte-for-byte compatible.
   log_config.py            Logging helpers
   qhist_plugin.py          DB-backed record retrieval for bin/qhist-db
+
+  cli/                     ── SAM-aligned CLI package ──────────────────
+    __init__.py            Re-exports the top-level `cli` Click group
+    core/                  Shared infrastructure
+      context.py             Context: session, machine, dates, group_by,
+                               output_format, output_dir, verbose, console
+      base.py                BaseCommand (ABC), BaseHistoryCommand,
+                               BaseResourceCommand, BaseSyncCommand
+      output.py              JSON encoder, output_json(), Exporter ABC,
+                               ExporterRegistry, RichTableExporter,
+                               JSONStdoutExporter
+      file_exporters.py      DatFileExporter / CsvFileExporter /
+                               MarkdownFileExporter / JSONFileExporter
+                               — wrap legacy exporters.py byte-for-byte
+      utils.py               EXIT_SUCCESS=0 / EXIT_NOT_FOUND=1 /
+                               EXIT_ERROR=2 / EXIT_KEYBOARD_INTERRUPT=130;
+                               parse_date Click callback
+    history/                One Command class per history subcommand
+      commands.py             JobsPerUserCommand, JobsPerProjectCommand,
+                                UniqueProjectsCommand, UniqueUsersCommand,
+                                DailySummaryCommand
+      builders.py             ORM-row → envelope dict (build_jobs_per_entity,
+                                build_unique_*, build_daily_summary)
+      display.py              Stub for future bespoke Rich renderers
+    resource/               Declarative reports + single execution class
+      reports.py              ColumnSpec, ReportConfig, ColumnSpecs factory,
+                                RESOURCE_REPORTS (~21 reports),
+                                PERIODIC_QUERY_METHODS
+      commands.py             ResourceCommand — drives every ReportConfig
+                                (multi-machine fan-out + period injection)
+      display.py              Stub for future bespoke Rich renderers
+    sync/                   Sync subcommand wiring
+      __init__.py             Re-exports `sync` from job_history.sync.cli
+                                (existing well-structured Click command)
+    cmds/                   Process-level Click entry points
+      jobhist.py              Top-level `jobhist` (history + resource + sync)
+      jobhist_history.py      `jobhist-history` wrapper
+      jobhist_resource.py     `jobhist-resource` wrapper
+      jobhist_sync.py         `jobhist-sync` wrapper
 
   database/                ── database management ──────────────────────
     __init__.py            Re-exports all public names
@@ -111,15 +151,10 @@ job_history/
     jobs.py                JobQueries — high-level query API
     builders.py            PeriodGrouper, ResourceTypeResolver
 
-  wrappers/                ── selective-deployment entry points ─────────
-    jobhist_sync.py        jobhist-sync  → jobhist sync
-    jobhist_history.py     jobhist-history → jobhist history
-    jobhist_resource.py    jobhist-resource → jobhist resource
-
   tests/                   ── test suite ────────────────────────────────
     conftest.py            Shared fixtures (in-memory DB, job data)
     fixtures/              PBS log fixtures for integration tests
-    test_*.py              217 tests, run with pytest
+    test_*.py              280+ tests, run with pytest
 
 bin/
   qhist-db                 qhist-compatible frontend, DB-backed via qhist_plugin
@@ -127,6 +162,90 @@ data/
   casper.db                Casper jobs (gitignored)
   derecho.db               Derecho jobs (gitignored)
 ```
+
+## CLI Architecture
+
+The `jobhist` CLI follows the same architectural patterns as
+project_samuel's `src/cli/` (the SAM CLI). The key conventions:
+
+- **One `Context`** (`cli/core/context.py`) carries the SQLAlchemy
+  session, target machine, date window, output format, and Rich
+  consoles. Built once by the top-level Click group; passed to every
+  command class via `@click.pass_obj`.
+- **Command classes** (`BaseCommand`, `BaseHistoryCommand`,
+  `BaseResourceCommand`) live in `cli/core/base.py`. Each subcommand is
+  a subclass whose `execute(**kwargs) -> int` runs the query, builds an
+  envelope, and emits via the active exporter. Exit code comes back
+  from `execute`; the Click wiring just `sys.exit`s it.
+- **Builders** (`cli/history/builders.py`) are pure functions that
+  convert raw query rows into a JSON-ready envelope:
+  `{kind, machine, start, end, group_by, columns, rows, ...}`.
+- **Exporters** (`cli/core/output.py`, `cli/core/file_exporters.py`)
+  are a single ABC interface. `ExporterRegistry.resolve("rich" | "json"
+  | "dat" | "csv" | "md" | "json-file")` returns the right one. The
+  same envelope drives every output format.
+- **Exit codes**: `EXIT_SUCCESS=0`, `EXIT_NOT_FOUND=1`,
+  `EXIT_ERROR=2`, `EXIT_KEYBOARD_INTERRUPT=130`. Defined in
+  `cli/core/utils.py`. Exceptions inside `execute()` are caught by
+  `BaseCommand.handle_exception` and reported on stderr (with full
+  traceback when `-v` is set).
+- **Resource reports** stay declarative — one `ReportConfig` per
+  subcommand in `cli/resource/reports.py:RESOURCE_REPORTS`. All ~21
+  resource subcommands share a single execution path through
+  `ResourceCommand`. Adding a new resource report = appending one
+  `ReportConfig` entry (no new class needed).
+
+### Adding a new history subcommand
+
+1. **Builder** — add a pure function to `cli/history/builders.py`:
+   ```python
+   def build_my_report(rows, *, ctx, **opts) -> dict:
+       return {
+           "kind": "my_report",
+           "machine": ctx.machine,
+           "start": ctx.start_date,
+           "end": ctx.end_date,
+           "columns": [
+               {"key": "user", "header": "User", "width": 16, "format": "s"},
+               {"key": "value", "header": "Value", "width": 0, "format": ".1f"},
+           ],
+           "rows": rows,
+       }
+   ```
+2. **Command class** — add to `cli/history/commands.py`:
+   ```python
+   class MyReportCommand(BaseHistoryCommand):
+       def execute(self) -> int:
+           try:
+               rows = self.get_queries().my_query_method(
+                   start=self.ctx.start_date, end=self.ctx.end_date,
+               )
+               envelope = builders.build_my_report(rows, ctx=self.ctx)
+               ExporterRegistry.resolve(self.ctx.output_format).emit(
+                   envelope, ctx=self.ctx,
+               )
+               return EXIT_SUCCESS
+           except Exception as e:
+               return self.handle_exception(e)
+   ```
+3. **Click wiring** — add a thin subcommand to `cli/cmds/jobhist.py`:
+   ```python
+   @history.command("my-report")
+   @click.pass_obj
+   def my_report(jh_ctx: Context):
+       code = MyReportCommand(jh_ctx).execute()
+       _close_session(jh_ctx)
+       sys.exit(code)
+   ```
+
+### Adding a new resource report
+
+Append one `ReportConfig` entry to `RESOURCE_REPORTS` in
+`cli/resource/reports.py`. The new subcommand is registered
+automatically by the declarative loop in `cli/cmds/jobhist.py`.
+
+If the underlying query method needs the `--group-by` value as a
+`period` kwarg, add its name to `PERIODIC_QUERY_METHODS`.
 
 ## Database Schema
 
@@ -337,11 +456,11 @@ queues, hours_field = ResourceTypeResolver.resolve('gpu', 'derecho', JobCharge)
 ## History and Resource Reports (CLI)
 
 ```bash
-# History subcommands
+# History subcommands (default --format rich → Rich table to stdout)
 jobhist history -m derecho --start-date 2026-01-01 --end-date 2026-01-31 \
     [daily-summary | jobs-per-user | jobs-per-project | unique-users | unique-projects]
 
-# Resource subcommands  (writes .dat/.json/.csv/.md files)
+# Resource subcommands (default --format dat → writes file to --output-dir)
 jobhist resource -m derecho --start-date 2026-01-01 --end-date 2026-01-31 \
     [cpu-job-sizes | gpu-job-sizes | job-sizes
      cpu-job-waits | gpu-job-waits | job-waits | memory-job-waits
@@ -349,10 +468,49 @@ jobhist resource -m derecho --start-date 2026-01-01 --end-date 2026-01-31 \
      cpu-job-memory-per-rank | gpu-job-memory-per-rank
      pie-user-cpu | pie-user-gpu | pie-proj-cpu | pie-proj-gpu
      pie-group-cpu | pie-group-gpu | usage-history | memory-job-sizes]
-
-# Output format (default: dat)
-jobhist resource --format json --start-date … pie-user-cpu
 ```
+
+### Output formats — `--format` (top-level)
+
+`--format` is a **top-level** flag on `jobhist` (applies to history
+*and* resource). One unified exporter set drives every format:
+
+| `--format` | Destination | Default for |
+|---|---|---|
+| `rich` | Rich table on stdout | history |
+| `json` | JSON envelope on stdout (machine-readable, `kind=…`) | — |
+| `dat`  | Fixed-width `.dat` file in `--output-dir` (byte-for-byte same as pre-refactor) | resource |
+| `csv`  | CSV file in `--output-dir` | — |
+| `md`   | Markdown table file in `--output-dir` | — |
+| `json-file` | JSON file in `--output-dir` (parallel to legacy file-based JSON) | — |
+
+```bash
+# Machine-readable history output
+jobhist --format json history --start-date 2026-01-01 --end-date 2026-01-31 jobs-per-user | jq
+
+# Resource report as a Rich table on stdout (instead of writing a .dat)
+jobhist --format rich resource --start-date 2026-01-01 --end-date 2026-01-31 pie-user-cpu
+
+# Resource report as JSON to stdout
+jobhist --format json resource --start-date 2026-01-01 --end-date 2026-01-31 pie-user-cpu | jq '.kind, .rows | length'
+```
+
+JSON envelope conventions (matches project_samuel's CLI):
+- `date` / `datetime` → ISO 8601 strings
+- `Decimal` → `float`
+- `set` → sorted list
+- Top-level `kind` field identifies the envelope shape
+  (`jobs_per_user`, `daily_summary`, `pie_user_cpu`, …)
+- `indent=2`, `sort_keys=False`
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0`   | Success |
+| `1`   | Not found (e.g. empty result window where expected) |
+| `2`   | Caught exception or validation failure (full traceback with `-v`) |
+| `130` | Keyboard interrupt (Ctrl-C) |
 
 ## Convenience Wrappers
 
@@ -363,6 +521,11 @@ Thin entry points for selective deployment (e.g., restrict sync to admins):
 | `jobhist-sync` | `jobhist sync` |
 | `jobhist-history` | `jobhist history` |
 | `jobhist-resource` | `jobhist resource` |
+
+Implementation: each wrapper lives in `job_history/cli/cmds/jobhist_<x>.py`
+and re-enters the full `cli` group with the matching subcommand prepended
+to `argv` — so `--format`/`--verbose` remain available exactly as on the
+unified `jobhist` binary.
 
 ## `bin/qhist-db` Frontend
 
