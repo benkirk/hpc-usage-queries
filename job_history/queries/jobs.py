@@ -7,13 +7,15 @@ database. It wraps SQLAlchemy queries with a convenient interface for:
 - Filtering by date ranges and status
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Sequence, Union
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
 
 from ..database import Job, DailySummary, JobCharge
+from ..database.config import JobHistoryConfig
 
 
 from sqlalchemy import case
@@ -264,20 +266,52 @@ class JobQueries:
     def _apply_date_filter(self, query, start: Optional[date], end: Optional[date]):
         """Apply consistent date filtering to a query.
 
-        Filters on Job.end time using datetime.combine for proper time boundaries.
+        ``start`` and ``end`` are interpreted as **site-local calendar days**
+        (per ``JOB_HISTORY_SITE_TIMEZONE``, default ``America/Denver``), not
+        UTC. The filter on ``Job.end`` is converted to the equivalent naive
+        UTC bounds — the same convention :mod:`sync.summary` uses to bin
+        jobs into ``DailySummary`` rows, so ``jobs_search`` and the daily
+        rollup always agree on which calendar day a job belongs to.
+
+        Without this conversion a job that ended at e.g. ``02:00 UTC`` on
+        2026-05-18 (=``20:00 MDT`` on 2026-05-17) would be counted in the
+        MDT-17 daily summary but excluded from a ``start=end=2026-05-17``
+        ``jobs_search`` filter — a silent under-count for every evening
+        job at western sites.
+
+        ``Job.end`` is stored as a naive UTC timestamp, so we strip
+        ``tzinfo`` after the conversion to keep psycopg2 from re-applying
+        the session's local TZ to the bind parameter.
+
+        The end boundary uses a half-open interval against the start of
+        the next site-local day (``< end+1day``) rather than ``<= 23:59:59.999``
+        to avoid sub-microsecond precision games and to match :mod:`sync.summary`.
 
         Args:
-            query: SQLAlchemy query object
-            start: Optional start date (inclusive)
-            end: Optional end date (inclusive)
+            query: SQLAlchemy query object.
+            start: Optional first site-local day to include.
+            end:   Optional last  site-local day to include.
 
         Returns:
-            Filtered query
+            Filtered query.
         """
-        if start:
-            query = query.filter(Job.end >= datetime.combine(start, datetime.min.time()))
-        if end:
-            query = query.filter(Job.end <= datetime.combine(end, datetime.max.time()))
+        site_tz = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
+        if start is not None:
+            start_utc = (
+                datetime.combine(start, time.min)
+                .replace(tzinfo=site_tz)
+                .astimezone(timezone.utc)
+                .replace(tzinfo=None)
+            )
+            query = query.filter(Job.end >= start_utc)
+        if end is not None:
+            end_exclusive_utc = (
+                datetime.combine(end + timedelta(days=1), time.min)
+                .replace(tzinfo=site_tz)
+                .astimezone(timezone.utc)
+                .replace(tzinfo=None)
+            )
+            query = query.filter(Job.end < end_exclusive_utc)
         return query
 
     def _build_range_case(self, ranges: List[tuple], overflow_label: str, field):

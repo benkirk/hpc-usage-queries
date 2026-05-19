@@ -138,11 +138,119 @@ class TestJobsSearchFilters:
 
     def test_date_range_filter(self, in_memory_session, search_jobs):
         # Job ends span 2025-01-15 13:00 .. 2025-01-17 13:00 (naive UTC).
-        # Window [2025-01-16, 2025-01-16] catches only the middle job.
+        # In America/Denver (MST, UTC-7 in January) those are 06:00 on the
+        # 15th/16th/17th respectively, so each lands on the same site-local
+        # day as its UTC date. Window [2025-01-16, 2025-01-16] catches only
+        # the middle job.
         rows = JobQueries(in_memory_session).jobs_search(
             start=date(2025, 1, 16), end=date(2025, 1, 16),
         )
         assert [r["job_id"] for r in rows] == ["101.desched1"]
+
+
+class TestJobsSearchSiteTimezone:
+    """``start`` / ``end`` filters are site-local days, not raw UTC dates.
+
+    The plugin's ``DailySummary`` rollup bins jobs by site-local day
+    (configured via ``JOB_HISTORY_SITE_TIMEZONE``); ``jobs_search`` must
+    use the same convention so the per-job drill-down agrees with the
+    daily totals.  Regression for the silent under-count where evening
+    Mountain Time jobs that ended after 00:00 UTC were dropped from
+    the previous day's drill-down.
+    """
+
+    @pytest.fixture
+    def evening_mt_jobs(self, in_memory_session):
+        """Two boundary jobs that end shortly after midnight UTC.
+
+        ``early_utc`` ends ``2026-05-18 02:00 UTC`` = ``2026-05-17 20:00 MDT``
+        → site-local day **2026-05-17**.
+
+        ``late_utc`` ends ``2026-05-18 23:00 UTC`` = ``2026-05-18 17:00 MDT``
+        → site-local day **2026-05-18**.
+
+        A naive-UTC filter (the pre-fix behaviour) would lump both into
+        2026-05-18; the site-TZ filter splits them correctly.
+        """
+        jobs = [
+            Job(
+                job_id="evening.1", short_id=1, name="evening-mt",
+                user="benkirk", account="SCSG0001", queue="htc", status="F",
+                submit=datetime(2026, 5, 17, 18, 0),
+                start=datetime(2026, 5, 17, 18, 0),
+                end=datetime(2026, 5, 18, 2, 0),       # 20:00 MDT on 5/17
+                elapsed=28800, numcpus=1, numgpus=0, numnodes=1, walltime=28800,
+            ),
+            Job(
+                job_id="afternoon.2", short_id=2, name="next-day-pm",
+                user="benkirk", account="SCSG0001", queue="htc", status="F",
+                submit=datetime(2026, 5, 18, 15, 0),
+                start=datetime(2026, 5, 18, 15, 0),
+                end=datetime(2026, 5, 18, 23, 0),      # 17:00 MDT on 5/18
+                elapsed=28800, numcpus=1, numgpus=0, numnodes=1, walltime=28800,
+            ),
+        ]
+        for j in jobs:
+            in_memory_session.add(j)
+        in_memory_session.commit()
+        return jobs
+
+    def test_evening_mt_job_belongs_to_prior_day_in_denver(
+        self, in_memory_session, evening_mt_jobs,
+    ):
+        # America/Denver is the default SITE_TIMEZONE — no patch needed.
+        rows = JobQueries(in_memory_session).jobs_search(
+            start=date(2026, 5, 17), end=date(2026, 5, 17),
+        )
+        assert [r["job_id"] for r in rows] == ["evening.1"]
+
+    def test_afternoon_mt_job_belongs_to_its_utc_day_in_denver(
+        self, in_memory_session, evening_mt_jobs,
+    ):
+        rows = JobQueries(in_memory_session).jobs_search(
+            start=date(2026, 5, 18), end=date(2026, 5, 18),
+        )
+        assert [r["job_id"] for r in rows] == ["afternoon.2"]
+
+    def test_utc_timezone_keeps_old_naive_behavior(
+        self, in_memory_session, evening_mt_jobs, monkeypatch,
+    ):
+        # With SITE_TIMEZONE=UTC, the new filter is mathematically
+        # equivalent to the old naive-UTC behaviour: both evening MT jobs
+        # land on their raw UTC date (2026-05-18) regardless of MDT offset.
+        from job_history.database.config import JobHistoryConfig
+        monkeypatch.setattr(JobHistoryConfig, "SITE_TIMEZONE", "UTC")
+        rows = JobQueries(in_memory_session).jobs_search(
+            start=date(2026, 5, 18), end=date(2026, 5, 18),
+        )
+        assert {r["job_id"] for r in rows} == {"evening.1", "afternoon.2"}
+
+    def test_end_boundary_is_half_open(
+        self, in_memory_session, evening_mt_jobs,
+    ):
+        # A job ending exactly at midnight site-local on day D+1 belongs
+        # to D+1, not D — the half-open interval is the only way to make
+        # consecutive-day queries non-overlapping.  Insert a job that ends
+        # exactly at 2026-05-18 00:00 MDT (= 2026-05-18 06:00 UTC) and
+        # confirm it lands on 5/18 from the day-D query and on 5/18 from
+        # the day-D+1 query.
+        in_memory_session.add(Job(
+            job_id="midnight.3", short_id=3, name="midnight-mt",
+            user="benkirk", account="SCSG0001", queue="htc", status="F",
+            submit=datetime(2026, 5, 17, 23, 0),
+            start=datetime(2026, 5, 17, 23, 0),
+            end=datetime(2026, 5, 18, 6, 0),       # exactly 00:00 MDT on 5/18
+            elapsed=25200, numcpus=1, numgpus=0, numnodes=1, walltime=25200,
+        ))
+        in_memory_session.commit()
+        rows_d   = JobQueries(in_memory_session).jobs_search(
+            start=date(2026, 5, 17), end=date(2026, 5, 17),
+        )
+        rows_d1  = JobQueries(in_memory_session).jobs_search(
+            start=date(2026, 5, 18), end=date(2026, 5, 18),
+        )
+        assert "midnight.3" not in {r["job_id"] for r in rows_d}
+        assert "midnight.3" in     {r["job_id"] for r in rows_d1}
 
 
 class TestJobsSearchColumns:
