@@ -19,6 +19,33 @@ from ..database import Job, DailySummary, JobCharge
 from sqlalchemy import case
 
 
+def _sort_expression(sort_by: str):
+    """Map a ``COLUMNS`` key to a SQLAlchemy expression suitable for ORDER BY.
+
+    Direct ``job.<attr>`` / ``charge.<attr>`` keys resolve to the matching
+    ``Job`` / ``JobCharge`` column. Computed ``*_charges`` keys sort on the
+    underlying ``hours × COALESCE(qos_factor, 1)`` product, matching the
+    formula in :func:`project_row`.
+    """
+    # Local import avoids a queries → cli circular import.
+    from job_history.cli.search.columns import COLUMNS
+
+    spec = COLUMNS[sort_by]
+    kind, attr = spec["source"].split(".", 1)
+    if kind == "job":
+        return getattr(Job, attr)
+    if kind == "charge":
+        return getattr(JobCharge, attr)
+    hours_attr = {
+        "cpu_charges":    "cpu_hours",
+        "gpu_charges":    "gpu_hours",
+        "memory_charges": "memory_hours",
+    }.get(attr)
+    if hours_attr is None:
+        raise ValueError(f"Cannot sort by computed column {sort_by!r}")
+    return getattr(JobCharge, hours_attr) * func.coalesce(JobCharge.qos_factor, 1.0)
+
+
 def _account_to_facility(account):
     """Map an NCAR project/account code to its facility bucket.
 
@@ -997,8 +1024,12 @@ class JobQueries:
         account: Optional[str] = None,
         queue: Optional[str] = None,
         status: Optional[str] = None,
+        has_gpus: Optional[bool] = None,
         columns: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
+        offset: int = 0,
+        sort_by: Optional[str] = None,
+        sort_dir: str = 'desc',
     ) -> List[Dict[str, Any]]:
         """Search individual job records — unified, dict-row contract.
 
@@ -1023,16 +1054,23 @@ class JobQueries:
             account: Optional project/account filter (text; resolved via FK hybrid)
             queue: Optional queue filter (text; resolved via FK hybrid)
             status: Optional job-status filter (e.g. 'F' for finished)
+            has_gpus: ``None`` ignore; ``True`` → ``Job.numgpus > 0`` (GPU jobs
+                only); ``False`` → ``numgpus == 0`` (CPU-only jobs).
             columns: Optional sequence of column keys to project.
                 When None, returns DEFAULT_COLUMNS. Unknown keys raise ValueError.
             limit: Optional max number of rows to return. Applied as a SQL
                 ``LIMIT`` (server-side) so the truncated rows are never
                 materialized. Must be a positive integer.
+            offset: Non-negative SQL ``OFFSET`` for paging. Default 0.
+            sort_by: Optional column-key (from ``COLUMNS``) to sort by.
+                ``None`` keeps the historical default (``Job.end DESC``).
+                Computed ``*_charges`` keys sort on ``hours × qos_factor``.
+            sort_dir: ``'asc'`` or ``'desc'``. Ignored when ``sort_by`` is None.
 
         Returns:
-            List of dicts ordered by ``Job.end DESC``. Each dict contains
-            exactly the requested column keys, with values pulled from
-            ``Job`` columns or the outer-joined ``JobCharge`` row.
+            List of dicts ordered by ``sort_by`` (default ``Job.end DESC``).
+            Each dict contains exactly the requested column keys, with values
+            pulled from ``Job`` columns or the outer-joined ``JobCharge`` row.
         """
         # Local import keeps the queries package importable without cli/.
         from job_history.cli.search.columns import (
@@ -1051,12 +1089,68 @@ class JobQueries:
 
         if limit is not None and (not isinstance(limit, int) or limit <= 0):
             raise ValueError(f"limit must be a positive integer, got {limit!r}")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"offset must be a non-negative integer, got {offset!r}")
+        if sort_by is not None and sort_by not in COLUMNS:
+            valid = ", ".join(sorted(COLUMNS))
+            raise ValueError(
+                f"Unknown sort_by: {sort_by!r}. Valid keys: {valid}"
+            )
+        if sort_by is not None and sort_dir not in ('asc', 'desc'):
+            raise ValueError(
+                f"sort_dir must be 'asc' or 'desc', got {sort_dir!r}"
+            )
 
         query = (
             self.session.query(Job, JobCharge)
             .outerjoin(JobCharge, Job.id == JobCharge.job_id)
         )
+        query = self._apply_jobs_search_filters(
+            query, start=start, end=end, user=user, account=account,
+            queue=queue, status=status, has_gpus=has_gpus,
+        )
 
+        if sort_by is None:
+            query = query.order_by(Job.end.desc())
+        else:
+            expr = _sort_expression(sort_by)
+            query = query.order_by(expr.desc() if sort_dir == 'desc' else expr.asc())
+
+        if limit is not None:
+            query = query.limit(limit)
+        if offset:
+            query = query.offset(offset)
+        return [project_row(job, charge, cols) for job, charge in query.all()]
+
+    def jobs_count(
+        self,
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[str] = None,
+        queue: Optional[str] = None,
+        status: Optional[str] = None,
+        has_gpus: Optional[bool] = None,
+    ) -> int:
+        """Count rows that ``jobs_search`` would return under the same filters.
+
+        Companion to :meth:`jobs_search` for paginated UIs: callers fetch
+        one page via ``jobs_search(limit=…, offset=…)`` and the total via
+        this method. Filter shape mirrors ``jobs_search`` exactly; ``columns``,
+        ``limit``, ``offset``, and sort args do not apply.
+        """
+        query = self.session.query(func.count(Job.id))
+        query = self._apply_jobs_search_filters(
+            query, start=start, end=end, user=user, account=account,
+            queue=queue, status=status, has_gpus=has_gpus,
+        )
+        return int(query.scalar() or 0)
+
+    def _apply_jobs_search_filters(
+        self, query, *, start, end, user, account, queue, status, has_gpus,
+    ):
+        """Apply the shared filter set used by jobs_search + jobs_count."""
         query = self._apply_date_filter(query, start, end)
         if user:
             query = query.filter(Job.user == user)
@@ -1066,11 +1160,11 @@ class JobQueries:
             query = query.filter(Job.queue == queue)
         if status:
             query = query.filter(Job.status == status)
-
-        query = query.order_by(Job.end.desc())
-        if limit is not None:
-            query = query.limit(limit)
-        return [project_row(job, charge, cols) for job, charge in query.all()]
+        if has_gpus is True:
+            query = query.filter(Job.numgpus > 0)
+        elif has_gpus is False:
+            query = query.filter(or_(Job.numgpus == 0, Job.numgpus.is_(None)))
+        return query
 
     def usage_summary(
         self,
