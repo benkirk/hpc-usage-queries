@@ -222,3 +222,121 @@ class TestJobsSearchColumns:
         assert by_id["100.desched1"]["cpu_charges"] == pytest.approx(128.0)
         # alice-2: 512 cpu_h × 0.5 qos = 256 charges
         assert by_id["101.desched1"]["cpu_charges"] == pytest.approx(256.0)
+
+
+class TestJobsSearchPagination:
+    """offset + sort_by/sort_dir + jobs_count, added for paginated webapp UIs."""
+
+    def test_offset_shifts_window(self, in_memory_session, search_jobs):
+        # 3 jobs total, default order is Job.end DESC → 102, 101, 100.
+        page1 = JobQueries(in_memory_session).jobs_search(limit=2, offset=0)
+        assert [r["job_id"] for r in page1] == ["102.desched1", "101.desched1"]
+        page2 = JobQueries(in_memory_session).jobs_search(limit=2, offset=2)
+        assert [r["job_id"] for r in page2] == ["100.desched1"]
+
+    def test_offset_zero_is_no_op(self, in_memory_session, search_jobs):
+        a = JobQueries(in_memory_session).jobs_search(limit=3, offset=0)
+        b = JobQueries(in_memory_session).jobs_search(limit=3)
+        assert [r["job_id"] for r in a] == [r["job_id"] for r in b]
+
+    def test_offset_invalid_raises(self, in_memory_session, search_jobs):
+        with pytest.raises(ValueError, match="offset must be a non-negative integer"):
+            JobQueries(in_memory_session).jobs_search(offset=-1)
+        with pytest.raises(ValueError, match="offset must be a non-negative integer"):
+            JobQueries(in_memory_session).jobs_search(offset="5")
+
+    def test_sort_by_elapsed_asc(self, in_memory_session, search_jobs):
+        # elapsed values: alice-1=3600, alice-2=7200, bob-1=3600
+        rows = JobQueries(in_memory_session).jobs_search(
+            sort_by="elapsed", sort_dir="asc",
+        )
+        elapsed = [r["elapsed"] for r in rows]
+        assert elapsed == sorted(elapsed)
+
+    def test_sort_by_elapsed_desc(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            sort_by="elapsed", sort_dir="desc",
+        )
+        # 7200 should come first
+        assert rows[0]["elapsed"] == 7200
+
+    def test_sort_by_computed_cpu_charges(self, in_memory_session, search_jobs):
+        # cpu_charges = cpu_hours × qos_factor:
+        # alice-1: 128×1.0=128; alice-2: 512×0.5=256; bob-1: 64×1.0=64
+        rows = JobQueries(in_memory_session).jobs_search(
+            sort_by="cpu_charges", sort_dir="desc",
+        )
+        assert [r["job_id"] for r in rows] == [
+            "101.desched1",  # 256
+            "100.desched1",  # 128
+            "102.desched1",  # 64
+        ]
+
+    def test_sort_by_unknown_raises(self, in_memory_session, search_jobs):
+        with pytest.raises(ValueError, match="Unknown sort_by"):
+            JobQueries(in_memory_session).jobs_search(sort_by="not_a_column")
+
+    def test_sort_dir_invalid_raises(self, in_memory_session, search_jobs):
+        with pytest.raises(ValueError, match="sort_dir must be"):
+            JobQueries(in_memory_session).jobs_search(
+                sort_by="elapsed", sort_dir="sideways",
+            )
+
+    def test_sort_dir_ignored_when_sort_by_is_none(self, in_memory_session, search_jobs):
+        # sort_dir='sideways' is normally invalid; with sort_by=None the
+        # default Job.end DESC order applies and sort_dir is not validated.
+        rows = JobQueries(in_memory_session).jobs_search(sort_dir="sideways")
+        assert rows[0]["job_id"] == "102.desched1"
+
+
+class TestJobsSearchHasGpus:
+    def test_has_gpus_true_returns_only_gpu_jobs(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(has_gpus=True)
+        # Only bob-1 has numgpus=4; alice's jobs have numgpus=0.
+        assert [r["job_id"] for r in rows] == ["102.desched1"]
+
+    def test_has_gpus_false_returns_cpu_only(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(has_gpus=False)
+        # alice-1 and alice-2 have numgpus=0.
+        assert {r["job_id"] for r in rows} == {"100.desched1", "101.desched1"}
+
+    def test_has_gpus_none_ignored(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(has_gpus=None)
+        assert len(rows) == 3
+
+    def test_has_gpus_false_includes_null_numgpus(self, in_memory_session, search_jobs):
+        # A job with numgpus=NULL should still be classified as CPU-only.
+        base = datetime(2025, 2, 1, 12, 0, 0)
+        in_memory_session.add(Job(
+            job_id="888.desched1", short_id=888, user="alice",
+            account="NCAR0001", queue="main", status="F",
+            submit=base, start=base, end=base + timedelta(hours=1),
+            elapsed=3600, numcpus=1, numnodes=1, numgpus=None,
+        ))
+        in_memory_session.commit()
+        rows = JobQueries(in_memory_session).jobs_search(has_gpus=False)
+        assert "888.desched1" in {r["job_id"] for r in rows}
+
+
+class TestJobsCount:
+    def test_count_matches_search_length(self, in_memory_session, search_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count() == len(q.jobs_search())
+
+    def test_count_respects_filters(self, in_memory_session, search_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(user="alice") == 2
+        assert q.jobs_count(account="NCAR0002") == 1
+        assert q.jobs_count(has_gpus=True) == 1
+        assert q.jobs_count(has_gpus=False) == 2
+
+    def test_count_empty_when_no_match(self, in_memory_session, search_jobs):
+        assert JobQueries(in_memory_session).jobs_count(user="nobody") == 0
+
+    def test_count_unaffected_by_limit_or_offset_args(self, in_memory_session, search_jobs):
+        # jobs_count deliberately does not accept limit/offset/columns/sort —
+        # callers should never have to plumb pagination kwargs through.
+        with pytest.raises(TypeError):
+            JobQueries(in_memory_session).jobs_count(limit=1)
+        with pytest.raises(TypeError):
+            JobQueries(in_memory_session).jobs_count(offset=5)
