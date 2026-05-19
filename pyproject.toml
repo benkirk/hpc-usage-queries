@@ -48,6 +48,7 @@ fs-scans-analyze = "fs_scans.wrappers.fs_scans_analyze:main"
 jobhist-sync = "job_history.cli.cmds.jobhist_sync:main"
 jobhist-history = "job_history.cli.cmds.jobhist_history:main"
 jobhist-resource = "job_history.cli.cmds.jobhist_resource:main"
+jobhist-search = "job_history.cli.cmds.jobhist_search:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
