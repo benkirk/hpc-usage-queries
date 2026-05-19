@@ -33,8 +33,8 @@ analysis = [
 ]
 
 [project.scripts]
-# unified job history CLI
-jobhist = "job_history.cli:cli"
+# unified job history CLI (SAM-aligned architecture under job_history/cli/)
+jobhist = "job_history.cli.cmds.jobhist:main"
 
 # unified filesystem scans CLI
 fs-scans = "fs_scans.cli.main:fs_scans_cli"
@@ -45,9 +45,10 @@ fs-scans-query = "fs_scans.wrappers.fs_scans_query:main"
 fs-scans-analyze = "fs_scans.wrappers.fs_scans_analyze:main"
 
 # jobhist convenience wrappers (allow selective deployment)
-jobhist-sync = "job_history.wrappers.jobhist_sync:main"
-jobhist-history = "job_history.wrappers.jobhist_history:main"
-jobhist-resource = "job_history.wrappers.jobhist_resource:main"
+jobhist-sync = "job_history.cli.cmds.jobhist_sync:main"
+jobhist-history = "job_history.cli.cmds.jobhist_history:main"
+jobhist-resource = "job_history.cli.cmds.jobhist_resource:main"
+jobhist-search = "job_history.cli.cmds.jobhist_search:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

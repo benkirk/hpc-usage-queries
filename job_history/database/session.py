@@ -9,7 +9,11 @@ Supports two backends, selected by the ``JOB_HISTORY_DB_BACKEND`` environment va
 See ``job_history/config.py`` and ``.env.example`` for full configuration details.
 """
 
+import threading
+from typing import Any, Mapping, Optional
+
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from .config import JobHistoryConfig
@@ -20,6 +24,12 @@ VALID_MACHINES = {"casper", "derecho"}
 
 # Backward-compat alias: code that imported JOB_HISTORY_DATA_DIR directly still works.
 JOB_HISTORY_DATA_DIR = JobHistoryConfig.SQLITE_DATA_DIR
+
+# Engine cache — populated by get_engine(), cleared by clear_engine_cache().
+# Long-lived consumers (Flask webapps, daemons) reuse a single Engine per
+# (backend-target, pool_kwargs) so connection pools amortize across requests.
+_engine_cache: dict[tuple, Engine] = {}
+_engine_cache_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +144,8 @@ def db_available(machine: str) -> bool:
         if JobHistoryConfig.DB_BACKEND == 'postgres':
             JobHistoryConfig.validate_postgres()
             engine = get_engine(machine)
-            try:
-                with engine.connect() as conn:
-                    conn.execute(text("SELECT 1"))
-            finally:
-                engine.dispose()
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
         else:
             return get_db_path(machine).exists()
         return True
@@ -146,56 +153,121 @@ def db_available(machine: str) -> bool:
         return False
 
 
-def get_engine(machine: str, echo: bool = False):
-    """Create and return a SQLAlchemy engine for *machine*.
+def _engine_cache_key(machine: str, pool_kwargs: Optional[Mapping[str, Any]]) -> tuple:
+    """Build a hashable cache key that captures backend target + pool config.
 
-    The backend (SQLite or PostgreSQL) is determined by ``JobHistoryConfig.DB_BACKEND``.
+    A change to ``JobHistoryConfig.DB_BACKEND``, the PostgreSQL host/db, the
+    SQLite path, or any ``pool_kwargs`` value produces a distinct key so the
+    cache returns the right engine when configuration changes between calls
+    (primarily relevant in tests and multi-tenant code).
+    """
+    cfg = JobHistoryConfig
+    if cfg.DB_BACKEND == "postgres":
+        target: tuple = (
+            "postgres",
+            cfg.PG_HOST, cfg.PG_PORT, cfg.PG_USER,
+            cfg.pg_db_name(machine),
+            bool(cfg.PG_REQUIRE_SSL),
+        )
+    else:
+        target = ("sqlite", str(get_db_path(machine)))
+    pk = frozenset((pool_kwargs or {}).items())
+    return (target, pk)
+
+
+def get_engine(
+    machine: str,
+    echo: bool = False,
+    *,
+    pool_kwargs: Optional[Mapping[str, Any]] = None,
+):
+    """Return a SQLAlchemy engine for *machine*, creating and caching it on first use.
+
+    Engines are memoized by ``(backend-target, pool_kwargs)`` so repeated calls
+    from long-lived processes (Flask webapps, daemons) reuse one Engine and its
+    connection pool. CLI usage that creates a fresh engine per command still
+    works — the cache just makes the second call cheap.
 
     Args:
         machine: Machine name ('casper' or 'derecho')
-        echo: If True, log all SQL statements
+        echo: If True, log all SQL statements (only honored on first creation
+            for a given cache key)
+        pool_kwargs: Optional mapping of ``create_engine`` pool parameters
+            (e.g. ``pool_size``, ``max_overflow``, ``pool_pre_ping``,
+            ``pool_recycle``). Forwarded verbatim to ``create_engine`` —
+            primarily useful for the PostgreSQL backend; SQLite ignores most
+            pool parameters.
 
     Returns:
-        SQLAlchemy Engine instance
+        SQLAlchemy Engine instance (cached after first creation)
     """
     machine = machine.lower()
     if machine not in VALID_MACHINES:
         raise ValueError(f"Unknown machine: {machine}. Must be one of: {VALID_MACHINES}")
 
     config = JobHistoryConfig
+    key = _engine_cache_key(machine, pool_kwargs)
 
-    if config.DB_BACKEND == "postgres":
-        config.validate_postgres()
-        db_name = config.pg_db_name(machine)
-        connect_args = {}
-        if config.PG_REQUIRE_SSL:
-            connect_args["sslmode"] = "require"
-        url = (
-            f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
-            f"@{config.PG_HOST}:{config.PG_PORT}/{db_name}"
-        )
-        return create_engine(url, echo=echo, connect_args=connect_args)
+    with _engine_cache_lock:
+        cached = _engine_cache.get(key)
+        if cached is not None:
+            return cached
 
-    # SQLite (default)
-    db_path = get_db_path(machine)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(f"sqlite:///{db_path}", echo=echo)
-    event.listen(engine, "connect", _set_sqlite_pragma)
-    return engine
+        extra: dict[str, Any] = dict(pool_kwargs or {})
+
+        if config.DB_BACKEND == "postgres":
+            config.validate_postgres()
+            db_name = config.pg_db_name(machine)
+            connect_args = {}
+            if config.PG_REQUIRE_SSL:
+                connect_args["sslmode"] = "require"
+            url = (
+                f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
+                f"@{config.PG_HOST}:{config.PG_PORT}/{db_name}"
+            )
+            engine = create_engine(url, echo=echo, connect_args=connect_args, **extra)
+        else:
+            db_path = get_db_path(machine)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            engine = create_engine(f"sqlite:///{db_path}", echo=echo, **extra)
+            event.listen(engine, "connect", _set_sqlite_pragma)
+
+        _engine_cache[key] = engine
+        return engine
 
 
-def get_session(machine: str, engine=None):
+def clear_engine_cache() -> None:
+    """Dispose all cached engines and clear the cache.
+
+    Primarily for tests and graceful shutdown. After clearing, the next call
+    to ``get_engine()`` will create a fresh engine.
+    """
+    with _engine_cache_lock:
+        for engine in _engine_cache.values():
+            engine.dispose()
+        _engine_cache.clear()
+
+
+def get_session(
+    machine: str,
+    engine=None,
+    *,
+    pool_kwargs: Optional[Mapping[str, Any]] = None,
+):
     """Create and return a new database session for *machine*.
 
     Args:
         machine: Machine name ('casper' or 'derecho')
-        engine: Existing engine to use. If None, creates a new one.
+        engine: Existing engine to use. If None, retrieves (or creates) the
+            cached engine for *machine*.
+        pool_kwargs: Forwarded to ``get_engine`` on cache miss; ignored when
+            *engine* is provided.
 
     Returns:
         SQLAlchemy Session instance
     """
     if engine is None:
-        engine = get_engine(machine)
+        engine = get_engine(machine, pool_kwargs=pool_kwargs)
 
     Session = sessionmaker(bind=engine)
     return Session()

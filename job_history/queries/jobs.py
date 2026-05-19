@@ -8,7 +8,7 @@ database. It wraps SQLAlchemy queries with a convenient interface for:
 """
 
 from datetime import date, datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Sequence
 
 from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
@@ -987,6 +987,90 @@ class JobQueries:
         query = self._apply_date_filter(query, start, end)
 
         return query.order_by(Job.end.desc()).all()
+
+    def jobs_search(
+        self,
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[str] = None,
+        queue: Optional[str] = None,
+        status: Optional[str] = None,
+        columns: Optional[Sequence[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search individual job records — unified, dict-row contract.
+
+        Returns a ``list[dict]`` with one entry per matching job; the dict
+        keys are controlled by the ``columns`` parameter and default to
+        :data:`job_history.cli.search.columns.DEFAULT_COLUMNS`. Filters
+        compose via AND.
+
+        This is the job-level companion to :meth:`daily_summary_report`,
+        which returns per-day *aggregated* rows. The two row shapes share
+        a handful of keys (``user``, ``account``, ``queue``, ``cpu_hours``,
+        ``gpu_hours``) but are otherwise different — ``jobs_search`` adds
+        per-job identifiers and resource fields (``job_id``, ``start``,
+        ``end``, ``elapsed``, ``numnodes``, ``numcpus``, ``numgpus``, …)
+        and ``daily_summary_report`` adds aggregate fields (``date``,
+        ``job_count``, ``memory_hours``, ``*_charges``).
+
+        Args:
+            start: Optional start date (inclusive) — filters on ``Job.end``
+            end: Optional end date (inclusive) — filters on ``Job.end``
+            user: Optional username filter (text; resolved via FK hybrid)
+            account: Optional project/account filter (text; resolved via FK hybrid)
+            queue: Optional queue filter (text; resolved via FK hybrid)
+            status: Optional job-status filter (e.g. 'F' for finished)
+            columns: Optional sequence of column keys to project.
+                When None, returns DEFAULT_COLUMNS. Unknown keys raise ValueError.
+            limit: Optional max number of rows to return. Applied as a SQL
+                ``LIMIT`` (server-side) so the truncated rows are never
+                materialized. Must be a positive integer.
+
+        Returns:
+            List of dicts ordered by ``Job.end DESC``. Each dict contains
+            exactly the requested column keys, with values pulled from
+            ``Job`` columns or the outer-joined ``JobCharge`` row.
+        """
+        # Local import keeps the queries package importable without cli/.
+        from job_history.cli.search.columns import (
+            COLUMNS,
+            DEFAULT_COLUMNS,
+            project_row,
+        )
+
+        cols = tuple(columns) if columns is not None else DEFAULT_COLUMNS
+        unknown = [c for c in cols if c not in COLUMNS]
+        if unknown:
+            valid = ", ".join(sorted(COLUMNS))
+            raise ValueError(
+                f"Unknown column(s): {', '.join(unknown)}. Valid columns: {valid}"
+            )
+
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ValueError(f"limit must be a positive integer, got {limit!r}")
+
+        query = (
+            self.session.query(Job, JobCharge)
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+        )
+
+        query = self._apply_date_filter(query, start, end)
+        if user:
+            query = query.filter(Job.user == user)
+        if account:
+            query = query.filter(Job.account == account)
+        if queue:
+            query = query.filter(Job.queue == queue)
+        if status:
+            query = query.filter(Job.status == status)
+
+        query = query.order_by(Job.end.desc())
+        if limit is not None:
+            query = query.limit(limit)
+        return [project_row(job, charge, cols) for job, charge in query.all()]
 
     def usage_summary(
         self,
