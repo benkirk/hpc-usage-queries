@@ -998,6 +998,7 @@ class JobQueries:
         queue: Optional[str] = None,
         status: Optional[str] = None,
         columns: Optional[Sequence[str]] = None,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Search individual job records — unified, dict-row contract.
 
@@ -1013,6 +1014,9 @@ class JobQueries:
             status: Optional job-status filter (e.g. 'F' for finished)
             columns: Optional sequence of column keys to project.
                 When None, returns DEFAULT_COLUMNS. Unknown keys raise ValueError.
+            limit: Optional max number of rows to return. Applied as a SQL
+                ``LIMIT`` (server-side) so the truncated rows are never
+                materialized. Must be a positive integer.
 
         Returns:
             List of dicts ordered by ``Job.end DESC``. Each dict contains
@@ -1034,6 +1038,9 @@ class JobQueries:
                 f"Unknown column(s): {', '.join(unknown)}. Valid columns: {valid}"
             )
 
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ValueError(f"limit must be a positive integer, got {limit!r}")
+
         query = (
             self.session.query(Job, JobCharge)
             .outerjoin(JobCharge, Job.id == JobCharge.job_id)
@@ -1049,8 +1056,10 @@ class JobQueries:
         if status:
             query = query.filter(Job.status == status)
 
-        results = query.order_by(Job.end.desc()).all()
-        return [project_row(job, charge, cols) for job, charge in results]
+        query = query.order_by(Job.end.desc())
+        if limit is not None:
+            query = query.limit(limit)
+        return [project_row(job, charge, cols) for job, charge in query.all()]
 
     def usage_summary(
         self,

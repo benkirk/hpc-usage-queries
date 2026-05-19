@@ -211,9 +211,11 @@ def daily_summary(jh_ctx: Context):
               help="Show all columns instead of the default subset.")
 @click.option("--display", default=None,
               help="Comma-separated list of columns to display (overrides --verbose).")
+@click.option("--limit", type=click.IntRange(min=1), default=None,
+              help="Truncate results to at most N rows (SQL LIMIT, server-side).")
 @click.pass_obj
 def search(jh_ctx: Context, start_date, end_date, machine,
-           user, account, queue, status, verbose, display):
+           user, account, queue, status, verbose, display, limit):
     """List individual job records matching the filters."""
     jh_ctx.start_date = start_date
     jh_ctx.end_date = end_date
@@ -224,7 +226,7 @@ def search(jh_ctx: Context, start_date, end_date, machine,
     jh_ctx.session = get_session(machine)
     code = SearchCommand(jh_ctx).execute(
         user=user, account=account, queue=queue, status=status,
-        verbose=verbose, display=display,
+        verbose=verbose, display=display, limit=limit,
     )
     _close_session(jh_ctx)
     sys.exit(code)

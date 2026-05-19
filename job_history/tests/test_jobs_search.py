@@ -169,6 +169,49 @@ class TestJobsSearchColumns:
             assert r["end"][:4].isdigit()
             assert r["end"][4] == "-"
 
+    def test_limit_truncates_results(self, in_memory_session, search_jobs):
+        # 3 jobs in the fixture; limit=1 should return just the most-recent.
+        rows = JobQueries(in_memory_session).jobs_search(limit=1)
+        assert len(rows) == 1
+        # Job.end DESC → bob's job (102) is first
+        assert rows[0]["job_id"] == "102.desched1"
+
+    def test_limit_larger_than_result_is_safe(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(limit=999)
+        assert len(rows) == 3
+
+    def test_limit_none_returns_all(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(limit=None)
+        assert len(rows) == 3
+
+    def test_limit_invalid_raises(self, in_memory_session, search_jobs):
+        with pytest.raises(ValueError, match="limit must be a positive integer"):
+            JobQueries(in_memory_session).jobs_search(limit=0)
+        with pytest.raises(ValueError, match="limit must be a positive integer"):
+            JobQueries(in_memory_session).jobs_search(limit=-5)
+        with pytest.raises(ValueError, match="limit must be a positive integer"):
+            JobQueries(in_memory_session).jobs_search(limit="10")
+
+    def test_limit_emits_sql_limit_clause(self, in_memory_session, search_jobs):
+        # Server-side truncation: the compiled SQL must contain LIMIT, not a
+        # Python slice after the fact. Catch a future refactor that drops to
+        # all()[:n] instead of .limit(n).
+        from sqlalchemy import event
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_search(limit=2)
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        # At least one SELECT against jobs carries a LIMIT clause.
+        assert any("LIMIT" in s.upper() and "jobs" in s.lower() for s in statements), \
+            f"Expected LIMIT in compiled SQL; got:\n{statements}"
+
     def test_computed_charges_apply_qos(self, in_memory_session, search_jobs):
         rows = JobQueries(in_memory_session).jobs_search(
             user="alice",

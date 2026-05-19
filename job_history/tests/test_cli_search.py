@@ -189,6 +189,14 @@ class TestSearchCommand:
         # Nothing emitted to stdout
         assert capsys.readouterr().out == ""
 
+    def test_limit_flag_truncates_and_appears_in_filters(self, search_ctx, capsys):
+        search_ctx.output_format = "json"
+        code = SearchCommand(search_ctx).execute(limit=1)
+        assert code == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert len(parsed["rows"]) == 1
+        assert parsed["filters"]["limit"] == 1
+
 
 # ---------------------------------------------------------------------------
 # CliRunner — Click integration through the new entry point
@@ -231,3 +239,11 @@ class TestJobhistSearchCli:
         result = CliRunner().invoke(cli, ["search", "-m", "fugaku"])
         assert result.exit_code != 0
         assert "Invalid value" in result.output or "invalid choice" in result.output.lower()
+
+    def test_limit_rejects_non_positive(self):
+        from click.testing import CliRunner
+        from job_history.cli.cmds.jobhist import cli
+
+        result = CliRunner().invoke(cli, ["search", "--limit", "0"])
+        assert result.exit_code != 0
+        assert "Invalid value" in result.output

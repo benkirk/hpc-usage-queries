@@ -28,6 +28,7 @@ class SearchCommand(BaseHistoryCommand):
         status: Optional[str] = None,
         verbose: bool = False,
         display: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> int:
         try:
             cols = _resolve_columns(display=display, verbose=verbose)
@@ -44,6 +45,7 @@ class SearchCommand(BaseHistoryCommand):
                 queue=queue,
                 status=status,
                 columns=cols,
+                limit=limit,
             )
             envelope = builders.build_search(
                 rows,
@@ -54,6 +56,7 @@ class SearchCommand(BaseHistoryCommand):
                     "account": account,
                     "queue": queue,
                     "status": status,
+                    "limit": limit,
                 },
             )
             ExporterRegistry.resolve(self.ctx.output_format).emit(envelope, ctx=self.ctx)
