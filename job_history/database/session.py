@@ -352,6 +352,37 @@ def _ensure_db_triggers(engine) -> None:
         conn.commit()
 
 
+# Canonical JobQoS seed rows.  Authoritative mapping of priority-class
+# name to charge multiplier; consumed by _ensure_qos_seed_rows() and by
+# bin/update_jobs_db.py during backfill.
+JOB_QOS_SEED = [
+    ("premium",   1.5, True),
+    ("regular",   1.0, True),
+    ("economy",   0.7, True),
+    ("jhublogin", 0.0, True),
+]
+
+
+def _ensure_qos_seed_rows(engine) -> None:
+    """Seed canonical JobQoS rows.  Idempotent on both PostgreSQL and SQLite."""
+    dialect = engine.dialect.name
+    with engine.connect() as conn:
+        if dialect == "postgresql":
+            for name, factor, active in JOB_QOS_SEED:
+                conn.execute(text("""
+                    INSERT INTO job_qos (name, factor, active)
+                    VALUES (:name, :factor, :active)
+                    ON CONFLICT (name) DO NOTHING;
+                """), {"name": name, "factor": factor, "active": active})
+        else:  # SQLite
+            for name, factor, active in JOB_QOS_SEED:
+                conn.execute(text("""
+                    INSERT OR IGNORE INTO job_qos (name, factor, active)
+                    VALUES (:name, :factor, :active);
+                """), {"name": name, "factor": factor, "active": int(active)})
+        conn.commit()
+
+
 def init_db(machine: str | None = None, echo: bool = False):
     """Initialize database(s) by creating all tables.
 
@@ -373,6 +404,7 @@ def init_db(machine: str | None = None, echo: bool = False):
         engine = get_engine(machine, echo=echo)
         Base.metadata.create_all(engine)
         _ensure_db_triggers(engine)
+        _ensure_qos_seed_rows(engine)
         return engine
 
     # Initialize all machines
@@ -383,4 +415,5 @@ def init_db(machine: str | None = None, echo: bool = False):
         engines[m] = get_engine(m, echo=echo)
         Base.metadata.create_all(engines[m])
         _ensure_db_triggers(engines[m])
+        _ensure_qos_seed_rows(engines[m])
     return engines

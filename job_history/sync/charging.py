@@ -24,6 +24,27 @@ SECONDS_PER_HOUR = 3600
 # Registry populated automatically via __init_subclass__
 _REGISTRY: dict[str, type["SystemCharging"]] = {}
 
+# Mapping of raw PBS priority strings → canonical JobQoS row name.
+# Authoritative for resolving _pending_qos_name at sync time; the numeric
+# factors live in the JobQoS table (seeded by _ensure_qos_seed_rows).
+_PRIORITY_TO_QOS_NAME: dict = {
+    "premium": "premium",
+    "economy": "economy",
+    "regular": "regular",
+    "":        "regular",
+    None:      "regular",
+}
+
+# Fallback factors used when a job has no resolved JobQoS row (test
+# fixtures using SimpleNamespace, legacy data pre-migration).  Must match
+# the canonical seed values in session.JOB_QOS_SEED.
+_FALLBACK_QOS_FACTORS: dict = {
+    "premium":   1.5,
+    "regular":   1.0,
+    "economy":   0.7,
+    "jhublogin": 0.0,
+}
+
 
 # ============================================================================
 # Base class
@@ -106,17 +127,37 @@ class SystemCharging(ABC):
         return getattr(job, "memory", None) or 0  # in bytes
 
     @staticmethod
-    def _get_qos_factor(job: "Job") -> float:
-        """Return the QoS multiplier based on job priority or for particular queues."""
-        priority = (getattr(job, "priority", None) or "").lower()
-        queue    = (getattr(job, "queue",   None) or "").lower()
+    def _resolve_qos_name(job) -> str:
+        """Map a job's queue + priority to a canonical JobQoS row name.
+
+        Queue takes precedence (jhublogin short-circuits the priority check),
+        preserving the historical behavior of _get_qos_factor.  Accepts
+        either an ORM Job (or SimpleNamespace) or a raw record dict.
+        """
+        if isinstance(job, dict):
+            queue = (job.get("queue") or "").lower()
+            priority = (job.get("priority") or "").lower()
+        else:
+            queue = (getattr(job, "queue", None) or "").lower()
+            priority = (getattr(job, "priority", None) or "").lower()
         if queue == "jhublogin":
-            return 0.0
-        if priority == "premium":
-            return 1.5
-        if priority == "economy":
-            return 0.7
-        return 1.0  # regular or unset
+            return "jhublogin"
+        return _PRIORITY_TO_QOS_NAME.get(priority, "regular")
+
+    @staticmethod
+    def _get_qos_factor(job: "Job") -> float:
+        """Return the QoS multiplier for *job*.
+
+        Prefers the resolved JobQoS row (job.qos_obj.factor) when present.
+        Falls back to mapping (priority, queue) against the canonical seed
+        factors so SimpleNamespace test fixtures and pre-migration rows
+        without qos_id still produce the right value.
+        """
+        qos_obj = getattr(job, "qos_obj", None)
+        if qos_obj is not None:
+            return qos_obj.factor
+        name = SystemCharging._resolve_qos_name(job)
+        return _FALLBACK_QOS_FACTORS.get(name, 1.0)
 
     @classmethod
     def _get_memory_hours(cls, job: "Job") -> float:

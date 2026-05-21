@@ -19,10 +19,11 @@ The schema uses **foreign key normalization** with **hybrid properties** for fre
 - **users** table: Maps `user_id` → `username` (~3,500 entries)
 - **accounts** table: Maps `account_id` → `account_name` (~1,300 entries)
 - **queues** table: Maps `queue_id` → `queue_name` (~150 entries)
+- **job_qos** table: Maps `qos_id` → (`name`, `factor`) — canonical priority class with its charging multiplier (4 seed rows)
 
-The `user`, `account`, and `queue` attributes are implemented as SQLAlchemy `@hybrid_property` decorators that:
-- Return text values from relationships (e.g., `job.user` → `"alice"`)
-- Accept text assignments via setters (e.g., `job.user = "alice"`)
+The `user`, `account`, `queue`, and `qos` attributes are implemented as SQLAlchemy `@hybrid_property` decorators that:
+- Return text values from relationships (e.g., `job.user` → `"alice"`, `job.qos` → `"premium"`)
+- Accept text assignments via setters (e.g., `job.user = "alice"`, `job.qos = "premium"`)
 - Generate SQL subqueries for filtering (e.g., `Job.user == "alice"`)
 - Maintain 100% backward compatibility with denormalized schema
 
@@ -60,13 +61,15 @@ Core job records with foreign keys to normalized tables.
 | `id` | INTEGER | PK, AUTO | Primary key (handles scheduler ID wrap) |
 | `job_id` | TEXT | YES | Scheduler job ID (e.g., "2712367.desched1") |
 | `short_id` | INTEGER | YES | Base job number (array index stripped) |
-| `priority` | TEXT | NO | Job priority (e.g., premium, regular, economy) |
+| `priority` | TEXT | NO | Raw PBS priority string (e.g., premium, regular, economy) — see `qos` below for the normalized form |
 | `user` | HYBRID | - | Username (hybrid property → user_obj.username) |
 | `account` | HYBRID | - | Account name (hybrid property → account_obj.account_name) |
 | `queue` | HYBRID | - | Queue name (hybrid property → queue_obj.queue_name) |
+| `qos` | HYBRID | - | Canonical QoS name (hybrid property → qos_obj.name) |
 | `user_id` | INTEGER | FK, YES | → users.id |
 | `account_id` | INTEGER | FK, YES | → accounts.id |
 | `queue_id` | INTEGER | FK, YES | → queues.id |
+| `qos_id` | INTEGER | FK, YES | → job_qos.id (resolved at sync time from `priority` + `queue`) |
 | `name` | TEXT | NO | Job name |
 | `status` | TEXT | YES | Completion status |
 | `submit` | DATETIME | YES | Submission time (naive UTC — see note below) |
@@ -116,6 +119,28 @@ Normalized lookup tables for efficient joins.
 - `id` (INTEGER, PK, AUTO)
 - `queue_name` (TEXT, UNIQUE, INDEXED)
 
+### job_qos
+
+Canonical QoS / priority-class lookup — single source of truth for the
+priority → factor mapping.  Seeded by `_ensure_qos_seed_rows()` (called
+from `init_db()` and `bin/update_jobs_db.py`).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER | PK, AUTO |
+| `name` | TEXT | UNIQUE, INDEXED — canonical class name |
+| `factor` | FLOAT | Charging multiplier |
+| `active` | BOOLEAN | When `false`, no new jobs should be assigned this row (existing FKs preserved) |
+
+**Seed rows:** `premium=1.5`, `regular=1.0`, `economy=0.7`, `jhublogin=0.0`.
+
+QoS resolution happens at sync time in `_insert_batch()` via
+`SystemCharging._resolve_qos_name(record)`, which gives `queue=jhublogin`
+precedence over the priority string.  The resolved `JobQoS.factor` is
+copied into `job_charges.qos_factor` at sync time as a materialized
+cache so `daily_summary` SQL can compute weighted charges via a simple
+column multiply without a join.
+
 ### job_charges
 
 Materialized charging calculations — **1:1 with jobs**, enforced by DB trigger.
@@ -142,6 +167,10 @@ Materialized charging calculations — **1:1 with jobs**, enforced by DB trigger
 | regular / unset | 1.0 |
 | `economy` | 0.7 |
 | `jhublogin` | 0.0 (free) |
+
+These values are seeded into the `job_qos` lookup table by `init_db()`;
+`job_charges.qos_factor` is a materialized copy refreshed at sync time
+from the resolved `JobQoS.factor` for each job's `qos_id`.
 
 **Charging rules** (implemented in `sync/charging.py`):
 

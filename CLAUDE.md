@@ -59,8 +59,9 @@ fs-scans-analyze        # → fs-scans analyze
 ## job_history Architecture
 
 ### Schema key points
-- `jobs` table: normalized FKs (`user_id`, `account_id`, `queue_id`) to lookup tables
-- `user`, `account`, `queue` are **`@hybrid_property`** — look like text columns to app code but use integer FK joins
+- `jobs` table: normalized FKs (`user_id`, `account_id`, `queue_id`, `qos_id`) to lookup tables
+- `user`, `account`, `queue`, `qos` are **`@hybrid_property`** — look like text columns to app code but use integer FK joins
+- `job_qos`: canonical priority-class lookup (`name`, `factor`, `active`) seeded by `_ensure_qos_seed_rows()`; resolved at sync time via `SystemCharging._resolve_qos_name()` (queue=jhublogin overrides the priority string)
 - **Timestamps are naive UTC** — Unix epoch → UTC then `tzinfo=None` stripped before storage.
   psycopg2 converts tz-aware datetimes to the PG server's local timezone when writing to
   `TIMESTAMP WITHOUT TIME ZONE`; naive values bypass that conversion and are portable across
