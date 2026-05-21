@@ -24,19 +24,19 @@ def search_jobs(in_memory_session):
     jobs = [
         Job(
             job_id="100.desched1", short_id=100, name="alice-1",
-            user="alice", account="NCAR0001", queue="main", status="F",
+            user="alice", account="NCAR0001", queue="main", qos="premium", status="F",
             submit=base, start=base, end=base + timedelta(hours=1),
             elapsed=3600, numcpus=128, numgpus=0, numnodes=1, walltime=7200,
         ),
         Job(
             job_id="101.desched1", short_id=101, name="alice-2",
-            user="alice", account="NCAR0001", queue="main", status="F",
+            user="alice", account="NCAR0001", queue="main", qos="economy", status="F",
             submit=base, start=base, end=base + timedelta(days=1, hours=1),
             elapsed=7200, numcpus=256, numgpus=0, numnodes=2, walltime=14400,
         ),
         Job(
             job_id="102.desched1", short_id=102, name="bob-1",
-            user="bob", account="NCAR0002", queue="gpudev", status="F",
+            user="bob", account="NCAR0002", queue="gpudev", qos="regular", status="F",
             submit=base, start=base, end=base + timedelta(days=2, hours=1),
             elapsed=3600, numcpus=64, numgpus=4, numnodes=1, walltime=7200,
         ),
@@ -118,6 +118,19 @@ class TestJobsSearchFilters:
     def test_queue_filter(self, in_memory_session, search_jobs):
         rows = JobQueries(in_memory_session).jobs_search(queue="gpudev")
         assert [r["job_id"] for r in rows] == ["102.desched1"]
+
+    def test_qos_filter(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(qos="premium")
+        assert [r["job_id"] for r in rows] == ["100.desched1"]
+
+    def test_qos_filter_no_match(self, in_memory_session, search_jobs):
+        # 'jhublogin' is a real seed value but no fixture job uses it.
+        rows = JobQueries(in_memory_session).jobs_search(qos="jhublogin")
+        assert rows == []
+
+    def test_qos_filter_combined_with_user(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(user="alice", qos="economy")
+        assert [r["job_id"] for r in rows] == ["101.desched1"]
 
     def test_combined_filters(self, in_memory_session, search_jobs):
         rows = JobQueries(in_memory_session).jobs_search(
@@ -460,6 +473,10 @@ class TestJobsCount:
         assert q.jobs_count(account="NCAR0002") == 1
         assert q.jobs_count(has_gpus=True) == 1
         assert q.jobs_count(has_gpus=False) == 2
+        assert q.jobs_count(qos="premium") == 1
+        assert q.jobs_count(qos="economy") == 1
+        assert q.jobs_count(qos="regular") == 1
+        assert q.jobs_count(qos="jhublogin") == 0
 
     def test_count_accepts_account_sequence(self, in_memory_session, search_jobs):
         q = JobQueries(in_memory_session)

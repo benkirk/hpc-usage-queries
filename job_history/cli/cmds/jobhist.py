@@ -205,6 +205,8 @@ def daily_summary(jh_ctx: Context):
 @click.option("--project", "account", default=None,
               help="Filter by project (account) code.")
 @click.option("--queue", default=None, help="Filter by queue name.")
+@click.option("--qos", default=None,
+              help="Filter by QoS / priority class name (e.g. premium, regular, economy, jhublogin).")
 @click.option("--status", default=None,
               help="Filter by job status (e.g. 'F' for finished).")
 @click.option("-v", "--verbose", is_flag=True, default=False,
@@ -215,7 +217,7 @@ def daily_summary(jh_ctx: Context):
               help="Truncate results to at most N rows (SQL LIMIT, server-side).")
 @click.pass_obj
 def search(jh_ctx: Context, start_date, end_date, machine,
-           user, account, queue, status, verbose, display, limit):
+           user, account, queue, qos, status, verbose, display, limit):
     """List individual job records matching the filters."""
     jh_ctx.start_date = start_date
     jh_ctx.end_date = end_date
@@ -225,7 +227,7 @@ def search(jh_ctx: Context, start_date, end_date, machine,
     from job_history.database import get_session
     jh_ctx.session = get_session(machine)
     code = SearchCommand(jh_ctx).execute(
-        user=user, account=account, queue=queue, status=status,
+        user=user, account=account, queue=queue, qos=qos, status=status,
         verbose=verbose, display=display, limit=limit,
     )
     _close_session(jh_ctx)
