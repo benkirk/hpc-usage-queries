@@ -66,7 +66,22 @@ spec:
   postgresql:
     parameters:
       # Connection settings
-      max_connections: "100"
+      # max_connections raised from 100 → 200 to give headroom for additional
+      # consumers (SAM webapp pods, hpc-usage-queries ETL cron, ad-hoc CLI
+      # users). At 64Gi memory limit and ~10 MiB per backend slot the extra
+      # 100 slots cost ~1Gi, well within budget.
+      max_connections: "200"
+      # Disconnect idle client sessions after 10 minutes. Postgres 14+
+      # feature. SQLAlchemy clients with `pool_pre_ping=True` detect the
+      # closed socket on next checkout and transparently open a fresh
+      # connection — so this is the server-side counterpart to client-side
+      # pool_recycle, and it works even when clients never check out a
+      # pooled connection again (which is how idle pool_size connections
+      # accumulate indefinitely otherwise). Value is milliseconds.
+      idle_session_timeout: "600000"
+      # Also abort transactions left idle for >10 min — protects against
+      # client crashes / hung sessions that hold locks.
+      idle_in_transaction_session_timeout: "600000"
 
       # SSL Configuration
       ssl_ciphers: "HIGH:!aNULL"
