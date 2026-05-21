@@ -121,4 +121,25 @@ Add a `qos` column to `job_history/cli/search/columns.py` (~line 36) showing `jo
 4. **Sync round-trip**: `jobhist sync --machine casper --upsert` over a recent day; confirm new jobs have `qos_id` populated and `job_charges.qos_factor == job_qos.factor` for the resolved row.
 5. **Summary invariance**: run `jobhist sync --resummarize` and confirm `daily_summary.cpu_charges` totals are unchanged vs. a pre-migration snapshot — proves the materialized `qos_factor` cache stayed correct.
 6. **Idempotency**: re-run `bin/update_jobs_db.py casper derecho`; output reports all changes as "already exists" and the backfill UPDATE affects zero rows.
-7. **jhublogin sanity**: pick a jhublogin job: assert `job.qos == "jhublogin"`, `job.qos_obj.factor == 0.0`, `JobCharge.qos_factor == 0.0` regardless of `job.priority`.
+7. **jhublogin sanity**: pick a jhublogin job: assert `job.qos == "uncharged"`, `job.qos_obj.factor == 0.0`, `JobCharge.qos_factor == 0.0` regardless of `job.priority`.
+
+---
+
+## Post-design amendments (pre-merge)
+
+These tweaks were applied to the as-built code after the initial design above:
+
+1. **`jhublogin` QoS row → general `uncharged` QoS.** Renamed the
+   canonical row from `jhublogin` to `uncharged` (factor still `0.0`),
+   and introduced `_QUEUE_TO_QOS_NAME = {"jhublogin": "uncharged"}` in
+   `sync/charging.py`. The queue named `jhublogin` continues to bypass
+   priority-based charging via the same precedence path, but routing
+   another non-chargeable queue is now a one-line dict edit instead of
+   a code branch. `_rename_jhublogin_to_uncharged()` (in
+   `database/session.py`) is wired into `init_db()` and
+   `bin/update_jobs_db.py` so existing dev/prod DBs with a `jhublogin`
+   QoS row get renamed in place — `jobs.qos_id` FK references are
+   preserved.
+2. **New `special` QoS** (factor `1.0`, active). Recognized as a
+   priority string (`_PRIORITY_TO_QOS_NAME`) and as a backfill
+   target. Seed list in `JOB_QOS_SEED` is now five rows.

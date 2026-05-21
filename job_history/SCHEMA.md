@@ -132,14 +132,19 @@ from `init_db()` and `bin/update_jobs_db.py`).
 | `factor` | FLOAT | Charging multiplier |
 | `active` | BOOLEAN | When `false`, no new jobs should be assigned this row (existing FKs preserved) |
 
-**Seed rows:** `premium=1.5`, `regular=1.0`, `economy=0.7`, `jhublogin=0.0`.
+**Seed rows:** `premium=1.5`, `regular=1.0`, `economy=0.7`, `uncharged=0.0`,
+`special=1.0`.
 
 QoS resolution happens at sync time in `_insert_batch()` via
-`SystemCharging._resolve_qos_name(record)`, which gives `queue=jhublogin`
-precedence over the priority string.  The resolved `JobQoS.factor` is
-copied into `job_charges.qos_factor` at sync time as a materialized
-cache so `daily_summary` SQL can compute weighted charges via a simple
-column multiply without a join.
+`SystemCharging._resolve_qos_name(record)`.  Queue takes precedence over
+priority: any queue listed in `_QUEUE_TO_QOS_NAME` (currently
+`jhublogin → uncharged`) short-circuits the priority check.  Add another
+non-chargeable or specially-rated queue with a one-line edit to that
+dict — no schema change required.
+
+The resolved `JobQoS.factor` is copied into `job_charges.qos_factor` at
+sync time as a materialized cache so `daily_summary` SQL can compute
+weighted charges via a simple column multiply without a join.
 
 ### job_charges
 
@@ -165,8 +170,9 @@ Materialized charging calculations — **1:1 with jobs**, enforced by DB trigger
 |---|---|
 | `premium` | 1.5 |
 | regular / unset | 1.0 |
+| `special` | 1.0 |
 | `economy` | 0.7 |
-| `jhublogin` | 0.0 (free) |
+| `uncharged` (e.g. `jhublogin` queue) | 0.0 (free) |
 
 These values are seeded into the `job_qos` lookup table by `init_db()`;
 `job_charges.qos_factor` is a materialized copy refreshed at sync time

@@ -31,8 +31,16 @@ _PRIORITY_TO_QOS_NAME: dict = {
     "premium": "premium",
     "economy": "economy",
     "regular": "regular",
+    "special": "special",
     "":        "regular",
     None:      "regular",
+}
+
+# Queues that bypass priority-based charging and map directly to a specific
+# JobQoS row.  Extend this dict (no other code changes required) to route a
+# new queue to an uncharged / specially-rated QoS.
+_QUEUE_TO_QOS_NAME: dict = {
+    "jhublogin": "uncharged",
 }
 
 # Fallback factors used when a job has no resolved JobQoS row (test
@@ -42,7 +50,8 @@ _FALLBACK_QOS_FACTORS: dict = {
     "premium":   1.5,
     "regular":   1.0,
     "economy":   0.7,
-    "jhublogin": 0.0,
+    "uncharged": 0.0,
+    "special":   1.0,
 }
 
 
@@ -130,9 +139,10 @@ class SystemCharging(ABC):
     def _resolve_qos_name(job) -> str:
         """Map a job's queue + priority to a canonical JobQoS row name.
 
-        Queue takes precedence (jhublogin short-circuits the priority check),
-        preserving the historical behavior of _get_qos_factor.  Accepts
-        either an ORM Job (or SimpleNamespace) or a raw record dict.
+        Queue takes precedence: any queue listed in _QUEUE_TO_QOS_NAME
+        short-circuits the priority check (preserves the historical
+        jhublogin → uncharged behavior).  Accepts either an ORM Job
+        (or SimpleNamespace) or a raw record dict.
         """
         if isinstance(job, dict):
             queue = (job.get("queue") or "").lower()
@@ -140,8 +150,8 @@ class SystemCharging(ABC):
         else:
             queue = (getattr(job, "queue", None) or "").lower()
             priority = (getattr(job, "priority", None) or "").lower()
-        if queue == "jhublogin":
-            return "jhublogin"
+        if queue in _QUEUE_TO_QOS_NAME:
+            return _QUEUE_TO_QOS_NAME[queue]
         return _PRIORITY_TO_QOS_NAME.get(priority, "regular")
 
     @staticmethod

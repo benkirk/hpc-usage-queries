@@ -206,7 +206,7 @@ def daily_summary(jh_ctx: Context):
               help="Filter by project (account) code.")
 @click.option("--queue", default=None, help="Filter by queue name.")
 @click.option("--qos", default=None,
-              help="Filter by QoS / priority class name (e.g. premium, regular, economy, jhublogin).")
+              help="Filter by QoS / priority class name (e.g. premium, regular, economy, special, uncharged).")
 @click.option("--status", default=None,
               help="Filter by job status (e.g. 'F' for finished).")
 @click.option("-v", "--verbose", is_flag=True, default=False,

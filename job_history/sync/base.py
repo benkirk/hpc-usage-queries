@@ -708,7 +708,7 @@ class SyncBase(ABC):
                 continue
 
             # Re-resolve qos_id from the fresh (priority, queue) values so
-            # upserts pick up any priority changes (e.g. jhublogin
+            # upserts pick up any priority changes (e.g. an uncharged-queue
             # re-classification or premium/economy corrections).
             if 'qos_id' not in r:
                 qos_name = SystemCharging._resolve_qos_name(r)

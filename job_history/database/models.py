@@ -47,9 +47,9 @@ class JobQoS(Base):
     """Normalized QoS / priority-class lookup table.
 
     Each row encodes a charging multiplier (e.g. premium=1.5, regular=1.0,
-    economy=0.7, jhublogin=0.0).  The canonical rows are seeded by init_db()
-    via _ensure_qos_seed_rows(); JobCharge.qos_factor remains the
-    materialized per-job multiplier used by daily_summary SQL.
+    economy=0.7, uncharged=0.0, special=1.0).  The canonical rows are seeded
+    by init_db() via _ensure_qos_seed_rows(); JobCharge.qos_factor remains
+    the materialized per-job multiplier used by daily_summary SQL.
     """
     __tablename__ = "job_qos"
     id = Column(Integer, primary_key=True, autoincrement=True)

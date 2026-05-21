@@ -1095,7 +1095,7 @@ class JobQueries:
             queue: Optional queue filter (text; resolved via FK hybrid)
             qos: Optional QoS / priority-class filter (text; resolved via FK
                 hybrid against the ``job_qos`` lookup — e.g. ``"premium"``,
-                ``"regular"``, ``"economy"``, ``"jhublogin"``).
+                ``"regular"``, ``"economy"``, ``"special"``, ``"uncharged"``).
             status: Optional job-status filter (e.g. 'F' for finished)
             has_gpus: ``None`` ignore; ``True`` → ``Job.numgpus > 0`` (GPU jobs
                 only); ``False`` → ``numgpus == 0`` (CPU-only jobs).

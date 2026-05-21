@@ -124,8 +124,8 @@ class TestJobsSearchFilters:
         assert [r["job_id"] for r in rows] == ["100.desched1"]
 
     def test_qos_filter_no_match(self, in_memory_session, search_jobs):
-        # 'jhublogin' is a real seed value but no fixture job uses it.
-        rows = JobQueries(in_memory_session).jobs_search(qos="jhublogin")
+        # 'uncharged' is a real seed value but no fixture job uses it.
+        rows = JobQueries(in_memory_session).jobs_search(qos="uncharged")
         assert rows == []
 
     def test_qos_filter_combined_with_user(self, in_memory_session, search_jobs):
@@ -476,7 +476,7 @@ class TestJobsCount:
         assert q.jobs_count(qos="premium") == 1
         assert q.jobs_count(qos="economy") == 1
         assert q.jobs_count(qos="regular") == 1
-        assert q.jobs_count(qos="jhublogin") == 0
+        assert q.jobs_count(qos="uncharged") == 0
 
     def test_count_accepts_account_sequence(self, in_memory_session, search_jobs):
         q = JobQueries(in_memory_session)
