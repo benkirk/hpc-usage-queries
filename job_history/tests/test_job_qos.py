@@ -506,3 +506,37 @@ class TestRenameJhubloginToUncharged:
         """Running the rename twice is a no-op on the second invocation."""
         _rename_jhublogin_to_uncharged(seeded_engine)
         _rename_jhublogin_to_uncharged(seeded_engine)
+
+
+# ---------------------------------------------------------------------------
+# JobQueries.list_qos_names
+# ---------------------------------------------------------------------------
+
+class TestListQoSNames:
+    """``JobQueries.list_qos_names`` lets a consumer (e.g. SAM webapp) populate
+    a QoS filter dropdown without hardcoding the seed list."""
+
+    def test_returns_seeded_names_alphabetical(self, seeded_session):
+        from job_history.queries.jobs import JobQueries
+        names = JobQueries(seeded_session).list_qos_names()
+        assert names == ["economy", "premium", "regular", "special", "uncharged"]
+
+    def test_excludes_inactive_by_default(self, seeded_session):
+        from job_history.queries.jobs import JobQueries
+        seeded_session.execute(text(
+            "UPDATE job_qos SET active = 0 WHERE name = 'economy'"
+        ))
+        seeded_session.commit()
+        names = JobQueries(seeded_session).list_qos_names()
+        assert "economy" not in names
+        assert names == ["premium", "regular", "special", "uncharged"]
+
+    def test_active_only_false_includes_inactive(self, seeded_session):
+        from job_history.queries.jobs import JobQueries
+        seeded_session.execute(text(
+            "UPDATE job_qos SET active = 0 WHERE name = 'economy'"
+        ))
+        seeded_session.commit()
+        names = JobQueries(seeded_session).list_qos_names(active_only=False)
+        assert "economy" in names
+        assert len(names) == 5

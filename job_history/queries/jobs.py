@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
 
-from ..database import Job, DailySummary, JobCharge
+from ..database import Job, DailySummary, JobCharge, JobQoS
 from ..database.config import JobHistoryConfig
 
 
@@ -1191,6 +1191,24 @@ class JobQueries:
             queue=queue, qos=qos, status=status, has_gpus=has_gpus,
         )
         return int(query.scalar() or 0)
+
+    def list_qos_names(self, *, active_only: bool = True) -> List[str]:
+        """Return JobQoS names from the lookup table, alphabetically ordered.
+
+        Lets a UI populate a QoS filter dropdown without hardcoding the
+        canonical seed list (``premium`` / ``regular`` / ``economy`` /
+        ``uncharged`` / ``special``) — the lookup table is the source of
+        truth, so a future addition shows up automatically.
+
+        Args:
+            active_only: If True (default), restrict to rows with
+                ``active = True``. Set False to include retired QoS names
+                still referenced by historical jobs.
+        """
+        query = self.session.query(JobQoS.name)
+        if active_only:
+            query = query.filter(JobQoS.active.is_(True))
+        return [name for (name,) in query.order_by(JobQoS.name).all()]
 
     def _apply_jobs_search_filters(
         self, query, *, start, end, user, account, queue, qos, status, has_gpus,
