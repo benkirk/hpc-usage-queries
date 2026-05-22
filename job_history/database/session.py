@@ -352,6 +352,74 @@ def _ensure_db_triggers(engine) -> None:
         conn.commit()
 
 
+# Canonical JobQoS seed rows.  Authoritative mapping of priority-class
+# name to charge multiplier; consumed by _ensure_qos_seed_rows() and by
+# bin/update_jobs_db.py during backfill.
+JOB_QOS_SEED = [
+    ("premium",   1.5, True),
+    ("regular",   1.0, True),
+    ("economy",   0.7, True),
+    ("uncharged", 0.0, True),
+    ("special",   1.0, True),
+]
+
+
+def _rename_jhublogin_to_uncharged(engine) -> None:
+    """One-time migration: rename legacy 'jhublogin' JobQoS row to 'uncharged'.
+
+    Preserves jobs.qos_id FK references that already point at the legacy row.
+    Idempotent: no-op when 'jhublogin' is absent. If both rows already exist
+    (unexpected, but possible after partial migrations), re-points jobs.qos_id
+    at 'uncharged' and deletes the orphaned 'jhublogin' row.
+    """
+    from sqlalchemy import inspect as _inspect
+
+    inspector = _inspect(engine)
+    if "job_qos" not in inspector.get_table_names():
+        return
+
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            "SELECT name, id FROM job_qos WHERE name IN ('jhublogin', 'uncharged')"
+        )).all()
+        by_name = {name: qid for name, qid in rows}
+        if "jhublogin" not in by_name:
+            return
+        jhub_id = by_name["jhublogin"]
+        if "uncharged" not in by_name:
+            conn.execute(text(
+                "UPDATE job_qos SET name = 'uncharged' WHERE id = :jid"
+            ), {"jid": jhub_id})
+            return
+        # Both rows exist — re-point any FK references then drop the legacy row.
+        unc_id = by_name["uncharged"]
+        if "jobs" in inspector.get_table_names():
+            conn.execute(text(
+                "UPDATE jobs SET qos_id = :unc WHERE qos_id = :jhub"
+            ), {"unc": unc_id, "jhub": jhub_id})
+        conn.execute(text("DELETE FROM job_qos WHERE id = :jid"), {"jid": jhub_id})
+
+
+def _ensure_qos_seed_rows(engine) -> None:
+    """Seed canonical JobQoS rows.  Idempotent on both PostgreSQL and SQLite."""
+    dialect = engine.dialect.name
+    with engine.connect() as conn:
+        if dialect == "postgresql":
+            for name, factor, active in JOB_QOS_SEED:
+                conn.execute(text("""
+                    INSERT INTO job_qos (name, factor, active)
+                    VALUES (:name, :factor, :active)
+                    ON CONFLICT (name) DO NOTHING;
+                """), {"name": name, "factor": factor, "active": active})
+        else:  # SQLite
+            for name, factor, active in JOB_QOS_SEED:
+                conn.execute(text("""
+                    INSERT OR IGNORE INTO job_qos (name, factor, active)
+                    VALUES (:name, :factor, :active);
+                """), {"name": name, "factor": factor, "active": int(active)})
+        conn.commit()
+
+
 def init_db(machine: str | None = None, echo: bool = False):
     """Initialize database(s) by creating all tables.
 
@@ -373,6 +441,8 @@ def init_db(machine: str | None = None, echo: bool = False):
         engine = get_engine(machine, echo=echo)
         Base.metadata.create_all(engine)
         _ensure_db_triggers(engine)
+        _rename_jhublogin_to_uncharged(engine)
+        _ensure_qos_seed_rows(engine)
         return engine
 
     # Initialize all machines
@@ -383,4 +453,6 @@ def init_db(machine: str | None = None, echo: bool = False):
         engines[m] = get_engine(m, echo=echo)
         Base.metadata.create_all(engines[m])
         _ensure_db_triggers(engines[m])
+        _rename_jhublogin_to_uncharged(engines[m])
+        _ensure_qos_seed_rows(engines[m])
     return engines

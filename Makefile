@@ -20,9 +20,14 @@ DATE ?= $(shell date +%Y-%m-%d)
 # Root of locally-mirrored PBS accounting logs (see sync-logs target)
 LOG_DIR ?= ./data/sample_pbs_logs
 
+MACHINES       := casper derecho
+SYNC_TARGETS   := $(addprefix sync-,$(MACHINES))
+UPSERT_TARGETS := $(addprefix upsert-,$(MACHINES))
+
 .PHONY: clean docker-build docker-down docker-restart docker-up \
         dry-run-all dry-run-casper dry-run-derecho \
-        help init-db sync-all sync-casper sync-derecho sync-logs \
+        help init-db sync-all sync-logs upsert-all \
+        $(SYNC_TARGETS) $(UPSERT_TARGETS) \
         test-import update-vendor
 
 help: ## Show this help message
@@ -36,6 +41,8 @@ help: ## Show this help message
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[32m%-22s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo -e "\033[1mPattern rules:\033[0m"
+	@echo -e "  \033[32mmake sync-<m>\033[0m          Sync   <m> (casper|derecho) for DATE / range"
+	@echo -e "  \033[32mmake upsert-<m>\033[0m        Upsert <m> (casper|derecho) for DATE / range"
 	@echo -e "  \033[32mmake <name>\033[0m            Create conda environment from <name>.yaml"
 	@echo -e "  \033[32mmake solve-<name>\033[0m      Dry-run solve for <name>.yaml (no install)"
 	@echo ""
@@ -56,21 +63,31 @@ init-db: ## Create database tables (both machines)
 	@echo "Created $(JOB_HISTORY_DATA_DIR)/casper.db"
 	@echo "Created $(JOB_HISTORY_DATA_DIR)/derecho.db"
 
-sync-casper: ## Sync Casper jobs for DATE (or START..END range)
+# Per-mode flags for the shared sync recipe (target-specific variables).
+# RANGE_FLAG applies in START..END mode; DATE_FLAG applies in single-DATE mode.
+$(SYNC_TARGETS):   RANGE_FLAG :=
+$(SYNC_TARGETS):   DATE_FLAG  := --incremental
+$(UPSERT_TARGETS): RANGE_FLAG := --upsert
+$(UPSERT_TARGETS): DATE_FLAG  := --upsert
+
+# Static pattern rules: sync-<machine> and upsert-<machine> for every machine
+# in $(MACHINES). To add another machine, extend $(MACHINES) — nothing else.
+$(SYNC_TARGETS): sync-%:
 ifdef START
-	jobhist sync -m casper -l $(LOG_DIR)/casper --start $(START) $(if $(END),--end $(END)) -v #--upsert
+	jobhist sync -m $* -l $(LOG_DIR)/$* --start $(START) $(if $(END),--end $(END)) -v $(RANGE_FLAG)
 else
-	jobhist sync -m casper -l $(LOG_DIR)/casper -d $(DATE) -v --incremental
+	jobhist sync -m $* -l $(LOG_DIR)/$* -d $(DATE) -v $(DATE_FLAG)
 endif
 
-sync-derecho: ## Sync Derecho jobs for DATE (or START..END range)
+$(UPSERT_TARGETS): upsert-%:
 ifdef START
-	jobhist sync -m derecho -l $(LOG_DIR)/derecho --start $(START) $(if $(END),--end $(END)) -v #--upsert
+	jobhist sync -m $* -l $(LOG_DIR)/$* --start $(START) $(if $(END),--end $(END)) -v $(RANGE_FLAG)
 else
-	jobhist sync -m derecho -l $(LOG_DIR)/derecho -d $(DATE) -v --incremental
+	jobhist sync -m $* -l $(LOG_DIR)/$* -d $(DATE) -v $(DATE_FLAG)
 endif
 
-sync-all: sync-casper sync-derecho ## Sync both machines for DATE (or range)
+sync-all:   $(SYNC_TARGETS)   ## Sync   both machines for DATE (or START..END range)
+upsert-all: $(UPSERT_TARGETS) ## Upsert both machines for DATE (or START..END range)
 
 clean: ## Remove all database files
 	@echo "Removing databases..."

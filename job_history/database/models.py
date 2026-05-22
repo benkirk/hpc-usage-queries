@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, Text, UniqueConstraint, select
+from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, Text, UniqueConstraint, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import declarative_base, declared_attr, relationship
@@ -43,6 +43,24 @@ class Queue(Base):
         return f"<Queue(id={self.id}, queue_name='{self.queue_name}')>"
 
 
+class JobQoS(Base):
+    """Normalized QoS / priority-class lookup table.
+
+    Each row encodes a charging multiplier (e.g. premium=1.5, regular=1.0,
+    economy=0.7, uncharged=0.0, special=1.0).  The canonical rows are seeded
+    by init_db() via _ensure_qos_seed_rows(); JobCharge.qos_factor remains
+    the materialized per-job multiplier used by daily_summary SQL.
+    """
+    __tablename__ = "job_qos"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(Text, unique=True, nullable=False, index=True)
+    factor = Column(Float, nullable=False)
+    active = Column(Boolean, nullable=False, default=True)
+
+    def __repr__(self):
+        return f"<JobQoS(id={self.id}, name='{self.name}', factor={self.factor})>"
+
+
 class LookupCache:
     """Session-scoped cache for User/Account/Queue lookup tables.
 
@@ -64,6 +82,7 @@ class LookupCache:
         self._users = {u.username: u for u in session.query(User).all()}
         self._accounts = {a.account_name: a for a in session.query(Account).all()}
         self._queues = {q.queue_name: q for q in session.query(Queue).all()}
+        self._qos = {q.name: q for q in session.query(JobQoS).all()}
 
     def get_or_create_user(self, username):
         if username not in self._users:
@@ -82,6 +101,30 @@ class LookupCache:
             obj = self._get_or_create(Queue, "queue_name", queue_name)
             self._queues[queue_name] = obj
         return self._queues[queue_name]
+
+    def get_or_create_qos(self, name, factor=1.0):
+        """Get an existing JobQoS row or create a new one.
+
+        The seed table provides canonical factors for known names; the
+        factor arg is only used when creating a previously unseen row
+        (existing rows keep their stored factor).
+        """
+        if name not in self._qos:
+            obj = self._get_or_create_qos(name, factor)
+            self._qos[name] = obj
+        return self._qos[name]
+
+    def _get_or_create_qos(self, name: str, factor: float):
+        """Savepoint-wrapped INSERT for JobQoS (two-column variant)."""
+        try:
+            with self._session.begin_nested():
+                obj = JobQoS(name=name, factor=factor, active=True)
+                self._session.add(obj)
+                if self._auto_flush:
+                    self._session.flush()
+        except IntegrityError:
+            obj = self._session.query(JobQoS).filter(JobQoS.name == name).one()
+        return obj
 
     def _get_or_create(self, model, field: str, value: str):
         """Insert a lookup row, handling concurrent inserts from other processes.
@@ -158,6 +201,10 @@ class LookupMixin:
     def queue_id(cls):
         return Column(Integer, ForeignKey('queues.id'), index=True)
 
+    @declared_attr
+    def qos_id(cls):
+        return Column(Integer, ForeignKey('job_qos.id'), index=True)
+
     # --- Relationships --------------------------------------------------------
 
     @declared_attr
@@ -171,6 +218,10 @@ class LookupMixin:
     @declared_attr
     def queue_obj(cls):
         return relationship("Queue")
+
+    @declared_attr
+    def qos_obj(cls):
+        return relationship("JobQoS")
 
     # --- user hybrid property -------------------------------------------------
 
@@ -231,6 +282,26 @@ class LookupMixin:
     @queue.expression
     def queue(cls):
         return select(Queue.queue_name).where(Queue.id == cls.queue_id).correlate(cls).scalar_subquery()
+
+    # --- qos hybrid property --------------------------------------------------
+
+    @hybrid_property
+    def qos(self):
+        return self.qos_obj.name if self.qos_obj else self._null_sentinel
+
+    @qos.setter
+    def qos(self, name):
+        if name is None or name == self._null_sentinel:
+            self.qos_id = None
+            self.qos_obj = None
+            self._pending_qos_name = None
+            return
+        # Store for deferred FK resolution in before_flush listener
+        self._pending_qos_name = name
+
+    @qos.expression
+    def qos(cls):
+        return select(JobQoS.name).where(JobQoS.id == cls.qos_id).correlate(cls).scalar_subquery()
 
 
 class Job(LookupMixin, Base):
@@ -315,6 +386,7 @@ class Job(LookupMixin, Base):
         result['user'] = self.user
         result['account'] = self.account
         result['queue'] = self.queue
+        result['qos'] = self.qos
         return result
 
     def calculate_charges(self, machine: str) -> dict:
@@ -534,3 +606,7 @@ def ensure_lookup_tables_before_flush(session, flush_context, instances):
             if hasattr(obj, '_pending_queue_name') and obj._pending_queue_name:
                 obj.queue_obj = cache.get_or_create_queue(obj._pending_queue_name)
                 del obj._pending_queue_name
+
+            if hasattr(obj, '_pending_qos_name') and obj._pending_qos_name:
+                obj.qos_obj = cache.get_or_create_qos(obj._pending_qos_name)
+                del obj._pending_qos_name

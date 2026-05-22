@@ -34,6 +34,7 @@ UPDATABLE_JOB_FIELDS = frozenset({
     "reqmem", "memory", "vmemory",                               # memory
     "cputype", "gputype",                                        # type inference
     "resources", "ptargets", "priority", "status", "name",
+    "qos_id",                                                    # normalized QoS FK
 })
 
 
@@ -312,7 +313,8 @@ class SyncBase(ABC):
         if not records:
             return {"inserted": 0, "updated": 0}
 
-        # Resolve foreign keys (user/account/queue → IDs)
+        # Resolve foreign keys (user/account/queue/qos → IDs)
+        from .charging import SystemCharging
         prepared = []
         for r in records:
             rec = r.copy()
@@ -322,6 +324,11 @@ class SyncBase(ABC):
                 rec['account_id'] = self.cache.get_or_create_account(rec['account']).id
             if rec.get('queue'):
                 rec['queue_id'] = self.cache.get_or_create_queue(rec['queue']).id
+            # QoS depends on both priority and queue; resolve here where both
+            # are merged into the record, then assign the FK from the cache.
+            qos_name = SystemCharging._resolve_qos_name(rec)
+            rec['qos'] = qos_name
+            rec['qos_id'] = self.cache.get_or_create_qos(qos_name).id
             prepared.append(rec)
 
         # Detect duplicates: check (job_id, submit) pairs already in the DB
@@ -688,6 +695,8 @@ class SyncBase(ABC):
             key = (job.job_id, normalize_datetime_to_naive(job.submit))
             job_lookup[key] = job
 
+        from .charging import SystemCharging
+
         update_mappings = []
         db_ids = []
         raw_record_map: dict = {}
@@ -697,6 +706,13 @@ class SyncBase(ABC):
             existing_job = job_lookup.get(key)
             if existing_job is None:
                 continue
+
+            # Re-resolve qos_id from the fresh (priority, queue) values so
+            # upserts pick up any priority changes (e.g. an uncharged-queue
+            # re-classification or premium/economy corrections).
+            if 'qos_id' not in r:
+                qos_name = SystemCharging._resolve_qos_name(r)
+                r['qos_id'] = self.cache.get_or_create_qos(qos_name).id
 
             mapping = {'id': existing_job.id}
             for field in UPDATABLE_JOB_FIELDS:

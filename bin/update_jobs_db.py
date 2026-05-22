@@ -11,16 +11,25 @@ your .env file — no manual configuration needed here.
 """
 import sys
 from sqlalchemy import inspect, text
-from job_history.database.session import get_engine, VALID_MACHINES
+from job_history.database.models import Base
+from job_history.database.session import (
+    _ensure_db_triggers,
+    _ensure_qos_seed_rows,
+    _rename_jhublogin_to_uncharged,
+    get_engine,
+    VALID_MACHINES,
+)
 
 # ── Columns to ADD ──────────────────────────────────────────────────────────
 # Each entry: (table, column, SQL type + default)
 ADD_COLUMNS = [
     ("job_charges",   "qos_factor",      "REAL DEFAULT 1.0"),
     ("jobs",          "priority",        "TEXT"),
+    ("jobs",          "qos_id",          "INTEGER"),
     ("daily_summary", "cpu_charges",     "REAL DEFAULT 0"),
     ("daily_summary", "gpu_charges",     "REAL DEFAULT 0"),
     ("daily_summary", "memory_charges",  "REAL DEFAULT 0"),
+    ("daily_summary", "qos_id",          "INTEGER"),
 ]
 
 # ── Columns to DROP ─────────────────────────────────────────────────────────
@@ -52,15 +61,144 @@ def drop_column_if_exists(conn, inspector, table, column):
         print("  Done.")
 
 
+DEFAULT_BACKFILL_CHUNK_SIZE = 100_000
+
+
+def backfill_qos_id(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
+    """Populate jobs.qos_id from existing priority + queue strings.
+
+    Chunked by primary-key range with per-chunk commit, so the migration:
+      - never holds a write lock on jobs for more than one chunk's duration
+        (concurrent sync jobs interleave between chunks instead of queueing
+        for the full multi-million-row UPDATE),
+      - keeps WAL volume bounded (each commit lets WAL recycle),
+      - is resumable: if interrupted partway, the next run skips chunks that
+        already have the correct qos_id (the IS DISTINCT FROM guard filters
+        them to zero work), then continues with the rest,
+      - emits per-chunk progress so an operator can watch a multi-million-row
+        backfill against production.
+
+    Non-destructive: job_charges.qos_factor values are untouched.  Idempotent:
+    re-running on a fully-backfilled table reports 0 rows updated across all
+    chunks.
+    """
+    dialect = engine.dialect.name
+
+    # Resolve seed-row ids once (cheap autocommit read).
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT name, id FROM job_qos")).all()
+    qos_ids = {name: qid for name, qid in rows}
+    required = {"premium", "regular", "economy", "uncharged", "special"}
+    missing = required - set(qos_ids)
+    if missing:
+        raise RuntimeError(f"Missing JobQoS seed rows: {missing}")
+
+    base_params = {
+        "unc":  qos_ids["uncharged"],
+        "prem": qos_ids["premium"],
+        "spec": qos_ids["special"],
+        "econ": qos_ids["economy"],
+        "reg":  qos_ids["regular"],
+    }
+
+    with engine.connect() as conn:
+        bounds = conn.execute(text("SELECT MIN(id), MAX(id) FROM jobs")).one()
+    lo, hi = bounds[0], bounds[1]
+    if lo is None:
+        print("  jobs table is empty — nothing to backfill.")
+        return
+
+    if dialect == "postgresql":
+        update_sql = text("""
+            UPDATE jobs j
+            SET qos_id = sub.qid
+            FROM (
+                SELECT j2.id,
+                       CASE
+                         WHEN LOWER(COALESCE(q.queue_name, '')) = 'jhublogin' THEN :unc
+                         WHEN LOWER(COALESCE(j2.priority, ''))  = 'premium'   THEN :prem
+                         WHEN LOWER(COALESCE(j2.priority, ''))  = 'special'   THEN :spec
+                         WHEN LOWER(COALESCE(j2.priority, ''))  = 'economy'   THEN :econ
+                         ELSE :reg
+                       END AS qid
+                FROM jobs j2
+                LEFT JOIN queues q ON q.id = j2.queue_id
+                WHERE j2.id >= :lo AND j2.id < :hi
+            ) sub
+            WHERE j.id = sub.id AND j.qos_id IS DISTINCT FROM sub.qid;
+        """)
+    else:  # SQLite
+        update_sql = text("""
+            UPDATE jobs
+            SET qos_id = CASE
+                WHEN LOWER(COALESCE((SELECT queue_name FROM queues q WHERE q.id = jobs.queue_id), '')) = 'jhublogin' THEN :unc
+                WHEN LOWER(COALESCE(jobs.priority, '')) = 'premium' THEN :prem
+                WHEN LOWER(COALESCE(jobs.priority, '')) = 'special' THEN :spec
+                WHEN LOWER(COALESCE(jobs.priority, '')) = 'economy' THEN :econ
+                ELSE :reg
+            END
+            WHERE id >= :lo AND id < :hi
+              AND (qos_id IS NULL OR qos_id != CASE
+                WHEN LOWER(COALESCE((SELECT queue_name FROM queues q WHERE q.id = jobs.queue_id), '')) = 'jhublogin' THEN :unc
+                WHEN LOWER(COALESCE(jobs.priority, '')) = 'premium' THEN :prem
+                WHEN LOWER(COALESCE(jobs.priority, '')) = 'special' THEN :spec
+                WHEN LOWER(COALESCE(jobs.priority, '')) = 'economy' THEN :econ
+                ELSE :reg
+              END);
+        """)
+
+    total_chunks = (hi - lo) // chunk_size + 1
+    print(f"  Backfilling jobs.qos_id in {total_chunks:,} chunk(s) of "
+          f"{chunk_size:,} ids over range [{lo:,}, {hi:,}] …")
+
+    import time
+    start = time.monotonic()
+    total_updated = 0
+    chunk_idx = 0
+    chunk_lo = lo
+    while chunk_lo <= hi:
+        chunk_hi = chunk_lo + chunk_size
+        chunk_idx += 1
+        params = {**base_params, "lo": chunk_lo, "hi": chunk_hi}
+        with engine.begin() as conn:
+            result = conn.execute(update_sql, params)
+        n = result.rowcount or 0
+        total_updated += n
+        # Progress: emit every chunk for small migrations; every 10th for
+        # large ones; always emit the last chunk.
+        is_last = chunk_hi > hi
+        if total_chunks <= 20 or chunk_idx % 10 == 0 or is_last:
+            elapsed = time.monotonic() - start
+            print(f"    chunk {chunk_idx:>5,}/{total_chunks:<5,}  "
+                  f"id [{chunk_lo:>12,}, {chunk_hi:>12,})  "
+                  f"updated {n:>7,}  "
+                  f"(total {total_updated:>10,}  "
+                  f"elapsed {elapsed:6.1f}s)")
+        chunk_lo = chunk_hi
+
+    print(f"  Done. Updated {total_updated:,} jobs.qos_id row(s) total "
+          f"in {time.monotonic() - start:.1f}s.")
+
+
 def migrate(machine):
     print(f"Updating: {machine}")
     engine = get_engine(machine)
+    # Create any missing tables (picks up new job_qos table on existing DBs)
+    Base.metadata.create_all(engine)
+    # Idempotent column adds + drops
     with engine.begin() as conn:
         inspector = inspect(conn)
         for table, col, defn in ADD_COLUMNS:
             add_column_if_missing(conn, inspector, table, col, defn)
         for table, col in DROP_COLUMNS:
             drop_column_if_exists(conn, inspector, table, col)
+    # Migrate legacy 'jhublogin' QoS row to 'uncharged' (idempotent), then
+    # seed canonical QoS rows and re-assert triggers (defensive)
+    _rename_jhublogin_to_uncharged(engine)
+    _ensure_qos_seed_rows(engine)
+    _ensure_db_triggers(engine)
+    # Backfill jobs.qos_id from existing priority + queue strings
+    backfill_qos_id(engine)
     engine.dispose()
     print()
 

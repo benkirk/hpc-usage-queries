@@ -265,7 +265,7 @@ If the underlying query method needs the `--group-by` value as a
 
 **job_charges** — Materialized charging calculations (1:1 with jobs, enforced by DB trigger)
 - Pre-computed: `cpu_hours`, `gpu_hours`, `memory_hours`
-- `qos_factor`: QoS multiplier (1.5 premium, 0.7 economy, 0.0 jhublogin, 1.0 regular)
+- `qos_factor`: QoS multiplier (1.5 premium, 1.0 regular/special, 0.7 economy, 0.0 uncharged)
 - `charge_version`: 0 = trigger placeholder awaiting calculation, 1 = real calculated value
 - DB trigger `trg_ensure_job_charge` inserts a zero placeholder on every job INSERT,
   guaranteeing the 1:1 invariant at the database level regardless of application code path

@@ -21,6 +21,7 @@ COLUMNS: Dict[str, Dict[str, Any]] = {
     "user":           {"header": "User",      "width": 12, "format": "s",   "source": "job.user"},
     "account":        {"header": "Project",   "width": 12, "format": "s",   "source": "job.account"},
     "queue":          {"header": "Queue",     "width": 10, "format": "s",   "source": "job.queue"},
+    "qos":            {"header": "QoS",       "width":  9, "format": "s",   "source": "job.qos"},
     "status":         {"header": "Status",    "width":  8, "format": "s",   "source": "job.status"},
     "numnodes":       {"header": "Nodes",     "width":  6, "format": "d",   "source": "job.numnodes"},
     "numcpus":        {"header": "CPUs",      "width":  6, "format": "d",   "source": "job.numcpus"},
@@ -46,7 +47,7 @@ COLUMNS: Dict[str, Dict[str, Any]] = {
     "gputype":        {"header": "GPU type",  "width": 12, "format": "s",   "source": "job.gputype"},
     "resources":      {"header": "Resources", "width": 30, "format": "s",   "source": "job.resources"},
     "memory_hours":   {"header": "Mem-h",     "width": 10, "format": ".2f", "source": "charge.memory_hours"},
-    "qos_factor":     {"header": "QoS",       "width":  6, "format": ".2f", "source": "charge.qos_factor"},
+    "qos_factor":     {"header": "Factor",    "width":  6, "format": ".2f", "source": "charge.qos_factor"},
     "charge_version": {"header": "Chg ver",   "width":  7, "format": "d",   "source": "charge.charge_version"},
     # Per-job QoS-weighted charges are not stored — computed = hours × qos_factor.
     "cpu_charges":    {"header": "CPU chg",   "width": 10, "format": ".2f", "source": "computed.cpu_charges"},
