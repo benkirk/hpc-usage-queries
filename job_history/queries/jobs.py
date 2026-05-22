@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
 
-from ..database import Job, DailySummary, JobCharge
+from ..database import Job, DailySummary, JobCharge, JobQoS
 from ..database.config import JobHistoryConfig
 
 
@@ -1057,6 +1057,7 @@ class JobQueries:
         user: Optional[str] = None,
         account: Optional[Union[str, Sequence[str]]] = None,
         queue: Optional[str] = None,
+        qos: Optional[str] = None,
         status: Optional[str] = None,
         has_gpus: Optional[bool] = None,
         columns: Optional[Sequence[str]] = None,
@@ -1092,6 +1093,9 @@ class JobQueries:
                 can pull every projcode in a project tree in one query.
                 Resolved via FK hybrid.
             queue: Optional queue filter (text; resolved via FK hybrid)
+            qos: Optional QoS / priority-class filter (text; resolved via FK
+                hybrid against the ``job_qos`` lookup — e.g. ``"premium"``,
+                ``"regular"``, ``"economy"``, ``"special"``, ``"uncharged"``).
             status: Optional job-status filter (e.g. 'F' for finished)
             has_gpus: ``None`` ignore; ``True`` → ``Job.numgpus > 0`` (GPU jobs
                 only); ``False`` → ``numgpus == 0`` (CPU-only jobs).
@@ -1146,7 +1150,7 @@ class JobQueries:
         )
         query = self._apply_jobs_search_filters(
             query, start=start, end=end, user=user, account=account,
-            queue=queue, status=status, has_gpus=has_gpus,
+            queue=queue, qos=qos, status=status, has_gpus=has_gpus,
         )
 
         if sort_by is None:
@@ -1169,6 +1173,7 @@ class JobQueries:
         user: Optional[str] = None,
         account: Optional[Union[str, Sequence[str]]] = None,
         queue: Optional[str] = None,
+        qos: Optional[str] = None,
         status: Optional[str] = None,
         has_gpus: Optional[bool] = None,
     ) -> int:
@@ -1183,12 +1188,30 @@ class JobQueries:
         query = self.session.query(func.count(Job.id))
         query = self._apply_jobs_search_filters(
             query, start=start, end=end, user=user, account=account,
-            queue=queue, status=status, has_gpus=has_gpus,
+            queue=queue, qos=qos, status=status, has_gpus=has_gpus,
         )
         return int(query.scalar() or 0)
 
+    def list_qos_names(self, *, active_only: bool = True) -> List[str]:
+        """Return JobQoS names from the lookup table, alphabetically ordered.
+
+        Lets a UI populate a QoS filter dropdown without hardcoding the
+        canonical seed list (``premium`` / ``regular`` / ``economy`` /
+        ``uncharged`` / ``special``) — the lookup table is the source of
+        truth, so a future addition shows up automatically.
+
+        Args:
+            active_only: If True (default), restrict to rows with
+                ``active = True``. Set False to include retired QoS names
+                still referenced by historical jobs.
+        """
+        query = self.session.query(JobQoS.name)
+        if active_only:
+            query = query.filter(JobQoS.active.is_(True))
+        return [name for (name,) in query.order_by(JobQoS.name).all()]
+
     def _apply_jobs_search_filters(
-        self, query, *, start, end, user, account, queue, status, has_gpus,
+        self, query, *, start, end, user, account, queue, qos, status, has_gpus,
     ):
         """Apply the shared filter set used by jobs_search + jobs_count."""
         query = self._apply_date_filter(query, start, end)
@@ -1208,6 +1231,8 @@ class JobQueries:
                 query = query.filter(Job.account.in_(account))
         if queue:
             query = query.filter(Job.queue == queue)
+        if qos:
+            query = query.filter(Job.qos == qos)
         if status:
             query = query.filter(Job.status == status)
         if has_gpus is True:
