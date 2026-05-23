@@ -462,6 +462,174 @@ class TestJobsSearchHasGpus:
         assert "888.desched1" in {r["job_id"] for r in rows}
 
 
+@pytest.fixture
+def job_id_jobs(in_memory_session):
+    """Job rows that mirror the real-DB ``job_id`` shape variety.
+
+    Confirmed against the live ``derecho_jobs`` / ``casper_jobs`` Postgres
+    DBs: scalar jobs carry ``short_id`` populated by pbsparse; **array
+    parents and elements have ``short_id = NULL``** (1.74M of 12.27M rows).
+    The filter must therefore key off ``job_id`` text alone.
+
+    The decoy ``60491170.desched1`` exists to prove the boundary-anchored
+    LIKE does not bleed a 7-digit prefix into an 8-digit id.
+    """
+    base = datetime(2026, 5, 1, 12, 0, 0)
+    jobs = [
+        # Scalar — pbsparse populates short_id
+        Job(job_id="6049117.desched1",       short_id=6049117, user="alice",
+            account="NCAR0001", queue="main", status="F",
+            submit=base, start=base, end=base + timedelta(hours=1),
+            elapsed=3600, numcpus=1, numgpus=0, numnodes=1),
+        # Array parent + elements — short_id is NULL in real data
+        Job(job_id="6049117[].desched1",     short_id=None, user="alice",
+            account="NCAR0001", queue="main", status="F",
+            submit=base, start=base, end=base + timedelta(hours=2),
+            elapsed=3600, numcpus=1, numgpus=0, numnodes=1),
+        Job(job_id="6049117[0].desched1",    short_id=None, user="alice",
+            account="NCAR0001", queue="main", status="F",
+            submit=base, start=base, end=base + timedelta(hours=3),
+            elapsed=3600, numcpus=1, numgpus=0, numnodes=1),
+        Job(job_id="6049117[28].desched1",   short_id=None, user="alice",
+            account="NCAR0001", queue="main", status="F",
+            submit=base, start=base, end=base + timedelta(hours=4),
+            elapsed=3600, numcpus=1, numgpus=0, numnodes=1),
+        # Cross-host array element — same [N], different scheduler suffix.
+        # (Job.job_id+submit is the unique constraint; we offset the submit.)
+        Job(job_id="6049117[28].casper-pbs", short_id=None, user="alice",
+            account="NCAR0001", queue="main", status="F",
+            submit=base + timedelta(seconds=1), start=base,
+            end=base + timedelta(hours=5),
+            elapsed=3600, numcpus=1, numgpus=0, numnodes=1),
+        # Decoy: same 7-digit prefix; must NOT match `--job-id 6049117`.
+        Job(job_id="60491170.desched1",      short_id=60491170, user="bob",
+            account="NCAR0002", queue="main", status="F",
+            submit=base, start=base, end=base + timedelta(hours=6),
+            elapsed=3600, numcpus=1, numgpus=0, numnodes=1),
+        # Decoy: unrelated id.
+        Job(job_id="9999999.desched1",       short_id=9999999, user="bob",
+            account="NCAR0002", queue="main", status="F",
+            submit=base, start=base, end=base + timedelta(hours=7),
+            elapsed=3600, numcpus=1, numgpus=0, numnodes=1),
+    ]
+    for j in jobs:
+        in_memory_session.add(j)
+    in_memory_session.commit()
+    return jobs
+
+
+class TestJobsSearchJobIdFilter:
+    """``job_id`` filter dispatches by input shape (see jobs_search docstring).
+
+    Input *with* a ``.`` → exact match on ``Job.job_id``.
+    Input *without* a ``.`` → boundary-anchored prefix LIKE on ``Job.job_id``
+    (``input.%`` OR ``input[%``), so digits alone match every variant
+    (scalar + parent + elements) of one job but never bleed into a longer
+    numeric prefix.
+    """
+
+    def test_digits_match_scalar_parent_and_array_elements(
+        self, in_memory_session, job_id_jobs,
+    ):
+        rows = JobQueries(in_memory_session).jobs_search(job_id="6049117")
+        assert {r["job_id"] for r in rows} == {
+            "6049117.desched1",         # scalar form
+            "6049117[].desched1",       # array parent
+            "6049117[0].desched1",      # element
+            "6049117[28].desched1",     # element
+            "6049117[28].casper-pbs",   # cross-host element
+        }
+
+    def test_digits_no_substring_bleed(
+        self, in_memory_session, job_id_jobs,
+    ):
+        # Regression guard: 7-digit '6049117' must not match the 8-digit
+        # neighbour '60491170.desched1' (boundary anchor on `.` or `[`).
+        rows = JobQueries(in_memory_session).jobs_search(job_id="6049117")
+        assert "60491170.desched1" not in {r["job_id"] for r in rows}
+
+    def test_array_parent_only(self, in_memory_session, job_id_jobs):
+        # Empty-brackets form selects just the parent marker row.
+        rows = JobQueries(in_memory_session).jobs_search(job_id="6049117[]")
+        assert [r["job_id"] for r in rows] == ["6049117[].desched1"]
+
+    def test_array_element_cross_host(self, in_memory_session, job_id_jobs):
+        # No host suffix → matches the same [N] across every scheduler host.
+        rows = JobQueries(in_memory_session).jobs_search(job_id="6049117[28]")
+        assert {r["job_id"] for r in rows} == {
+            "6049117[28].desched1",
+            "6049117[28].casper-pbs",
+        }
+
+    def test_exact_full_id_with_host(self, in_memory_session, job_id_jobs):
+        # Presence of `.` short-circuits to an exact match.
+        rows = JobQueries(in_memory_session).jobs_search(
+            job_id="6049117[28].desched1",
+        )
+        assert [r["job_id"] for r in rows] == ["6049117[28].desched1"]
+
+    def test_exact_full_id_scalar(self, in_memory_session, job_id_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            job_id="6049117.desched1",
+        )
+        assert [r["job_id"] for r in rows] == ["6049117.desched1"]
+
+    def test_no_match(self, in_memory_session, job_id_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(job_id="42")
+        assert rows == []
+
+    def test_whitespace_is_stripped(self, in_memory_session, job_id_jobs):
+        # Stray whitespace from shell quoting must not turn an exact match
+        # into "no rows".
+        rows = JobQueries(in_memory_session).jobs_search(job_id="  6049117  ")
+        assert {r["job_id"] for r in rows} == {
+            "6049117.desched1",
+            "6049117[].desched1",
+            "6049117[0].desched1",
+            "6049117[28].desched1",
+            "6049117[28].casper-pbs",
+        }
+
+    def test_empty_string_is_no_filter(self, in_memory_session, job_id_jobs):
+        # Mirrors how user/queue/qos/status handle "" — falsy → not applied.
+        rows = JobQueries(in_memory_session).jobs_search(job_id="")
+        assert len(rows) == len(job_id_jobs)
+
+    def test_none_is_no_filter(self, in_memory_session, job_id_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(job_id=None)
+        assert len(rows) == len(job_id_jobs)
+
+    def test_works_with_null_short_id(self, in_memory_session, job_id_jobs):
+        # Regression guard: array rows have short_id=NULL in real data, so
+        # the filter MUST work off Job.job_id text. If anyone reintroduces
+        # a short_id-based path, the four NULL-short_id rows would silently
+        # drop out of the result here.
+        rows = JobQueries(in_memory_session).jobs_search(job_id="6049117")
+        null_short_id_returned = [r for r in rows if "[" in r["job_id"]]
+        assert len(null_short_id_returned) == 4
+
+    def test_count_matches_search(self, in_memory_session, job_id_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(job_id="6049117") == len(q.jobs_search(job_id="6049117"))
+        assert q.jobs_count(job_id="6049117[28]") == 2
+        assert q.jobs_count(job_id="6049117[28].desched1") == 1
+        assert q.jobs_count(job_id="42") == 0
+
+    def test_combines_with_other_filters(self, in_memory_session, job_id_jobs):
+        # All five 6049117* rows belong to alice — restricting by user is a
+        # no-op for the matching set, but excludes the bob-owned decoys.
+        rows = JobQueries(in_memory_session).jobs_search(
+            user="alice", job_id="6049117",
+        )
+        assert len(rows) == 5
+        # Bob's decoy '60491170.desched1' is excluded both by job_id boundary
+        # AND by user — confirm the AND composition.
+        rows_bob = JobQueries(in_memory_session).jobs_search(
+            user="bob", job_id="6049117",
+        )
+        assert rows_bob == []
+
+
 class TestJobsCount:
     def test_count_matches_search_length(self, in_memory_session, search_jobs):
         q = JobQueries(in_memory_session)
