@@ -197,6 +197,16 @@ class TestSearchCommand:
         assert len(parsed["rows"]) == 1
         assert parsed["filters"]["limit"] == 1
 
+    def test_job_id_flag_filters_and_appears_in_filters(self, search_ctx, capsys):
+        # The search_db fixture has '200.desched1' (alice) and '201.desched1'
+        # (bob). `--job-id 200` should boundary-match only the first.
+        search_ctx.output_format = "json"
+        code = SearchCommand(search_ctx).execute(job_id="200")
+        assert code == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [r["job_id"] for r in parsed["rows"]] == ["200.desched1"]
+        assert parsed["filters"]["job_id"] == "200"
+
 
 # ---------------------------------------------------------------------------
 # CliRunner — Click integration through the new entry point
@@ -218,7 +228,7 @@ class TestJobhistSearchCli:
         result = CliRunner().invoke(cli, ["search", "--help"])
         assert result.exit_code == 0
         for opt in ("--start-date", "--end-date", "-m, --machine",
-                    "--user", "--project", "--queue",
+                    "--user", "--project", "--queue", "--job-id",
                     "-v, --verbose", "--display"):
             assert opt in result.output
 

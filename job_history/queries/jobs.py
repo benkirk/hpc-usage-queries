@@ -1060,6 +1060,7 @@ class JobQueries:
         qos: Optional[str] = None,
         status: Optional[str] = None,
         has_gpus: Optional[bool] = None,
+        job_id: Optional[str] = None,
         columns: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         offset: int = 0,
@@ -1099,6 +1100,23 @@ class JobQueries:
             status: Optional job-status filter (e.g. 'F' for finished)
             has_gpus: ``None`` ignore; ``True`` → ``Job.numgpus > 0`` (GPU jobs
                 only); ``False`` → ``numgpus == 0`` (CPU-only jobs).
+            job_id: Optional job-id filter, classified by input shape:
+
+                * Has a ``.`` (e.g. ``"6049117[28].desched1"``) → exact match
+                  on ``Job.job_id``.
+                * No ``.`` — either bare digits (``"6049117"``) or a partial
+                  array form (``"6049117[28]"``, ``"6049117[]"``) → two
+                  boundary-anchored ``LIKE`` clauses
+                  (``<input>.%`` OR ``<input>[%``) so e.g. ``"6049117"``
+                  matches the scalar ``6049117.host`` AND every array
+                  element ``6049117[N].host`` AND the array parent
+                  ``6049117[].host``, but does **not** bleed into the
+                  unrelated ``60491170.host``.
+
+                ``Job.short_id`` is intentionally not consulted: pbsparse
+                leaves it ``NULL`` on every array-job row, so a
+                ``short_id``-based path would miss the dominant
+                "match all elements of my array job" use case.
             columns: Optional sequence of column keys to project.
                 When None, returns DEFAULT_COLUMNS. Unknown keys raise ValueError.
             limit: Optional max number of rows to return. Applied as a SQL
@@ -1151,6 +1169,7 @@ class JobQueries:
         query = self._apply_jobs_search_filters(
             query, start=start, end=end, user=user, account=account,
             queue=queue, qos=qos, status=status, has_gpus=has_gpus,
+            job_id=job_id,
         )
 
         if sort_by is None:
@@ -1176,6 +1195,7 @@ class JobQueries:
         qos: Optional[str] = None,
         status: Optional[str] = None,
         has_gpus: Optional[bool] = None,
+        job_id: Optional[str] = None,
     ) -> int:
         """Count rows that ``jobs_search`` would return under the same filters.
 
@@ -1183,12 +1203,15 @@ class JobQueries:
         one page via ``jobs_search(limit=…, offset=…)`` and the total via
         this method. Filter shape mirrors ``jobs_search`` exactly; ``columns``,
         ``limit``, ``offset``, and sort args do not apply. ``account``
-        accepts a single projcode or a sequence (see :meth:`jobs_search`).
+        accepts a single projcode or a sequence (see :meth:`jobs_search`);
+        ``job_id`` matches the shape-classifier described in
+        :meth:`jobs_search`.
         """
         query = self.session.query(func.count(Job.id))
         query = self._apply_jobs_search_filters(
             query, start=start, end=end, user=user, account=account,
             queue=queue, qos=qos, status=status, has_gpus=has_gpus,
+            job_id=job_id,
         )
         return int(query.scalar() or 0)
 
@@ -1212,6 +1235,7 @@ class JobQueries:
 
     def _apply_jobs_search_filters(
         self, query, *, start, end, user, account, queue, qos, status, has_gpus,
+        job_id,
     ):
         """Apply the shared filter set used by jobs_search + jobs_count."""
         query = self._apply_date_filter(query, start, end)
@@ -1239,6 +1263,25 @@ class JobQueries:
             query = query.filter(Job.numgpus > 0)
         elif has_gpus is False:
             query = query.filter(or_(Job.numgpus == 0, Job.numgpus.is_(None)))
+        if job_id:
+            jid = job_id.strip()
+            if '.' in jid:
+                # Host suffix supplied → exact match.
+                query = query.filter(Job.job_id == jid)
+            else:
+                # Bare digits or partial array form (e.g. "6049117",
+                # "6049117[28]", "6049117[]"). Boundary-anchor on the char
+                # immediately after the user-supplied prefix — either `.`
+                # (scalar) or `[` (array) — so a search for "6049117"
+                # matches every variant of that job but never bleeds into
+                # an unrelated longer-prefix id like "60491170.host". Both
+                # clauses are leading-anchored LIKE patterns that use the
+                # `ix_jobs_job_id` btree on both Postgres and SQLite;
+                # `[` and `]` are literal in `LIKE` on both backends.
+                query = query.filter(or_(
+                    Job.job_id.like(f"{jid}.%"),   # scalar form
+                    Job.job_id.like(f"{jid}[%"),   # array forms (parent + elements)
+                ))
         return query
 
     def usage_summary(

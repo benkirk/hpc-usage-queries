@@ -209,6 +209,12 @@ def daily_summary(jh_ctx: Context):
               help="Filter by QoS / priority class name (e.g. premium, regular, economy, special, uncharged).")
 @click.option("--status", default=None,
               help="Filter by job status (e.g. 'F' for finished).")
+@click.option("--job-id", "job_id", default=None, metavar="ID",
+              help="Filter by job id. Digits alone (e.g. '6049117') match "
+                   "the scalar form and every array element/parent; a "
+                   "partial array form ('6049117[28]', '6049117[]') matches "
+                   "that variant across hosts; supplying the host suffix "
+                   "('6049117[28].desched1') does an exact match.")
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Show all columns instead of the default subset.")
 @click.option("--display", default=None,
@@ -217,7 +223,7 @@ def daily_summary(jh_ctx: Context):
               help="Truncate results to at most N rows (SQL LIMIT, server-side).")
 @click.pass_obj
 def search(jh_ctx: Context, start_date, end_date, machine,
-           user, account, queue, qos, status, verbose, display, limit):
+           user, account, queue, qos, status, job_id, verbose, display, limit):
     """List individual job records matching the filters."""
     jh_ctx.start_date = start_date
     jh_ctx.end_date = end_date
@@ -228,6 +234,7 @@ def search(jh_ctx: Context, start_date, end_date, machine,
     jh_ctx.session = get_session(machine)
     code = SearchCommand(jh_ctx).execute(
         user=user, account=account, queue=queue, qos=qos, status=status,
+        job_id=job_id,
         verbose=verbose, display=display, limit=limit,
     )
     _close_session(jh_ctx)
