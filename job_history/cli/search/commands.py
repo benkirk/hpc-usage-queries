@@ -27,6 +27,7 @@ class SearchCommand(BaseHistoryCommand):
         queue: Optional[str] = None,
         qos: Optional[str] = None,
         status: Optional[str] = None,
+        job_id: Optional[str] = None,
         verbose: bool = False,
         display: Optional[str] = None,
         limit: Optional[int] = None,
@@ -46,6 +47,7 @@ class SearchCommand(BaseHistoryCommand):
                 queue=queue,
                 qos=qos,
                 status=status,
+                job_id=job_id,
                 columns=cols,
                 limit=limit,
             )
@@ -59,6 +61,7 @@ class SearchCommand(BaseHistoryCommand):
                     "queue": queue,
                     "qos": qos,
                     "status": status,
+                    "job_id": job_id,
                     "limit": limit,
                 },
             )
