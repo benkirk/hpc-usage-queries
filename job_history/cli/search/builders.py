@@ -22,11 +22,14 @@ def build_search(
     ``requested_cols`` controls column ordering / visibility — the row dicts
     already contain exactly those keys (see :func:`columns.project_row`).
     """
-    columns = [
-        {"key": k, "header": COLUMNS[k]["header"],
-         "width": COLUMNS[k]["width"], "format": COLUMNS[k]["format"]}
-        for k in requested_cols
-    ]
+    columns = []
+    for k in requested_cols:
+        spec = COLUMNS[k]
+        col = {"key": k, "header": spec["header"],
+               "width": spec["width"], "format": spec["format"]}
+        if "rich_header" in spec:
+            col["rich_header"] = spec["rich_header"]
+        columns.append(col)
     return {
         "kind": "search",
         "machine": ctx.machine,
