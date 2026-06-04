@@ -70,7 +70,7 @@ class RichTableExporter(Exporter):
         table = Table(show_header=True, header_style="bold cyan")
         if columns:
             for col in columns:
-                table.add_column(col["header"])
+                table.add_column(col.get("rich_header") or col["header"])
             for row in rows:
                 table.add_row(*[self._cell(row.get(col["key"]), col) for col in columns])
         else:
