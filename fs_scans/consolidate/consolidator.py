@@ -16,6 +16,7 @@ This preserves the SQLite generation path unchanged and gives a non-disruptive
 weekly swap (live readers on other collections are unaffected).
 """
 
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -260,6 +261,10 @@ def consolidate_sqlite_to_postgres(
     Session = sessionmaker(bind=engine)
     session = Session()
     try:
+        # Larger maintenance_work_mem speeds up the post-load index builds
+        # (notably for cgd's tens of millions of rows). USERSET, per-session.
+        work_mem = os.getenv("FS_SCAN_PG_MAINTENANCE_WORK_MEM", "1GB")
+        session.execute(text(f"SET maintenance_work_mem = '{work_mem}'"))
         add_directories_indexing(session)
         add_directory_stats_indexing(session)
     finally:
@@ -298,8 +303,6 @@ def _grant_read_only(engine, schema: str) -> None:
 
     No-op when ``FS_SCAN_PG_READONLY_ROLE`` is unset.
     """
-    import os
-
     role = os.getenv("FS_SCAN_PG_READONLY_ROLE", "").strip()
     if not role:
         return

@@ -124,6 +124,59 @@ export FS_SCAN_DB=/tmp/custom.db
 fs-scans import input.log
 ```
 
+## Backends: SQLite (default) and PostgreSQL/CNPG
+
+`fs_scans` supports two storage backends, selected by `FS_SCAN_DB_BACKEND`:
+
+| Backend | Selector | Layout | Use |
+|---------|----------|--------|-----|
+| `sqlite` (default) | `FS_SCAN_DB_BACKEND=sqlite` | per-collection `.db` files | local CLI, the generation pipeline |
+| `postgres` | `FS_SCAN_DB_BACKEND=postgres` | one **database = filesystem** (`campaign`); one **schema = collection** (`cgd`, `acom`, …) | networked / webserver access |
+
+Both are produced every week and are first-class — the `.db` files stay for local
+use, and the same data is additionally loaded into a shared Cloud Native Postgres
+(CNPG) server for a networked, webserver-visible database. The query/analyze
+commands are backend-agnostic; `--show-config` reports the active backend.
+
+PostgreSQL settings (used only when `FS_SCAN_DB_BACKEND=postgres`):
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `FS_SCAN_PG_HOST` / `FS_SCAN_PG_PORT` | `localhost` / `5432` | CNPG server |
+| `FS_SCAN_PG_USER` / `FS_SCAN_PG_PASSWORD` | `postgres` / — | credentials (keep in `.env`) |
+| `FS_SCAN_PG_REQUIRE_SSL` | `false` | set `true` to require TLS |
+| `FS_SCAN_PG_DB` | `campaign` | database name = filesystem |
+| `FS_SCAN_PG_READONLY_ROLE` | — | optional role granted `SELECT` after each swap |
+
+### Consolidation: SQLite → PostgreSQL
+
+`fs-scans consolidate` loads a finished `.db` into a PostgreSQL schema and
+atomically swaps it into place, so the SQLite generation pipeline is untouched:
+
+```bash
+export FS_SCAN_DB_BACKEND=postgres
+fs-scans consolidate asp                 # one collection
+fs-scans consolidate --all               # every .db in the data dir
+fs-scans consolidate cgd --no-swap       # stage only (cgd_staging), no swap
+fs-scans consolidate cgd --keep-old      # keep cgd_old after swap (more disk)
+```
+
+Per collection it: (re)creates a `<collection>_staging` schema, bulk-loads every
+table with PostgreSQL `COPY` (foreign keys and secondary indexes deferred —
+mirroring the SQLite import), re-adds/validates the FKs, builds the indexes,
+`ANALYZE`s, optionally grants `SELECT` to the read-only web role, then swaps via
+`ALTER SCHEMA RENAME` (live readers on other collections are undisturbed) and
+drops the previous generation to reclaim disk. Per-collection failures are
+isolated — one bad `.db` does not block the others.
+
+In the weekly pipeline (`fs_scans/PBS/`), `consolidate.pbs` runs after the
+`collect_results` rsync step. It is **disabled by default**; enable it once the
+per-collection performance pass and the CNPG disk/role review have signed off:
+
+```bash
+FS_SCAN_ENABLE_CONSOLIDATE=1 ./fs_scans/PBS/submit_all.sh
+```
+
 ## Log File Format
 
 The parser expects GPFS policy scan output with lines in this format:

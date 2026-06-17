@@ -128,17 +128,28 @@ any shims. See `_get_record_class()` in `sync/pbs.py`.
 ### Key files
 | File | Role |
 |------|------|
+| `fs_scans/core/config.py` | `FsScanConfig` — backend selection (`FS_SCAN_DB_BACKEND`) + `FS_SCAN_PG_*` settings |
+| `fs_scans/core/database.py` | Backend-aware engine/session factory, discovery helpers (`list_pg_schemas`, `filesystem_available`, `describe_databases`) |
 | `fs_scans/core/models.py` | ORM models: Directory, DirectoryStats, histograms |
-| `fs_scans/core/query_builder.py` | `DirectoryQueryBuilder` — fluent filter API |
+| `fs_scans/core/query_builder.py` | `DirectoryQueryBuilder` — fluent filter API (dialect-aware GLOB/regex; `dir_id` tiebreaker) |
 | `fs_scans/importers/importer.py` | Multi-pass import (directory discovery → stats → aggregation) |
 | `fs_scans/parsers/` | GPFS, Lustre, POSIX parsers |
 | `fs_scans/queries/` | Query engine + histogram analytics |
-| `fs_scans/cli/` | `import_cmd`, `query_cmd`, `analyze_cmd` |
+| `fs_scans/consolidate/consolidator.py` | SQLite→PostgreSQL COPY loader + atomic schema swap |
+| `fs_scans/cli/` | `import_cmd`, `query_cmd`, `analyze_cmd`, `consolidate_cmd` |
+| `fs_scans/PBS/consolidate.pbs` | Weekly consolidation job (after `collect_results`; gated by `FS_SCAN_ENABLE_CONSOLIDATE=1`) |
+
+### Backends (dual: SQLite default + PostgreSQL)
+- **SQLite** (default, `FS_SCAN_DB_BACKEND=sqlite`): per-collection `.db` files; the generation pipeline (`fs_scans/PBS/`) is SQLite-only and unchanged.
+- **PostgreSQL/CNPG** (`FS_SCAN_DB_BACKEND=postgres`): **database = filesystem** (`campaign`), **schema = collection** (`cgd`, `acom`, …). The engine pins `search_path` to the collection schema so the existing bare-table SQL resolves unmodified.
+- **Consolidation** (`fs-scans consolidate`): loads a finished `.db` into a `<collection>_staging` schema via `COPY` (deferred FKs/indexes, like the SQLite import), then atomically swaps with `ALTER SCHEMA RENAME` and drops the previous generation. DateTime columns need care — SQLite stores an integer-`0` sentinel in `max_atime_*` that must map to an epoch timestamp for PG.
+- Both outputs are published weekly: `.db` for local CLI, CNPG for the webserver. Selected purely by `FS_SCAN_DB_BACKEND`. Postgres creds reuse the shared CNPG server via `.env` (`FS_SCAN_PG_*` → `${CIRRUS_PG_*}`).
 
 ### Performance notes
 - Import is 3-pass: directory discovery → non-recursive stats + histograms → recursive aggregation
 - `access_histogram` and `size_histogram` tables enable `<100ms` analytics (fast path)
 - Path/depth filters force slower on-the-fly computation from `directory_stats`
+- Consolidation preserves the deferred-indexing win: `COPY` into unindexed staging tables, then build indexes + `ANALYZE` (with raised `maintenance_work_mem`)
 
 ## Commit Style
 
