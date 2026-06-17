@@ -393,9 +393,12 @@ class DirectoryQueryBuilder:
         if self._conditions:
             query += " WHERE " + " AND ".join(self._conditions)
 
-        # Add ORDER BY
+        # Add ORDER BY. Append the unique dir_id as a final tiebreaker so the
+        # ordering is fully deterministic — otherwise rows with equal sort keys
+        # come back in arbitrary (engine-dependent) order, which also makes
+        # LIMIT cut through tie groups differently on SQLite vs PostgreSQL.
         order_clause = self.SORT_MAP.get(self._sort_by, self.SORT_MAP["size_r"])
-        query += f" ORDER BY {order_clause}"
+        query += f" ORDER BY {order_clause}, d.dir_id ASC"
 
         # Add LIMIT
         if self._limit:
