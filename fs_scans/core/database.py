@@ -1,13 +1,24 @@
-"""Database connection and session management for GPFS scan data."""
+"""Database connection and session management for GPFS scan data.
+
+Supports two backends, selected by the ``FS_SCAN_DB_BACKEND`` environment
+variable (or a ``.env`` file loaded via python-dotenv):
+
+  sqlite   (default) — per-collection .db files under the data directory
+  postgres           — one database per filesystem on a shared PostgreSQL
+                       (CNPG) server, with one schema per collection
+
+See ``fs_scans/core/config.py`` and ``.env.example`` for configuration details.
+"""
 
 import os
 import re
 import threading
 from pathlib import Path
 
-from sqlalchemy import create_engine, Engine
+from sqlalchemy import create_engine, Engine, text
 from sqlalchemy.orm import sessionmaker
 
+from .config import FsScanConfig
 from .models import Base
 
 # Default database directory (module directory + /data)
@@ -16,8 +27,10 @@ _DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
 # Module-level cache for the configured data directory (set via CLI)
 _data_dir_override: Path | None = None
 
-# Module-level engine cache with thread safety for parallel queries
-_engine_cache: dict[str, Engine] = {}
+# Module-level engine cache with thread safety for parallel queries.
+# Keyed by a tuple that captures the backend target (sqlite path, or postgres
+# host/db/schema) so a change of backend or schema yields a distinct engine.
+_engine_cache: dict[tuple, Engine] = {}
 _engine_cache_lock = threading.Lock()
 
 
@@ -133,23 +146,34 @@ def extract_scan_timestamp(filename: str):
 
 
 def get_db_path(filesystem: str, db_path: Path | None = None) -> Path:
-    """Get the database path for a specific filesystem.
+    """Get the SQLite database path for a specific filesystem/collection.
 
     Precedence for determining database path:
         1. Explicit db_path argument (highest priority - from CLI --db)
         2. FS_SCAN_DB environment variable
         3. get_data_dir() / f"{filesystem}.db" (default)
 
+    Raises ``RuntimeError`` when the active backend is not SQLite — use
+    ``get_db_url()`` for a backend-agnostic connection descriptor instead.
+
     Args:
-        filesystem: Filesystem name (e.g., 'asp', 'cisl', 'eol', 'hao')
+        filesystem: Filesystem/collection name (e.g., 'asp', 'cisl', 'cgd')
         db_path: Explicit database path override (typically from CLI --db option)
 
     Returns:
         Path to the SQLite database file
     """
-    # 1. Explicit path takes highest precedence
+    # An explicit path is always honored (the consolidate step reads a finished
+    # .db by path even when the active backend is postgres).
     if db_path is not None:
         return db_path
+
+    if FsScanConfig.DB_BACKEND != "sqlite":
+        raise RuntimeError(
+            f"get_db_path() is only meaningful for the sqlite backend "
+            f"(current backend: {FsScanConfig.DB_BACKEND!r}). "
+            "Use get_db_url() instead, or pass an explicit db_path."
+        )
 
     filesystem = filesystem.lower()
 
@@ -161,21 +185,72 @@ def get_db_path(filesystem: str, db_path: Path | None = None) -> Path:
     return get_data_dir() / f"{filesystem}.db"
 
 
-def get_engine(filesystem: str, echo: bool = False, db_path: Path | None = None) -> Engine:
-    """Create or retrieve a cached SQLAlchemy engine for a specific filesystem.
+def get_db_url(filesystem: str, schema: str | None = None) -> str:
+    """Return a connection descriptor for *filesystem* suitable for display.
 
-    Engines are cached by resolved database path. Thread-safe for parallel queries.
+    SQLite: the .db path string.  PostgreSQL: a URL with the password masked
+    and the target schema appended as a fragment for clarity.
+    """
+    config = FsScanConfig
+    if config.DB_BACKEND == "postgres":
+        schema = schema or config.pg_schema_name(filesystem)
+        return (
+            f"postgresql+psycopg2://{config.PG_USER}:***@"
+            f"{config.PG_HOST}:{config.PG_PORT}/{config.PG_DB_NAME}#schema={schema}"
+        )
+    return str(get_db_path(filesystem))
+
+
+def get_engine(
+    filesystem: str,
+    echo: bool = False,
+    db_path: Path | None = None,
+    *,
+    schema: str | None = None,
+) -> Engine:
+    """Create or retrieve a cached SQLAlchemy engine for a filesystem/collection.
+
+    Engines are cached by backend target. Thread-safe for parallel queries.
 
     Args:
-        filesystem: Filesystem name (e.g., 'asp', 'cisl')
+        filesystem: Filesystem/collection name (e.g., 'asp', 'cisl', 'cgd')
         echo: If True, log all SQL statements (only affects engine creation)
-        db_path: Explicit database path override
+        db_path: Explicit SQLite database path override (sqlite backend only)
+        schema: PostgreSQL schema to pin via ``search_path`` (postgres backend
+            only). Defaults to ``FsScanConfig.pg_schema_name(filesystem)``;
+            the consolidate step passes ``"<collection>_staging"`` here.
 
     Returns:
         SQLAlchemy Engine instance (may be cached)
     """
+    config = FsScanConfig
+
+    if config.DB_BACKEND == "postgres":
+        config.validate_postgres()
+        schema = schema or config.pg_schema_name(filesystem)
+        cache_key = (
+            "postgres", config.PG_HOST, config.PG_PORT, config.PG_USER,
+            config.PG_DB_NAME, schema, bool(config.PG_REQUIRE_SSL),
+        )
+        with _engine_cache_lock:
+            if cache_key not in _engine_cache:
+                # Pin search_path so the existing bare-table-name SQL resolves
+                # to this collection's schema without any rewrite.
+                connect_args = {"options": f"-csearch_path={schema},public"}
+                if config.PG_REQUIRE_SSL:
+                    connect_args["sslmode"] = "require"
+                url = (
+                    f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
+                    f"@{config.PG_HOST}:{config.PG_PORT}/{config.PG_DB_NAME}"
+                )
+                _engine_cache[cache_key] = create_engine(
+                    url, echo=echo, connect_args=connect_args
+                )
+            return _engine_cache[cache_key]
+
+    # sqlite (default) — behavior unchanged from the single-backend era.
     resolved_path = get_db_path(filesystem, db_path)
-    cache_key = str(resolved_path)
+    cache_key = ("sqlite", str(resolved_path))
 
     with _engine_cache_lock:
         if cache_key not in _engine_cache:
@@ -200,51 +275,113 @@ def clear_engine_cache() -> None:
         _engine_cache.clear()
 
 
-def get_session(filesystem: str, engine=None, db_path: Path | None = None):
-    """Create and return a new database session for a specific filesystem.
+def get_session(filesystem: str, engine=None, db_path: Path | None = None, *, schema: str | None = None):
+    """Create and return a new database session for a filesystem/collection.
 
     Args:
-        filesystem: Filesystem name (e.g., 'asp', 'cisl')
+        filesystem: Filesystem/collection name (e.g., 'asp', 'cisl', 'cgd')
         engine: Existing engine to use. If None, creates a new one.
-        db_path: Explicit database path override (ignored if engine provided)
+        db_path: Explicit SQLite database path override (ignored if engine provided)
+        schema: PostgreSQL schema to pin (ignored if engine provided)
 
     Returns:
         SQLAlchemy Session instance
     """
     if engine is None:
-        engine = get_engine(filesystem, db_path=db_path)
+        engine = get_engine(filesystem, db_path=db_path, schema=schema)
 
     Session = sessionmaker(bind=engine)
     return Session()
 
 
-def init_db(filesystem: str, echo: bool = False, db_path: Path | None = None):
-    """Initialize database by creating all tables.
+def db_available(filesystem: str) -> bool:
+    """Return True if a database is reachable for *filesystem*.
+
+    SQLite: the .db file exists.  PostgreSQL: credentials validate and a test
+    connection (``SELECT 1``) succeeds, so a down server is reported as
+    unavailable rather than raising.
+    """
+    try:
+        if FsScanConfig.DB_BACKEND == "postgres":
+            FsScanConfig.validate_postgres()
+            engine = get_engine(filesystem)
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return True
+        return get_db_path(filesystem).exists()
+    except Exception:
+        return False
+
+
+def _ensure_pg_database() -> None:
+    """Create the PostgreSQL database (``FsScanConfig.PG_DB_NAME``) if missing.
+
+    Connects to the ``postgres`` maintenance database with AUTOCOMMIT so that
+    ``CREATE DATABASE`` can run outside a transaction.
+    """
+    config = FsScanConfig
+    db_name = config.PG_DB_NAME
+    admin_url = (
+        f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
+        f"@{config.PG_HOST}:{config.PG_PORT}/postgres"
+    )
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin_engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :db"),
+                {"db": db_name},
+            )
+            if not result.fetchone():
+                conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+    finally:
+        admin_engine.dispose()
+
+
+def init_db(filesystem: str, echo: bool = False, db_path: Path | None = None, *, schema: str | None = None):
+    """Initialize a database by creating all tables.
+
+    For the PostgreSQL backend this also creates the target database (once) and
+    the target schema if they do not already exist; tables are created inside
+    that schema (resolved via the engine's ``search_path``).
 
     Args:
-        filesystem: Filesystem name
+        filesystem: Filesystem/collection name
         echo: If True, log all SQL statements
-        db_path: Explicit database path override
+        db_path: Explicit SQLite database path override (sqlite backend only)
+        schema: PostgreSQL schema to create tables in (postgres backend only)
 
     Returns:
         SQLAlchemy Engine instance
     """
+    config = FsScanConfig
+    if config.DB_BACKEND == "postgres":
+        config.validate_postgres()
+        schema = schema or config.pg_schema_name(filesystem)
+        _ensure_pg_database()
+        engine = get_engine(filesystem, echo=echo, schema=schema)
+        with engine.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        Base.metadata.create_all(engine)
+        return engine
+
     engine = get_engine(filesystem, echo=echo, db_path=db_path)
     Base.metadata.create_all(engine)
     return engine
 
 
-def drop_tables(filesystem: str, echo: bool = False, db_path: Path | None = None):
-    """Drop all tables in the database.
+def drop_tables(filesystem: str, echo: bool = False, db_path: Path | None = None, *, schema: str | None = None):
+    """Drop all tables in the database (within the target schema for postgres).
 
     Args:
-        filesystem: Filesystem name
+        filesystem: Filesystem/collection name
         echo: If True, log all SQL statements
-        db_path: Explicit database path override
+        db_path: Explicit SQLite database path override (sqlite backend only)
+        schema: PostgreSQL schema to drop tables from (postgres backend only)
 
     Returns:
         SQLAlchemy Engine instance
     """
-    engine = get_engine(filesystem, echo=echo, db_path=db_path)
+    engine = get_engine(filesystem, echo=echo, db_path=db_path, schema=schema)
     Base.metadata.drop_all(engine)
     return engine
