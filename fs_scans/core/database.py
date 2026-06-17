@@ -313,6 +313,59 @@ def db_available(filesystem: str) -> bool:
         return False
 
 
+# Schemas that are never user collections.
+_PG_SYSTEM_SCHEMAS = {"public", "information_schema"}
+
+
+def list_pg_schemas() -> list[str]:
+    """Return the collection schemas in the PostgreSQL database.
+
+    Excludes system schemas (``public``, ``information_schema``, ``pg_*``) and
+    the transient ``*_staging`` / ``*_old`` schemas used during a swap.
+    """
+    engine = get_engine("__discovery__", schema="public")
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT schema_name FROM information_schema.schemata")
+        ).fetchall()
+    return sorted(
+        name
+        for (name,) in rows
+        if name not in _PG_SYSTEM_SCHEMAS
+        and not name.startswith("pg_")
+        and not name.endswith("_staging")
+        and not name.endswith("_old")
+    )
+
+
+def filesystem_available(filesystem: str) -> bool:
+    """Backend-aware existence check for a single collection.
+
+    SQLite: the .db file exists.  PostgreSQL: a schema of that name exists.
+    """
+    if FsScanConfig.DB_BACKEND == "postgres":
+        return filesystem.lower() in list_pg_schemas()
+    return get_db_path(filesystem).exists()
+
+
+def describe_databases() -> list[tuple[str, str, int | None]]:
+    """Describe available collections for ``--show-config`` display.
+
+    Returns a list of ``(name, location, size_bytes_or_None)`` tuples.  Size is
+    the .db file size for SQLite and ``None`` for PostgreSQL (not file-backed).
+    """
+    from ..queries.query_engine import get_all_filesystems
+
+    out: list[tuple[str, str, int | None]] = []
+    for fs in get_all_filesystems():
+        if FsScanConfig.DB_BACKEND == "postgres":
+            out.append((fs, get_db_url(fs), None))
+        else:
+            path = get_db_path(fs)
+            out.append((fs, str(path), path.stat().st_size if path.exists() else 0))
+    return out
+
+
 def _ensure_pg_database() -> None:
     """Create the PostgreSQL database (``FsScanConfig.PG_DB_NAME``) if missing.
 

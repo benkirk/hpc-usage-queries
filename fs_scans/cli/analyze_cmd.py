@@ -7,8 +7,9 @@ import click
 from ..cli.common import (
     console,
     make_dynamic_help_command,
+    render_show_config,
 )
-from ..core.database import get_data_dir_info, get_db_path, get_session, set_data_dir
+from ..core.database import filesystem_available, get_db_url, get_session, set_data_dir
 from ..queries.query_engine import (
     get_all_filesystems,
     get_scan_date,
@@ -119,23 +120,7 @@ def analyze_cmd(
 
     # Handle --show-config
     if show_config:
-        data_path, source = get_data_dir_info()
-        console.print("[bold]Configuration[/bold]")
-        console.print(f"  Data directory: {data_path}")
-        console.print(f"  Source: {source}")
-        console.print()
-
-        filesystems = get_all_filesystems()
-        if filesystems:
-            console.print("[bold]Available databases[/bold]")
-            for fs in filesystems:
-                db_path = get_db_path(fs)
-                size_bytes = db_path.stat().st_size if db_path.exists() else 0
-                from ..cli.common import format_size
-                size_str = format_size(size_bytes)
-                console.print(f"  {fs}: {db_path} ({size_str})")
-        else:
-            console.print("[yellow]No database files found.[/yellow]")
+        render_show_config()
         return
 
     # Check that at least one analysis option is specified
@@ -154,9 +139,8 @@ def analyze_cmd(
             console.print("Run fs-scans import first to import data.")
             raise SystemExit(1)
     else:
-        db_path = get_db_path(filesystem)
-        if not db_path.exists():
-            console.print(f"[red]Database not found: {db_path}[/red]")
+        if not filesystem_available(filesystem):
+            console.print(f"[red]Database not found: {get_db_url(filesystem)}[/red]")
             console.print("Run fs-scans import first to import data.")
             raise SystemExit(1)
         filesystems = [filesystem]

@@ -48,13 +48,21 @@ def normalize_path(path: str) -> str:
 
 
 def get_all_filesystems() -> list[str]:
-    """Discover all available filesystem databases.
+    """Discover all available filesystem/collection databases.
 
-    Searches in the configured data directory (via get_data_dir()).
+    SQLite: the ``*.db`` files in the configured data directory (via
+    get_data_dir()).  PostgreSQL: the collection schemas in the configured
+    database (via list_pg_schemas()).
 
     Returns:
-        List of filesystem names (e.g., ['asp', 'cisl', 'eol', 'hao'])
+        List of filesystem/collection names (e.g., ['asp', 'cisl', 'cgd'])
     """
+    from ..core.config import FsScanConfig
+    from ..core.database import list_pg_schemas
+
+    if FsScanConfig.DB_BACKEND == "postgres":
+        return list_pg_schemas()
+
     data_dir = get_data_dir()
     db_files = data_dir.glob("*.db")
     return sorted([f.stem for f in db_files])

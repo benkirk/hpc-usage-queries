@@ -265,3 +265,38 @@ def echo_option():
         is_flag=True,
         help="Echo SQL statements (for debugging)",
     )
+
+
+def render_show_config() -> None:
+    """Print the active backend configuration and available databases.
+
+    Backend-aware: shows the SQLite data directory + per-file sizes, or the
+    PostgreSQL server + collection schemas. Shared by the query and analyze
+    ``--show-config`` handlers.
+    """
+    from ..core.config import FsScanConfig
+    from ..core.database import describe_databases, get_data_dir_info
+
+    console.print("[bold]Configuration[/bold]")
+    console.print(f"  Backend: {FsScanConfig.DB_BACKEND}")
+    if FsScanConfig.DB_BACKEND == "postgres":
+        console.print(
+            f"  Server: {FsScanConfig.PG_HOST}:{FsScanConfig.PG_PORT}"
+            f"/{FsScanConfig.PG_DB_NAME}"
+        )
+    else:
+        data_path, source = get_data_dir_info()
+        console.print(f"  Data directory: {data_path}")
+        console.print(f"  Source: {source}")
+    console.print()
+
+    databases = describe_databases()
+    if databases:
+        console.print("[bold]Available databases[/bold]")
+        for name, location, size_bytes in databases:
+            if size_bytes is None:
+                console.print(f"  {name}: {location}")
+            else:
+                console.print(f"  {name}: {location} ({format_size(size_bytes)})")
+    else:
+        console.print("[yellow]No databases found.[/yellow]")
