@@ -170,10 +170,12 @@ drops the previous generation to reclaim disk. Per-collection failures are
 isolated — one bad `.db` does not block the others.
 
 In the weekly pipeline (`fs_scans/PBS/`), `consolidate.pbs` runs after the
-`collect_results` rsync step. It is **disabled by default**; enable it once the
-per-collection performance pass and the CNPG disk/role review have signed off:
+`collect_results` rsync step. The automated weekly driver (`cron_driver.sh`)
+**enables** it (`FS_SCAN_ENABLE_CONSOLIDATE=1`); manual `submit_all.sh`
+invocations stay opt-in:
 
 ```bash
+# automated weekly run consolidates; a manual run does not unless you opt in:
 FS_SCAN_ENABLE_CONSOLIDATE=1 ./fs_scans/PBS/submit_all.sh
 ```
 
