@@ -7,7 +7,7 @@ histogram data from pre-computed ORM tables (AccessHistogram, SizeHistogram).
 from collections import defaultdict
 from datetime import datetime
 
-from sqlalchemy import text
+from sqlalchemy import inspect as sa_inspect, text
 
 from ..cli.common import format_size
 from ..core.database import get_session
@@ -215,14 +215,10 @@ def query_histogram_orm(
     else:
         raise ValueError(f"Invalid histogram_type: {histogram_type}")
 
-    # Check if table exists
+    # Check if table exists (dialect-agnostic: works on sqlite and postgresql)
     try:
-        table_check = session.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name = :table_name"),
-            {"table_name": table_name}
-        ).fetchone()
-
-        if not table_check:
+        bind = session.get_bind()
+        if not sa_inspect(bind).has_table(table_name):
             return None  # Table doesn't exist
     except Exception:
         return None

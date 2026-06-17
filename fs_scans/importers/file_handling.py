@@ -79,7 +79,11 @@ def configure_sqlite_pragmas(session):
     """
     Configure SQLite for maximum insertion performance.
     Risky if system crashes during import, but fine for a rebuildable cache.
+
+    No-op on non-SQLite backends.
     """
+    if session.get_bind().dialect.name != "sqlite":
+        return
     session.execute(text("PRAGMA synchronous = OFF"))
     session.execute(text("PRAGMA journal_mode = MEMORY"))
     session.execute(text("PRAGMA temp_store = MEMORY"))
@@ -93,6 +97,10 @@ def finalize_sqlite_pragmas(session):
     """
     Finalize SQLite after import for optimal query performance.
     Should be called after all inserts are complete.
+
+    No-op on non-SQLite backends.
     """
+    if session.get_bind().dialect.name != "sqlite":
+        return
     session.execute(text("PRAGMA optimize"))  # Optimize index statistics
     session.commit()

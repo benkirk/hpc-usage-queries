@@ -302,8 +302,9 @@ def query_directories(
         if not ancestor_ids:
             return []  # No valid paths found
 
-    # Phase 2: Build query using DirectoryQueryBuilder
-    builder = DirectoryQueryBuilder()
+    # Phase 2: Build query using DirectoryQueryBuilder (dialect-aware so name
+    # pattern matching uses GLOB on sqlite and regex `~`/ILIKE on postgresql).
+    builder = DirectoryQueryBuilder(dialect=session.get_bind().dialect.name)
 
     # Apply depth filters
     if min_depth is not None or max_depth is not None:

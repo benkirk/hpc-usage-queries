@@ -8,6 +8,32 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+# Regex metacharacters to escape when translating a shell glob to a POSIX
+# regex for PostgreSQL.  ``*`` and ``?`` are handled separately as wildcards.
+_REGEX_META = set(r".\+()[]{}^$|")
+
+
+def glob_to_posix_regex(pattern: str) -> str:
+    """Translate a shell-style glob into an anchored POSIX regex.
+
+    Mirrors the wildcard subset SQLite ``GLOB`` and the case-insensitive
+    ``LIKE`` path support: ``*`` → ``.*`` and ``?`` → ``.``.  All other regex
+    metacharacters are escaped, so ``[...]`` character classes are treated as
+    literals (GLOB-only feature, intentionally not ported).
+    """
+    out = ["^"]
+    for ch in pattern:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        elif ch in _REGEX_META:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    out.append("$")
+    return "".join(out)
+
 
 @dataclass
 class QueryResult:
@@ -44,6 +70,10 @@ class DirectoryQueryBuilder:
     _use_descendants_cte: bool = False
     _sort_by: str = "size_r"
     _limit: int | None = None
+
+    # Target SQL dialect ("sqlite" or "postgresql"); controls dialect-specific
+    # operators such as GLOB (sqlite) vs regex `~` (postgresql).
+    dialect: str = "sqlite"
 
     # Sort field mapping
     SORT_MAP: dict[str, str] = field(
@@ -182,15 +212,22 @@ class DirectoryQueryBuilder:
         if not patterns:
             return self
 
+        is_postgres = self.dialect == "postgresql"
+
         pattern_conditions = []
         for i, pattern in enumerate(patterns):
             param_name = f"name_pattern_{i}"
             if ignore_case:
-                # Convert GLOB to LIKE pattern (* -> %, ? -> _)
-                # LIKE is case-insensitive by default in SQLite
+                # Case-insensitive: LIKE is already case-insensitive in SQLite;
+                # PostgreSQL needs ILIKE.  (* -> %, ? -> _)
                 like_pattern = pattern.replace("*", "%").replace("?", "_")
-                pattern_conditions.append(f"d.name LIKE :{param_name}")
+                op = "ILIKE" if is_postgres else "LIKE"
+                pattern_conditions.append(f"d.name {op} :{param_name}")
                 self._params[param_name] = like_pattern
+            elif is_postgres:
+                # Case-sensitive: PostgreSQL has no GLOB — use an anchored regex.
+                pattern_conditions.append(f"d.name ~ :{param_name}")
+                self._params[param_name] = glob_to_posix_regex(pattern)
             else:
                 pattern_conditions.append(f"d.name GLOB :{param_name}")
                 self._params[param_name] = pattern
