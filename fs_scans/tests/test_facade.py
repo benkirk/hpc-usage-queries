@@ -25,6 +25,10 @@ from fs_scans.core.models import (
     SizeHistogram as SizeHistogramRow,
     UserInfo,
 )
+from fs_scans.queries.query_engine import (
+    resolve_groupnames_across_databases,
+    resolve_usernames_across_databases,
+)
 from fs_scans.queries.facade import FsScanQueries
 from fs_scans.cli.core import (
     build_access_history,
@@ -234,6 +238,68 @@ def test_access_history_envelope_json_serializable(collection, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["kind"] == "fs_access_history"
     assert payload["histogram"]["total_files"] == 500
+
+
+# ---------------------------------------------------------------------------
+# Cross-database name resolution (regression for the multi-db UID bug)
+# ---------------------------------------------------------------------------
+# UIDs/GIDs chosen far outside any local passwd/group range so pwd/grp lookups
+# fail and the database-backed resolution is what's under test.
+_REMOTE_UID = 9_400_001
+_REMOTE_GID = 9_400_002
+
+
+@pytest.fixture
+def two_collections(tmp_path):
+    """Two collections where the second owns the user/group, the first does not.
+
+    Reproduces the bug: a path-filtered multi-db query fans out across every
+    database, but only the owning collection's user_info/group_info knows its
+    users. The first database queried must not short-circuit the search with a
+    str(uid) placeholder.
+    """
+    for name, populate in (("a_first", False), ("b_owner", True)):
+        engine = create_engine(f"sqlite:///{tmp_path / (name + '.db')}")
+        Base.metadata.create_all(engine)
+        session = sessionmaker(bind=engine)()
+        if populate:
+            session.add_all([
+                UserInfo(uid=_REMOTE_UID, username="claire"),
+                GroupInfo(gid=_REMOTE_GID, groupname="climate"),
+            ])
+        else:
+            # An unrelated user, so a_first.db's user_info is non-empty but
+            # lacks _REMOTE_UID (the historical trigger for the early-stop bug).
+            session.add(UserInfo(uid=1, username="root"))
+        session.commit()
+        session.close()
+        engine.dispose()
+
+    set_data_dir(tmp_path)
+    clear_engine_cache()
+    yield ["a_first", "b_owner"]  # order matters: owning db is second
+    clear_engine_cache()
+    set_data_dir(None)
+
+
+def test_username_resolved_from_non_first_database(two_collections):
+    names = resolve_usernames_across_databases([_REMOTE_UID], two_collections)
+    assert names == {_REMOTE_UID: "claire"}
+
+
+def test_groupname_resolved_from_non_first_database(two_collections):
+    names = resolve_groupnames_across_databases([_REMOTE_GID], two_collections)
+    assert names == {_REMOTE_GID: "climate"}
+
+
+def test_unknown_uid_falls_back_to_str(two_collections):
+    names = resolve_usernames_across_databases([_REMOTE_UID + 999], two_collections)
+    assert names == {_REMOTE_UID + 999: str(_REMOTE_UID + 999)}
+
+
+def test_facade_resolve_usernames_across_collections(two_collections):
+    names = FsScanQueries(filesystems=two_collections).resolve_usernames({_REMOTE_UID})
+    assert names == {_REMOTE_UID: "claire"}
 
 
 def test_rich_exporter_renders_all_kinds(collection):
