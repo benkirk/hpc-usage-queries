@@ -79,9 +79,11 @@ class DirectoryStats(Base):
     dir_count_r = Column(BigInteger, nullable=False, default=0)
     max_atime_r = Column(DateTime, nullable=True)
 
-    # Owner/group tracking: -1=no files yet, NULL=multiple, else=single UID/GID
-    owner_uid = Column(Integer, nullable=True, default=-1)
-    owner_gid = Column(Integer, nullable=True, default=-1)
+    # Owner/group tracking: -1=no files yet, NULL=multiple, else=single UID/GID.
+    # BigInteger: 32-bit *unsigned* UIDs/GIDs (e.g. nobody=4294967294) exceed
+    # PostgreSQL's 32-bit signed `integer` range.
+    owner_uid = Column(BigInteger, nullable=True, default=-1)
+    owner_gid = Column(BigInteger, nullable=True, default=-1)
 
     # Relationship
     directory = relationship("Directory", back_populates="stats")
@@ -140,7 +142,7 @@ class OwnerSummary(Base):
 
     __tablename__ = "owner_summary"
 
-    owner_uid = Column(Integer, primary_key=True)
+    owner_uid = Column(BigInteger, primary_key=True)
     total_size = Column(BigInteger, default=0)
     total_files = Column(BigInteger, default=0)
     directory_count = Column(Integer, default=0)
@@ -161,7 +163,7 @@ class UserInfo(Base):
 
     __tablename__ = "user_info"
 
-    uid = Column(Integer, primary_key=True)
+    uid = Column(BigInteger, primary_key=True)
     username = Column(Text)
     full_name = Column(Text)  # GECOS field
 
@@ -178,7 +180,7 @@ class GroupInfo(Base):
 
     __tablename__ = "group_info"
 
-    gid = Column(Integer, primary_key=True)
+    gid = Column(BigInteger, primary_key=True)
     groupname = Column(Text)
 
     def __repr__(self):
@@ -194,7 +196,7 @@ class GroupSummary(Base):
 
     __tablename__ = "group_summary"
 
-    owner_gid = Column(Integer, primary_key=True)
+    owner_gid = Column(BigInteger, primary_key=True)
     total_size = Column(BigInteger, default=0)
     total_files = Column(BigInteger, default=0)
     directory_count = Column(Integer, default=0)
@@ -215,7 +217,7 @@ class AccessHistogram(Base):
 
     __tablename__ = "access_histogram"
 
-    owner_uid = Column(Integer, primary_key=True)
+    owner_uid = Column(BigInteger, primary_key=True)
     bucket_index = Column(Integer, primary_key=True)  # 0-9 (maps to ATIME_BUCKETS)
 
     file_count = Column(BigInteger, default=0)
@@ -279,7 +281,7 @@ class SizeHistogram(Base):
 
     __tablename__ = "size_histogram"
 
-    owner_uid = Column(Integer, primary_key=True)
+    owner_uid = Column(BigInteger, primary_key=True)
     bucket_index = Column(Integer, primary_key=True)  # 0-9 (maps to SIZE_BUCKETS)
 
     file_count = Column(BigInteger, default=0)

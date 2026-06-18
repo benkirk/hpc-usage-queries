@@ -230,6 +230,35 @@ class TestDirectoryQueryBuilder:
         assert "GLOB" not in result.sql
         assert "LIKE" not in result.sql
 
+    def test_name_patterns_postgres_regex(self):
+        """PostgreSQL dialect: case-sensitive patterns compile to a regex (~)."""
+        builder = DirectoryQueryBuilder(dialect="postgresql")
+        result = builder.with_name_patterns(["*scratch*", "tmp?"]).build()
+
+        assert "d.name ~ :name_pattern_0" in result.sql
+        assert "d.name ~ :name_pattern_1" in result.sql
+        assert "GLOB" not in result.sql
+        # * -> .*, ? -> . , anchored
+        assert result.params["name_pattern_0"] == "^.*scratch.*$"
+        assert result.params["name_pattern_1"] == "^tmp.$"
+
+    def test_name_patterns_postgres_ilike_ignore_case(self):
+        """PostgreSQL dialect: case-insensitive patterns use ILIKE, not LIKE."""
+        builder = DirectoryQueryBuilder(dialect="postgresql")
+        result = builder.with_name_patterns(["*TMP*"], ignore_case=True).build()
+
+        assert "d.name ILIKE :name_pattern_0" in result.sql
+        assert "d.name LIKE " not in result.sql
+        assert result.params["name_pattern_0"] == "%TMP%"
+
+    def test_glob_to_posix_regex_escapes_metacharacters(self):
+        """Regex metacharacters in a glob are escaped; wildcards are translated."""
+        from fs_scans.core.query_builder import glob_to_posix_regex
+
+        assert glob_to_posix_regex("a.b+c") == r"^a\.b\+c$"
+        assert glob_to_posix_regex("*.log") == r"^.*\.log$"
+        assert glob_to_posix_regex("data_?") == r"^data_.$"
+
     def test_path_prefix_cte_single(self):
         """Test single path prefix generates descendants CTE."""
         builder = DirectoryQueryBuilder()

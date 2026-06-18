@@ -5,6 +5,7 @@ import click
 from .import_cmd import import_cmd
 from .query_cmd import query_cmd
 from .analyze_cmd import analyze_cmd
+from .consolidate_cmd import consolidate_cmd
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -33,6 +34,7 @@ def fs_scans_cli():
 fs_scans_cli.add_command(import_cmd, name="import")
 fs_scans_cli.add_command(query_cmd, name="query")
 fs_scans_cli.add_command(analyze_cmd, name="analyze")
+fs_scans_cli.add_command(consolidate_cmd, name="consolidate")
 
 
 if __name__ == "__main__":

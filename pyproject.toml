@@ -43,6 +43,7 @@ fs-scans = "fs_scans.cli.main:fs_scans_cli"
 fs-scans-import = "fs_scans.wrappers.fs_scans_import:main"
 fs-scans-query = "fs_scans.wrappers.fs_scans_query:main"
 fs-scans-analyze = "fs_scans.wrappers.fs_scans_analyze:main"
+fs-scans-consolidate = "fs_scans.wrappers.fs_scans_consolidate:main"
 
 # jobhist convenience wrappers (allow selective deployment)
 jobhist-sync = "job_history.cli.cmds.jobhist_sync:main"

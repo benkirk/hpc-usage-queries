@@ -1,0 +1,59 @@
+#!/bin/bash
+
+#PBS -N fs_scans_consolidate
+#PBS -A SCSG0001
+#PBS -j oe
+#PBS -q casper
+#PBS -l walltime=8:00:00
+#PBS -l select=1:ncpus=1:mpiprocs=1:ompthreads=1:mem=8G
+
+# Consolidate the freshly-published per-collection SQLite .db files into the
+# CNPG PostgreSQL database (one schema per collection), with an atomic swap.
+# Runs after collect_results (rsync) in the weekly pipeline.
+#
+# The heavy lifting (COPY, index builds, ANALYZE) happens server-side on CNPG;
+# this job only streams, so it needs modest local resources.
+
+#----------------------------------------------------------------------------
+# Determine the directory containing this script, compatible with bash and zsh
+if [ -n "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION}" ]; then
+  SCRIPT_PATH="${(%):-%x}"
+else
+  echo "Unknown shell!"
+fi
+SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
+# Under PBS the script runs from a spool copy, so resolve the repo from the
+# job's working directory (PBS starts in the submission dir; falls back to CWD
+# for manual runs) — matching fs_scan.pbs / rsync_results.pbs.
+cd "${PBS_O_WORKDIR:-.}"
+TOP_DIR=$(git rev-parse --show-toplevel)
+#----------------------------------------------------------------------------
+
+sep="#----------------------------------------------------------------------------"
+
+set -e
+
+source ${TOP_DIR}/etc/config_env.sh
+which python3
+
+# Export the fs_scans PostgreSQL settings to the environment so the CLI picks
+# them up even if the package is not an editable install (find_dotenv may not
+# reach the repo .env otherwise). Values (incl. ${CIRRUS_PG_*}) come from .env.
+set -a
+source ${TOP_DIR}/.env
+set +a
+
+export FS_SCAN_DB_BACKEND=postgres
+# Consume exactly the published .db set (override with FS_SCAN_DATA_DIR if set).
+export FS_SCAN_DATA_DIR="${FS_SCAN_DATA_DIR:-${TOP_DIR}/fs_scans/data}"
+
+echo ${sep}
+echo "Backend:   ${FS_SCAN_DB_BACKEND}"
+echo "Data dir:  ${FS_SCAN_DATA_DIR}"
+echo "PG server: ${FS_SCAN_PG_HOST}:${FS_SCAN_PG_PORT:-5432}/${FS_SCAN_PG_DB:-campaign}"
+echo ${sep}
+
+cd ${TOP_DIR}
+time fs-scans-consolidate --all
