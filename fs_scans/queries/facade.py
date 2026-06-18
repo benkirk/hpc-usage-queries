@@ -103,6 +103,32 @@ def _is_collection_root(norm_prefix: str) -> bool:
     return bool(norm_prefix) and "/" not in norm_prefix.strip("/")
 
 
+def _merge_histogram(combined, src, all_uids: set) -> None:
+    """Additively merge histogram *src* into *combined* (same bucket labels).
+
+    Works for any histogram object exposing ``.buckets`` /
+    ``.total_data`` / ``.total_files`` — i.e. both the pre-computed
+    :class:`HistogramData` (fast path) and the on-the-fly
+    :class:`AccessHistogram` (slow path) — so a single query can union the
+    two when a project spans both root- and sub-path-scoped collections.
+    ``all_uids`` accumulates every owner UID seen, for one batched
+    username resolution by the caller.
+    """
+    combined.total_data += src.total_data
+    combined.total_files += src.total_files
+    for label in combined.buckets:
+        s = src.buckets.get(label)
+        if not s:
+            continue
+        dst = combined.buckets[label]
+        dst["data"] += s["data"]
+        dst["files"] += s["files"]
+        for uid, stats in s["owners"].items():
+            dst["owners"][uid]["data"] += stats["data"]
+            dst["owners"][uid]["files"] += stats["files"]
+            all_uids.add(uid)
+
+
 class FsScanQueries:
     """Machine-/filesystem-aware query API for filesystem scan databases.
 
@@ -157,35 +183,55 @@ class FsScanQueries:
         return dates
 
     def _resolve_scope(self, path_prefixes):
-        """Normalize + collapse *path_prefixes* and apply the root fast path.
+        """Normalize + collapse *path_prefixes* into a PER-COLLECTION scope.
 
-        Returns ``(filesystems, norm_prefixes)``:
+        Returns an ordered ``{filesystem: prefixes}`` map naming exactly the
+        collections to query, where each value is either:
 
-          * ``filesystems`` — the collections to query. Narrowed to exactly
-            the collections named by the prefixes when every (collapsed)
-            prefix is a whole-collection root, so we don't scan collections
-            the caller didn't ask for; otherwise the configured
-            ``self.filesystems``.
-          * ``norm_prefixes`` — the collapsed, mount-normalized prefixes, or
-            ``None`` when every prefix is a whole-collection root. ``None``
-            routes each query method to its pre-computed / unfiltered fast
-            path (OwnerSummary / GroupSummary / DirectoryStats /
-            AccessHistogram), returning the identical result far faster.
+          * ``None`` — query the whole collection *unfiltered*, routing this
+            collection to its pre-computed / fast path (OwnerSummary /
+            GroupSummary / DirectoryStats / AccessHistogram). Used when a
+            (collapsed) prefix is the bare collection root *and* names a
+            configured collection.
+          * a list of normalized sub-path prefixes — the genuine drill-down /
+            on-the-fly path for this collection.
 
-        A root prefix naming a collection that isn't configured falls back to
-        the filtered path over ``self.filesystems`` (which simply matches
-        nothing for that prefix) rather than silently widening scope.
+        The decision is made **per collection**, not globally: a project that
+        owns the whole of one collection (``/ral``) but only sub-paths in
+        another (``/ncar/USGS_Water``) gets the fast path for ``ral`` and the
+        slow path for ``ncar`` — instead of the old all-or-nothing rule where
+        a single sub-path forced every collection (including the big root one)
+        onto the slow path.
+
+        Genuine sub-paths, and roots naming a collection that isn't
+        configured, become "leftover" prefixes applied across the remaining
+        (non-fast) configured filesystems — preserving the old fallback that
+        never widens scope (a non-matching collection simply resolves the
+        prefix to nothing). ``None`` path_prefixes → every configured
+        collection unfiltered.
         """
         if not path_prefixes:
-            return self.filesystems, None
+            return {fs: None for fs in self.filesystems}
 
         norm = _collapse_prefixes(normalize_path(p) for p in path_prefixes)
-        if norm and all(_is_collection_root(p) for p in norm):
-            named = {p.strip("/").lower() for p in norm}
-            targets = [f for f in self.filesystems if f.lower() in named]
-            if targets:
-                return targets, None
-        return self.filesystems, norm
+        configured = {f.lower(): f for f in self.filesystems}
+
+        fast = {}        # fs -> None  (whole-collection root, fast path)
+        leftover = []    # genuine sub-paths / unconfigured-collection roots
+        for p in norm:
+            if _is_collection_root(p):
+                fs = configured.get(p.strip("/").lower())
+                if fs is not None:
+                    fast[fs] = None
+                    continue
+            leftover.append(p)
+
+        scope = dict(fast)
+        if leftover:
+            for fs in self.filesystems:
+                if fs not in fast:
+                    scope[fs] = list(leftover)
+        return scope
 
     def summary(self) -> list[dict]:
         """Per-filesystem summary statistics (rows tagged with ``filesystem``)."""
@@ -240,14 +286,16 @@ class FsScanQueries:
         multiple filesystems each is queried in parallel and the combined
         result set is re-sorted and truncated to ``limit``.
         """
-        filesystems, norm_prefixes = self._resolve_scope(path_prefixes)
+        scope = self._resolve_scope(path_prefixes)
+        filesystems = list(scope)
         norm_excludes = [normalize_path(p) for p in exclude_paths] if exclude_paths else None
         query_limit = limit if (limit is not None and limit > 0) else None
 
         if len(filesystems) <= 1:
             if not filesystems:
                 return []
-            session = get_session(filesystems[0])
+            fs = filesystems[0]
+            session = get_session(fs)
             try:
                 return query_directories(
                     session,
@@ -255,7 +303,7 @@ class FsScanQueries:
                     max_depth=max_depth,
                     single_owner=single_owner,
                     owner_id=owner_id,
-                    path_prefixes=norm_prefixes,
+                    path_prefixes=scope[fs],
                     exclude_paths=norm_excludes,
                     sort_by=sort_by,
                     limit=query_limit,
@@ -273,7 +321,8 @@ class FsScanQueries:
             finally:
                 session.close()
 
-        # Multi-filesystem: parallel fan-out, then combine + re-sort + re-limit.
+        # Multi-filesystem: parallel fan-out (each with ITS OWN scope), then
+        # combine + re-sort + re-limit.
         all_directories: list[dict] = []
         max_workers = min(len(filesystems), 8)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -285,7 +334,7 @@ class FsScanQueries:
                     max_depth,
                     single_owner,
                     owner_id,
-                    norm_prefixes,
+                    scope[fs],
                     norm_excludes,
                     sort_by,
                     query_limit,
@@ -350,11 +399,13 @@ class FsScanQueries:
         else:  # pragma: no cover - guarded by callers
             raise ValueError(f"Invalid entity_type: {entity_type}")
 
-        filesystems, norm_prefixes = self._resolve_scope(path_prefixes)
+        scope = self._resolve_scope(path_prefixes)
+        filesystems = list(scope)
         entity_sort_by = _ENTITY_SORT_MAP.get(sort_by, "size")
         query_limit = limit if (limit is not None and limit > 0) else None
 
-        # Query each filesystem (tag each row with its source filesystem).
+        # Query each filesystem with ITS OWN scope (None -> pre-computed
+        # OwnerSummary/GroupSummary fast path; sub-paths -> dynamic).
         all_results: list[dict] = []
         for fs in filesystems:
             session = get_session(fs)
@@ -363,7 +414,7 @@ class FsScanQueries:
                     session,
                     min_depth=min_depth,
                     max_depth=max_depth,
-                    path_prefixes=norm_prefixes,
+                    path_prefixes=scope[fs],
                     limit=query_limit,
                     sort_by=entity_sort_by,
                 )
@@ -426,33 +477,33 @@ class FsScanQueries:
         when no path/depth filters are given, otherwise computes on the fly
         from ``directory_stats``.
         """
-        filesystems, norm_prefixes = self._resolve_scope(path_prefixes)
-        use_fast_path = norm_prefixes is None and not min_depth and not max_depth
-        display_dir = self._display_directory(norm_prefixes, filesystems)
+        scope = self._resolve_scope(path_prefixes)
+        filesystems = list(scope)
+        display_dir = self._display_directory(scope)
 
         scan_dates = self.scan_dates(filesystems)
         if not scan_dates:
             return None
         reference_scan_date = max(scan_dates)
 
-        if use_fast_path:
-            combined, username_map = aggregate_histograms_across_databases(
-                filesystems=filesystems,
-                histogram_type="access",
-                owner_uid=owner_uid,
-            )
-            return self._histogram_dict(
-                combined, username_map,
-                histogram_type="access", renderer="histogram_data",
-                title="Access Time Distribution", directory=display_dir,
-                fast_path=True, approximate=False,
-                scan_dates=scan_dates, reference_scan_date=reference_scan_date,
-            )
+        # Per-collection split: root-scoped collections (scope==None) take the
+        # pre-computed fast path; sub-path collections compute on the fly.
+        # Any depth filter disqualifies the fast path entirely.
+        depth_filtered = bool(min_depth) or bool(max_depth)
+        fast_fs = [fs for fs, pref in scope.items() if pref is None] if not depth_filtered else []
+        fast_set = set(fast_fs)
+        slow_fs = [fs for fs in filesystems if fs not in fast_set]
 
-        # Slow path: compute per-filesystem AccessHistogram and merge.
         combined = AccessHistogram(reference_scan_date)
         all_uids: set[int] = set()
-        for fs in filesystems:
+
+        if fast_fs:
+            fast_hist, _ = aggregate_histograms_across_databases(
+                filesystems=fast_fs, histogram_type="access", owner_uid=owner_uid,
+            )
+            _merge_histogram(combined, fast_hist, all_uids)
+
+        for fs in slow_fs:
             session = get_session(fs)
             try:
                 scan_date = get_scan_date(session)
@@ -460,30 +511,24 @@ class FsScanQueries:
                     continue
                 fs_hist = compute_access_history(
                     session, scan_date,
-                    path_prefixes=norm_prefixes,
+                    path_prefixes=scope[fs],
                     min_depth=min_depth, max_depth=max_depth,
                 )
             finally:
                 session.close()
-
-            combined.total_data += fs_hist.total_data
-            combined.total_files += fs_hist.total_files
-            for label in combined.buckets:
-                src = fs_hist.buckets[label]
-                dst = combined.buckets[label]
-                dst["data"] += src["data"]
-                dst["files"] += src["files"]
-                for uid, stats in src["owners"].items():
-                    dst["owners"][uid]["data"] += stats["data"]
-                    dst["owners"][uid]["files"] += stats["files"]
-                    all_uids.add(uid)
+            _merge_histogram(combined, fs_hist, all_uids)
 
         username_map = self.resolve_usernames(all_uids)
+        # "fast_path" reports a purely pre-computed result; a mixed query
+        # (some on-the-fly collections) is rendered via the slow renderer.
+        purely_fast = bool(fast_fs) and not slow_fs
         return self._histogram_dict(
             combined, username_map,
-            histogram_type="access", renderer="access_histogram",
-            title=None, directory=display_dir,
-            fast_path=False, approximate=False,
+            histogram_type="access",
+            renderer="histogram_data" if purely_fast else "access_histogram",
+            title="Access Time Distribution" if purely_fast else None,
+            directory=display_dir,
+            fast_path=purely_fast, approximate=False,
             scan_dates=scan_dates, reference_scan_date=reference_scan_date,
         )
 
@@ -501,34 +546,32 @@ class FsScanQueries:
         available. Uses the ORM fast path when unfiltered, otherwise an
         approximate computation from ``directory_stats``.
         """
-        filesystems, norm_prefixes = self._resolve_scope(path_prefixes)
-        use_fast_path = norm_prefixes is None and not min_depth and not max_depth
-        display_dir = self._display_directory(norm_prefixes, filesystems)
+        scope = self._resolve_scope(path_prefixes)
+        filesystems = list(scope)
+        display_dir = self._display_directory(scope)
 
         scan_dates = self.scan_dates(filesystems)
         if not scan_dates:
             return None
         reference_scan_date = max(scan_dates)
 
-        if use_fast_path:
-            combined, username_map = aggregate_histograms_across_databases(
-                filesystems=filesystems,
-                histogram_type="size",
-                owner_uid=owner_uid,
-            )
-            return self._histogram_dict(
-                combined, username_map,
-                histogram_type="size", renderer="histogram_data",
-                title="File Size Distribution", directory=display_dir,
-                fast_path=True, approximate=False,
-                scan_dates=scan_dates, reference_scan_date=reference_scan_date,
-            )
-
-        # Slow path: approximate per-filesystem size histogram and merge.
         bucket_labels = [label for label, _, _ in SIZE_BUCKETS]
+        depth_filtered = bool(min_depth) or bool(max_depth)
+        fast_fs = [fs for fs, pref in scope.items() if pref is None] if not depth_filtered else []
+        fast_set = set(fast_fs)
+        slow_fs = [fs for fs in filesystems if fs not in fast_set]
+
         combined = HistogramData(bucket_labels, reference_scan_date)
         all_uids: set[int] = set()
-        for fs in filesystems:
+
+        if fast_fs:
+            fast_hist, _ = aggregate_histograms_across_databases(
+                filesystems=fast_fs, histogram_type="size", owner_uid=owner_uid,
+            )
+            _merge_histogram(combined, fast_hist, all_uids)
+
+        # Slow collections: approximate per-filesystem size histogram (dict).
+        for fs in slow_fs:
             session = get_session(fs)
             try:
                 scan_date = get_scan_date(session)
@@ -536,7 +579,7 @@ class FsScanQueries:
                     continue
                 fs_hist = compute_size_histogram_from_directory_stats(
                     session, scan_date,
-                    path_prefixes=norm_prefixes,
+                    path_prefixes=scope[fs],
                     min_depth=min_depth, max_depth=max_depth,
                     owner_uid=owner_uid,
                 )
@@ -550,29 +593,34 @@ class FsScanQueries:
                         all_uids.add(uid)
 
         username_map = self.resolve_usernames(all_uids)
+        # Approximate whenever any collection took the on-the-fly size path.
+        purely_fast = bool(fast_fs) and not slow_fs
         return self._histogram_dict(
             combined, username_map,
             histogram_type="size", renderer="histogram_data",
-            title="File Size Distribution (Approximate)", directory=display_dir,
-            fast_path=False, approximate=True,
+            title="File Size Distribution" if purely_fast
+                  else "File Size Distribution (Approximate)",
+            directory=display_dir,
+            fast_path=purely_fast, approximate=not purely_fast,
             scan_dates=scan_dates, reference_scan_date=reference_scan_date,
         )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _display_directory(self, norm_prefixes, filesystems=None) -> str:
+    def _display_directory(self, scope) -> str:
         """Compute the human-readable 'Directory' label for histogram output.
 
-        ``filesystems`` is the (possibly root-narrowed) set actually queried;
-        defaults to all configured filesystems. When a whole-collection-root
-        prefix collapses to ``norm_prefixes=None`` over a single collection,
-        the label reflects that collection (``/mmm``) rather than "All
-        filesystems".
+        ``scope`` is the ``{filesystem: None|prefixes}`` map from
+        :meth:`_resolve_scope`. A lone sub-path renders as itself; multiple
+        sub-paths (or a mix of root + sub-path collections) render as
+        "Multiple paths"; a single whole-collection root renders as that
+        collection (``/mmm``); otherwise "All filesystems".
         """
-        fs = filesystems if filesystems is not None else self.filesystems
-        if norm_prefixes:
-            return norm_prefixes[0] if len(norm_prefixes) == 1 else "Multiple paths"
+        sub_prefixes = [p for prefixes in scope.values() if prefixes for p in prefixes]
+        if sub_prefixes:
+            return sub_prefixes[0] if len(sub_prefixes) == 1 and len(scope) == 1 else "Multiple paths"
+        fs = list(scope)
         if len(fs) == 1:
             return f"/{fs[0]}"
         return "All filesystems"

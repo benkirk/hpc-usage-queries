@@ -213,26 +213,42 @@ def test_is_collection_root():
 def test_resolve_scope_root_prefix_uses_fast_path():
     q = FsScanQueries(filesystems=["mmm", "cisl"])
     # A whole-collection root -> unfiltered (None) over just the named collection.
-    assert q._resolve_scope(["/gpfs/csfs1/mmm"]) == (["mmm"], None)
+    assert q._resolve_scope(["/gpfs/csfs1/mmm"]) == {"mmm": None}
     # Nested children collapse to the root, then take the fast path.
-    assert q._resolve_scope(["/glade/campaign/mmm", "/gpfs/csfs1/mmm/parc"]) == (["mmm"], None)
+    assert q._resolve_scope(["/glade/campaign/mmm", "/gpfs/csfs1/mmm/parc"]) == {"mmm": None}
 
 
 def test_resolve_scope_subpath_stays_filtered():
+    # A genuine sub-path is applied (as leftover) across the non-fast
+    # configured collections — a non-matching one resolves it to nothing.
     q = FsScanQueries(filesystems=["mmm", "cisl"])
-    assert q._resolve_scope(["/gpfs/csfs1/cisl/csg"]) == (["mmm", "cisl"], ["/cisl/csg"])
+    assert q._resolve_scope(["/gpfs/csfs1/cisl/csg"]) == {
+        "mmm": ["/cisl/csg"], "cisl": ["/cisl/csg"],
+    }
+
+
+def test_resolve_scope_mixed_root_and_subpath():
+    # Per-collection decision: the whole-collection root (/ral) takes the
+    # fast path (None) while the sub-path collection (/ncar/...) stays
+    # filtered — instead of the old all-or-nothing rule dragging ral slow.
+    q = FsScanQueries(filesystems=["ral", "ncar"])
+    assert q._resolve_scope([
+        "/gpfs/csfs1/ral",
+        "/gpfs/csfs1/ncar/USGS_Water",
+        "/gpfs/csfs1/ncar/fedata",
+    ]) == {"ral": None, "ncar": ["/ncar/USGS_Water", "/ncar/fedata"]}
 
 
 def test_resolve_scope_unconfigured_root_falls_back():
     # A root prefix naming a collection that isn't configured does NOT widen
     # scope — it falls back to the filtered path (which matches nothing).
     q = FsScanQueries(filesystems=["mmm"])
-    assert q._resolve_scope(["/gpfs/csfs1/zzz"]) == (["mmm"], ["/zzz"])
+    assert q._resolve_scope(["/gpfs/csfs1/zzz"]) == {"mmm": ["/zzz"]}
 
 
 def test_resolve_scope_no_prefixes():
     q = FsScanQueries(filesystems=["mmm", "cisl"])
-    assert q._resolve_scope(None) == (["mmm", "cisl"], None)
+    assert q._resolve_scope(None) == {"mmm": None, "cisl": None}
 
 
 def test_owner_summary_collection_root_matches_unfiltered(collection):
@@ -247,6 +263,79 @@ def test_access_history_collection_root_uses_fast_path(collection):
     hist = q.access_history(path_prefixes=["/testfs"])
     assert hist["fast_path"] is True
     assert hist["total_files"] == 500  # whole collection, from precomputed table
+
+
+@pytest.fixture
+def mixed_collections(tmp_path):
+    """Two collections to exercise the per-collection fast/slow split:
+
+      * ``alpha`` — only a pre-computed AccessHistogram table (no directory
+        tree needed); a ``/alpha`` root prefix takes the FAST path.
+      * ``beta`` — a directory tree with stats; a ``/beta/sub`` SUB-path
+        takes the SLOW on-the-fly path. A second stats row directly under
+        ``/beta`` (outside ``/beta/sub``) must NOT be counted.
+    """
+    # alpha: precomputed access histogram (bucket 0 = "< 1 Month")
+    eng_a = create_engine(f"sqlite:///{tmp_path / 'alpha.db'}")
+    Base.metadata.create_all(eng_a)
+    sa = sessionmaker(bind=eng_a)()
+    sa.add_all([
+        AccessHistogramRow(owner_uid=1001, bucket_index=0, file_count=300, total_size=3_000),
+        UserInfo(uid=1001, username="alice"),
+        ScanMetadata(source_file="20260115_alpha.log", filesystem="alpha", scan_timestamp=SCAN_DATE),
+    ])
+    sa.commit(); sa.close(); eng_a.dispose()
+
+    # beta: directory tree; /beta/sub (dir 2) is in scope, /beta/other (dir 3) is not
+    eng_b = create_engine(f"sqlite:///{tmp_path / 'beta.db'}")
+    Base.metadata.create_all(eng_b)
+    sb = sessionmaker(bind=eng_b)()
+    sb.add_all([
+        Directory(dir_id=1, parent_id=None, name="beta", depth=1),
+        Directory(dir_id=2, parent_id=1, name="sub", depth=2),
+        Directory(dir_id=3, parent_id=1, name="other", depth=2),
+    ])
+    sb.add_all([
+        DirectoryStats(dir_id=2, file_count_r=200, total_size_r=2_000, owner_uid=1002,
+                       owner_gid=2001, file_count_nr=200, total_size_nr=2_000,
+                       max_atime_nr=datetime(2025, 6, 1)),
+        DirectoryStats(dir_id=3, file_count_r=999, total_size_r=9_999, owner_uid=1003,
+                       owner_gid=2001, file_count_nr=999, total_size_nr=9_999,
+                       max_atime_nr=datetime(2025, 6, 1)),
+        DirectoryStats(dir_id=1, file_count_r=0, total_size_r=0, owner_uid=-1,
+                       owner_gid=-1, file_count_nr=0, total_size_nr=0),
+    ])
+    sb.add_all([
+        UserInfo(uid=1002, username="bob"),
+        ScanMetadata(source_file="20260115_beta.log", filesystem="beta", scan_timestamp=SCAN_DATE),
+    ])
+    sb.commit(); sb.close(); eng_b.dispose()
+
+    set_data_dir(tmp_path)
+    clear_engine_cache()
+    yield ["alpha", "beta"]
+    clear_engine_cache()
+    set_data_dir(None)
+
+
+def test_access_history_mixed_root_and_subpath(mixed_collections):
+    """A single call unions a FAST root collection (alpha, precomputed) with a
+    SLOW sub-path collection (beta, on-the-fly) — the per-collection win."""
+    q = FsScanQueries(filesystems=mixed_collections)
+    hist = q.access_history(path_prefixes=["/alpha", "/beta/sub"])
+
+    assert hist is not None
+    # Mixed query -> not a purely pre-computed result.
+    assert hist["fast_path"] is False
+    # alpha (3000/300) + beta's /beta/sub (2000/200); /beta/other excluded.
+    assert hist["total_data"] == 5_000
+    assert hist["total_files"] == 500
+    # alice's 300 files come from alpha's precomputed bucket 0.
+    assert hist["buckets"]["< 1 Month"]["files"] == 300
+    # bob's 200 files came from the on-the-fly beta scan and are present.
+    bob_files = sum(b["owners"].get(1002, {}).get("files", 0)
+                    for b in hist["buckets"].values())
+    assert bob_files == 200
 
 
 def test_list_directories_overlapping_prefixes_no_duplicates(collection):
