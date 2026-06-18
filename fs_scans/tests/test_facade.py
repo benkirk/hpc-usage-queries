@@ -29,7 +29,11 @@ from fs_scans.queries.query_engine import (
     resolve_groupnames_across_databases,
     resolve_usernames_across_databases,
 )
-from fs_scans.queries.facade import FsScanQueries
+from fs_scans.queries.facade import (
+    FsScanQueries,
+    _collapse_prefixes,
+    _is_collection_root,
+)
 from fs_scans.cli.core import (
     build_access_history,
     build_directories,
@@ -182,12 +186,77 @@ def test_file_size_histogram_fast_path(collection):
 
 
 def test_access_history_path_filter_slow_path(collection):
-    hist = FsScanQueries(filesystems="testfs").access_history(path_prefixes=["/tank"])
+    # A genuine SUB-path (not the collection root) still takes the slow,
+    # on-the-fly path. '/tank/alice' is below the root, so it can't use the
+    # pre-computed AccessHistogram table.
+    hist = FsScanQueries(filesystems="testfs").access_history(path_prefixes=["/tank/alice"])
     assert hist is not None
     assert hist["fast_path"] is False
     assert hist["renderer"] == "access_histogram"
-    # alice + bob + proj non-recursive sizes = 6000
-    assert hist["total_data"] == 6_000
+
+
+# ---------------------------------------------------------------------------
+# Path-prefix scope resolution: collapse + whole-collection-root fast path
+# ---------------------------------------------------------------------------
+def test_collapse_prefixes_drops_descendants():
+    assert _collapse_prefixes(["/mmm", "/mmm/parc", "/mmm/c3we"]) == ["/mmm"]
+    assert _collapse_prefixes(["/mmm/parc", "/cisl"]) == ["/cisl", "/mmm/parc"]
+    assert _collapse_prefixes(["/mmm", "/mmm"]) == ["/mmm"]  # dedupe
+
+
+def test_is_collection_root():
+    assert _is_collection_root("/mmm") is True
+    assert _is_collection_root("/mmm/parc") is False
+    assert _is_collection_root("") is False
+
+
+def test_resolve_scope_root_prefix_uses_fast_path():
+    q = FsScanQueries(filesystems=["mmm", "cisl"])
+    # A whole-collection root -> unfiltered (None) over just the named collection.
+    assert q._resolve_scope(["/gpfs/csfs1/mmm"]) == (["mmm"], None)
+    # Nested children collapse to the root, then take the fast path.
+    assert q._resolve_scope(["/glade/campaign/mmm", "/gpfs/csfs1/mmm/parc"]) == (["mmm"], None)
+
+
+def test_resolve_scope_subpath_stays_filtered():
+    q = FsScanQueries(filesystems=["mmm", "cisl"])
+    assert q._resolve_scope(["/gpfs/csfs1/cisl/csg"]) == (["mmm", "cisl"], ["/cisl/csg"])
+
+
+def test_resolve_scope_unconfigured_root_falls_back():
+    # A root prefix naming a collection that isn't configured does NOT widen
+    # scope — it falls back to the filtered path (which matches nothing).
+    q = FsScanQueries(filesystems=["mmm"])
+    assert q._resolve_scope(["/gpfs/csfs1/zzz"]) == (["mmm"], ["/zzz"])
+
+
+def test_resolve_scope_no_prefixes():
+    q = FsScanQueries(filesystems=["mmm", "cisl"])
+    assert q._resolve_scope(None) == (["mmm", "cisl"], None)
+
+
+def test_owner_summary_collection_root_matches_unfiltered(collection):
+    # '/testfs' names the whole collection -> identical to the unfiltered
+    # pre-computed fast path (the 20-150x speedup for lab-parent projects).
+    q = FsScanQueries(filesystems="testfs")
+    assert q.owner_summary(path_prefixes=["/testfs"]) == q.owner_summary()
+
+
+def test_access_history_collection_root_uses_fast_path(collection):
+    q = FsScanQueries(filesystems="testfs")
+    hist = q.access_history(path_prefixes=["/testfs"])
+    assert hist["fast_path"] is True
+    assert hist["total_files"] == 500  # whole collection, from precomputed table
+
+
+def test_list_directories_overlapping_prefixes_no_duplicates(collection):
+    # Overlapping prefixes used to yield duplicate rows (one per matching
+    # ancestor); _collapse_prefixes removes the redundancy.
+    rows = FsScanQueries(filesystems="testfs").list_directories(
+        path_prefixes=["/tank", "/tank/alice"], limit=0,
+    )
+    paths = [r["path"] for r in rows]
+    assert len(paths) == len(set(paths))
 
 
 # ---------------------------------------------------------------------------

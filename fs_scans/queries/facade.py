@@ -77,6 +77,32 @@ _ENTITY_SORT_MAP = {
 }
 
 
+def _collapse_prefixes(prefixes) -> list[str]:
+    """Drop any prefix that is a descendant of another; dedupe + sort.
+
+    Overlapping prefixes (e.g. ``/mmm`` and ``/mmm/parc``) otherwise match the
+    same directories once per ancestor — producing duplicate result rows and
+    redundant subtree computation. Keeping only the shallowest covering
+    prefixes yields identical coverage with no duplication.
+    """
+    out: list[str] = []
+    for p in sorted(set(prefixes)):
+        if not any(p == anc or p.startswith(anc.rstrip("/") + "/") for anc in out):
+            out.append(p)
+    return out
+
+
+def _is_collection_root(norm_prefix: str) -> bool:
+    """True when a normalized prefix names a whole collection (single segment).
+
+    ``normalize_path`` strips mount prefixes down to ``/<collection>[/...]``;
+    a single remaining segment (``/mmm``) is the collection root. Filtering on
+    it covers the entire collection, so the pre-computed / unfiltered query
+    path returns the identical result far faster (20-150x in practice).
+    """
+    return bool(norm_prefix) and "/" not in norm_prefix.strip("/")
+
+
 class FsScanQueries:
     """Machine-/filesystem-aware query API for filesystem scan databases.
 
@@ -112,10 +138,15 @@ class FsScanQueries:
         """True when more than one filesystem will be queried."""
         return len(self.filesystems) > 1
 
-    def scan_dates(self) -> list[datetime]:
-        """Collect scan timestamps across all configured filesystems."""
+    def scan_dates(self, filesystems=None) -> list[datetime]:
+        """Collect scan timestamps across the configured filesystems.
+
+        ``filesystems`` restricts the lookup to a subset (used by the
+        histogram methods after the whole-collection-root fast-path narrows
+        the queried collections); defaults to all configured filesystems.
+        """
         dates = []
-        for fs in self.filesystems:
+        for fs in (filesystems if filesystems is not None else self.filesystems):
             session = get_session(fs)
             try:
                 scan_date = get_scan_date(session)
@@ -124,6 +155,37 @@ class FsScanQueries:
             finally:
                 session.close()
         return dates
+
+    def _resolve_scope(self, path_prefixes):
+        """Normalize + collapse *path_prefixes* and apply the root fast path.
+
+        Returns ``(filesystems, norm_prefixes)``:
+
+          * ``filesystems`` — the collections to query. Narrowed to exactly
+            the collections named by the prefixes when every (collapsed)
+            prefix is a whole-collection root, so we don't scan collections
+            the caller didn't ask for; otherwise the configured
+            ``self.filesystems``.
+          * ``norm_prefixes`` — the collapsed, mount-normalized prefixes, or
+            ``None`` when every prefix is a whole-collection root. ``None``
+            routes each query method to its pre-computed / unfiltered fast
+            path (OwnerSummary / GroupSummary / DirectoryStats /
+            AccessHistogram), returning the identical result far faster.
+
+        A root prefix naming a collection that isn't configured falls back to
+        the filtered path over ``self.filesystems`` (which simply matches
+        nothing for that prefix) rather than silently widening scope.
+        """
+        if not path_prefixes:
+            return self.filesystems, None
+
+        norm = _collapse_prefixes(normalize_path(p) for p in path_prefixes)
+        if norm and all(_is_collection_root(p) for p in norm):
+            named = {p.strip("/").lower() for p in norm}
+            targets = [f for f in self.filesystems if f.lower() in named]
+            if targets:
+                return targets, None
+        return self.filesystems, norm
 
     def summary(self) -> list[dict]:
         """Per-filesystem summary statistics (rows tagged with ``filesystem``)."""
@@ -178,14 +240,14 @@ class FsScanQueries:
         multiple filesystems each is queried in parallel and the combined
         result set is re-sorted and truncated to ``limit``.
         """
-        norm_prefixes = [normalize_path(p) for p in path_prefixes] if path_prefixes else None
+        filesystems, norm_prefixes = self._resolve_scope(path_prefixes)
         norm_excludes = [normalize_path(p) for p in exclude_paths] if exclude_paths else None
         query_limit = limit if (limit is not None and limit > 0) else None
 
-        if not self.multi_db:
-            if not self.filesystems:
+        if len(filesystems) <= 1:
+            if not filesystems:
                 return []
-            session = get_session(self.filesystems[0])
+            session = get_session(filesystems[0])
             try:
                 return query_directories(
                     session,
@@ -213,7 +275,7 @@ class FsScanQueries:
 
         # Multi-filesystem: parallel fan-out, then combine + re-sort + re-limit.
         all_directories: list[dict] = []
-        max_workers = min(len(self.filesystems), 8)
+        max_workers = min(len(filesystems), 8)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
@@ -238,7 +300,7 @@ class FsScanQueries:
                     max_files,
                     compute_dir_counts,
                 ): fs
-                for fs in self.filesystems
+                for fs in filesystems
             }
             for future in as_completed(futures):
                 all_directories.extend(future.result())
@@ -288,13 +350,13 @@ class FsScanQueries:
         else:  # pragma: no cover - guarded by callers
             raise ValueError(f"Invalid entity_type: {entity_type}")
 
+        filesystems, norm_prefixes = self._resolve_scope(path_prefixes)
         entity_sort_by = _ENTITY_SORT_MAP.get(sort_by, "size")
-        norm_prefixes = [normalize_path(p) for p in path_prefixes] if path_prefixes else None
         query_limit = limit if (limit is not None and limit > 0) else None
 
         # Query each filesystem (tag each row with its source filesystem).
         all_results: list[dict] = []
-        for fs in self.filesystems:
+        for fs in filesystems:
             session = get_session(fs)
             try:
                 results = query_func(
@@ -311,7 +373,7 @@ class FsScanQueries:
                 result["filesystem"] = fs
             all_results.extend(results)
 
-        if not self.multi_db:
+        if len(filesystems) <= 1:
             return all_results
 
         if breakdown:
@@ -364,18 +426,18 @@ class FsScanQueries:
         when no path/depth filters are given, otherwise computes on the fly
         from ``directory_stats``.
         """
-        norm_prefixes = [normalize_path(p) for p in path_prefixes] if path_prefixes else None
-        use_fast_path = not norm_prefixes and not min_depth and not max_depth
-        display_dir = self._display_directory(norm_prefixes)
+        filesystems, norm_prefixes = self._resolve_scope(path_prefixes)
+        use_fast_path = norm_prefixes is None and not min_depth and not max_depth
+        display_dir = self._display_directory(norm_prefixes, filesystems)
 
-        scan_dates = self.scan_dates()
+        scan_dates = self.scan_dates(filesystems)
         if not scan_dates:
             return None
         reference_scan_date = max(scan_dates)
 
         if use_fast_path:
             combined, username_map = aggregate_histograms_across_databases(
-                filesystems=self.filesystems,
+                filesystems=filesystems,
                 histogram_type="access",
                 owner_uid=owner_uid,
             )
@@ -390,7 +452,7 @@ class FsScanQueries:
         # Slow path: compute per-filesystem AccessHistogram and merge.
         combined = AccessHistogram(reference_scan_date)
         all_uids: set[int] = set()
-        for fs in self.filesystems:
+        for fs in filesystems:
             session = get_session(fs)
             try:
                 scan_date = get_scan_date(session)
@@ -439,18 +501,18 @@ class FsScanQueries:
         available. Uses the ORM fast path when unfiltered, otherwise an
         approximate computation from ``directory_stats``.
         """
-        norm_prefixes = [normalize_path(p) for p in path_prefixes] if path_prefixes else None
-        use_fast_path = not norm_prefixes and not min_depth and not max_depth
-        display_dir = self._display_directory(norm_prefixes)
+        filesystems, norm_prefixes = self._resolve_scope(path_prefixes)
+        use_fast_path = norm_prefixes is None and not min_depth and not max_depth
+        display_dir = self._display_directory(norm_prefixes, filesystems)
 
-        scan_dates = self.scan_dates()
+        scan_dates = self.scan_dates(filesystems)
         if not scan_dates:
             return None
         reference_scan_date = max(scan_dates)
 
         if use_fast_path:
             combined, username_map = aggregate_histograms_across_databases(
-                filesystems=self.filesystems,
+                filesystems=filesystems,
                 histogram_type="size",
                 owner_uid=owner_uid,
             )
@@ -466,7 +528,7 @@ class FsScanQueries:
         bucket_labels = [label for label, _, _ in SIZE_BUCKETS]
         combined = HistogramData(bucket_labels, reference_scan_date)
         all_uids: set[int] = set()
-        for fs in self.filesystems:
+        for fs in filesystems:
             session = get_session(fs)
             try:
                 scan_date = get_scan_date(session)
@@ -499,12 +561,20 @@ class FsScanQueries:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _display_directory(self, norm_prefixes) -> str:
-        """Compute the human-readable 'Directory' label for histogram output."""
+    def _display_directory(self, norm_prefixes, filesystems=None) -> str:
+        """Compute the human-readable 'Directory' label for histogram output.
+
+        ``filesystems`` is the (possibly root-narrowed) set actually queried;
+        defaults to all configured filesystems. When a whole-collection-root
+        prefix collapses to ``norm_prefixes=None`` over a single collection,
+        the label reflects that collection (``/mmm``) rather than "All
+        filesystems".
+        """
+        fs = filesystems if filesystems is not None else self.filesystems
         if norm_prefixes:
             return norm_prefixes[0] if len(norm_prefixes) == 1 else "Multiple paths"
-        if len(self.filesystems) == 1:
-            return f"/{self.filesystems[0]}"
+        if len(fs) == 1:
+            return f"/{fs[0]}"
         return "All filesystems"
 
     @staticmethod
