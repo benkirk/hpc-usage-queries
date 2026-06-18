@@ -1,0 +1,254 @@
+"""Tests for the FsScanQueries facade and the CLI exporter/envelope layer.
+
+The facade is the single source of truth shared by the ``fs-scans`` CLI and
+external Python importers, so these tests exercise it directly against a small
+on-disk SQLite collection and verify the envelope/exporter round-trips.
+"""
+
+import json
+from datetime import datetime
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from fs_scans.core.database import clear_engine_cache, set_data_dir
+from fs_scans.core.models import (
+    AccessHistogram as AccessHistogramRow,
+    Base,
+    Directory,
+    DirectoryStats,
+    GroupInfo,
+    GroupSummary,
+    OwnerSummary,
+    ScanMetadata,
+    SizeHistogram as SizeHistogramRow,
+    UserInfo,
+)
+from fs_scans.queries.facade import FsScanQueries
+from fs_scans.cli.core import (
+    build_access_history,
+    build_directories,
+    build_group_summary,
+    build_owner_summary,
+)
+from fs_scans.cli.core.output import ExporterRegistry, RichExporter
+
+SCAN_DATE = datetime(2026, 1, 15)
+
+
+@pytest.fixture
+def collection(tmp_path):
+    """Create an on-disk SQLite collection named ``testfs`` and point the data
+    directory at it, so ``FsScanQueries(filesystems=["testfs"])`` resolves it.
+    """
+    db_path = tmp_path / "testfs.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+
+    # Directory hierarchy: /tank (root) -> alice, bob, proj
+    session.add_all([
+        Directory(dir_id=1, parent_id=None, name="tank", depth=1),
+        Directory(dir_id=2, parent_id=1, name="alice", depth=2),
+        Directory(dir_id=3, parent_id=1, name="bob", depth=2),
+        Directory(dir_id=4, parent_id=1, name="proj", depth=2),
+    ])
+    session.add_all([
+        DirectoryStats(dir_id=1, file_count_r=600, total_size_r=6_000, owner_uid=-1,
+                       owner_gid=-1, file_count_nr=0, total_size_nr=0),
+        DirectoryStats(dir_id=2, file_count_r=300, total_size_r=3_000, owner_uid=1001,
+                       owner_gid=2001, file_count_nr=300, total_size_nr=3_000,
+                       max_atime_r=datetime(2025, 12, 1), max_atime_nr=datetime(2025, 12, 1)),
+        DirectoryStats(dir_id=3, file_count_r=200, total_size_r=2_000, owner_uid=1002,
+                       owner_gid=2001, file_count_nr=200, total_size_nr=2_000,
+                       max_atime_r=datetime(2025, 6, 1), max_atime_nr=datetime(2025, 6, 1)),
+        DirectoryStats(dir_id=4, file_count_r=100, total_size_r=1_000, owner_uid=None,
+                       owner_gid=None, file_count_nr=100, total_size_nr=1_000,
+                       max_atime_r=datetime(2024, 1, 1), max_atime_nr=datetime(2024, 1, 1)),
+    ])
+    # Pre-computed summaries (fast paths)
+    session.add_all([
+        OwnerSummary(owner_uid=1001, total_size=3_000, total_files=300, directory_count=1),
+        OwnerSummary(owner_uid=1002, total_size=2_000, total_files=200, directory_count=1),
+        GroupSummary(owner_gid=2001, total_size=5_000, total_files=500, directory_count=2),
+    ])
+    # Pre-computed histograms (bucket_index 0 = most recent)
+    session.add_all([
+        AccessHistogramRow(owner_uid=1001, bucket_index=0, file_count=300, total_size=3_000),
+        AccessHistogramRow(owner_uid=1002, bucket_index=3, file_count=200, total_size=2_000),
+        SizeHistogramRow(owner_uid=1001, bucket_index=1, file_count=300, total_size=3_000),
+        SizeHistogramRow(owner_uid=1002, bucket_index=2, file_count=200, total_size=2_000),
+    ])
+    # Name maps + scan metadata
+    session.add_all([
+        UserInfo(uid=1001, username="alice"),
+        UserInfo(uid=1002, username="bob"),
+        GroupInfo(gid=2001, groupname="staff"),
+        ScanMetadata(source_file="20260115_testfs.log", filesystem="testfs",
+                     scan_timestamp=SCAN_DATE),
+    ])
+    session.commit()
+    session.close()
+    engine.dispose()
+
+    set_data_dir(tmp_path)
+    clear_engine_cache()
+    yield "testfs"
+    clear_engine_cache()
+    set_data_dir(None)
+
+
+# ---------------------------------------------------------------------------
+# Construction
+# ---------------------------------------------------------------------------
+def test_single_filesystem_resolution(collection):
+    q = FsScanQueries(filesystems="testfs")
+    assert q.filesystems == ["testfs"]
+    assert q.multi_db is False
+
+
+def test_all_resolution_discovers_collection(collection):
+    q = FsScanQueries(filesystems="all")
+    assert "testfs" in q.filesystems
+
+
+# ---------------------------------------------------------------------------
+# Owner / group summaries
+# ---------------------------------------------------------------------------
+def test_owner_summary_fast_path(collection):
+    rows = FsScanQueries(filesystems="testfs").owner_summary(limit=10)
+    assert [r["owner_uid"] for r in rows] == [1001, 1002]  # sorted by size desc
+    assert rows[0]["total_size"] == 3_000
+    assert all(r["filesystem"] == "testfs" for r in rows)
+
+
+def test_owner_summary_sort_by_files(collection):
+    rows = FsScanQueries(filesystems="testfs").owner_summary(sort_by="files")
+    assert rows[0]["total_files"] >= rows[-1]["total_files"]
+
+
+def test_group_summary_fast_path(collection):
+    rows = FsScanQueries(filesystems="testfs").group_summary()
+    assert rows[0]["owner_gid"] == 2001
+    assert rows[0]["total_size"] == 5_000
+
+
+# ---------------------------------------------------------------------------
+# Directory listing
+# ---------------------------------------------------------------------------
+def test_list_directories_depth_filter(collection):
+    rows = FsScanQueries(filesystems="testfs").list_directories(min_depth=2, limit=0)
+    assert {r["path"] for r in rows} == {"/tank/alice", "/tank/bob", "/tank/proj"}
+
+
+def test_list_directories_single_owner(collection):
+    rows = FsScanQueries(filesystems="testfs").list_directories(
+        min_depth=2, single_owner=True, limit=0
+    )
+    # proj has multiple owners (owner_uid NULL) -> excluded
+    assert {r["path"] for r in rows} == {"/tank/alice", "/tank/bob"}
+
+
+def test_list_directories_owner_filter(collection):
+    rows = FsScanQueries(filesystems="testfs").list_directories(owner_id=1001, limit=0)
+    assert [r["path"] for r in rows] == ["/tank/alice"]
+
+
+# ---------------------------------------------------------------------------
+# Histograms
+# ---------------------------------------------------------------------------
+def test_access_history_fast_path(collection):
+    hist = FsScanQueries(filesystems="testfs").access_history()
+    assert hist is not None
+    assert hist["histogram_type"] == "access"
+    assert hist["renderer"] == "histogram_data"
+    assert hist["fast_path"] is True
+    assert hist["total_files"] == 500
+    assert hist["total_data"] == 5_000
+    # bucket 0 ("< 1 Month") holds alice's 300 files
+    assert hist["buckets"]["< 1 Month"]["files"] == 300
+
+
+def test_file_size_histogram_fast_path(collection):
+    hist = FsScanQueries(filesystems="testfs").file_size_histogram()
+    assert hist is not None
+    assert hist["histogram_type"] == "size"
+    assert hist["total_files"] == 500
+
+
+def test_access_history_path_filter_slow_path(collection):
+    hist = FsScanQueries(filesystems="testfs").access_history(path_prefixes=["/tank"])
+    assert hist is not None
+    assert hist["fast_path"] is False
+    assert hist["renderer"] == "access_histogram"
+    # alice + bob + proj non-recursive sizes = 6000
+    assert hist["total_data"] == 6_000
+
+
+# ---------------------------------------------------------------------------
+# Name resolution
+# ---------------------------------------------------------------------------
+def test_resolve_usernames(collection):
+    names = FsScanQueries(filesystems="testfs").resolve_usernames({1001, 1002})
+    assert names == {1001: "alice", 1002: "bob"}
+
+
+def test_resolve_groupnames(collection):
+    names = FsScanQueries(filesystems="testfs").resolve_groupnames({2001})
+    assert names == {2001: "staff"}
+
+
+# ---------------------------------------------------------------------------
+# Envelope builders + exporters
+# ---------------------------------------------------------------------------
+def test_owner_envelope_json_roundtrip(collection, capsys):
+    q = FsScanQueries(filesystems="testfs")
+    rows = q.owner_summary(limit=10)
+    env = build_owner_summary(rows, filesystems=["testfs"],
+                              name_map=q.resolve_usernames({1001, 1002}))
+    assert env["kind"] == "fs_owner_summary"
+    assert {c["key"] for c in env["columns"]} >= {"owner_uid", "total_size"}
+
+    ExporterRegistry.resolve("json").emit(env)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == "fs_owner_summary"
+    assert payload["rows"][0]["owner_uid"] == 1001
+
+
+def test_directories_envelope_json_roundtrip(collection, capsys):
+    q = FsScanQueries(filesystems="testfs")
+    rows = q.list_directories(min_depth=2, limit=0)
+    env = build_directories(rows, filesystems=["testfs"])
+    ExporterRegistry.resolve("json").emit(env)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == "fs_directories"
+    assert len(payload["rows"]) == 3
+
+
+def test_access_history_envelope_json_serializable(collection, capsys):
+    q = FsScanQueries(filesystems="testfs")
+    hist = q.access_history()
+    env = build_access_history(hist, filesystems=["testfs"], top_n=5)
+    ExporterRegistry.resolve("json").emit(env)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == "fs_access_history"
+    assert payload["histogram"]["total_files"] == 500
+
+
+def test_rich_exporter_renders_all_kinds(collection):
+    """The rich exporter must handle every envelope kind without error."""
+    q = FsScanQueries(filesystems="testfs")
+    exporter = RichExporter()
+
+    exporter.emit(build_owner_summary(
+        q.owner_summary(), filesystems=["testfs"],
+        name_map=q.resolve_usernames({1001, 1002})))
+    exporter.emit(build_group_summary(
+        q.group_summary(), filesystems=["testfs"],
+        name_map=q.resolve_groupnames({2001})))
+    exporter.emit(build_directories(
+        q.list_directories(min_depth=2, limit=0), filesystems=["testfs"]))
+    exporter.emit(build_access_history(q.access_history(), filesystems=["testfs"]))
+    exporter.emit(build_access_history(
+        q.access_history(path_prefixes=["/tank"]), filesystems=["testfs"]))

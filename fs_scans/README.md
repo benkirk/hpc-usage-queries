@@ -209,6 +209,52 @@ Data files should be decompressed before processing.
 
 ---
 
+## Programmatic API
+
+The same results behind `fs-scans query` and `fs-scans analyze` are available
+to other Python applications via the `FsScanQueries` facade — the **single
+source of truth** that the CLI itself consumes. This mirrors how `job_history`
+exposes `JobQueries`, and lets peer projects (e.g. project_samuel) load
+`fs_scans` as a plugin instead of shelling out to the CLI.
+
+```python
+from fs_scans import FsScanQueries
+
+# "all" (default) discovers every collection; or pass a name / list of names.
+q = FsScanQueries(filesystems="all")          # or "asp", or ["asp", "cgd"]
+
+# Directory listing (same data as `fs-scans query`)
+dirs = q.list_directories(min_depth=4, single_owner=True, limit=20)
+
+# Per-owner / per-group rollups (`--group-by owner|group`)
+owners = q.owner_summary(limit=20)             # list[dict]
+groups = q.group_summary(limit=20)
+
+# Access-time / file-size histograms (`fs-scans analyze`)
+access = q.access_history()                    # dict of buckets -> owners
+sizes  = q.file_size_histogram()
+
+# Name resolution across the configured collections
+names = q.resolve_usernames({uid for d in dirs for uid in [d["owner_uid"]] if uid})
+```
+
+All methods return plain dicts (and open/close their own sessions internally),
+so callers never manage SQLAlchemy state. The facade is **backend-agnostic**:
+set `FS_SCAN_DB_BACKEND=postgres` and the identical calls run against the
+CNPG/PostgreSQL backend.
+
+The CLI adds a `--format rich|json` option to `query` and `analyze`; `--format
+json` emits the same `kind=`-tagged envelope (`columns`/`rows` for tabular
+results, bucketed `histogram` payloads for analyze) that the API produces
+internally.
+
+```bash
+fs-scans query --group-by owner --format json | python -m json.tool
+fs-scans analyze --access-history --format json
+```
+
+---
+
 ## CLI Commands
 
 ### Import Command
