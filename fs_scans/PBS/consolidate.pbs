@@ -24,7 +24,11 @@ else
   echo "Unknown shell!"
 fi
 SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
-TOP_DIR=$(git -C ${SCRIPT_DIR} rev-parse --show-toplevel)
+# Under PBS the script runs from a spool copy, so resolve the repo from the
+# job's working directory (PBS starts in the submission dir; falls back to CWD
+# for manual runs) — matching fs_scan.pbs / rsync_results.pbs.
+cd "${PBS_O_WORKDIR:-.}"
+TOP_DIR=$(git rev-parse --show-toplevel)
 #----------------------------------------------------------------------------
 
 sep="#----------------------------------------------------------------------------"
