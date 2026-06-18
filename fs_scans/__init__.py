@@ -41,10 +41,14 @@ from .core.models import (
     UserInfo,
 )
 from .queries.facade import FsScanQueries
+from .queries.query_engine import collection_for_path, normalize_path
 
 __all__ = [
     # High-level query API
     "FsScanQueries",
+    # Path helpers (full path -> collection / mount-stripped path)
+    "collection_for_path",
+    "normalize_path",
     # Configuration
     "FsScanConfig",
     # Database / session helpers

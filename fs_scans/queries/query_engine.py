@@ -47,6 +47,45 @@ def normalize_path(path: str) -> str:
     return path
 
 
+def collection_for_path(path: str) -> str | None:
+    """Return the collection/schema name a full path belongs to, or None.
+
+    Strips the mount-point prefix (via :func:`normalize_path`) and returns the
+    first remaining path component — the top-level collection that maps to a
+    PostgreSQL schema / SQLite ``*.db`` name. For example::
+
+        /glade/campaign/cisl/csg -> "cisl"
+        /gpfs/csfs1/aiml         -> "aiml"
+
+    External consumers (e.g. SAM) use this to turn a project's directory
+    paths into the minimal set of ``filesystems=`` collections to query,
+    avoiding a fan-out across every collection. Returns ``None`` when no
+    collection component can be determined (e.g. an empty or root path).
+
+    The name is lower-cased to match the rest of the stack
+    (:func:`get_all_filesystems`, :func:`filesystem_available`,
+    ``pg_schema_name`` and the SQLite ``*.db`` names all use lower case).
+
+    This is a pure, DB-free lexical helper: it does **not** check that the
+    collection exists. Callers should validate the result against the
+    available collections (:func:`get_all_filesystems` /
+    :func:`filesystem_available`) before querying — on the SQLite backend
+    ``get_session("bogus")`` would otherwise create an empty ``bogus.db``
+    and silently return zero rows.
+
+    Args:
+        path: A full or already-normalized filesystem path.
+
+    Returns:
+        The lower-cased collection name, or ``None`` if it can't be derived.
+    """
+    normalized = normalize_path(path).strip("/")
+    if not normalized:
+        return None
+    first = normalized.split("/", 1)[0]
+    return first.lower() if first else None
+
+
 def get_all_filesystems() -> list[str]:
     """Discover all available filesystem/collection databases.
 

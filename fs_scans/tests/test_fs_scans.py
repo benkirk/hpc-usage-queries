@@ -9,7 +9,7 @@ from fs_scans.core.models import Base, Directory, DirectoryStats
 from fs_scans.core.database import get_engine, clear_engine_cache
 from fs_scans.core.query_builder import DirectoryQueryBuilder, QueryResult
 from fs_scans.cli.common import parse_size, parse_file_count
-from fs_scans.queries.query_engine import normalize_path
+from fs_scans.queries.query_engine import collection_for_path, normalize_path
 
 
 # ============================================================================
@@ -579,3 +579,30 @@ class TestNormalizePath:
     def test_no_match_returns_unchanged(self):
         assert normalize_path("/some/other/path") == "/some/other/path"
         assert normalize_path("/glade/other/path") == "/glade/other/path"
+
+
+class TestCollectionForPath:
+    """Tests for collection_for_path helper (full path -> collection name)."""
+
+    def test_mount_prefixed_paths(self):
+        assert collection_for_path("/glade/campaign/cisl/csg") == "cisl"
+        assert collection_for_path("/gpfs/csfs1/aiml") == "aiml"
+        assert collection_for_path("/lustre/desc1/p/nral0032") == "p"
+
+    def test_already_normalized(self):
+        assert collection_for_path("/cisl/users") == "cisl"
+        assert collection_for_path("/asp") == "asp"
+
+    def test_lowercased_to_match_discovery_api(self):
+        # get_all_filesystems()/filesystem_available()/schema names are
+        # lowercase, so the returned collection must be too.
+        assert collection_for_path("/glade/campaign/CISL/x") == "cisl"
+        assert collection_for_path("/AIML") == "aiml"
+
+    def test_trailing_slash(self):
+        assert collection_for_path("/glade/campaign/cisl/") == "cisl"
+
+    def test_root_or_empty_returns_none(self):
+        assert collection_for_path("/") is None
+        assert collection_for_path("") is None
+        assert collection_for_path("/gpfs/csfs1") is None
