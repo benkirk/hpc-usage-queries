@@ -1,0 +1,27 @@
+{{- if .Values.db.readOnlyService.enabled }}
+# Read-only LoadBalancer pointing at the replica instance(s). The primary
+# -service (pg_service.yaml) selects instanceRole=primary; this one selects
+# instanceRole=replica so read-only consumers (notably the fs_scans
+# interactive scans, which are read-only over weekly-batch data where replica
+# lag is immaterial) can offload their load off the primary. Consumers opt in
+# by pointing their host at this -ro name; nothing routes here automatically.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.db.name }}-ro-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    cirrus/lb: internal
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: "{{ .Values.db.name }}-ro.k8s.ucar.edu"
+    external-dns.alpha.kubernetes.io/ttl: "300"
+spec:
+  type: LoadBalancer
+  selector:
+    cnpg.io/cluster: {{ .Values.db.name }}
+    cnpg.io/instanceRole: replica
+  ports:
+  - port: 5432
+    targetPort: 5432
+    protocol: TCP
+{{- end }}

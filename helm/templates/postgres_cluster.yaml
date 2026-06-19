@@ -64,13 +64,32 @@ spec:
         name: "{{ .Values.db.name }}-app-user"
 
   postgresql:
+    # Preload pg_stat_statements for cumulative per-query-shape cost stats —
+    # the fs_scans slow-path recursive directory/owner scans are the target,
+    # and without this we have no way to rank query shapes by total time.
+    # Adding a library to shared_preload_libraries requires a restart; CNPG
+    # performs a controlled rolling restart (replicas first, then switchover),
+    # so downtime is near-zero. The extension must additionally be created once
+    # per database (not auto-created on an existing cluster):
+    #   CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+    shared_preload_libraries:
+      - pg_stat_statements
     parameters:
       # Connection settings
-      # max_connections raised from 100 → 200 to give headroom for additional
-      # consumers (SAM webapp pods, hpc-usage-queries ETL cron, ad-hoc CLI
-      # users). At 64Gi memory limit and ~10 MiB per backend slot the extra
+      # max_connections raised 200 → 300 to absorb the fs_scans interactive
+      # read load: the SAM webapp opens ONE engine per filesystem-scan
+      # collection per pod (~13 collections), each a SQLAlchemy QueuePool that
+      # can reach 5+10 connections under concurrency. Pools self-relieve when
+      # idle (server idle_session_timeout reaps them), but a multi-pod burst
+      # plus the resource-mode explorer fanning across all collections can spike
+      # well past 200. At the 64Gi limit and ~10 MiB per backend slot the extra
       # 100 slots cost ~1Gi, well within budget.
-      max_connections: "200"
+      max_connections: "300"
+      # Query statistics (pg_stat_statements; library preloaded above). Track
+      # the top normalized statements so the fs_scans slow-path scans surface in
+      # cost rankings.
+      pg_stat_statements.max: "10000"
+      pg_stat_statements.track: "top"
       # Disconnect idle client sessions after 10 minutes. Postgres 14+
       # feature. SQLAlchemy clients with `pool_pre_ping=True` detect the
       # closed socket on next checkout and transparently open a fresh
@@ -90,7 +109,14 @@ spec:
       # Memory settings
       shared_buffers: "32GB"
       temp_buffers: "64MB"
-      work_mem: "32MB"
+      # work_mem raised 32MB → 64MB. The fs_scans slow path aggregates over
+      # directory_stats (tens of millions of rows per collection) and spills
+      # large sorts/hashes to temp files (observed ~250GB cumulative on the
+      # campaign DB). 64MB halves the spill pressure on those queries while
+      # staying safe: peak observed concurrency is low (1–2 active scans) and
+      # memory sits at ~37/64Gi, so even a worst-case sort-node multiplier
+      # leaves comfortable headroom. Revisit if active concurrency climbs.
+      work_mem: "64MB"
       maintenance_work_mem: "128MB"
       dynamic_shared_memory_type: "posix"
 
@@ -115,7 +141,12 @@ spec:
       # Logging settings
       logging_collector: "on"
       log_rotation_age: "0"
-      log_min_duration_statement: "120000"
+      # log_min_duration_statement lowered 120000 → 2000 (ms). The fs_scans
+      # slow-path scans run 10–40s under interactive load — far slower than any
+      # acceptable page load, yet invisible at the old 120s threshold. Logging
+      # everything ≥2s surfaces them without drowning the log in fast-path
+      # histogram reads (which return in <100ms).
+      log_min_duration_statement: "2000"
       log_line_prefix: "%t %a [%p] "
       log_timezone: "America/Denver"
 

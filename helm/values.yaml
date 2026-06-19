@@ -3,6 +3,10 @@ db:
   group: csg-postgres                     # Group label for related resources
   instances: 2                            # Number of PostgreSQL servers in the cluster
   size: 512Gi                             # Storage size for the database
+  readOnlyService:
+    enabled: true                         # Expose a -ro LoadBalancer at the replica(s) for read-only consumers
+                                          # (e.g. fs_scans interactive scans). Offloads read load from the
+                                          # primary; consumers opt in by pointing their host at the -ro name.
   resource:
     limits:
       cpu: '8'
