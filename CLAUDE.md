@@ -135,8 +135,10 @@ any shims. See `_get_record_class()` in `sync/pbs.py`.
 | `fs_scans/importers/importer.py` | Multi-pass import (directory discovery → stats → aggregation) |
 | `fs_scans/parsers/` | GPFS, Lustre, POSIX parsers |
 | `fs_scans/queries/` | Query engine + histogram analytics |
+| `fs_scans/queries/facade.py` | `FsScanQueries` — **single source of truth** high-level API (analogue of `JobQueries`); owns multi-fs fan-out, aggregation, scan-date collection, name resolution, histogram fast/slow paths; returns plain dicts. Exported from `fs_scans/__init__.py` for importers (e.g. SAM) |
+| `fs_scans/cli/core/` | Ported (fs_scans-local) Exporter/`kind=`-envelope layer: `output.py` (`Exporter`, `ExporterRegistry` rich/json, `TSVFileExporter`, JSON encoder), `builders.py` (envelope builders). Rich exporters reuse `queries/display.py` + histogram `format_output` for byte parity |
 | `fs_scans/consolidate/consolidator.py` | SQLite→PostgreSQL COPY loader + atomic schema swap |
-| `fs_scans/cli/` | `import_cmd`, `query_cmd`, `analyze_cmd`, `consolidate_cmd` |
+| `fs_scans/cli/` | `import_cmd`, `query_cmd`, `analyze_cmd`, `consolidate_cmd` — `query`/`analyze` are thin adapters over `FsScanQueries` + exporters (`--format rich|json`) |
 | `fs_scans/PBS/consolidate.pbs` | Weekly consolidation job (after `collect_results`; gated by `FS_SCAN_ENABLE_CONSOLIDATE=1`) |
 
 ### Backends (dual: SQLite default + PostgreSQL)

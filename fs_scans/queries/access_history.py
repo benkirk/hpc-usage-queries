@@ -190,6 +190,47 @@ class AccessHistogram:
         else:
             return f"{count:,}"
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the histogram to a plain (JSON-friendly) dict.
+
+        Owner sub-dicts keep integer UID keys in-process; the JSON exporter
+        stringifies them on dump. Use :meth:`from_dict` to round-trip.
+        """
+        return {
+            "scan_date": self.scan_date,
+            "bucket_labels": [label for label, _ in self.BUCKETS],
+            "total_data": self.total_data,
+            "total_files": self.total_files,
+            "buckets": {
+                label: {
+                    "data": bucket["data"],
+                    "files": bucket["files"],
+                    "owners": {
+                        uid: {"data": stats["data"], "files": stats["files"]}
+                        for uid, stats in bucket["owners"].items()
+                    },
+                }
+                for label, bucket in self.buckets.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AccessHistogram":
+        """Reconstruct an AccessHistogram from :meth:`to_dict` output."""
+        hist = cls(data["scan_date"])
+        hist.total_data = data["total_data"]
+        hist.total_files = data["total_files"]
+        for label, bucket in data["buckets"].items():
+            if label not in hist.buckets:
+                continue
+            target = hist.buckets[label]
+            target["data"] = bucket["data"]
+            target["files"] = bucket["files"]
+            for uid, stats in bucket["owners"].items():
+                target["owners"][int(uid)]["data"] += stats["data"]
+                target["owners"][int(uid)]["files"] += stats["files"]
+        return hist
+
 
 def compute_access_history(
     session,
