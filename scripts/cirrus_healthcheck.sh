@@ -103,6 +103,18 @@ pg_query_db() {
         psql -U postgres -d "$db" -tAXqc "$sql" 2>/dev/null
 }
 
+# Same, but against an explicit pod. Used by the per-instance probes: read-only
+# consumers (fs_scans) target the -ro replica service, so their connections,
+# pg_stat_statements costs, and temp-file spill accumulate on the REPLICA's
+# stats — invisible if we only ever query the primary.
+pg_query_pod() {
+    local pod="$1"
+    local db="$2"
+    local sql="$3"
+    "${KCTL_NS[@]}" exec "$pod" -c postgres -- \
+        psql -U postgres -d "$db" -tAXqc "$sql" 2>/dev/null
+}
+
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || { fail "$1 not found in PATH"; exit 1; }
 }
@@ -484,30 +496,32 @@ section "9. In-pod psql probes"
 if ! "${KCTL_NS[@]}" exec "${CLUSTER}-1" -c postgres -- true >/dev/null 2>&1; then
     warn "cannot exec into ${CLUSTER}-1 — skipping psql probes"
 else
-    # Connections vs max
-    conns=$(pg_query "SELECT count(*) FROM pg_stat_activity;" | tr -d '[:space:]')
-    maxc=$(pg_query "SHOW max_connections;" | tr -d '[:space:]')
-    if [[ -n "$conns" && -n "$maxc" ]]; then
-        pct=$(awk -v c="$conns" -v m="$maxc" 'BEGIN{printf "%.1f", 100*c/m}')
-        echo "  connections: $conns / $maxc (${pct}%)"
-        explain "max_connections is set in helm/templates/postgres_cluster.yaml (currently $maxc)."
-        if   awk -v p="$pct" 'BEGIN{exit !(p>80)}'; then warn "connection pool ${pct}% full"
-        elif awk -v p="$pct" 'BEGIN{exit !(p<5)}';  then
-            pass "${conns}/${maxc} connections"
-            hint "Only $conns/$maxc connections in use — max_connections=$maxc may be far higher than needed"
-        else                                             pass "${conns}/${maxc} connections"
-        fi
+    # Resolve every instance pod + role. The fs_scans-relevant probes
+    # (connections / consumer breakdown / temp-spill / pg_stat_statements) run
+    # PER-INSTANCE because read-only consumers target the -ro replica service:
+    # fs_scans load lands on the REPLICA, so probing only the primary misses it.
+    INSTANCES=$("${KCTL_NS[@]}" get pods -l "cnpg.io/cluster=$CLUSTER" \
+        -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.labels.cnpg\.io/instanceRole}{"\n"}{end}' 2>/dev/null)
+    [[ -z "$INSTANCES" ]] && INSTANCES="${PRIMARY_POD:-${CLUSTER}-1}=unknown"
 
-        # Breakdown by consumer. SAM tags every connection with an
-        # application_name like 'sam-webapp:<pod>:fs_scans:<collection>'; the
-        # fs_scans plugin opens ONE engine (≥1 conn) per collection per pod, so
-        # this family rollup is the early-warning gauge for pool growth as the
-        # interactive read load ramps. Default SQLAlchemy QueuePool = 5+10, so a
-        # single hot collection can reach 15 conns/pod under concurrency.
+    maxc=$(pg_query "SHOW max_connections;" | tr -d '[:space:]')
+    explain "max_connections is set in helm/templates/postgres_cluster.yaml (currently $maxc); it is a PER-INSTANCE limit, so each pod is checked separately below."
+
+    # --- Per-instance: connections + consumer breakdown ---
+    # SAM tags every connection with an application_name like
+    # 'sam-webapp:<pod>:fs_scans:<collection>'; the fs_scans plugin opens ONE
+    # engine (≥1 conn) per collection per pod (default SQLAlchemy QueuePool 5+10,
+    # so a hot collection can reach 15 conns/pod under concurrency). fs_scans
+    # rows appear on the replica; job_history/system_status writers on the primary.
+    while IFS='=' read -r pod role; do
+        [[ -z "$pod" ]] && continue
+        conns=$(pg_query_pod "$pod" "$DATABASE" "SELECT count(*) FROM pg_stat_activity;" | tr -d '[:space:]')
+        [[ -z "$conns" ]] && { warn "could not read pg_stat_activity on $pod"; continue; }
+        pct=$(awk -v c="$conns" -v m="${maxc:-0}" 'BEGIN{printf "%.1f", (m>0)?100*c/m:0}')
         echo
-        echo "  connections by consumer (application_name family — conns / active / distinct):"
-        explain "fs_scans = sum across all per-collection engines; 'distinct' counts how many engine/pod tags are open. Watch fs_scans climb as pods scale or resource-mode explorer fans out across collections."
-        breakdown=$(pg_query "
+        echo "  ${BOLD}${pod}${NC} (${role:-?}) — connections: $conns / $maxc (${pct}%), by consumer:"
+        if   awk -v p="$pct" 'BEGIN{exit !(p>80)}'; then warn "$pod connection pool ${pct}% full"; fi
+        breakdown=$(pg_query_pod "$pod" "$DATABASE" "
             SELECT family || E'\t' || conns || E'\t' || active || E'\t' || distinct_apps
             FROM (
               SELECT
@@ -526,45 +540,49 @@ else
               WHERE backend_type='client backend'
               GROUP BY 1
             ) s ORDER BY conns DESC;")
-        if [[ -n "$breakdown" ]]; then
+        if [[ -z "$breakdown" ]]; then
+            echo "      (no client backends)"
+        else
             while IFS=$'\t' read -r fam c a d; do
                 [[ -z "$fam" ]] && continue
-                printf "    %-22s %4s conns  %3s active  %3s distinct\n" "$fam" "$c" "$a" "$d"
+                printf "      %-22s %4s conns  %3s active  %3s distinct\n" "$fam" "$c" "$a" "$d"
             done <<< "$breakdown"
             fs_conns=$(echo "$breakdown" | awk -F'\t' '$1=="fs_scans"{print $2}')
             if [[ -n "$fs_conns" ]]; then
-                fs_pct=$(awk -v c="$fs_conns" -v m="$maxc" 'BEGIN{printf "%.0f", 100*c/m}')
-                if   awk -v p="$fs_pct" 'BEGIN{exit !(p>40)}'; then
-                    warn "fs_scans holds $fs_conns conns (${fs_pct}% of max) — per-collection pools growing; consider bounding pool_size or routing reads to the replica"
+                fs_pct=$(awk -v c="$fs_conns" -v m="${maxc:-1}" 'BEGIN{printf "%.0f", 100*c/m}')
+                if awk -v p="$fs_pct" 'BEGIN{exit !(p>40)}'; then
+                    warn "$pod: fs_scans holds $fs_conns conns (${fs_pct}% of max) — per-collection pools growing; consider bounding pool_size"
                 else
-                    info "fs_scans holds $fs_conns conns (${fs_pct}% of max)"
+                    info "$pod: fs_scans holds $fs_conns conns (${fs_pct}% of max)"
                 fi
             fi
         fi
-    fi
+    done <<< "$INSTANCES"
 
-    # Temp-file spill — proxy for work_mem pressure. Cumulative since last
-    # stats reset: a nonzero, growing count means queries are spilling sorts/
-    # hashes to disk (likely the slow-path fs_scans scans over directory_stats,
-    # millions of rows). Compare across runs — a fast-climbing temp_bytes argues
-    # for a higher per-session work_mem on those queries.
+    # --- Per-instance: temp-file spill (work_mem pressure proxy) ---
+    # Cumulative since each instance's stats reset. fs_scans slow-path scans over
+    # directory_stats (millions of rows) spill sorts/hashes to disk on whichever
+    # instance runs them — now the replica. Fast-path histogram reads never spill.
     echo
-    echo "  temp-file spill (cumulative since stats reset — work_mem pressure proxy):"
-    explain "Fast-path histogram reads never spill. Growth here points at slow-path / resource-mode aggregation exceeding work_mem (32MB)."
-    spill=$(pg_query "SELECT datname || E'\t' || temp_files || E'\t' || pg_size_pretty(temp_bytes) || E'\t' || temp_bytes FROM pg_stat_database WHERE temp_files > 0 ORDER BY temp_bytes DESC;")
-    if [[ -z "$spill" ]]; then
-        pass "no temp-file spill on any database"
-    else
-        while IFS=$'\t' read -r db files pretty raw; do
-            [[ -z "$db" ]] && continue
-            printf "    %-16s %s files, %s spilled\n" "$db" "$files" "$pretty"
-            # >10 GiB cumulative spill is worth a closer look at work_mem.
-            if awk -v b="${raw:-0}" 'BEGIN{exit !(b>10*1024*1024*1024)}'; then
-                hint "$db has spilled $pretty to temp files — slow-path scans may benefit from a higher work_mem (currently 32MB) on heavy fs_scans queries"
-            fi
-        done <<< "$spill"
-        info "values are cumulative — re-run to see the rate of growth, not just the total"
-    fi
+    echo "  temp-file spill per instance (cumulative since stats reset — work_mem pressure proxy):"
+    explain "Growth here points at slow-path / resource-mode aggregation exceeding work_mem (64MB). The recursive directory_stats walk is the usual culprit; it lands on the -ro replica."
+    while IFS='=' read -r pod role; do
+        [[ -z "$pod" ]] && continue
+        spill=$(pg_query_pod "$pod" "$DATABASE" "SELECT datname || E'\t' || temp_files || E'\t' || pg_size_pretty(temp_bytes) || E'\t' || temp_bytes FROM pg_stat_database WHERE temp_files > 0 ORDER BY temp_bytes DESC;")
+        if [[ -z "$spill" ]]; then
+            echo "    ${pod} (${role:-?}): no temp-file spill"
+        else
+            echo "    ${BOLD}${pod}${NC} (${role:-?}):"
+            while IFS=$'\t' read -r db files pretty raw; do
+                [[ -z "$db" ]] && continue
+                printf "      %-16s %s files, %s spilled\n" "$db" "$files" "$pretty"
+                if awk -v b="${raw:-0}" 'BEGIN{exit !(b>10*1024*1024*1024)}'; then
+                    hint "$db on $pod has spilled $pretty to temp files — heavy fs_scans recursive scans; the durable fix is query-side (pre-aggregated rollups), not a higher work_mem"
+                fi
+            done <<< "$spill"
+        fi
+    done <<< "$INSTANCES"
+    info "temp values are cumulative — re-run to see the rate of growth, not just the total"
 
     # DB sizes
     echo
@@ -690,25 +708,31 @@ PLSQL
         warn "$(echo "$long" | wc -l | tr -d ' ') long-running quer(y/ies) — investigate"
     fi
 
-    # Top query shapes by cumulative time (pg_stat_statements — only if enabled).
-    # The definitive "what's expensive" view: the fs_scans slow-path recursive
-    # directory/owner scans should rank near the top here. Queried against the
-    # campaign DB (where fs_scans lives); the extension is per-database.
+    # Top query shapes by cumulative time (pg_stat_statements — per instance).
+    # Stats are per-instance: fs_scans recursive directory/owner scans accumulate
+    # on the -ro REPLICA, writers on the primary. The recursive directory_stats
+    # walk should rank at the top of the replica's campaign ranking.
     echo
-    echo "  top query shapes by total time (pg_stat_statements, campaign DB):"
-    explain "Ranks normalized statements by cumulative execution time. Requires pg_stat_statements in shared_preload_libraries AND 'CREATE EXTENSION pg_stat_statements' in the campaign DB."
-    pss_present=$(pg_query_db campaign "SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements' LIMIT 1;" | tr -d '[:space:]')
-    if [[ "$pss_present" != "1" ]]; then
-        info "pg_stat_statements not enabled on campaign — run: CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
-    else
-        pss=$(pg_query_db campaign "SELECT round(total_exec_time/1000)::text || 's tot  ' || calls || ' calls  ' || round(mean_exec_time)::text || 'ms mean  ' || left(replace(query, E'\n', ' '), 70) FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 8;")
-        if [[ -z "$pss" ]]; then
-            info "pg_stat_statements enabled but empty (no queries recorded, or recently reset)"
-        else
-            echo "$pss" | sed 's/^/    /'
-            pass "query-shape cost ranking available"
+    echo "  top query shapes by total time (pg_stat_statements, campaign DB, per instance):"
+    explain "Ranks normalized statements by cumulative execution time. Requires pg_stat_statements in shared_preload_libraries AND 'CREATE EXTENSION' in campaign. fs_scans costs land on the replica; the 'max' column is the worst single run."
+    pss_any=0
+    while IFS='=' read -r pod role; do
+        [[ -z "$pod" ]] && continue
+        pss_present=$(pg_query_pod "$pod" campaign "SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements' LIMIT 1;" | tr -d '[:space:]')
+        if [[ "$pss_present" != "1" ]]; then
+            info "${pod} (${role:-?}): pg_stat_statements not enabled on campaign — run: CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+            continue
         fi
-    fi
+        pss=$(pg_query_pod "$pod" campaign "SELECT round(total_exec_time/1000)::text || 's tot | ' || calls || 'x | ' || round(mean_exec_time)::text || 'ms mean | ' || round(max_exec_time)::text || 'ms max | ' || left(replace(query, E'\n', ' '), 78) FROM pg_stat_statements WHERE query NOT ILIKE '%pg_stat_statements%' AND query NOT ILIKE '%information_schema%' ORDER BY total_exec_time DESC LIMIT 6;")
+        if [[ -z "$pss" ]]; then
+            info "${pod} (${role:-?}): pg_stat_statements empty (no queries recorded, or recently reset)"
+        else
+            echo "    ${BOLD}${pod}${NC} (${role:-?}):"
+            echo "$pss" | sed 's/^/      /'
+            pss_any=1
+        fi
+    done <<< "$INSTANCES"
+    [[ $pss_any -eq 1 ]] && pass "query-shape cost ranking sampled per instance"
 
     # Top tables in app DB
     if [[ $VERBOSE -eq 1 ]]; then
