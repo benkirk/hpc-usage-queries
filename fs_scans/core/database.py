@@ -243,8 +243,18 @@ def get_engine(
                     f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
                     f"@{config.PG_HOST}:{config.PG_PORT}/{config.PG_DB_NAME}"
                 )
+                # pool_pre_ping validates each pooled connection with a cheap
+                # liveness check at checkout and transparently reconnects a
+                # dropped one — without it, an engine cached for the life of
+                # the process (e.g. the webapp's per-collection engines) hands
+                # out connections that CNPG/the network silently closed while
+                # idle, surfacing as "SSL connection has been closed
+                # unexpectedly" on the next query. pool_recycle caps connection
+                # age so a very stale one is never reused (checkout-only, so
+                # pre_ping does the heavy lifting; this is belt-and-suspenders).
                 _engine_cache[cache_key] = create_engine(
-                    url, echo=echo, connect_args=connect_args
+                    url, echo=echo, connect_args=connect_args,
+                    pool_pre_ping=True, pool_recycle=1800,
                 )
             return _engine_cache[cache_key]
 

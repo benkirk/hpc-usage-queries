@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime
+from unittest.mock import MagicMock
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -113,6 +114,43 @@ class TestEngineCaching:
         engine2 = get_engine("test")
 
         assert engine1 is not engine2
+
+    def test_postgres_engine_has_pre_ping_and_recycle(self, monkeypatch):
+        """Postgres engines must enable pool_pre_ping (and pool_recycle).
+
+        These engines are cached for the life of the process (e.g. the
+        webapp warms one per collection at startup). Without pre-ping, a
+        connection that CNPG/the network silently closes while the pool sits
+        idle is still handed out on the next checkout, surfacing as
+        "SSL connection has been closed unexpectedly". pre_ping validates and
+        transparently reconnects at checkout; pool_recycle caps connection age.
+        """
+        import fs_scans.core.database as db
+        from fs_scans.core.config import FsScanConfig
+
+        monkeypatch.setattr(FsScanConfig, "DB_BACKEND", "postgres")
+        monkeypatch.setattr(FsScanConfig, "PG_HOST", "cnpg.example")
+        monkeypatch.setattr(FsScanConfig, "PG_USER", "reader")
+        monkeypatch.setattr(FsScanConfig, "PG_PASSWORD", "secret")
+
+        captured = {}
+
+        def _fake_create_engine(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return MagicMock()  # .dispose() is a no-op on clear_engine_cache
+
+        monkeypatch.setattr(db, "create_engine", _fake_create_engine)
+
+        clear_engine_cache()
+        try:
+            db.get_engine("cisl")
+        finally:
+            clear_engine_cache()
+
+        assert captured["url"].startswith("postgresql+psycopg2://")
+        assert captured["kwargs"].get("pool_pre_ping") is True
+        assert captured["kwargs"].get("pool_recycle") == 1800
 
 
 # ============================================================================
