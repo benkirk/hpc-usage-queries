@@ -490,13 +490,80 @@ else
     if [[ -n "$conns" && -n "$maxc" ]]; then
         pct=$(awk -v c="$conns" -v m="$maxc" 'BEGIN{printf "%.1f", 100*c/m}')
         echo "  connections: $conns / $maxc (${pct}%)"
-        explain "max_connections is set in helm/templates/postgres_cluster.yaml (currently 500)."
+        explain "max_connections is set in helm/templates/postgres_cluster.yaml (currently $maxc)."
         if   awk -v p="$pct" 'BEGIN{exit !(p>80)}'; then warn "connection pool ${pct}% full"
         elif awk -v p="$pct" 'BEGIN{exit !(p<5)}';  then
             pass "${conns}/${maxc} connections"
             hint "Only $conns/$maxc connections in use — max_connections=$maxc may be far higher than needed"
         else                                             pass "${conns}/${maxc} connections"
         fi
+
+        # Breakdown by consumer. SAM tags every connection with an
+        # application_name like 'sam-webapp:<pod>:fs_scans:<collection>'; the
+        # fs_scans plugin opens ONE engine (≥1 conn) per collection per pod, so
+        # this family rollup is the early-warning gauge for pool growth as the
+        # interactive read load ramps. Default SQLAlchemy QueuePool = 5+10, so a
+        # single hot collection can reach 15 conns/pod under concurrency.
+        echo
+        echo "  connections by consumer (application_name family — conns / active / distinct):"
+        explain "fs_scans = sum across all per-collection engines; 'distinct' counts how many engine/pod tags are open. Watch fs_scans climb as pods scale or resource-mode explorer fans out across collections."
+        breakdown=$(pg_query "
+            SELECT family || E'\t' || conns || E'\t' || active || E'\t' || distinct_apps
+            FROM (
+              SELECT
+                CASE
+                  WHEN application_name LIKE '%:fs_scans:%'      THEN 'fs_scans'
+                  WHEN application_name LIKE '%:job_history:%'   THEN 'job_history'
+                  WHEN application_name LIKE '%system_status%'   THEN 'system_status'
+                  WHEN application_name LIKE 'sam-webapp%'       THEN 'sam-webapp:other'
+                  WHEN coalesce(application_name,'')=''          THEN '(untagged)'
+                  ELSE application_name
+                END AS family,
+                count(*)                                  AS conns,
+                count(*) FILTER (WHERE state='active')    AS active,
+                count(DISTINCT application_name)          AS distinct_apps
+              FROM pg_stat_activity
+              WHERE backend_type='client backend'
+              GROUP BY 1
+            ) s ORDER BY conns DESC;")
+        if [[ -n "$breakdown" ]]; then
+            while IFS=$'\t' read -r fam c a d; do
+                [[ -z "$fam" ]] && continue
+                printf "    %-22s %4s conns  %3s active  %3s distinct\n" "$fam" "$c" "$a" "$d"
+            done <<< "$breakdown"
+            fs_conns=$(echo "$breakdown" | awk -F'\t' '$1=="fs_scans"{print $2}')
+            if [[ -n "$fs_conns" ]]; then
+                fs_pct=$(awk -v c="$fs_conns" -v m="$maxc" 'BEGIN{printf "%.0f", 100*c/m}')
+                if   awk -v p="$fs_pct" 'BEGIN{exit !(p>40)}'; then
+                    warn "fs_scans holds $fs_conns conns (${fs_pct}% of max) — per-collection pools growing; consider bounding pool_size or routing reads to the replica"
+                else
+                    info "fs_scans holds $fs_conns conns (${fs_pct}% of max)"
+                fi
+            fi
+        fi
+    fi
+
+    # Temp-file spill — proxy for work_mem pressure. Cumulative since last
+    # stats reset: a nonzero, growing count means queries are spilling sorts/
+    # hashes to disk (likely the slow-path fs_scans scans over directory_stats,
+    # millions of rows). Compare across runs — a fast-climbing temp_bytes argues
+    # for a higher per-session work_mem on those queries.
+    echo
+    echo "  temp-file spill (cumulative since stats reset — work_mem pressure proxy):"
+    explain "Fast-path histogram reads never spill. Growth here points at slow-path / resource-mode aggregation exceeding work_mem (32MB)."
+    spill=$(pg_query "SELECT datname || E'\t' || temp_files || E'\t' || pg_size_pretty(temp_bytes) || E'\t' || temp_bytes FROM pg_stat_database WHERE temp_files > 0 ORDER BY temp_bytes DESC;")
+    if [[ -z "$spill" ]]; then
+        pass "no temp-file spill on any database"
+    else
+        while IFS=$'\t' read -r db files pretty raw; do
+            [[ -z "$db" ]] && continue
+            printf "    %-16s %s files, %s spilled\n" "$db" "$files" "$pretty"
+            # >10 GiB cumulative spill is worth a closer look at work_mem.
+            if awk -v b="${raw:-0}" 'BEGIN{exit !(b>10*1024*1024*1024)}'; then
+                hint "$db has spilled $pretty to temp files — slow-path scans may benefit from a higher work_mem (currently 32MB) on heavy fs_scans queries"
+            fi
+        done <<< "$spill"
+        info "values are cumulative — re-run to see the rate of growth, not just the total"
     fi
 
     # DB sizes
@@ -623,6 +690,26 @@ PLSQL
         warn "$(echo "$long" | wc -l | tr -d ' ') long-running quer(y/ies) — investigate"
     fi
 
+    # Top query shapes by cumulative time (pg_stat_statements — only if enabled).
+    # The definitive "what's expensive" view: the fs_scans slow-path recursive
+    # directory/owner scans should rank near the top here. Queried against the
+    # campaign DB (where fs_scans lives); the extension is per-database.
+    echo
+    echo "  top query shapes by total time (pg_stat_statements, campaign DB):"
+    explain "Ranks normalized statements by cumulative execution time. Requires pg_stat_statements in shared_preload_libraries AND 'CREATE EXTENSION pg_stat_statements' in the campaign DB."
+    pss_present=$(pg_query_db campaign "SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements' LIMIT 1;" | tr -d '[:space:]')
+    if [[ "$pss_present" != "1" ]]; then
+        info "pg_stat_statements not enabled on campaign — run: CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+    else
+        pss=$(pg_query_db campaign "SELECT round(total_exec_time/1000)::text || 's tot  ' || calls || ' calls  ' || round(mean_exec_time)::text || 'ms mean  ' || left(replace(query, E'\n', ' '), 70) FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 8;")
+        if [[ -z "$pss" ]]; then
+            info "pg_stat_statements enabled but empty (no queries recorded, or recently reset)"
+        else
+            echo "$pss" | sed 's/^/    /'
+            pass "query-shape cost ranking available"
+        fi
+    fi
+
     # Top tables in app DB
     if [[ $VERBOSE -eq 1 ]]; then
         echo
@@ -638,15 +725,19 @@ section "10. Recent log lines"
 
 if "${KCTL_NS[@]}" logs "${CLUSTER}-1" -c postgres --tail=200 >/dev/null 2>&1; then
     # CNPG emits one JSON object per line: {"level":"...","record":{"error_severity":"ERROR",...}}
+    # duration: [0-9]{5,} flags statements ≥10s. log_min_duration_statement is
+    # now 2000ms, so the logs carry every ≥2s statement; we surface only the
+    # ≥10s ones here to keep "notable" meaningful (4-digit durations are the
+    # expected fs_scans slow-path noise).
     matches=$("${KCTL_NS[@]}" logs "${CLUSTER}-1" -c postgres --tail=500 2>/dev/null \
-              | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"|duration: [0-9]{6,}' || true)
+              | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"|duration: [0-9]{5,}' || true)
     if [[ -z "$matches" ]]; then
         pass "no ERROR/FATAL/long-duration lines in last 500 log lines"
     else
         echo "$matches" | tail -10 | sed 's/^/    /'
         warn "$(echo "$matches" | wc -l | tr -d ' ') notable log line(s) in last 500"
     fi
-    explain "log_min_duration_statement=120000 means queries >120s are logged with 'duration:'."
+    explain "log_min_duration_statement=2000 means queries >2s are logged with 'duration:'; we flag only the ≥10s ones above."
 else
     warn "could not read logs for ${CLUSTER}-1"
 fi
