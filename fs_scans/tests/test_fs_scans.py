@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime
+from unittest.mock import MagicMock
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -9,7 +10,7 @@ from fs_scans.core.models import Base, Directory, DirectoryStats
 from fs_scans.core.database import get_engine, clear_engine_cache
 from fs_scans.core.query_builder import DirectoryQueryBuilder, QueryResult
 from fs_scans.cli.common import parse_size, parse_file_count
-from fs_scans.queries.query_engine import normalize_path
+from fs_scans.queries.query_engine import collection_for_path, normalize_path
 
 
 # ============================================================================
@@ -113,6 +114,43 @@ class TestEngineCaching:
         engine2 = get_engine("test")
 
         assert engine1 is not engine2
+
+    def test_postgres_engine_has_pre_ping_and_recycle(self, monkeypatch):
+        """Postgres engines must enable pool_pre_ping (and pool_recycle).
+
+        These engines are cached for the life of the process (e.g. the
+        webapp warms one per collection at startup). Without pre-ping, a
+        connection that CNPG/the network silently closes while the pool sits
+        idle is still handed out on the next checkout, surfacing as
+        "SSL connection has been closed unexpectedly". pre_ping validates and
+        transparently reconnects at checkout; pool_recycle caps connection age.
+        """
+        import fs_scans.core.database as db
+        from fs_scans.core.config import FsScanConfig
+
+        monkeypatch.setattr(FsScanConfig, "DB_BACKEND", "postgres")
+        monkeypatch.setattr(FsScanConfig, "PG_HOST", "cnpg.example")
+        monkeypatch.setattr(FsScanConfig, "PG_USER", "reader")
+        monkeypatch.setattr(FsScanConfig, "PG_PASSWORD", "secret")
+
+        captured = {}
+
+        def _fake_create_engine(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return MagicMock()  # .dispose() is a no-op on clear_engine_cache
+
+        monkeypatch.setattr(db, "create_engine", _fake_create_engine)
+
+        clear_engine_cache()
+        try:
+            db.get_engine("cisl")
+        finally:
+            clear_engine_cache()
+
+        assert captured["url"].startswith("postgresql+psycopg2://")
+        assert captured["kwargs"].get("pool_pre_ping") is True
+        assert captured["kwargs"].get("pool_recycle") == 1800
 
 
 # ============================================================================
@@ -229,6 +267,35 @@ class TestDirectoryQueryBuilder:
 
         assert "GLOB" not in result.sql
         assert "LIKE" not in result.sql
+
+    def test_name_patterns_postgres_regex(self):
+        """PostgreSQL dialect: case-sensitive patterns compile to a regex (~)."""
+        builder = DirectoryQueryBuilder(dialect="postgresql")
+        result = builder.with_name_patterns(["*scratch*", "tmp?"]).build()
+
+        assert "d.name ~ :name_pattern_0" in result.sql
+        assert "d.name ~ :name_pattern_1" in result.sql
+        assert "GLOB" not in result.sql
+        # * -> .*, ? -> . , anchored
+        assert result.params["name_pattern_0"] == "^.*scratch.*$"
+        assert result.params["name_pattern_1"] == "^tmp.$"
+
+    def test_name_patterns_postgres_ilike_ignore_case(self):
+        """PostgreSQL dialect: case-insensitive patterns use ILIKE, not LIKE."""
+        builder = DirectoryQueryBuilder(dialect="postgresql")
+        result = builder.with_name_patterns(["*TMP*"], ignore_case=True).build()
+
+        assert "d.name ILIKE :name_pattern_0" in result.sql
+        assert "d.name LIKE " not in result.sql
+        assert result.params["name_pattern_0"] == "%TMP%"
+
+    def test_glob_to_posix_regex_escapes_metacharacters(self):
+        """Regex metacharacters in a glob are escaped; wildcards are translated."""
+        from fs_scans.core.query_builder import glob_to_posix_regex
+
+        assert glob_to_posix_regex("a.b+c") == r"^a\.b\+c$"
+        assert glob_to_posix_regex("*.log") == r"^.*\.log$"
+        assert glob_to_posix_regex("data_?") == r"^data_.$"
 
     def test_path_prefix_cte_single(self):
         """Test single path prefix generates descendants CTE."""
@@ -550,3 +617,30 @@ class TestNormalizePath:
     def test_no_match_returns_unchanged(self):
         assert normalize_path("/some/other/path") == "/some/other/path"
         assert normalize_path("/glade/other/path") == "/glade/other/path"
+
+
+class TestCollectionForPath:
+    """Tests for collection_for_path helper (full path -> collection name)."""
+
+    def test_mount_prefixed_paths(self):
+        assert collection_for_path("/glade/campaign/cisl/csg") == "cisl"
+        assert collection_for_path("/gpfs/csfs1/aiml") == "aiml"
+        assert collection_for_path("/lustre/desc1/p/nral0032") == "p"
+
+    def test_already_normalized(self):
+        assert collection_for_path("/cisl/users") == "cisl"
+        assert collection_for_path("/asp") == "asp"
+
+    def test_lowercased_to_match_discovery_api(self):
+        # get_all_filesystems()/filesystem_available()/schema names are
+        # lowercase, so the returned collection must be too.
+        assert collection_for_path("/glade/campaign/CISL/x") == "cisl"
+        assert collection_for_path("/AIML") == "aiml"
+
+    def test_trailing_slash(self):
+        assert collection_for_path("/glade/campaign/cisl/") == "cisl"
+
+    def test_root_or_empty_returns_none(self):
+        assert collection_for_path("/") is None
+        assert collection_for_path("") is None
+        assert collection_for_path("/gpfs/csfs1") is None

@@ -1,9 +1,11 @@
 """Query subcommand for fs-scans CLI.
 
-This module provides the query interface for the unified fs-scans CLI.
+Thin Click adapter over :class:`fs_scans.queries.FsScanQueries`: it parses and
+validates options, calls the facade (the single source of truth shared with
+importing Python apps), wraps the result in a ``kind=`` envelope, and emits it
+through the selected :class:`~fs_scans.cli.core.Exporter`.
 """
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -15,157 +17,24 @@ from ..cli.common import (
     parse_date_arg,
     parse_file_count,
     parse_size,
+    render_show_config,
 )
-from ..core.database import get_data_dir_info, get_db_path, get_session, set_data_dir
+from ..cli.core import (
+    ExporterRegistry,
+    build_directories,
+    build_group_summary,
+    build_owner_summary,
+)
+from ..cli.core.output import TSVFileExporter
+from ..core.database import filesystem_available, get_db_url, set_data_dir
+from ..queries.facade import FsScanQueries
 from ..queries.query_engine import (
     get_all_filesystems,
-    get_scan_date,
-    get_summary,
-    normalize_path,
-    query_directories,
-    query_group_summary,
-    query_owner_summary,
-    query_single_filesystem,
-    resolve_group_filter,
-    resolve_groupnames_across_databases,
     resolve_owner_filter,
-    resolve_usernames_across_databases,
-)
-from ..queries.display import (
-    print_group_results,
-    print_owner_results,
-    print_results,
-    write_tsv,
 )
 
-
-# Entity-specific configuration for owner/group summary queries
-_ENTITY_CONFIG = {
-    "owner": {
-        "id_field": "owner_uid",
-        "query_func": query_owner_summary,
-        "resolve_func": resolve_usernames_across_databases,
-        "print_func": print_owner_results,
-    },
-    "group": {
-        "id_field": "owner_gid",
-        "query_func": query_group_summary,
-        "resolve_func": resolve_groupnames_across_databases,
-        "print_func": print_group_results,
-    },
-}
-
-
-def _process_entity_summary(
-    entity_type: str,
-    filesystems: list[str],
-    sort_by: str,
-    min_depth: int | None,
-    max_depth: int | None,
-    normalized_path_prefixes: list[str],
-    limit: int,
-    verbose: bool,
-) -> None:
-    """Process and display owner or group summary results.
-
-    Unified handler for both --group-by owner and --group-by group modes.
-
-    Args:
-        entity_type: "owner" or "group"
-        filesystems: List of filesystem names to query
-        sort_by: Sort field (size, files, dirs)
-        min_depth: Minimum path depth filter
-        max_depth: Maximum path depth filter
-        normalized_path_prefixes: Path prefix filters
-        limit: Result limit (0 for unlimited)
-        verbose: Show per-filesystem breakdown for multi-DB queries
-    """
-    config = _ENTITY_CONFIG[entity_type]
-
-    # Stage 1: Validate and map sort_by
-    sort_map = {
-        "size": "size",
-        "files": "files",
-        "dirs": "dirs",
-        "directories": "dirs",
-    }
-    entity_sort_by = sort_map.get(sort_by, "size")
-
-    if sort_by not in sort_map:
-        console.print(
-            f"[yellow]Warning: --sort-by '{sort_by}' not valid with --group-by {entity_type}. "
-            f"Using 'size' instead. Valid options: size, files, dirs[/yellow]"
-        )
-        entity_sort_by = "size"
-
-    # Stage 2: Query each filesystem
-    all_results = []
-    all_ids = set()
-
-    for fs in filesystems:
-        session = get_session(fs)
-        try:
-            results = config["query_func"](
-                session,
-                min_depth=min_depth,
-                max_depth=max_depth,
-                path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
-                limit=limit if limit > 0 else None,
-                sort_by=entity_sort_by,
-            )
-            # Tag each result with filesystem name
-            for result in results:
-                result["filesystem"] = fs
-
-            all_results.extend(results)
-            all_ids.update(r[config["id_field"]] for r in results)
-        finally:
-            session.close()
-
-    # Stage 3: Multi-DB post-processing
-    if len(filesystems) > 1:
-        if verbose:
-            # Show per-filesystem breakdown
-            sort_key_map = {
-                "size": lambda r: (-r["total_size"], r[config["id_field"]], r["filesystem"]),
-                "files": lambda r: (-r["total_files"], r[config["id_field"]], r["filesystem"]),
-                "dirs": lambda r: (-r["directory_count"], r[config["id_field"]], r["filesystem"]),
-            }
-            sort_key = sort_key_map[entity_sort_by]
-            all_results.sort(key=sort_key)
-
-            if limit > 0:
-                all_results = all_results[:limit]
-        else:
-            # Aggregate across filesystems by ID
-            from collections import defaultdict
-            aggregated = defaultdict(lambda: {"total_size": 0, "total_files": 0, "directory_count": 0})
-
-            for result in all_results:
-                entity_id = result[config["id_field"]]
-                aggregated[entity_id][config["id_field"]] = entity_id
-                aggregated[entity_id]["total_size"] += result["total_size"]
-                aggregated[entity_id]["total_files"] += result["total_files"]
-                aggregated[entity_id]["directory_count"] += result["directory_count"]
-
-            all_results = list(aggregated.values())
-
-            # Sort aggregated results
-            sort_key_map = {
-                "size": lambda r: -r["total_size"],
-                "files": lambda r: -r["total_files"],
-                "dirs": lambda r: -r["directory_count"],
-            }
-            all_results.sort(key=sort_key_map[entity_sort_by])
-
-            if limit > 0:
-                all_results = all_results[:limit]
-
-    # Stage 4: Name resolution and display
-    name_map = config["resolve_func"](all_ids, filesystems)
-
-    show_filesystem = len(filesystems) > 1 and verbose
-    config["print_func"](all_results, name_map, show_filesystem=show_filesystem)
+# Valid --sort-by values when grouping by owner/group.
+_ENTITY_SORT_CHOICES = {"size", "files", "dirs", "directories"}
 
 
 # Create DynamicHelpCommand for this tool
@@ -238,6 +107,14 @@ DynamicHelpCommand = make_dynamic_help_command('fs-scans query')
     "--output",
     type=click.Path(path_type=Path),
     help="Write TSV output to file",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["rich", "json"]),
+    default="rich",
+    show_default=True,
+    help="Output format for stdout (ignored when -o/--output is given)",
 )
 @click.option(
     "--accessed-before",
@@ -343,6 +220,7 @@ def query_cmd(
     limit: int,
     sort_by: str,
     output: Path | None,
+    output_format: str,
     accessed_before: str | None,
     accessed_after: str | None,
     verbose: bool,
@@ -381,6 +259,7 @@ def query_cmd(
       fs-scans query --group-by owner -d 4 -P /gpfs/csfs1/cisl
       fs-scans query --group-by group         # Per-group summary (aggregated)
       fs-scans query --group-by group -v     # Per-group per-filesystem breakdown
+      fs-scans query --group-by owner --format json     # JSON envelope to stdout
     """
     # Apply data directory override if provided via CLI
     if data_dir is not None:
@@ -388,23 +267,11 @@ def query_cmd(
 
     # Handle --show-config
     if show_config:
-        data_path, source = get_data_dir_info()
-        console.print("[bold]Configuration[/bold]")
-        console.print(f"  Data directory: {data_path}")
-        console.print(f"  Source: {source}")
-        console.print()
-
-        filesystems = get_all_filesystems()
-        if filesystems:
-            console.print("[bold]Available databases[/bold]")
-            for fs in filesystems:
-                db_path = get_db_path(fs)
-                size_bytes = db_path.stat().st_size if db_path.exists() else 0
-                size_str = format_size(size_bytes)
-                console.print(f"  {fs}: {db_path} ({size_str})")
-        else:
-            console.print("[yellow]No database files found.[/yellow]")
+        render_show_config()
         return
+
+    # JSON output goes to stdout, so suppress the human-oriented header lines.
+    quiet = output_format == "json" and output is None
 
     # Resolve owner_id: can be UID (int) or username (string)
     resolved_owner_id = resolve_owner_filter(owner_id, mine)
@@ -417,204 +284,128 @@ def query_cmd(
             console.print("Run fs-scan-to-db first to import data.")
             raise SystemExit(1)
     else:
-        db_path = get_db_path(filesystem)
-        if not db_path.exists():
-            console.print(f"[red]Database not found: {db_path}[/red]")
+        if not filesystem_available(filesystem):
+            console.print(f"[red]Database not found: {get_db_url(filesystem)}[/red]")
             console.print("Run fs-scan-to-db first to import data.")
             raise SystemExit(1)
         filesystems = [filesystem]
 
-    console.print(f"[bold]Filesystem Scan Database Query[/bold]")
-    console.print(f"Databases: {', '.join(filesystems)}")
+    queries = FsScanQueries(filesystems=filesystems)
 
-    # Collect and display scan dates
-    scan_dates = []
-    for fs in filesystems:
-        session = get_session(fs)
-        try:
-            scan_date = get_scan_date(session)
-            if scan_date:
-                scan_dates.append(scan_date)
-        finally:
-            session.close()
+    if not quiet:
+        console.print(f"[bold]Filesystem Scan Database Query[/bold]")
+        console.print(f"Databases: {', '.join(filesystems)}")
 
-    if scan_dates:
-        unique_dates = sorted(set(d.date() for d in scan_dates))
-        if len(unique_dates) == 1:
-            console.print(f"[dim]Data from scan: {unique_dates[0]}[/dim]")
-        else:
-            console.print(f"[dim]Scans from {unique_dates[0]} to {unique_dates[-1]}[/dim]")
+        # Collect and display scan dates
+        scan_dates = queries.scan_dates()
+        if scan_dates:
+            unique_dates = sorted(set(d.date() for d in scan_dates))
+            if len(unique_dates) == 1:
+                console.print(f"[dim]Data from scan: {unique_dates[0]}[/dim]")
+            else:
+                console.print(f"[dim]Scans from {unique_dates[0]} to {unique_dates[-1]}[/dim]")
 
-    console.print(f"Note: this information is [bold]NOT[/bold] real-time")
-    console.print()
-
-    # Parse date arguments once
-    parsed_before = parse_date_arg(accessed_before) if accessed_before else None
-    parsed_after = parse_date_arg(accessed_after) if accessed_after else None
+        console.print(f"Note: this information is [bold]NOT[/bold] real-time")
+        console.print()
 
     # Parse size/file-count filter arguments
+    parsed_before = parse_date_arg(accessed_before) if accessed_before else None
+    parsed_after = parse_date_arg(accessed_after) if accessed_after else None
     parsed_min_size = parse_size(min_size) if min_size else None
     parsed_max_size = parse_size(max_size) if max_size else None
     parsed_min_files = parse_file_count(min_files) if min_files else None
     parsed_max_files = parse_file_count(max_files) if max_files else None
 
-    # Normalize path arguments (strip mount point prefixes)
-    normalized_path_prefixes = [normalize_path(p) for p in path_prefixes] if path_prefixes else []
-    normalized_exclude_paths = [normalize_path(p) for p in exclude_paths] if exclude_paths else []
-
     # Handle summary mode
     if summary:
-        for fs in filesystems:
-            session = get_session(fs)
-            try:
-                stats = get_summary(session)
-                console.print(f"[cyan]{fs}:[/cyan]")
-                console.print(f"  Total directories: {stats['total_directories']:,}")
-                console.print(f"  Root directories: {stats['root_directories']:,}")
-                console.print(f"  Total files (root): {stats['total_files']:,}")
-                console.print(f"  Total size (root): {format_size(stats['total_size'])}")
-                console.print(f"  Maximum depth: {stats['max_depth']}")
-            finally:
-                session.close()
+        for stats in queries.summary():
+            console.print(f"[cyan]{stats['filesystem']}:[/cyan]")
+            console.print(f"  Total directories: {stats['total_directories']:,}")
+            console.print(f"  Root directories: {stats['root_directories']:,}")
+            console.print(f"  Total files (root): {stats['total_files']:,}")
+            console.print(f"  Total size (root): {format_size(stats['total_size'])}")
+            console.print(f"  Maximum depth: {stats['max_depth']}")
         return
 
-    # Handle --group-by owner mode
-    if group_by == "owner":
-        if dir_counts:
-            console.print("[yellow]Warning: --dir-counts ignored with --group-by owner[/yellow]")
-
-        _process_entity_summary(
-            entity_type="owner",
-            filesystems=filesystems,
-            sort_by=sort_by,
-            min_depth=min_depth,
-            max_depth=max_depth,
-            normalized_path_prefixes=normalized_path_prefixes,
-            limit=limit,
-            verbose=verbose,
-        )
-        return
-
-    # Handle --group-by group mode
-    if group_by == "group":
-        if dir_counts:
-            console.print("[yellow]Warning: --dir-counts ignored with --group-by group[/yellow]")
-
-        _process_entity_summary(
-            entity_type="group",
-            filesystems=filesystems,
-            sort_by=sort_by,
-            min_depth=min_depth,
-            max_depth=max_depth,
-            normalized_path_prefixes=normalized_path_prefixes,
-            limit=limit,
-            verbose=verbose,
-        )
-        return
-
-    # Query directories
-    multi_db = len(filesystems) > 1
-    all_directories = []
-
-    if multi_db:
-        # Parallel execution for multiple filesystems
-        max_workers = min(len(filesystems), 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    query_single_filesystem,
-                    fs,
-                    min_depth,
-                    max_depth,
-                    single_owner,
-                    resolved_owner_id,
-                    normalized_path_prefixes if normalized_path_prefixes else None,
-                    normalized_exclude_paths if normalized_exclude_paths else None,
-                    sort_by,
-                    limit if limit > 0 else None,
-                    parsed_before,
-                    parsed_after,
-                    leaves_only,
-                    list(name_patterns) if name_patterns else None,
-                    ignore_case,
-                    parsed_min_size,
-                    parsed_max_size,
-                    parsed_min_files,
-                    parsed_max_files,
-                    dir_counts,
-                ): fs
-                for fs in filesystems
-            }
-            for future in as_completed(futures):
-                fs = futures[future]
-                try:
-                    dirs = future.result()
-                    all_directories.extend(dirs)
-                except Exception as e:
-                    console.print(f"[red]Error querying {fs}: {e}[/red]")
-    else:
-        # Single filesystem - sequential execution (no thread overhead)
-        session = get_session(filesystems[0])
-        try:
-            all_directories = query_directories(
-                session,
-                min_depth=min_depth,
-                max_depth=max_depth,
-                single_owner=single_owner,
-                owner_id=resolved_owner_id,
-                path_prefixes=normalized_path_prefixes if normalized_path_prefixes else None,
-                exclude_paths=normalized_exclude_paths if normalized_exclude_paths else None,
-                sort_by=sort_by,
-                limit=limit if limit > 0 else None,
-                accessed_before=parsed_before,
-                accessed_after=parsed_after,
-                leaves_only=leaves_only,
-                name_patterns=list(name_patterns) if name_patterns else None,
-                name_pattern_ignorecase=ignore_case,
-                min_size=parsed_min_size,
-                max_size=parsed_max_size,
-                min_files=parsed_min_files,
-                max_files=parsed_max_files,
-                compute_dir_counts=dir_counts,
+    # Handle --group-by owner/group modes
+    if group_by in ("owner", "group"):
+        if dir_counts and not quiet:
+            console.print(f"[yellow]Warning: --dir-counts ignored with --group-by {group_by}[/yellow]")
+        if sort_by not in _ENTITY_SORT_CHOICES and not quiet:
+            console.print(
+                f"[yellow]Warning: --sort-by '{sort_by}' not valid with --group-by {group_by}. "
+                f"Using 'size' instead. Valid options: size, files, dirs[/yellow]"
             )
-        finally:
-            session.close()
 
-    # For multi-db: sort combined results and apply limit
-    if multi_db:
-        sort_key_map = {
-            "size": lambda d: d["total_size_r"] or 0,
-            "size_r": lambda d: d["total_size_r"] or 0,
-            "size_nr": lambda d: d["total_size_nr"] or 0,
-            "files": lambda d: d["file_count_r"] or 0,
-            "files_r": lambda d: d["file_count_r"] or 0,
-            "files_nr": lambda d: d["file_count_nr"] or 0,
-            "dirs": lambda d: d["dir_count_r"] or 0,
-            "dirs_r": lambda d: d["dir_count_r"] or 0,
-            "dirs_nr": lambda d: d["dir_count_nr"] or 0,
-            "atime_r": lambda d: d["max_atime_r"] or "",
-            "path": lambda d: (d["depth"], d["path"]),
-            "depth": lambda d: d["depth"],
-        }
-        reverse = sort_by not in ("path",)  # Most sorts are descending
-        all_directories.sort(key=sort_key_map.get(sort_by, sort_key_map["size_r"]), reverse=reverse)
+        method = queries.owner_summary if group_by == "owner" else queries.group_summary
+        rows = method(
+            breakdown=verbose,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            path_prefixes=path_prefixes or None,
+            limit=limit,
+            sort_by=sort_by,
+        )
 
-        # Apply limit after sorting combined results
-        if limit > 0:
-            all_directories = all_directories[:limit]
+        show_filesystem = len(filesystems) > 1 and verbose
+        if group_by == "owner":
+            ids = {r["owner_uid"] for r in rows}
+            name_map = queries.resolve_usernames(ids)
+            envelope = build_owner_summary(
+                rows, filesystems=filesystems, name_map=name_map,
+                show_filesystem=show_filesystem,
+            )
+        else:
+            ids = {r["owner_gid"] for r in rows}
+            name_map = queries.resolve_groupnames(ids)
+            envelope = build_group_summary(
+                rows, filesystems=filesystems, name_map=name_map,
+                show_filesystem=show_filesystem,
+            )
 
-    # Output results
+        ExporterRegistry.resolve(output_format).emit(envelope)
+        return
+
+    # Default: directory listing
+    directories = queries.list_directories(
+        min_depth=min_depth,
+        max_depth=max_depth,
+        single_owner=single_owner,
+        owner_id=resolved_owner_id,
+        path_prefixes=path_prefixes or None,
+        exclude_paths=exclude_paths or None,
+        sort_by=sort_by,
+        limit=limit,
+        accessed_before=parsed_before,
+        accessed_after=parsed_after,
+        leaves_only=leaves_only,
+        name_patterns=list(name_patterns) if name_patterns else None,
+        name_pattern_ignorecase=ignore_case,
+        min_size=parsed_min_size,
+        max_size=parsed_max_size,
+        min_files=parsed_min_files,
+        max_files=parsed_max_files,
+        compute_dir_counts=dir_counts,
+    )
+
+    # Resolve UIDs to usernames for display (aggregate across all databases)
+    unique_uids = {
+        d["owner_uid"] for d in directories
+        if d["owner_uid"] is not None and d["owner_uid"] != -1
+    }
+    username_map = queries.resolve_usernames(unique_uids)
+
+    envelope = build_directories(
+        directories,
+        filesystems=filesystems,
+        username_map=username_map,
+        verbose=verbose,
+        leaves_only=leaves_only,
+        show_total=show_total,
+        show_dir_counts=dir_counts,
+    )
+
     if output:
-        write_tsv(all_directories, output, include_dir_counts=dir_counts)
+        TSVFileExporter(output).emit(envelope)
     else:
-        # Resolve UIDs to usernames for display (aggregate across all databases)
-        unique_uids = {
-            d["owner_uid"] for d in all_directories
-            if d["owner_uid"] is not None and d["owner_uid"] != -1
-        }
-        username_map = resolve_usernames_across_databases(unique_uids, filesystems)
-        print_results(all_directories, verbose=verbose, leaves_only=leaves_only, username_map=username_map, show_total=show_total, show_dir_counts=dir_counts)
-
-
-if __name__ == "__main__":
-    main()
+        ExporterRegistry.resolve(output_format).emit(envelope)

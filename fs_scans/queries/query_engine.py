@@ -47,14 +47,61 @@ def normalize_path(path: str) -> str:
     return path
 
 
-def get_all_filesystems() -> list[str]:
-    """Discover all available filesystem databases.
+def collection_for_path(path: str) -> str | None:
+    """Return the collection/schema name a full path belongs to, or None.
 
-    Searches in the configured data directory (via get_data_dir()).
+    Strips the mount-point prefix (via :func:`normalize_path`) and returns the
+    first remaining path component — the top-level collection that maps to a
+    PostgreSQL schema / SQLite ``*.db`` name. For example::
+
+        /glade/campaign/cisl/csg -> "cisl"
+        /gpfs/csfs1/aiml         -> "aiml"
+
+    External consumers (e.g. SAM) use this to turn a project's directory
+    paths into the minimal set of ``filesystems=`` collections to query,
+    avoiding a fan-out across every collection. Returns ``None`` when no
+    collection component can be determined (e.g. an empty or root path).
+
+    The name is lower-cased to match the rest of the stack
+    (:func:`get_all_filesystems`, :func:`filesystem_available`,
+    ``pg_schema_name`` and the SQLite ``*.db`` names all use lower case).
+
+    This is a pure, DB-free lexical helper: it does **not** check that the
+    collection exists. Callers should validate the result against the
+    available collections (:func:`get_all_filesystems` /
+    :func:`filesystem_available`) before querying — on the SQLite backend
+    ``get_session("bogus")`` would otherwise create an empty ``bogus.db``
+    and silently return zero rows.
+
+    Args:
+        path: A full or already-normalized filesystem path.
 
     Returns:
-        List of filesystem names (e.g., ['asp', 'cisl', 'eol', 'hao'])
+        The lower-cased collection name, or ``None`` if it can't be derived.
     """
+    normalized = normalize_path(path).strip("/")
+    if not normalized:
+        return None
+    first = normalized.split("/", 1)[0]
+    return first.lower() if first else None
+
+
+def get_all_filesystems() -> list[str]:
+    """Discover all available filesystem/collection databases.
+
+    SQLite: the ``*.db`` files in the configured data directory (via
+    get_data_dir()).  PostgreSQL: the collection schemas in the configured
+    database (via list_pg_schemas()).
+
+    Returns:
+        List of filesystem/collection names (e.g., ['asp', 'cisl', 'cgd'])
+    """
+    from ..core.config import FsScanConfig
+    from ..core.database import list_pg_schemas
+
+    if FsScanConfig.DB_BACKEND == "postgres":
+        return list_pg_schemas()
+
     data_dir = get_data_dir()
     db_files = data_dir.glob("*.db")
     return sorted([f.stem for f in db_files])
@@ -302,8 +349,9 @@ def query_directories(
         if not ancestor_ids:
             return []  # No valid paths found
 
-    # Phase 2: Build query using DirectoryQueryBuilder
-    builder = DirectoryQueryBuilder()
+    # Phase 2: Build query using DirectoryQueryBuilder (dialect-aware so name
+    # pattern matching uses GLOB on sqlite and regex `~`/ILIKE on postgresql).
+    builder = DirectoryQueryBuilder(dialect=session.get_bind().dialect.name)
 
     # Apply depth filters
     if min_depth is not None or max_depth is not None:
@@ -601,25 +649,31 @@ def resolve_owner_filter(owner_arg: str | None, mine_flag: bool) -> int | None:
     return None
 
 
-def get_username_map(session, uids: list[int]) -> dict[int, str]:
+def get_username_map(session, uids: list[int], fallback: bool = True) -> dict[int, str]:
     """
     Get username mappings for a list of UIDs from the user_info table.
-
-    Falls back to pwd.getpwuid() for UIDs not in the table.
 
     Args:
         session: SQLAlchemy session
         uids: List of UIDs to resolve
+        fallback: When True (default), UIDs absent from this database's
+            user_info table fall back to pwd.getpwuid() and finally to
+            str(uid), so every requested UID is present in the result. When
+            False, only UIDs with a real (non-empty) username in user_info are
+            returned — used by resolve_usernames_across_databases() so that a
+            str(uid) placeholder in one database does not stop the search from
+            consulting the others.
 
     Returns:
-        Dictionary mapping UID to username (or str(uid) if unknown)
+        Dictionary mapping UID to username. With fallback=True every requested
+        UID is present (real name, pwd lookup, or str(uid)); with
+        fallback=False only real user_info hits are included.
     """
     if not uids:
         return {}
 
-    result = {}
+    real = {}  # UIDs with a non-empty username in this database's user_info
 
-    # Try to get from user_info table first
     try:
         placeholders = ", ".join(f":uid_{i}" for i in range(len(uids)))
         params = {f"uid_{i}": uid for i, uid in enumerate(uids)}
@@ -630,11 +684,16 @@ def get_username_map(session, uids: list[int]) -> dict[int, str]:
         ).fetchall()
 
         for uid, username in rows:
-            result[uid] = username if username else str(uid)
+            if username:
+                real[uid] = username
     except Exception:
         pass
 
-    # Fall back to pwd for missing UIDs
+    if not fallback:
+        return real
+
+    # Fall back to pwd then str(uid) for UIDs without a real username here.
+    result = dict(real)
     for uid in uids:
         if uid not in result:
             try:
@@ -651,16 +710,19 @@ def resolve_usernames_across_databases(
 ) -> dict[int, str]:
     """Resolve UIDs to usernames by searching across multiple databases.
 
-    Efficiently searches databases in order, stopping early once all
-    UIDs are resolved. This is useful when querying multiple databases
-    and needing to resolve usernames from any of them.
+    Searches databases in order, stopping early once every UID has a real
+    user_info match. A UID's str(uid) placeholder is *not* treated as resolved
+    (that would stop the search at the first database — e.g. a path-filtered
+    query against /<collection> still fans out across every database, but only
+    the owning collection's user_info knows its users), so the str(uid) /
+    pwd.getpwuid() last resort is applied once, after all databases are tried.
 
     Args:
         uids: Set or list of UIDs to resolve
         filesystems: List of filesystem names to search
 
     Returns:
-        Dictionary mapping UID to username (or str(uid) if unknown)
+        Dictionary mapping UID to username (or str(uid) if unknown in any db)
     """
     if not uids:
         return {}
@@ -670,15 +732,23 @@ def resolve_usernames_across_databases(
 
     for fs in filesystems:
         if not remaining_uids:
-            break  # All UIDs resolved, stop early
+            break  # All UIDs resolved to real names, stop early
 
         session = get_session(fs)
         try:
-            found = get_username_map(session, list(remaining_uids))
-            username_map.update(found)
-            remaining_uids -= found.keys()
+            found = get_username_map(session, list(remaining_uids), fallback=False)
         finally:
             session.close()
+
+        username_map.update(found)
+        remaining_uids -= found.keys()
+
+    # Last resort for UIDs absent from every database's user_info.
+    for uid in remaining_uids:
+        try:
+            username_map[uid] = pwd.getpwuid(uid).pw_name
+        except (KeyError, OverflowError):
+            username_map[uid] = str(uid)
 
     return username_map
 
@@ -715,25 +785,29 @@ def resolve_group_filter(group_arg: str | None, mine_flag: bool) -> int | None:
     return None
 
 
-def get_groupname_map(session, gids: list[int]) -> dict[int, str]:
+def get_groupname_map(session, gids: list[int], fallback: bool = True) -> dict[int, str]:
     """
     Get groupname mappings for a list of GIDs from the group_info table.
-
-    Falls back to grp.getgrgid() for GIDs not in the table.
 
     Args:
         session: SQLAlchemy session
         gids: List of GIDs to resolve
+        fallback: When True (default), GIDs absent from this database's
+            group_info table fall back to grp.getgrgid() and finally to
+            str(gid). When False, only GIDs with a real (non-empty) groupname
+            in group_info are returned — used by
+            resolve_groupnames_across_databases() so a str(gid) placeholder in
+            one database does not stop the search from consulting the others.
 
     Returns:
-        Dictionary mapping GID to groupname (or str(gid) if unknown)
+        Dictionary mapping GID to groupname. With fallback=True every requested
+        GID is present; with fallback=False only real group_info hits.
     """
     if not gids:
         return {}
 
-    result = {}
+    real = {}  # GIDs with a non-empty groupname in this database's group_info
 
-    # Try to get from group_info table first
     try:
         placeholders = ", ".join(f":gid_{i}" for i in range(len(gids)))
         params = {f"gid_{i}": gid for i, gid in enumerate(gids)}
@@ -744,11 +818,16 @@ def get_groupname_map(session, gids: list[int]) -> dict[int, str]:
         ).fetchall()
 
         for gid, groupname in rows:
-            result[gid] = groupname if groupname else str(gid)
+            if groupname:
+                real[gid] = groupname
     except Exception:
         pass
 
-    # Fall back to grp for missing GIDs
+    if not fallback:
+        return real
+
+    # Fall back to grp then str(gid) for GIDs without a real groupname here.
+    result = dict(real)
     for gid in gids:
         if gid not in result:
             try:
@@ -765,16 +844,17 @@ def resolve_groupnames_across_databases(
 ) -> dict[int, str]:
     """Resolve GIDs to groupnames by searching across multiple databases.
 
-    Efficiently searches databases in order, stopping early once all
-    GIDs are resolved. This is useful when querying multiple databases
-    and needing to resolve groupnames from any of them.
+    Searches databases in order, stopping early once every GID has a real
+    group_info match. A GID's str(gid) placeholder is *not* treated as resolved
+    (that would stop the search at the first database), so the str(gid) /
+    grp.getgrgid() last resort is applied once, after all databases are tried.
 
     Args:
         gids: Set or list of GIDs to resolve
         filesystems: List of filesystem names to search
 
     Returns:
-        Dictionary mapping GID to groupname (or str(gid) if unknown)
+        Dictionary mapping GID to groupname (or str(gid) if unknown in any db)
     """
     if not gids:
         return {}
@@ -784,15 +864,23 @@ def resolve_groupnames_across_databases(
 
     for fs in filesystems:
         if not remaining_gids:
-            break  # All GIDs resolved, stop early
+            break  # All GIDs resolved to real names, stop early
 
         session = get_session(fs)
         try:
-            found = get_groupname_map(session, list(remaining_gids))
-            groupname_map.update(found)
-            remaining_gids -= found.keys()
+            found = get_groupname_map(session, list(remaining_gids), fallback=False)
         finally:
             session.close()
+
+        groupname_map.update(found)
+        remaining_gids -= found.keys()
+
+    # Last resort for GIDs absent from every database's group_info.
+    for gid in remaining_gids:
+        try:
+            groupname_map[gid] = grp.getgrgid(gid).gr_name
+        except (KeyError, OverflowError):
+            groupname_map[gid] = str(gid)
 
     return groupname_map
 

@@ -7,7 +7,7 @@ histogram data from pre-computed ORM tables (AccessHistogram, SizeHistogram).
 from collections import defaultdict
 from datetime import datetime
 
-from sqlalchemy import text
+from sqlalchemy import inspect as sa_inspect, text
 
 from ..cli.common import format_size
 from ..core.database import get_session
@@ -188,6 +188,47 @@ class HistogramData:
         else:
             return f"{count:,}"
 
+    def to_dict(self) -> dict:
+        """Serialize the histogram to a plain (JSON-friendly) dict.
+
+        Owner sub-dicts keep integer UID keys in-process; the JSON exporter
+        stringifies them on dump. Use :meth:`from_dict` to round-trip.
+        """
+        return {
+            "scan_date": self.scan_date,
+            "bucket_labels": list(self.bucket_labels),
+            "total_data": self.total_data,
+            "total_files": self.total_files,
+            "buckets": {
+                label: {
+                    "data": bucket["data"],
+                    "files": bucket["files"],
+                    "owners": {
+                        uid: {"data": stats["data"], "files": stats["files"]}
+                        for uid, stats in bucket["owners"].items()
+                    },
+                }
+                for label, bucket in self.buckets.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HistogramData":
+        """Reconstruct a HistogramData from :meth:`to_dict` output."""
+        hist = cls(list(data["bucket_labels"]), data.get("scan_date"))
+        for label, bucket in data["buckets"].items():
+            if label not in hist.buckets:
+                continue
+            target = hist.buckets[label]
+            target["data"] = bucket["data"]
+            target["files"] = bucket["files"]
+            for uid, stats in bucket["owners"].items():
+                target["owners"][int(uid)]["data"] += stats["data"]
+                target["owners"][int(uid)]["files"] += stats["files"]
+        hist.total_data = data["total_data"]
+        hist.total_files = data["total_files"]
+        return hist
+
 
 def query_histogram_orm(
     session,
@@ -215,14 +256,10 @@ def query_histogram_orm(
     else:
         raise ValueError(f"Invalid histogram_type: {histogram_type}")
 
-    # Check if table exists
+    # Check if table exists (dialect-agnostic: works on sqlite and postgresql)
     try:
-        table_check = session.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name = :table_name"),
-            {"table_name": table_name}
-        ).fetchone()
-
-        if not table_check:
+        bind = session.get_bind()
+        if not sa_inspect(bind).has_table(table_name):
             return None  # Table doesn't exist
     except Exception:
         return None
