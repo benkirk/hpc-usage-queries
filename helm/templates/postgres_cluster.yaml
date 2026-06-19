@@ -62,6 +62,16 @@ spec:
       owner: {{ .Values.db.app.owner }}
       secret:
         name: "{{ .Values.db.name }}-app-user"
+      # Install pg_stat_statements into template1 at cluster bootstrap. Because
+      # CREATE DATABASE clones template1, every database created afterward
+      # (campaign, per-machine job DBs, future filesystems like desc1) inherits
+      # the extension automatically — no per-DB manual step. This only runs at
+      # initial bootstrap, so it is insurance for a from-scratch rebuild / new
+      # environment; the currently-running cluster was backfilled by hand. The
+      # library itself is loaded via shared_preload_libraries (above); this just
+      # exposes the view. Requires superuser, which bootstrap runs as.
+      postInitTemplateSQL:
+        - CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
   postgresql:
     # Preload pg_stat_statements for cumulative per-query-shape cost stats —
