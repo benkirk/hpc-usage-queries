@@ -10,7 +10,11 @@ from fs_scans.core.models import Base, Directory, DirectoryStats
 from fs_scans.core.database import get_engine, clear_engine_cache
 from fs_scans.core.query_builder import DirectoryQueryBuilder, QueryResult
 from fs_scans.cli.common import parse_size, parse_file_count
-from fs_scans.queries.query_engine import collection_for_path, normalize_path
+from fs_scans.queries.query_engine import (
+    collection_for_path,
+    normalize_path,
+    query_directories,
+)
 
 
 # ============================================================================
@@ -215,6 +219,14 @@ class TestDirectoryQueryBuilder:
 
         assert "s.owner_uid = :owner_id" in result.sql
         assert result.params["owner_id"] == 12345
+
+    def test_group_filter(self):
+        """Test specific group filtering."""
+        builder = DirectoryQueryBuilder()
+        result = builder.with_group(2000).build()
+
+        assert "s.owner_gid = :group_id" in result.sql
+        assert result.params["group_id"] == 2000
 
     def test_accessed_before_filter(self):
         """Test accessed before date filtering."""
@@ -644,3 +656,49 @@ class TestCollectionForPath:
         assert collection_for_path("/") is None
         assert collection_for_path("") is None
         assert collection_for_path("/gpfs/csfs1") is None
+
+
+# ============================================================================
+# query_directories group filter (end-to-end)
+# ============================================================================
+
+
+class TestQueryDirectoriesGroupFilter:
+    """query_directories(group_id=...) filters the listing by owner_gid.
+
+    Mirrors the existing owner_uid drill-down so the SAM webapp can expand a
+    'By group' row into that group's directories (previously the facade only
+    exposed an owner-UID filter)."""
+
+    def _populate_groups(self, session):
+        """Three sibling dirs: one multi-group root + two single-group leaves."""
+        dirs = [
+            Directory(dir_id=1, parent_id=None, name="gpfs", depth=1),
+            Directory(dir_id=2, parent_id=1, name="groupA_dir", depth=2),
+            Directory(dir_id=3, parent_id=1, name="groupB_dir", depth=2),
+        ]
+        stats = [
+            DirectoryStats(dir_id=1, file_count_r=300, total_size_r=300000,
+                           owner_uid=-1, owner_gid=-1),
+            DirectoryStats(dir_id=2, file_count_r=200, total_size_r=200000,
+                           owner_uid=12345, owner_gid=1000),
+            DirectoryStats(dir_id=3, file_count_r=100, total_size_r=100000,
+                           owner_uid=67890, owner_gid=2000),
+        ]
+        session.add_all(dirs + stats)
+        session.commit()
+
+    def test_group_filter_returns_only_matching_gid(self, fs_scan_session):
+        self._populate_groups(fs_scan_session)
+
+        rows = query_directories(fs_scan_session, group_id=1000)
+
+        assert [r["dir_id"] for r in rows] == [2]
+        assert rows[0]["owner_gid"] == 1000
+
+    def test_no_group_filter_returns_all(self, fs_scan_session):
+        self._populate_groups(fs_scan_session)
+
+        rows = query_directories(fs_scan_session)
+
+        assert {r["dir_id"] for r in rows} == {1, 2, 3}
