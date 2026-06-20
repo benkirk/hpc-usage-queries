@@ -264,6 +264,7 @@ class FsScanQueries:
         max_depth: int | None = None,
         single_owner: bool = False,
         owner_id: int | None = None,
+        group_id: int | None = None,
         path_prefixes=None,
         exclude_paths=None,
         sort_by: str = "size",
@@ -303,6 +304,7 @@ class FsScanQueries:
                     max_depth=max_depth,
                     single_owner=single_owner,
                     owner_id=owner_id,
+                    group_id=group_id,
                     path_prefixes=scope[fs],
                     exclude_paths=norm_excludes,
                     sort_by=sort_by,
@@ -348,6 +350,7 @@ class FsScanQueries:
                     min_files,
                     max_files,
                     compute_dir_counts,
+                    group_id=group_id,
                 ): fs
                 for fs in filesystems
             }

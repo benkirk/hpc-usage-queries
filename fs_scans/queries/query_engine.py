@@ -296,6 +296,7 @@ def query_directories(
     max_depth: int | None = None,
     single_owner: bool = False,
     owner_id: int | None = None,
+    group_id: int | None = None,
     path_prefixes: list[str] | None = None,
     exclude_paths: list[str] | None = None,
     sort_by: str = "size_r",
@@ -320,6 +321,7 @@ def query_directories(
         max_depth: Maximum path depth filter
         single_owner: Only show single-owner directories
         owner_id: Filter to specific owner UID
+        group_id: Filter to specific group GID
         path_prefixes: Filter to paths under these prefixes (OR'd together)
         exclude_paths: List of paths to exclude (with descendants)
         sort_by: Sort field (size_r, size_nr, files_r, files_nr, atime_r, path)
@@ -362,6 +364,8 @@ def query_directories(
         builder.with_single_owner()
     if owner_id is not None:
         builder.with_owner(owner_id)
+    if group_id is not None:
+        builder.with_group(group_id)
 
     # Apply date filters
     if accessed_before is not None:
@@ -1049,6 +1053,7 @@ def query_single_filesystem(
     min_files: int | None = None,
     max_files: int | None = None,
     compute_dir_counts: bool = False,
+    group_id: int | None = None,
 ) -> list[dict]:
     """Query a single filesystem database.
 
@@ -1070,6 +1075,7 @@ def query_single_filesystem(
             max_depth=max_depth,
             single_owner=single_owner,
             owner_id=owner_id,
+            group_id=group_id,
             path_prefixes=path_prefixes,
             exclude_paths=exclude_paths,
             sort_by=sort_by,
