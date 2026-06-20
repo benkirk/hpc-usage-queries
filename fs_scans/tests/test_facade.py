@@ -163,6 +163,13 @@ def test_list_directories_owner_filter(collection):
     assert [r["path"] for r in rows] == ["/tank/alice"]
 
 
+def test_list_directories_group_filter(collection):
+    # alice + bob share owner_gid 2001; proj is multi-group (NULL); root is -1.
+    rows = FsScanQueries(filesystems="testfs").list_directories(group_id=2001, limit=0)
+    assert {r["path"] for r in rows} == {"/tank/alice", "/tank/bob"}
+    assert all(r["owner_gid"] == 2001 for r in rows)
+
+
 # ---------------------------------------------------------------------------
 # Histograms
 # ---------------------------------------------------------------------------

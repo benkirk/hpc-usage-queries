@@ -30,6 +30,7 @@ from ..core.database import filesystem_available, get_db_url, set_data_dir
 from ..queries.facade import FsScanQueries
 from ..queries.query_engine import (
     get_all_filesystems,
+    resolve_group_filter,
     resolve_owner_filter,
 )
 
@@ -70,6 +71,18 @@ DynamicHelpCommand = make_dynamic_help_command('fs-scans query')
     "--mine",
     is_flag=True,
     help="Filter to current user's UID (shortcut for -u $UID)",
+)
+@click.option(
+    "-g",
+    "--group",
+    "group_id",
+    type=str,
+    help="Filter to specific group (GID or groupname)",
+)
+@click.option(
+    "--mygroup",
+    is_flag=True,
+    help="Filter to current user's primary GID (shortcut for -g $GID)",
 )
 @click.option(
     "--path-prefix",
@@ -215,6 +228,8 @@ def query_cmd(
     single_owner: bool,
     owner_id: str | None,
     mine: bool,
+    group_id: str | None,
+    mygroup: bool,
     path_prefixes: tuple[str, ...],
     exclude_paths: tuple[str, ...],
     limit: int,
@@ -257,6 +272,8 @@ def query_cmd(
       fs-scans query --group-by owner -v     # Per-user per-filesystem breakdown
       fs-scans query --group-by owner --sort-by files  # Sort by file count
       fs-scans query --group-by owner -d 4 -P /gpfs/csfs1/cisl
+      fs-scans query -g cseg                  # Directories owned by a group
+      fs-scans query --mygroup                # Directories owned by your group
       fs-scans query --group-by group         # Per-group summary (aggregated)
       fs-scans query --group-by group -v     # Per-group per-filesystem breakdown
       fs-scans query --group-by owner --format json     # JSON envelope to stdout
@@ -275,6 +292,8 @@ def query_cmd(
 
     # Resolve owner_id: can be UID (int) or username (string)
     resolved_owner_id = resolve_owner_filter(owner_id, mine)
+    # Resolve group_id: can be GID (int) or groupname (string)
+    resolved_group_id = resolve_group_filter(group_id, mygroup)
 
     # Determine which filesystems to query
     if filesystem.lower() == "all":
@@ -372,6 +391,7 @@ def query_cmd(
         max_depth=max_depth,
         single_owner=single_owner,
         owner_id=resolved_owner_id,
+        group_id=resolved_group_id,
         path_prefixes=path_prefixes or None,
         exclude_paths=exclude_paths or None,
         sort_by=sort_by,
