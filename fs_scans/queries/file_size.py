@@ -11,7 +11,12 @@ from sqlalchemy import text
 
 from ..cli.common import format_size
 from ..core.models import SIZE_BUCKETS, classify_size_bucket
-from ..queries.query_engine import get_scan_date, resolve_path_to_id
+from ..queries.query_engine import (
+    get_scan_date,
+    resolve_scope,
+    _anc_predicate,
+    _recursive_descendants_cte,
+)
 
 
 def query_size_histogram_fast(
@@ -104,38 +109,33 @@ def compute_size_histogram_from_directory_stats(
         conditions.append("s.owner_uid = :owner_uid")
         params["owner_uid"] = owner_uid
 
-    # Handle path prefixes
+    # Handle path prefixes: prefer the fast anc_d{k} lineage predicate, fall
+    # back to the recursive descendants CTE for deep scopes / older .db files.
     cte_clause = ""
     join_clause = ""
     if path_prefixes:
-        ancestor_ids = []
-        for prefix in path_prefixes:
-            ancestor_id = resolve_path_to_id(session, prefix)
-            if ancestor_id is not None:
-                idx = len(ancestor_ids)
-                ancestor_ids.append(ancestor_id)
-                params[f"ancestor_id_{idx}"] = ancestor_id
-
-        if not ancestor_ids:
+        resolved, use_fast = resolve_scope(session, path_prefixes)
+        if resolved is None:
             # No valid paths found, return empty histogram
             return {}
-
-        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
-        cte_clause = f"""
-            WITH RECURSIVE
-            ancestors AS (
-                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
-            ),
-            descendants AS (
-                SELECT dir_id FROM ancestors
-                UNION ALL
-                SELECT d.dir_id FROM directories d
-                JOIN descendants p ON d.parent_id = p.dir_id
+        if use_fast:
+            conditions.append(_anc_predicate(resolved, params, alias="s"))
+        else:
+            cte_clause, join_clause = _recursive_descendants_cte(
+                [rid for rid, _ in resolved], params
             )
-        """
-        join_clause = "JOIN descendants USING (dir_id)"
 
     where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+    # The directories join is only needed for depth filters or the recursive
+    # CTE; the fast path streams directly from directory_stats.
+    if min_depth is not None or max_depth is not None or cte_clause:
+        from_clause = (
+            "FROM directories d\n        JOIN directory_stats s USING (dir_id)\n"
+            f"        {join_clause}"
+        )
+    else:
+        from_clause = "FROM directory_stats s"
 
     query = f"""
         {cte_clause}
@@ -143,9 +143,7 @@ def compute_size_histogram_from_directory_stats(
             s.total_size_nr,
             s.file_count_nr,
             s.owner_uid
-        FROM directories d
-        JOIN directory_stats s USING (dir_id)
-        {join_clause}
+        {from_clause}
         WHERE {where_clause} AND s.file_count_nr > 0
     """
 
