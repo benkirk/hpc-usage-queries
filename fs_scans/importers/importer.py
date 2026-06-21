@@ -30,6 +30,7 @@ from .file_handling import *
 from .pass1 import *
 from .pass2a import *
 from .pass2b import *
+from .pass2c import *
 from .pass3 import *
 from .add_table_indexing import *
 
@@ -131,6 +132,11 @@ def run_import(
 
         # Pass 2b: Compute recursive stats via bottom-up aggregation (pure SQL)
         pass2b_aggregate_recursive_stats(session)
+
+        # Pass 2c: Populate denormalized ancestor-at-depth columns (pure SQL).
+        # Enables scoped subtree queries via a single indexed equality instead
+        # of a recursive parent_id walk.
+        pass2c_populate_ancestor_columns(session)
 
         # add all other directory_stats indexing *after* recursive stats
         add_directory_stats_indexing(session)

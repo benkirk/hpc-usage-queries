@@ -15,6 +15,26 @@ from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
 
+# Denormalized "ancestor-at-depth" scope columns on directory_stats.
+#
+# For each row we precompute the dir_id of its ancestor at each fixed depth in
+# columns anc_d1 .. anc_d{SCOPE_MAX_DEPTH}. A scoped subtree query for an ancestor
+# X resolved at depth k then becomes `WHERE anc_d{k} = X` — a single indexed
+# equality that replaces the recursive `parent_id` walk. See
+# docs/plans/FS_SCANS_ANCESTOR_AT_DEPTH.md.
+#
+# SCOPE_MAX_DEPTH bounds how deep a scope can be answered via the fast path;
+# deeper scopes fall back to the recursive CTE (their subtrees are small, so the
+# fallback is already ~1s). Tune against the real depth histogram on-machine.
+SCOPE_MAX_DEPTH = 12
+
+# PostgreSQL covering scope indexes are built only over this (selective) depth
+# band — a few levels below the collection root. The root depth itself is the
+# non-selective whole-collection fast path and is skipped. SQLite builds none of
+# these (the local CLI uses the recursive-CTE fallback). Tune on-machine.
+SCOPE_INDEX_MIN_DEPTH = 3
+SCOPE_INDEX_MAX_DEPTH = 8
+
 
 class Directory(Base):
     """Directory entry in the normalized path hierarchy.
@@ -93,6 +113,17 @@ class DirectoryStats(Base):
             f"<DirectoryStats(dir_id={self.dir_id}, "
             f"files_r={self.file_count_r}, size_r={self.total_size_r})>"
         )
+
+
+# Denormalized ancestor-at-depth columns anc_d1 .. anc_d{SCOPE_MAX_DEPTH}.
+# Added post-hoc (SQLAlchemy declarative maps columns assigned to the class) so
+# the column count always tracks SCOPE_MAX_DEPTH. Plain Integer (4 B) — dir_id
+# stays well inside signed int32 — and nullable (rows shallower than k store
+# NULL). No ForeignKey: the consolidator drops FKs for bulk COPY and this is a
+# denormalized lookup, not a referential constraint.
+for _k in range(1, SCOPE_MAX_DEPTH + 1):
+    setattr(DirectoryStats, f"anc_d{_k}", Column(f"anc_d{_k}", Integer, nullable=True))
+del _k
 
 
 class DirStatsAccumulator:
