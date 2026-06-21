@@ -234,6 +234,10 @@ no new table).
 
 ## 6.5 Chosen design — denormalized ancestor-at-depth columns
 
+> **Full standalone implementation spec:** `FS_SCANS_ANCESTOR_AT_DEPTH.md`
+> (self-contained, restartable from a cold session). This section is the summary;
+> that doc carries the layer-by-layer plan, parity proof, and on-machine knobs.
+
 **Access pattern resolved (§8), with the SAM owner:**
 - Scoping happens at **arbitrary depth**; drill-down below a fileset root must stay
   *reasonably* fast (faster is nice, not a hard <1s).
