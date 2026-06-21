@@ -51,13 +51,13 @@ def add_directory_stats_indexing(session):
         session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_group_size     ON directory_stats(owner_gid, total_size_r);"))
         session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_group_files    ON directory_stats(owner_gid, file_count_r);"))
 
-        # Scoped-query (ancestor-at-level) indexes. PostgreSQL only: covering
-        # indexes give index-only aggregates for the scoped owner/group/listing
-        # paths over the selective band of root-relative levels. SQLite leaves the
-        # anc_d* columns unindexed — the local CLI uses the recursive-CTE fallback
-        # and these heavy indexes would only bloat the published .db. Tune the
-        # band via SCOPE_INDEX_MIN_DEPTH / SCOPE_INDEX_MAX_DEPTH in core/models.py.
-        if session.get_bind().dialect.name == "postgresql":
+        # Scoped-query (ancestor-at-level) indexes over the selective band of
+        # root-relative levels (SCOPE_INDEX_MIN_DEPTH..SCOPE_INDEX_MAX_DEPTH in
+        # core/models.py). Both backends index the band so a scoped query is an
+        # index seek instead of a full scan; the index *shape* differs by engine.
+        dialect = session.get_bind().dialect.name
+        if dialect == "postgresql":
+            # Covering indexes → index-only aggregates for owner/group/listing.
             for k in range(SCOPE_INDEX_MIN_DEPTH, SCOPE_INDEX_MAX_DEPTH + 1):
                 session.execute(text(
                     f"CREATE INDEX IF NOT EXISTS ix_stats_anc_d{k}_owner ON directory_stats "
@@ -70,6 +70,17 @@ def add_directory_stats_indexing(session):
                 session.execute(text(
                     f"CREATE INDEX IF NOT EXISTS ix_stats_anc_d{k}_size  ON directory_stats "
                     f"(anc_d{k}, total_size_r);"
+                ))
+        else:
+            # SQLite (and others): plain single-column anc_d{k} indexes. SQLite
+            # has no INCLUDE/covering, and the full covering set would ~double the
+            # published .db; a plain index still turns the scoped equality into an
+            # index seek (measured ~4-5x on cgd-scale data), keeping the .db
+            # standalone-performant for the local CLI and other non-CNPG consumers
+            # at a modest (~+20% on cgd) size cost.
+            for k in range(SCOPE_INDEX_MIN_DEPTH, SCOPE_INDEX_MAX_DEPTH + 1):
+                session.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS ix_stats_anc_d{k} ON directory_stats(anc_d{k});"
                 ))
 
         session.commit()
