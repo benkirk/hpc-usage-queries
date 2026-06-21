@@ -11,9 +11,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from ..core.database import get_data_dir, get_db_path, get_session
+from ..core.models import SCOPE_INDEX_MIN_DEPTH, SCOPE_INDEX_MAX_DEPTH
 from ..core.query_builder import DirectoryQueryBuilder
 
 
@@ -185,6 +186,176 @@ def resolve_path_to_id(session, path: str) -> int | None:
     return result[0] if result else None
 
 
+def resolve_path_to_id_with_depth(session, path: str) -> tuple[int, int] | None:
+    """Resolve a path to its ``(dir_id, stored_depth)``, or ``None`` if absent.
+
+    ``depth`` is read from the ``directories`` row, NOT inferred from the number
+    of path components: callers pass mount-stripped paths (the facade strips
+    ``/gpfs/csfs1`` etc.) while per-collection databases store the depth measured
+    from the true filesystem root (e.g. ``asp`` is depth 3), so the two differ.
+    The stored depth is what indexes the anc_d{k} columns, so it must be exact.
+    """
+    dir_id = resolve_path_to_id(session, path)
+    if dir_id is None:
+        return None
+    depth = session.execute(
+        text("SELECT depth FROM directories WHERE dir_id = :id"), {"id": dir_id}
+    ).scalar()
+    if depth is None:
+        return None
+    return dir_id, depth
+
+
+# Cache of "does directory_stats carry the anc_d* scope columns?" keyed by
+# engine. Existence rarely changes; reflection is cheap but the scoped queries
+# fan out per-filesystem, so memoize.
+_ANC_COLUMNS_CACHE: dict = {}
+
+# Cache of each database's collection-root depth (MIN(depth)) keyed by engine.
+# anc_d* levels are relative to this root; pass2c derives it the same way, so the
+# two agree (the depth values are identical after consolidation to PostgreSQL).
+_ROOT_DEPTH_CACHE: dict = {}
+
+
+def collection_root_depth(session) -> int | None:
+    """The shallowest directory depth in this database (the collection root).
+
+    anc_d{k} levels are measured relative to this: ``level = depth - root + 1``.
+    """
+    bind = session.get_bind()
+    key = id(bind)
+    if key not in _ROOT_DEPTH_CACHE:
+        _ROOT_DEPTH_CACHE[key] = session.execute(
+            text("SELECT MIN(depth) FROM directories")
+        ).scalar()
+    return _ROOT_DEPTH_CACHE[key]
+
+
+def anc_columns_exist(session) -> bool:
+    """True if directory_stats declares the anc_d* scope columns.
+
+    Older ``.db`` files (imported before this feature) lack them entirely.
+    Checked via the inspector (no failed query, so it never aborts an open
+    PostgreSQL transaction); the anc_d* columns are all added together, so the
+    presence of ``anc_d1`` implies the whole set.
+    """
+    bind = session.get_bind()
+    key = id(bind)
+    cached = _ANC_COLUMNS_CACHE.get(key)
+    if cached is None:
+        try:
+            cols = {c["name"] for c in inspect(bind).get_columns("directory_stats")}
+            cached = "anc_d1" in cols
+        except Exception:
+            cached = False
+        _ANC_COLUMNS_CACHE[key] = cached
+    return cached
+
+
+def _scopes_populated(session, resolved) -> bool:
+    """True if every resolved scope's anc_d{level} self-slot is populated.
+
+    pass2c sets ``anc_d{k} = dir_id`` on every directory at relative level k (for
+    k <= SCOPE_MAX_DEPTH): a directory is its own level-k ancestor. Verifying that
+    invariant for the scope rows themselves is the exact correctness precondition
+    for the fast predicate — it confirms the columns are populated (not merely
+    declared) without assuming any particular tree depth. A self-slot lookup is a
+    single primary-key probe.
+    """
+    for dir_id, level in resolved:
+        row = session.execute(
+            text(f"SELECT 1 FROM directory_stats WHERE dir_id = :id AND anc_d{level} = :id"),
+            {"id": dir_id},
+        ).fetchone()
+        if row is None:
+            return False
+    return True
+
+
+def resolve_scope(session, path_prefixes: list[str]):
+    """Resolve *path_prefixes* into a subtree scope.
+
+    Returns ``(resolved, use_fast)`` where ``resolved`` is a list of
+    ``(dir_id, level)`` pairs — ``level`` being the scope's depth *relative to the
+    collection root* (root = 1), which is exactly the ``anc_d{level}`` column that
+    indexes it — or ``None`` if no prefix resolved (the caller should return an
+    empty result). ``use_fast`` is True when every relative level falls in the
+    indexed band ``[SCOPE_INDEX_MIN_DEPTH, SCOPE_INDEX_MAX_DEPTH]``, the anc_d*
+    columns exist, and those scope rows are actually populated — i.e. the scope
+    can be answered with an ``anc_d{level}`` equality predicate instead of the
+    recursive CTE.
+
+    The gate is the *indexed* band, not the full populated range: outside it a
+    PostgreSQL ``anc_d{k}`` predicate has no covering index and would seq-scan
+    the whole table, which for a deep (hence thin) subtree loses to the
+    self-bounding recursive walk. Columns are populated to ``SCOPE_MAX_DEPTH`` as
+    headroom so the band can be widened later by reconsolidating (rebuilding the
+    PG indexes) without re-importing.
+
+    Prefixes are assumed already collapsed (the facade's ``_collapse_prefixes``
+    drops any nested under another), so the per-level predicates OR together
+    without double-counting.
+    """
+    raw = []
+    for prefix in path_prefixes:
+        pair = resolve_path_to_id_with_depth(session, prefix)
+        if pair is not None:
+            raw.append(pair)
+    if not raw:
+        return None, False
+
+    # Convert absolute depth → level relative to the collection root.
+    root_depth = collection_root_depth(session) or 1
+    resolved = [(dir_id, depth - root_depth + 1) for dir_id, depth in raw]
+
+    use_fast = (
+        all(SCOPE_INDEX_MIN_DEPTH <= level <= SCOPE_INDEX_MAX_DEPTH for _, level in resolved)
+        and anc_columns_exist(session)
+        and _scopes_populated(session, resolved)
+    )
+    return resolved, use_fast
+
+
+def _recursive_descendants_cte(ancestor_ids: list[int], params: dict) -> tuple[str, str]:
+    """Build the recursive-subtree CTE + join clause for *ancestor_ids*.
+
+    Mutates *params* with ``ancestor_id_{i}`` binds. Returns
+    ``(cte_clause, join_clause)`` — the historical fallback shared by every
+    scoped consumer.
+    """
+    for i, aid in enumerate(ancestor_ids):
+        params[f"ancestor_id_{i}"] = aid
+    ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
+    cte_clause = f"""
+        WITH RECURSIVE
+        ancestors AS (
+            SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
+        ),
+        descendants AS (
+            SELECT dir_id FROM ancestors
+            UNION ALL
+            SELECT d.dir_id FROM directories d
+            JOIN descendants p ON d.parent_id = p.dir_id
+        )
+    """
+    return cte_clause, "JOIN descendants USING (dir_id)"
+
+
+def _anc_predicate(resolved: list, params: dict, alias: str = "s") -> str:
+    """Build the fast ``(alias.anc_d{level} = :scope_i OR ...)`` lineage predicate.
+
+    *resolved* is a list of ``(dir_id, level)`` pairs (each relative level already
+    verified inside the indexed band). Mutates *params* with ``scope_anc_{i}``
+    binds.
+    """
+    preds = []
+    for i, (dir_id, level) in enumerate(resolved):
+        key = f"scope_anc_{i}"
+        params[key] = dir_id
+        preds.append(f"{alias}.anc_d{level} = :{key}")
+    return "(" + " OR ".join(preds) + ")"
+
+
 def get_full_path(session, dir_id: int) -> str:
     """
     Reconstruct full path for a directory using recursive CTE.
@@ -341,14 +512,11 @@ def query_directories(
         List of directory dictionaries with stats
     """
     # Phase 1: Resolve path_prefixes to IDs (if provided)
-    ancestor_ids = []
+    scope_resolved = None
+    scope_use_fast = False
     if path_prefixes:
-        for prefix in path_prefixes:
-            ancestor_id = resolve_path_to_id(session, prefix)
-            if ancestor_id is not None:
-                ancestor_ids.append(ancestor_id)
-
-        if not ancestor_ids:
+        scope_resolved, scope_use_fast = resolve_scope(session, path_prefixes)
+        if scope_resolved is None:
             return []  # No valid paths found
 
     # Phase 2: Build query using DirectoryQueryBuilder (dialect-aware so name
@@ -387,9 +555,13 @@ def query_directories(
     if min_files is not None or max_files is not None:
         builder.with_file_count_range(min_files, max_files)
 
-    # Apply path prefix filter (using resolved IDs)
-    if ancestor_ids:
-        builder.with_path_prefix_ids(ancestor_ids)
+    # Apply path prefix filter: fast anc_d{k} lineage predicate when possible,
+    # else the recursive descendants CTE (deep scopes / older .db files).
+    if scope_resolved:
+        if scope_use_fast:
+            builder.with_path_prefix_anc(scope_resolved)
+        else:
+            builder.with_path_prefix_ids([rid for rid, _ in scope_resolved])
 
     # Apply sorting and limit
     builder.with_sort(sort_by)
@@ -554,35 +726,20 @@ def query_owner_summary(
         conditions.append("d.depth <= :max_depth")
         params["max_depth"] = max_depth
 
-    # Handle path prefixes
+    # Handle path prefixes: prefer the fast anc_d{k} lineage predicate, fall
+    # back to the recursive descendants CTE for deep scopes / older .db files.
     cte_clause = ""
     join_clause = ""
     if path_prefixes:
-        ancestor_ids = []
-        for prefix in path_prefixes:
-            ancestor_id = resolve_path_to_id(session, prefix)
-            if ancestor_id is not None:
-                idx = len(ancestor_ids)
-                ancestor_ids.append(ancestor_id)
-                params[f"ancestor_id_{idx}"] = ancestor_id
-
-        if not ancestor_ids:
+        resolved, use_fast = resolve_scope(session, path_prefixes)
+        if resolved is None:
             return []  # No valid paths found
-
-        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
-        cte_clause = f"""
-            WITH RECURSIVE
-            ancestors AS (
-                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
-            ),
-            descendants AS (
-                SELECT dir_id FROM ancestors
-                UNION ALL
-                SELECT d.dir_id FROM directories d
-                JOIN descendants p ON d.parent_id = p.dir_id
+        if use_fast:
+            conditions.append(_anc_predicate(resolved, params, alias="s"))
+        else:
+            cte_clause, join_clause = _recursive_descendants_cte(
+                [rid for rid, _ in resolved], params
             )
-        """
-        join_clause = "JOIN descendants USING (dir_id)"
 
     sort_map = {
         "size": "total_size DESC",
@@ -593,6 +750,16 @@ def query_owner_summary(
 
     where_clause = " AND ".join(conditions)
 
+    # The directories join is only needed for depth filters or the recursive
+    # CTE; the fast aggregate reads everything it needs from directory_stats.
+    if min_depth is not None or max_depth is not None or cte_clause:
+        from_clause = (
+            "FROM directories d\n        JOIN directory_stats s USING (dir_id)\n"
+            f"        {join_clause}"
+        )
+    else:
+        from_clause = "FROM directory_stats s"
+
     query = f"""
         {cte_clause}
         SELECT
@@ -600,9 +767,7 @@ def query_owner_summary(
             SUM(s.total_size_nr) as total_size,
             SUM(s.file_count_nr) as total_files,
             COUNT(*) as directory_count
-        FROM directories d
-        JOIN directory_stats s USING (dir_id)
-        {join_clause}
+        {from_clause}
         WHERE {where_clause}
         GROUP BY s.owner_uid
         ORDER BY {order_clause}
@@ -965,35 +1130,20 @@ def query_group_summary(
         conditions.append("d.depth <= :max_depth")
         params["max_depth"] = max_depth
 
-    # Handle path prefixes
+    # Handle path prefixes: prefer the fast anc_d{k} lineage predicate, fall
+    # back to the recursive descendants CTE for deep scopes / older .db files.
     cte_clause = ""
     join_clause = ""
     if path_prefixes:
-        ancestor_ids = []
-        for prefix in path_prefixes:
-            ancestor_id = resolve_path_to_id(session, prefix)
-            if ancestor_id is not None:
-                idx = len(ancestor_ids)
-                ancestor_ids.append(ancestor_id)
-                params[f"ancestor_id_{idx}"] = ancestor_id
-
-        if not ancestor_ids:
+        resolved, use_fast = resolve_scope(session, path_prefixes)
+        if resolved is None:
             return []  # No valid paths found
-
-        ancestor_params = ", ".join(f":ancestor_id_{i}" for i in range(len(ancestor_ids)))
-        cte_clause = f"""
-            WITH RECURSIVE
-            ancestors AS (
-                SELECT dir_id FROM directories WHERE dir_id IN ({ancestor_params})
-            ),
-            descendants AS (
-                SELECT dir_id FROM ancestors
-                UNION ALL
-                SELECT d.dir_id FROM directories d
-                JOIN descendants p ON d.parent_id = p.dir_id
+        if use_fast:
+            conditions.append(_anc_predicate(resolved, params, alias="s"))
+        else:
+            cte_clause, join_clause = _recursive_descendants_cte(
+                [rid for rid, _ in resolved], params
             )
-        """
-        join_clause = "JOIN descendants USING (dir_id)"
 
     sort_map = {
         "size": "total_size DESC",
@@ -1004,6 +1154,16 @@ def query_group_summary(
 
     where_clause = " AND ".join(conditions)
 
+    # The directories join is only needed for depth filters or the recursive
+    # CTE; the fast aggregate reads everything it needs from directory_stats.
+    if min_depth is not None or max_depth is not None or cte_clause:
+        from_clause = (
+            "FROM directories d\n        JOIN directory_stats s USING (dir_id)\n"
+            f"        {join_clause}"
+        )
+    else:
+        from_clause = "FROM directory_stats s"
+
     query = f"""
         {cte_clause}
         SELECT
@@ -1011,9 +1171,7 @@ def query_group_summary(
             SUM(s.total_size_nr) as total_size,
             SUM(s.file_count_nr) as total_files,
             COUNT(*) as directory_count
-        FROM directories d
-        JOIN directory_stats s USING (dir_id)
-        {join_clause}
+        {from_clause}
         WHERE {where_clause}
         GROUP BY s.owner_gid
         ORDER BY {order_clause}

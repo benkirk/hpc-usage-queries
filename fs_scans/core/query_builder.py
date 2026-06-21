@@ -330,6 +330,35 @@ class DirectoryQueryBuilder:
         self._use_descendants_cte = True
         return self
 
+    def with_path_prefix_anc(self, pairs: list[tuple[int, int]]) -> "DirectoryQueryBuilder":
+        """Filter to descendants of scopes via the denormalized anc_d{k} columns.
+
+        The fast counterpart to :meth:`with_path_prefix_ids`: instead of a
+        recursive descendants CTE, each scope ``(dir_id, level)`` becomes an
+        ``s.anc_d{level} = :scope`` equality (OR'd together), where ``level`` is
+        the scope's depth relative to the collection root. The ``directories``
+        join in :meth:`build` is retained — the listing SELECT needs ``d.name`` /
+        ``d.depth`` / ``d.parent_id`` and the deterministic ``d.dir_id``
+        tiebreaker — but the subtree walk is gone.
+
+        Args:
+            pairs: ``(dir_id, level)`` per scope; every relative ``level`` already
+                verified inside the indexed band by the caller.
+
+        Returns:
+            self for chaining
+        """
+        if not pairs:
+            return self
+
+        preds = []
+        for i, (dir_id, level) in enumerate(pairs):
+            key = f"anc_scope_{i}"
+            self._params[key] = dir_id
+            preds.append(f"s.anc_d{level} = :{key}")
+        self._conditions.append("(" + " OR ".join(preds) + ")")
+        return self
+
     def with_sort(self, sort_by: str) -> "DirectoryQueryBuilder":
         """Set sort order.
 
