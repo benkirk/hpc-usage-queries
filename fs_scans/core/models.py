@@ -34,10 +34,13 @@ Base = declarative_base()
 # the same database, so they always agree.
 #
 # SCOPE_MAX_DEPTH is how many anc_d* columns (relative levels) pass2c populates.
-# It is *headroom*: the columns are cheap, and populating beyond the indexed band
+# It is *headroom* beyond the indexed band: populating a couple of levels past it
 # lets the band be widened later by reconsolidating (rebuilding the PG indexes)
-# without a re-import. Tune against the real depth histogram on-machine.
-SCOPE_MAX_DEPTH = 12
+# without a re-import. Set from the real data — the largest collection (cgd,
+# 57.4M rows) has fat subtrees only through relative level 7, with subtree sizes
+# falling off a cliff at level 8 (max ~45k, none >100k), so 9 (band max 7 + 2)
+# is ample headroom; deeper scopes are thin and use the recursive fallback.
+SCOPE_MAX_DEPTH = 9
 
 # The fast path engages — and PostgreSQL covering scope indexes are built — only
 # over this (selective) band of *relative* levels. Lower bound 2 skips level 1,
