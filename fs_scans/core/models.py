@@ -23,15 +23,20 @@ Base = declarative_base()
 # equality that replaces the recursive `parent_id` walk. See
 # docs/plans/FS_SCANS_ANCESTOR_AT_DEPTH.md.
 #
-# SCOPE_MAX_DEPTH bounds how deep a scope can be answered via the fast path;
-# deeper scopes fall back to the recursive CTE (their subtrees are small, so the
-# fallback is already ~1s). Tune against the real depth histogram on-machine.
+# SCOPE_MAX_DEPTH is how many anc_d* columns pass2c populates. It is *headroom*:
+# the columns are cheap, and populating beyond the indexed band lets the band be
+# widened later by reconsolidating (rebuilding the PG indexes) without a
+# re-import. Tune against the real depth histogram on-machine.
 SCOPE_MAX_DEPTH = 12
 
-# PostgreSQL covering scope indexes are built only over this (selective) depth
-# band — a few levels below the collection root. The root depth itself is the
-# non-selective whole-collection fast path and is skipped. SQLite builds none of
-# these (the local CLI uses the recursive-CTE fallback). Tune on-machine.
+# The fast path engages — and PostgreSQL covering scope indexes are built — only
+# over this (selective) depth band. Lower bound skips the non-selective
+# whole-collection root (handled by the precomputed-summary fast path); upper
+# bound is the deepest scope the fast predicate answers. Deeper scopes fall back
+# to the recursive CTE (their subtrees are small, so the fallback is ~1s) — which
+# also avoids an unindexed seq-scan on PG. SQLite builds none of these indexes
+# (the local CLI relies on the fallback for out-of-band scopes). Must satisfy
+# SCOPE_INDEX_MAX_DEPTH <= SCOPE_MAX_DEPTH. Tune on-machine.
 SCOPE_INDEX_MIN_DEPTH = 3
 SCOPE_INDEX_MAX_DEPTH = 8
 

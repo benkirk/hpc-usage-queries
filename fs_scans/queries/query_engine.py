@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from ..core.database import get_data_dir, get_db_path, get_session
-from ..core.models import SCOPE_MAX_DEPTH
+from ..core.models import SCOPE_INDEX_MIN_DEPTH, SCOPE_INDEX_MAX_DEPTH
 from ..core.query_builder import DirectoryQueryBuilder
 
 
@@ -187,51 +187,71 @@ def resolve_path_to_id(session, path: str) -> int | None:
 
 
 def resolve_path_to_id_with_depth(session, path: str) -> tuple[int, int] | None:
-    """Resolve a full path to its ``(dir_id, depth)``.
+    """Resolve a path to its ``(dir_id, stored_depth)``, or ``None`` if absent.
 
-    ``depth`` equals the number of path components: directory depth is assigned
-    from the component count at import time (root = depth 1), so a path with N
-    components resolves to a directory at depth N. Returns ``None`` if the path
-    is not found.
+    ``depth`` is read from the ``directories`` row, NOT inferred from the number
+    of path components: callers pass mount-stripped paths (the facade strips
+    ``/gpfs/csfs1`` etc.) while per-collection databases store the depth measured
+    from the true filesystem root (e.g. ``asp`` is depth 3), so the two differ.
+    The stored depth is what indexes the anc_d{k} columns, so it must be exact.
     """
     dir_id = resolve_path_to_id(session, path)
     if dir_id is None:
         return None
-    depth = len([p for p in path.rstrip("/").split("/") if p])
+    depth = session.execute(
+        text("SELECT depth FROM directories WHERE dir_id = :id"), {"id": dir_id}
+    ).scalar()
+    if depth is None:
+        return None
     return dir_id, depth
 
 
-# Cache of "are the anc_d* scope columns present AND populated?" keyed by engine.
-# Reflection + the probe are cheap but these queries fan out per-filesystem.
+# Cache of "does directory_stats carry the anc_d* scope columns?" keyed by
+# engine. Existence rarely changes; reflection is cheap but the scoped queries
+# fan out per-filesystem, so memoize.
 _ANC_COLUMNS_CACHE: dict = {}
 
 
-def anc_scope_available(session) -> bool:
-    """True if directory_stats has the anc_d* columns *and* they are populated.
+def anc_columns_exist(session) -> bool:
+    """True if directory_stats declares the anc_d* scope columns.
 
-    Presence alone is insufficient: a freshly created schema (or an older ``.db``
-    imported before this feature) carries NULL anc_d* values, for which the
-    equality predicate would match nothing. We probe for a non-NULL ``anc_d1``
-    (pass2c sets it on every row), so any such database transparently falls back
-    to the recursive-CTE path. Column existence is checked via the inspector
-    first so the probe never aborts an open PostgreSQL transaction.
+    Older ``.db`` files (imported before this feature) lack them entirely.
+    Checked via the inspector (no failed query, so it never aborts an open
+    PostgreSQL transaction); the anc_d* columns are all added together, so the
+    presence of ``anc_d1`` implies the whole set.
     """
     bind = session.get_bind()
     key = id(bind)
     cached = _ANC_COLUMNS_CACHE.get(key)
     if cached is None:
-        cached = False
         try:
             cols = {c["name"] for c in inspect(bind).get_columns("directory_stats")}
-            if "anc_d1" in cols:
-                row = session.execute(
-                    text("SELECT 1 FROM directory_stats WHERE anc_d1 IS NOT NULL LIMIT 1")
-                ).fetchone()
-                cached = row is not None
+            cached = "anc_d1" in cols
         except Exception:
             cached = False
         _ANC_COLUMNS_CACHE[key] = cached
     return cached
+
+
+def _scopes_populated(session, resolved) -> bool:
+    """True if every resolved scope's anc_d{depth} self-slot is populated.
+
+    pass2c sets ``anc_d{k} = dir_id`` on every directory at depth k (for
+    k <= SCOPE_MAX_DEPTH): a directory is its own depth-k ancestor. Verifying
+    that invariant for the scope rows themselves is the exact correctness
+    precondition for the fast predicate — it confirms the columns are populated
+    (not merely declared) without assuming any particular tree depth (real
+    per-collection databases start at depth ~3, so shallower anc_d* slots are
+    legitimately NULL). A self-slot lookup is a single primary-key probe.
+    """
+    for dir_id, depth in resolved:
+        row = session.execute(
+            text(f"SELECT 1 FROM directory_stats WHERE dir_id = :id AND anc_d{depth} = :id"),
+            {"id": dir_id},
+        ).fetchone()
+        if row is None:
+            return False
+    return True
 
 
 def resolve_scope(session, path_prefixes: list[str]):
@@ -240,9 +260,17 @@ def resolve_scope(session, path_prefixes: list[str]):
     Returns ``(resolved, use_fast)`` where ``resolved`` is a list of
     ``(dir_id, depth)`` pairs (or ``None`` if no prefix resolved — the caller
     should return an empty result). ``use_fast`` is True when every resolved
-    depth is within ``SCOPE_MAX_DEPTH`` *and* the anc_d* columns exist, meaning
-    the scope can be answered with an ``anc_d{k}`` equality predicate instead of
-    the recursive CTE.
+    depth falls in the indexed band ``[SCOPE_INDEX_MIN_DEPTH,
+    SCOPE_INDEX_MAX_DEPTH]``, the anc_d* columns exist, and those scope rows are
+    actually populated — i.e. the scope can be answered with an ``anc_d{k}``
+    equality predicate instead of the recursive CTE.
+
+    The gate is the *indexed* band, not the full populated range: outside it a
+    PostgreSQL ``anc_d{k}`` predicate has no covering index and would seq-scan
+    the whole table, which for a deep (hence thin) subtree loses to the
+    self-bounding recursive walk. Columns are populated to ``SCOPE_MAX_DEPTH`` as
+    headroom so the band can be widened later by reconsolidating (rebuilding the
+    PG indexes) without re-importing.
 
     Prefixes are assumed already collapsed (the facade's ``_collapse_prefixes``
     drops any nested under another), so the per-depth predicates OR together
@@ -255,8 +283,10 @@ def resolve_scope(session, path_prefixes: list[str]):
             resolved.append(pair)
     if not resolved:
         return None, False
-    use_fast = anc_scope_available(session) and all(
-        1 <= depth <= SCOPE_MAX_DEPTH for _, depth in resolved
+    use_fast = (
+        all(SCOPE_INDEX_MIN_DEPTH <= depth <= SCOPE_INDEX_MAX_DEPTH for _, depth in resolved)
+        and anc_columns_exist(session)
+        and _scopes_populated(session, resolved)
     )
     return resolved, use_fast
 

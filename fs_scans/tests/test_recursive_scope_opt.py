@@ -5,7 +5,7 @@ access-history and file-size histograms) can answer a subtree query either via
 the historical recursive `parent_id` CTE or via the denormalized `anc_d{k}`
 equality predicate populated by pass2c. These tests assert the two paths return
 byte-identical results — same rows, same aggregates, same ordering — and that a
-scope deeper than SCOPE_MAX_DEPTH transparently falls back to the CTE.
+scope outside the indexed depth band transparently falls back to the CTE.
 
 The fast path engages only when the anc_d* columns are *populated* (pass2c run);
 an otherwise-identical database without pass2c drives the recursive CTE. We build
@@ -17,7 +17,13 @@ from datetime import datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from fs_scans.core.models import Base, Directory, DirectoryStats, SCOPE_MAX_DEPTH
+from fs_scans.core.models import (
+    Base,
+    Directory,
+    DirectoryStats,
+    SCOPE_MAX_DEPTH,
+    SCOPE_INDEX_MAX_DEPTH,
+)
 from fs_scans.importers.pass2c import pass2c_populate_ancestor_columns
 from fs_scans.queries.query_engine import (
     query_owner_summary,
@@ -61,8 +67,17 @@ _DEEP_CHAIN = [
 ]
 _ALL_ROWS = _BASE_ROWS + _DEEP_CHAIN
 
-# Path of the depth-13 deep-chain node (dc13, dir_id 20): exceeds SCOPE_MAX_DEPTH.
-_DEEP_SCOPE_DEPTH13 = "/fs/coll/p1/" + "/".join(f"dc{d}" for d in range(4, 14))
+
+def _chain_path(depth: int) -> str:
+    """Path of the deep-chain node at *depth* (dc4..dc{depth}, hanging off p1)."""
+    return "/fs/coll/p1/" + "/".join(f"dc{d}" for d in range(4, depth + 1))
+
+
+# A scope deeper than the indexed band but still within the populated columns
+# (anc_d{depth} exists) — must still fall back to the recursive CTE.
+_DEEP_SCOPE_OUT_OF_BAND = _chain_path(SCOPE_INDEX_MAX_DEPTH + 2)
+# A scope deeper than every populated column — fallback on both paths.
+_DEEP_SCOPE_BEYOND_MAX = _chain_path(SCOPE_MAX_DEPTH + 1)
 
 
 def _make_session(run_pass2c: bool):
@@ -142,12 +157,18 @@ def test_fast_path_engages_for_in_range_scope(fast_session, slow_session):
     assert use_fast is False
 
 
-def test_deep_scope_forces_fallback_even_when_populated(fast_session):
-    # dc13 sits at depth 13 > SCOPE_MAX_DEPTH (12): fast path declines.
-    resolved, use_fast = resolve_scope(fast_session, [_DEEP_SCOPE_DEPTH13])
-    assert resolved == [(20, 13)]
+def test_out_of_band_scope_forces_fallback_even_when_populated(fast_session):
+    # Depth SCOPE_INDEX_MAX_DEPTH+2 is below the indexed band but its anc column
+    # IS populated; the fast path must still decline (would seq-scan on PG).
+    resolved, use_fast = resolve_scope(fast_session, [_DEEP_SCOPE_OUT_OF_BAND])
+    assert resolved is not None and resolved[0][1] == SCOPE_INDEX_MAX_DEPTH + 2
     assert use_fast is False
-    assert SCOPE_MAX_DEPTH == 12  # guard: update _DEEP_SCOPE_DEPTH13 if this changes
+
+
+def test_beyond_populated_scope_forces_fallback(fast_session):
+    resolved, use_fast = resolve_scope(fast_session, [_DEEP_SCOPE_BEYOND_MAX])
+    assert resolved is not None and resolved[0][1] == SCOPE_MAX_DEPTH + 1
+    assert use_fast is False
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +183,7 @@ def test_deep_scope_forces_fallback_even_when_populated(fast_session):
         ["/fs/coll/p2"],
         ["/fs/coll/p1", "/fs/coll/p2"],  # multi-prefix OR
         ["/fs/coll"],             # whole-collection sub-root
-        [_DEEP_SCOPE_DEPTH13],    # > SCOPE_MAX_DEPTH → fallback on both
+        [_DEEP_SCOPE_OUT_OF_BAND],    # outside indexed band → fallback on both
     ],
 )
 def test_owner_summary_parity(fast_session, slow_session, prefixes):
@@ -188,7 +209,7 @@ def test_owner_summary_with_depth_filter_parity(fast_session, slow_session):
 
 @pytest.mark.parametrize(
     "prefixes",
-    [["/fs/coll/p1"], ["/fs/coll/p1", "/fs/coll/p2"], [_DEEP_SCOPE_DEPTH13]],
+    [["/fs/coll/p1"], ["/fs/coll/p1", "/fs/coll/p2"], [_DEEP_SCOPE_OUT_OF_BAND]],
 )
 def test_group_summary_parity(fast_session, slow_session, prefixes):
     for sort_by in ("size", "files", "dirs"):
@@ -199,7 +220,7 @@ def test_group_summary_parity(fast_session, slow_session, prefixes):
 
 @pytest.mark.parametrize(
     "prefixes",
-    [["/fs/coll/p1"], ["/fs/coll/p1", "/fs/coll/p2"], [_DEEP_SCOPE_DEPTH13]],
+    [["/fs/coll/p1"], ["/fs/coll/p1", "/fs/coll/p2"], [_DEEP_SCOPE_OUT_OF_BAND]],
 )
 def test_list_directories_parity(fast_session, slow_session, prefixes):
     for sort_by in ("size_r", "files_r", "path"):
@@ -219,7 +240,7 @@ def test_list_directories_tiebreaker_parity(fast_session, slow_session):
 
 @pytest.mark.parametrize(
     "prefixes",
-    [["/fs/coll/p1"], ["/fs/coll/p1", "/fs/coll/p2"], [_DEEP_SCOPE_DEPTH13]],
+    [["/fs/coll/p1"], ["/fs/coll/p1", "/fs/coll/p2"], [_DEEP_SCOPE_OUT_OF_BAND]],
 )
 def test_access_history_parity(fast_session, slow_session, prefixes):
     fast = compute_access_history(fast_session, _SCAN_DATE, path_prefixes=prefixes)
@@ -229,7 +250,7 @@ def test_access_history_parity(fast_session, slow_session, prefixes):
 
 @pytest.mark.parametrize(
     "prefixes",
-    [["/fs/coll/p1"], ["/fs/coll/p1", "/fs/coll/p2"], [_DEEP_SCOPE_DEPTH13]],
+    [["/fs/coll/p1"], ["/fs/coll/p1", "/fs/coll/p2"], [_DEEP_SCOPE_OUT_OF_BAND]],
 )
 def test_size_histogram_parity(fast_session, slow_session, prefixes):
     fast = compute_size_histogram_from_directory_stats(
