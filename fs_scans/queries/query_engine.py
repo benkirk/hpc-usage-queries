@@ -211,6 +211,25 @@ def resolve_path_to_id_with_depth(session, path: str) -> tuple[int, int] | None:
 # fan out per-filesystem, so memoize.
 _ANC_COLUMNS_CACHE: dict = {}
 
+# Cache of each database's collection-root depth (MIN(depth)) keyed by engine.
+# anc_d* levels are relative to this root; pass2c derives it the same way, so the
+# two agree (the depth values are identical after consolidation to PostgreSQL).
+_ROOT_DEPTH_CACHE: dict = {}
+
+
+def collection_root_depth(session) -> int | None:
+    """The shallowest directory depth in this database (the collection root).
+
+    anc_d{k} levels are measured relative to this: ``level = depth - root + 1``.
+    """
+    bind = session.get_bind()
+    key = id(bind)
+    if key not in _ROOT_DEPTH_CACHE:
+        _ROOT_DEPTH_CACHE[key] = session.execute(
+            text("SELECT MIN(depth) FROM directories")
+        ).scalar()
+    return _ROOT_DEPTH_CACHE[key]
+
 
 def anc_columns_exist(session) -> bool:
     """True if directory_stats declares the anc_d* scope columns.
@@ -234,19 +253,18 @@ def anc_columns_exist(session) -> bool:
 
 
 def _scopes_populated(session, resolved) -> bool:
-    """True if every resolved scope's anc_d{depth} self-slot is populated.
+    """True if every resolved scope's anc_d{level} self-slot is populated.
 
-    pass2c sets ``anc_d{k} = dir_id`` on every directory at depth k (for
-    k <= SCOPE_MAX_DEPTH): a directory is its own depth-k ancestor. Verifying
-    that invariant for the scope rows themselves is the exact correctness
-    precondition for the fast predicate — it confirms the columns are populated
-    (not merely declared) without assuming any particular tree depth (real
-    per-collection databases start at depth ~3, so shallower anc_d* slots are
-    legitimately NULL). A self-slot lookup is a single primary-key probe.
+    pass2c sets ``anc_d{k} = dir_id`` on every directory at relative level k (for
+    k <= SCOPE_MAX_DEPTH): a directory is its own level-k ancestor. Verifying that
+    invariant for the scope rows themselves is the exact correctness precondition
+    for the fast predicate — it confirms the columns are populated (not merely
+    declared) without assuming any particular tree depth. A self-slot lookup is a
+    single primary-key probe.
     """
-    for dir_id, depth in resolved:
+    for dir_id, level in resolved:
         row = session.execute(
-            text(f"SELECT 1 FROM directory_stats WHERE dir_id = :id AND anc_d{depth} = :id"),
+            text(f"SELECT 1 FROM directory_stats WHERE dir_id = :id AND anc_d{level} = :id"),
             {"id": dir_id},
         ).fetchone()
         if row is None:
@@ -258,12 +276,14 @@ def resolve_scope(session, path_prefixes: list[str]):
     """Resolve *path_prefixes* into a subtree scope.
 
     Returns ``(resolved, use_fast)`` where ``resolved`` is a list of
-    ``(dir_id, depth)`` pairs (or ``None`` if no prefix resolved — the caller
-    should return an empty result). ``use_fast`` is True when every resolved
-    depth falls in the indexed band ``[SCOPE_INDEX_MIN_DEPTH,
-    SCOPE_INDEX_MAX_DEPTH]``, the anc_d* columns exist, and those scope rows are
-    actually populated — i.e. the scope can be answered with an ``anc_d{k}``
-    equality predicate instead of the recursive CTE.
+    ``(dir_id, level)`` pairs — ``level`` being the scope's depth *relative to the
+    collection root* (root = 1), which is exactly the ``anc_d{level}`` column that
+    indexes it — or ``None`` if no prefix resolved (the caller should return an
+    empty result). ``use_fast`` is True when every relative level falls in the
+    indexed band ``[SCOPE_INDEX_MIN_DEPTH, SCOPE_INDEX_MAX_DEPTH]``, the anc_d*
+    columns exist, and those scope rows are actually populated — i.e. the scope
+    can be answered with an ``anc_d{level}`` equality predicate instead of the
+    recursive CTE.
 
     The gate is the *indexed* band, not the full populated range: outside it a
     PostgreSQL ``anc_d{k}`` predicate has no covering index and would seq-scan
@@ -273,18 +293,23 @@ def resolve_scope(session, path_prefixes: list[str]):
     PG indexes) without re-importing.
 
     Prefixes are assumed already collapsed (the facade's ``_collapse_prefixes``
-    drops any nested under another), so the per-depth predicates OR together
+    drops any nested under another), so the per-level predicates OR together
     without double-counting.
     """
-    resolved = []
+    raw = []
     for prefix in path_prefixes:
         pair = resolve_path_to_id_with_depth(session, prefix)
         if pair is not None:
-            resolved.append(pair)
-    if not resolved:
+            raw.append(pair)
+    if not raw:
         return None, False
+
+    # Convert absolute depth → level relative to the collection root.
+    root_depth = collection_root_depth(session) or 1
+    resolved = [(dir_id, depth - root_depth + 1) for dir_id, depth in raw]
+
     use_fast = (
-        all(SCOPE_INDEX_MIN_DEPTH <= depth <= SCOPE_INDEX_MAX_DEPTH for _, depth in resolved)
+        all(SCOPE_INDEX_MIN_DEPTH <= level <= SCOPE_INDEX_MAX_DEPTH for _, level in resolved)
         and anc_columns_exist(session)
         and _scopes_populated(session, resolved)
     )
@@ -317,17 +342,17 @@ def _recursive_descendants_cte(ancestor_ids: list[int], params: dict) -> tuple[s
 
 
 def _anc_predicate(resolved: list, params: dict, alias: str = "s") -> str:
-    """Build the fast ``(alias.anc_d{k} = :scope_i OR ...)`` lineage predicate.
+    """Build the fast ``(alias.anc_d{level} = :scope_i OR ...)`` lineage predicate.
 
-    *resolved* is a list of ``(dir_id, depth)`` pairs (every depth already
-    verified ``<= SCOPE_MAX_DEPTH``). Mutates *params* with ``scope_anc_{i}``
+    *resolved* is a list of ``(dir_id, level)`` pairs (each relative level already
+    verified inside the indexed band). Mutates *params* with ``scope_anc_{i}``
     binds.
     """
     preds = []
-    for i, (dir_id, depth) in enumerate(resolved):
+    for i, (dir_id, level) in enumerate(resolved):
         key = f"scope_anc_{i}"
         params[key] = dir_id
-        preds.append(f"{alias}.anc_d{depth} = :{key}")
+        preds.append(f"{alias}.anc_d{level} = :{key}")
     return "(" + " OR ".join(preds) + ")"
 
 

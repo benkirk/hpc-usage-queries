@@ -17,28 +17,39 @@ Base = declarative_base()
 
 # Denormalized "ancestor-at-depth" scope columns on directory_stats.
 #
-# For each row we precompute the dir_id of its ancestor at each fixed depth in
-# columns anc_d1 .. anc_d{SCOPE_MAX_DEPTH}. A scoped subtree query for an ancestor
-# X resolved at depth k then becomes `WHERE anc_d{k} = X` — a single indexed
-# equality that replaces the recursive `parent_id` walk. See
-# docs/plans/FS_SCANS_ANCESTOR_AT_DEPTH.md.
+# For each row we precompute the dir_id of its ancestor at each fixed level
+# *relative to the collection root* in columns anc_d1 .. anc_d{SCOPE_MAX_DEPTH}.
+# A scoped subtree query for an ancestor X at relative level k then becomes
+# `WHERE anc_d{k} = X` — a single indexed equality that replaces the recursive
+# `parent_id` walk. See docs/plans/FS_SCANS_ANCESTOR_AT_DEPTH.md.
 #
-# SCOPE_MAX_DEPTH is how many anc_d* columns pass2c populates. It is *headroom*:
-# the columns are cheap, and populating beyond the indexed band lets the band be
-# widened later by reconsolidating (rebuilding the PG indexes) without a
-# re-import. Tune against the real depth histogram on-machine.
+# RELATIVE, not absolute: levels are measured from each collection's own root
+# (the shallowest directory, MIN(depth)) — root = level 1, one below = level 2,
+# and so on. The stored `depth` column stays absolute; only this anc indexing is
+# root-relative, so a collection rooted deep on disk
+# (/glade/campaign/a/b/c/d == /gpfs/csfs1/a/b/c/d) gets the same useful band as a
+# shallow one and never starves. Today every collection roots at depth 3, so
+# relative == absolute-shifted and behavior is unchanged. pass2c
+# (population) and resolve_scope (query) both derive the root from MIN(depth) of
+# the same database, so they always agree.
+#
+# SCOPE_MAX_DEPTH is how many anc_d* columns (relative levels) pass2c populates.
+# It is *headroom*: the columns are cheap, and populating beyond the indexed band
+# lets the band be widened later by reconsolidating (rebuilding the PG indexes)
+# without a re-import. Tune against the real depth histogram on-machine.
 SCOPE_MAX_DEPTH = 12
 
 # The fast path engages — and PostgreSQL covering scope indexes are built — only
-# over this (selective) depth band. Lower bound skips the non-selective
-# whole-collection root (handled by the precomputed-summary fast path); upper
-# bound is the deepest scope the fast predicate answers. Deeper scopes fall back
-# to the recursive CTE (their subtrees are small, so the fallback is ~1s) — which
-# also avoids an unindexed seq-scan on PG. SQLite builds none of these indexes
-# (the local CLI relies on the fallback for out-of-band scopes). Must satisfy
+# over this (selective) band of *relative* levels. Lower bound 2 skips level 1,
+# the whole-collection root (non-selective: every row shares it, and it is served
+# by the precomputed-summary fast path anyway). Upper bound is the deepest
+# relative level the fast predicate answers; deeper scopes fall back to the
+# recursive CTE (their subtrees are small, so the fallback is ~1s) — which also
+# avoids an unindexed seq-scan on PG. SQLite builds none of these indexes (the
+# local CLI relies on the fallback for out-of-band scopes). Must satisfy
 # SCOPE_INDEX_MAX_DEPTH <= SCOPE_MAX_DEPTH. Tune on-machine.
-SCOPE_INDEX_MIN_DEPTH = 3
-SCOPE_INDEX_MAX_DEPTH = 8
+SCOPE_INDEX_MIN_DEPTH = 2
+SCOPE_INDEX_MAX_DEPTH = 7
 
 
 class Directory(Base):

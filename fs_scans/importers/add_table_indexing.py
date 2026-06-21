@@ -51,12 +51,12 @@ def add_directory_stats_indexing(session):
         session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_group_size     ON directory_stats(owner_gid, total_size_r);"))
         session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_group_files    ON directory_stats(owner_gid, file_count_r);"))
 
-        # Scoped-query (ancestor-at-depth) indexes. PostgreSQL only: covering
+        # Scoped-query (ancestor-at-level) indexes. PostgreSQL only: covering
         # indexes give index-only aggregates for the scoped owner/group/listing
-        # paths over the selective depth band. SQLite leaves the anc_d* columns
-        # unindexed — the local CLI uses the recursive-CTE fallback and these
-        # heavy indexes would only bloat the published .db. Tune the band via
-        # SCOPE_INDEX_MIN_DEPTH / SCOPE_INDEX_MAX_DEPTH in core/models.py.
+        # paths over the selective band of root-relative levels. SQLite leaves the
+        # anc_d* columns unindexed — the local CLI uses the recursive-CTE fallback
+        # and these heavy indexes would only bloat the published .db. Tune the
+        # band via SCOPE_INDEX_MIN_DEPTH / SCOPE_INDEX_MAX_DEPTH in core/models.py.
         if session.get_bind().dialect.name == "postgresql":
             for k in range(SCOPE_INDEX_MIN_DEPTH, SCOPE_INDEX_MAX_DEPTH + 1):
                 session.execute(text(

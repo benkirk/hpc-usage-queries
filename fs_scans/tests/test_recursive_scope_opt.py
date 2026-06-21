@@ -31,9 +31,15 @@ from fs_scans.queries.query_engine import (
     query_directories,
     resolve_scope,
     _ANC_COLUMNS_CACHE,
+    _ROOT_DEPTH_CACHE,
 )
 from fs_scans.queries.access_history import compute_access_history
 from fs_scans.queries.file_size import compute_size_histogram_from_directory_stats
+
+
+def _clear_caches():
+    _ANC_COLUMNS_CACHE.clear()
+    _ROOT_DEPTH_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +114,7 @@ def _make_session(run_pass2c: bool):
         pass2c_populate_ancestor_columns(session)
     # The fast/slow decision is cached per engine; clear so each fixture decides
     # afresh against its own (populated or not) database.
-    _ANC_COLUMNS_CACHE.clear()
+    _clear_caches()
     return session
 
 
@@ -118,7 +124,7 @@ def fast_session():
     s = _make_session(run_pass2c=True)
     yield s
     s.close()
-    _ANC_COLUMNS_CACHE.clear()
+    _clear_caches()
 
 
 @pytest.fixture
@@ -127,7 +133,7 @@ def slow_session():
     s = _make_session(run_pass2c=False)
     yield s
     s.close()
-    _ANC_COLUMNS_CACHE.clear()
+    _clear_caches()
 
 
 _SCAN_DATE = datetime(2026, 1, 1)
