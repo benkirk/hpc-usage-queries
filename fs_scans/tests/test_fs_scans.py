@@ -561,6 +561,24 @@ class TestSizeRangeFilter:
         assert "min_size" not in result.params
         assert "max_size" not in result.params
 
+    def test_avg_file_size_range(self):
+        # Filters on the AVERAGE own-file size (total_size_nr/file_count_nr),
+        # the file-size histogram's dimension — lower-inclusive, upper-exclusive.
+        builder = DirectoryQueryBuilder()
+        result = builder.with_avg_file_size_range(min_avg=1024, max_avg=10240).build()
+
+        assert "s.file_count_nr > 0" in result.sql        # division guard
+        assert "COALESCE(s.total_size_nr, 0) / s.file_count_nr >= :min_avg_size" in result.sql
+        assert "COALESCE(s.total_size_nr, 0) / s.file_count_nr < :max_avg_size" in result.sql
+        assert result.params["min_avg_size"] == 1024
+        assert result.params["max_avg_size"] == 10240
+
+    def test_avg_file_size_range_noop(self):
+        builder = DirectoryQueryBuilder()
+        result = builder.with_avg_file_size_range().build()
+        assert "min_avg_size" not in result.params
+        assert "file_count_nr > 0" not in result.sql
+
 
 class TestFileCountRangeFilter:
     """Tests for with_file_count_range query builder method."""
@@ -780,3 +798,43 @@ class TestQueryDirectoriesAtimeRecursive:
         )
 
         assert [r["dir_id"] for r in rows] == [2]
+
+
+class TestQueryDirectoriesAvgFileSize:
+    """query_directories(min_avg_size/max_avg_size=...) filters by average
+    own-file size (total_size_nr/file_count_nr) — the dimension the file-size
+    histogram buckets by, so a size-band drill returns exactly the directories
+    that fed that bar."""
+
+    def _populate(self, session):
+        dirs = [
+            Directory(dir_id=1, parent_id=None, name="root", depth=1),
+            Directory(dir_id=2, parent_id=1, name="small_files", depth=2),
+            Directory(dir_id=3, parent_id=1, name="big_files", depth=2),
+        ]
+        stats = [
+            # root: no own files -> excluded from any avg filter (count 0 guard)
+            DirectoryStats(dir_id=1, file_count_r=102, total_size_r=10_985_760,
+                           owner_uid=-1, owner_gid=-1),
+            # avg = 500000/100 = 5000 bytes -> "1 KiB - 10 KiB" band
+            DirectoryStats(dir_id=2, file_count_nr=100, total_size_nr=500_000,
+                           file_count_r=100, total_size_r=500_000,
+                           owner_uid=1001, owner_gid=1),
+            # avg = 10485760/2 = 5 MiB -> well outside the KiB band
+            DirectoryStats(dir_id=3, file_count_nr=2, total_size_nr=10_485_760,
+                           file_count_r=2, total_size_r=10_485_760,
+                           owner_uid=1002, owner_gid=1),
+        ]
+        session.add_all(dirs + stats)
+        session.commit()
+
+    def test_band_returns_only_matching_avg(self, fs_scan_session):
+        self._populate(fs_scan_session)
+        # "1 KiB - 10 KiB" band = [1024, 10240): only dir #2 (avg 5000) matches.
+        rows = query_directories(fs_scan_session, min_avg_size=1024, max_avg_size=10240)
+        assert [r["dir_id"] for r in rows] == [2]
+
+    def test_no_avg_filter_returns_all(self, fs_scan_session):
+        self._populate(fs_scan_session)
+        rows = query_directories(fs_scan_session)
+        assert {r["dir_id"] for r in rows} == {1, 2, 3}

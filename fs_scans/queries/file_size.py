@@ -10,7 +10,7 @@ from datetime import datetime
 from sqlalchemy import text
 
 from ..cli.common import format_size
-from ..core.models import SIZE_BUCKETS, classify_size_bucket
+from ..core.models import SIZE_BUCKETS
 from ..queries.query_engine import (
     get_scan_date,
     resolve_scope,
@@ -66,6 +66,30 @@ def query_size_histogram_fast(
             histogram_data[bucket_label][uid] = (file_count, total_size)
 
     return dict(histogram_data)
+
+
+def _size_bucket_case_sql(col_avg: str = "COALESCE(s.total_size_nr, 0) / s.file_count_nr"):
+    """Build a SQL ``CASE`` mapping a directory's average file size to its
+    :data:`SIZE_BUCKETS` index, plus the bound threshold params.
+
+    Mirrors :func:`classify_size_bucket` on the integer-floored average
+    (``total_size_nr // file_count_nr``): bucket ``i`` is the first whose
+    ``max_size`` the average is under; averages past the last bound fall in the
+    final bucket. Dividing (rather than comparing ``total_size_nr`` to
+    ``max_size * file_count_nr``) avoids BIGINT overflow on directories with
+    very large file counts. Doing this in SQL lets the caller ``GROUP BY`` the
+    bucket instead of streaming every directory row into Python.
+    """
+    last_idx = len(SIZE_BUCKETS) - 1
+    whens, params = [], {}
+    for i, (_, _min, _max) in enumerate(SIZE_BUCKETS):
+        if _max is None:
+            continue
+        key = f"size_cut_{i}"
+        params[key] = _max
+        whens.append(f"            WHEN {col_avg} < :{key} THEN {i}")
+    case = "CASE\n" + "\n".join(whens) + f"\n            ELSE {last_idx} END"
+    return case, params
 
 
 def compute_size_histogram_from_directory_stats(
@@ -137,53 +161,37 @@ def compute_size_histogram_from_directory_stats(
     else:
         from_clause = "FROM directory_stats s"
 
+    # Bucket each directory by its average file size and SUM server-side: a
+    # sub-path scope can cover millions of directories, so aggregate to a
+    # per-(bucket, owner) rollup in SQL and stream ~10 buckets x owners rows
+    # rather than every directory row (which blows the statement_timeout on
+    # large scopes). The CASE mirrors classify_size_bucket on the floored avg.
+    bucket_case, bucket_params = _size_bucket_case_sql()
+    params.update(bucket_params)
     query = f"""
         {cte_clause}
         SELECT
-            s.total_size_nr,
-            s.file_count_nr,
-            s.owner_uid
+            {bucket_case} AS bucket_index,
+            s.owner_uid AS owner_uid,
+            SUM(s.file_count_nr) AS file_count,
+            SUM(COALESCE(s.total_size_nr, 0)) AS total_size
         {from_clause}
         WHERE {where_clause} AND s.file_count_nr > 0
+        GROUP BY 1, 2
     """
 
-    # Structure: {bucket_label: {owner_uid: (file_count, total_size)}}
-    histogram_data = defaultdict(lambda: defaultdict(lambda: [0, 0]))  # [file_count, total_size]
-
-    # Stream results in batches to avoid loading all into memory
+    # Final format: {bucket_label: {owner_uid: (file_count, total_size)}}.
+    # int() coerces Postgres SUM()'s Decimal so downstream float arithmetic in
+    # the webapp chart never hits float += Decimal.
+    final_histogram: dict = defaultdict(dict)
     result_proxy = session.execute(text(query), params)
-
     batch_size = 10000
     while True:
         batch = result_proxy.fetchmany(batch_size)
         if not batch:
             break
-
         for row in batch:
-            total_size_nr = row[0] or 0
-            file_count_nr = row[1] or 0
-            uid = row[2]
+            bucket_label = SIZE_BUCKETS[int(row[0])][0]
+            final_histogram[bucket_label][row[1]] = (int(row[2] or 0), int(row[3] or 0))
 
-            if file_count_nr == 0:
-                continue
-
-            # Approximate: assume uniform file sizes within directory
-            avg_file_size = total_size_nr // file_count_nr
-
-            # Classify into size bucket
-            bucket_idx = classify_size_bucket(avg_file_size)
-            bucket_label = SIZE_BUCKETS[bucket_idx][0]
-
-            # Accumulate all files in this directory to the bucket
-            histogram_data[bucket_label][uid][0] += file_count_nr
-            histogram_data[bucket_label][uid][1] += total_size_nr
-
-    # Convert to final format: {bucket_label: {owner_uid: (file_count, total_size)}}
-    final_histogram = {}
-    for bucket_label, owner_data in histogram_data.items():
-        final_histogram[bucket_label] = {
-            uid: (counts[0], counts[1])
-            for uid, counts in owner_data.items()
-        }
-
-    return final_histogram
+    return dict(final_histogram)

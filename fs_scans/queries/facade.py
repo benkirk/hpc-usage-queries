@@ -279,6 +279,8 @@ class FsScanQueries:
         max_size: int | None = None,
         min_files: int | None = None,
         max_files: int | None = None,
+        min_avg_size: int | None = None,
+        max_avg_size: int | None = None,
         compute_dir_counts: bool = False,
     ) -> list[dict]:
         """Return directory statistics across the configured filesystems.
@@ -291,6 +293,10 @@ class FsScanQueries:
         ``atime_recursive`` selects which column the ``accessed_before`` /
         ``accessed_after`` filters compare against: ``max_atime_r`` (subtree,
         default) or ``max_atime_nr`` (the directory's own files) when False.
+
+        ``min_avg_size`` / ``max_avg_size`` filter on a directory's average
+        own-file size (``total_size_nr / file_count_nr``) — the dimension the
+        file-size histogram buckets by — for size-band drill-downs.
         """
         scope = self._resolve_scope(path_prefixes)
         filesystems = list(scope)
@@ -324,6 +330,8 @@ class FsScanQueries:
                     max_size=max_size,
                     min_files=min_files,
                     max_files=max_files,
+                    min_avg_size=min_avg_size,
+                    max_avg_size=max_avg_size,
                     compute_dir_counts=compute_dir_counts,
                 )
             finally:
@@ -358,6 +366,8 @@ class FsScanQueries:
                     compute_dir_counts,
                     group_id=group_id,
                     atime_recursive=atime_recursive,
+                    min_avg_size=min_avg_size,
+                    max_avg_size=max_avg_size,
                 ): fs
                 for fs in filesystems
             }
