@@ -223,6 +223,61 @@ def test_list_directories_atime_non_recursive(atime_collection):
     assert [r["path"] for r in rows] == ["/tank/cold_own_fresh_subtree"]
 
 
+@pytest.fixture
+def avgsize_collection(tmp_path):
+    """Collection with two directories of differing average own-file size
+    (total_size_nr / file_count_nr): tiny ~5 KiB-avg and big ~5 MiB-avg, so an
+    average-size band selects exactly one. The count-0 root is filtered by the
+    division guard. Mirrors the dimension the file-size histogram buckets by.
+    """
+    db_path = tmp_path / "avgfs.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    session.add_all([
+        Directory(dir_id=1, parent_id=None, name="tank", depth=1),
+        Directory(dir_id=2, parent_id=1, name="small_files", depth=2),
+        Directory(dir_id=3, parent_id=1, name="big_files", depth=2),
+    ])
+    session.add_all([
+        DirectoryStats(dir_id=1, file_count_r=102, total_size_r=10_985_760, owner_uid=-1,
+                       owner_gid=-1, file_count_nr=0, total_size_nr=0),
+        # avg = 500_000 / 100 = 5000 bytes -> "1 KiB - 10 KiB" band [1024, 10240)
+        DirectoryStats(dir_id=2, file_count_r=100, total_size_r=500_000, owner_uid=1001,
+                       owner_gid=2001, file_count_nr=100, total_size_nr=500_000),
+        # avg = 10_485_760 / 2 = 5 MiB -> well outside the KiB band
+        DirectoryStats(dir_id=3, file_count_r=2, total_size_r=10_485_760, owner_uid=1002,
+                       owner_gid=2001, file_count_nr=2, total_size_nr=10_485_760),
+    ])
+    session.add(ScanMetadata(source_file="20260115_avgfs.log", filesystem="avgfs",
+                             scan_timestamp=SCAN_DATE))
+    session.commit()
+    session.close()
+    engine.dispose()
+
+    set_data_dir(tmp_path)
+    clear_engine_cache()
+    yield "avgfs"
+    clear_engine_cache()
+    set_data_dir(None)
+
+
+def test_list_directories_avg_size_band(avgsize_collection):
+    # The "1 KiB - 10 KiB" band [1024, 10240) selects only the 5000-byte-avg
+    # directory; the 5 MiB-avg dir and the count-0 root (division guard) are out.
+    q = FsScanQueries(filesystems="avgfs")
+    rows = q.list_directories(min_avg_size=1024, max_avg_size=10240, min_size=0, limit=0)
+    assert [r["path"] for r in rows] == ["/tank/small_files"]
+
+
+def test_list_directories_avg_size_no_filter_includes_count0_root(avgsize_collection):
+    # Without the avg-size bounds the count-0 root is returned; the band test
+    # above shows the division guard (file_count_nr > 0) drops it once filtered.
+    q = FsScanQueries(filesystems="avgfs")
+    rows = q.list_directories(min_size=0, limit=0)
+    assert {r["path"] for r in rows} == {"/tank", "/tank/small_files", "/tank/big_files"}
+
+
 # ---------------------------------------------------------------------------
 # Histograms
 # ---------------------------------------------------------------------------
