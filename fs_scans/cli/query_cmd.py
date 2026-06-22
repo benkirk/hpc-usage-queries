@@ -132,12 +132,19 @@ DynamicHelpCommand = make_dynamic_help_command('fs-scans query')
 @click.option(
     "--accessed-before",
     type=str,
-    help="Filter to max_atime_r before date (YYYY-MM-DD or Nyrs/Nmo)",
+    help="Filter to last access before date (YYYY-MM-DD or Nyrs/Nmo)",
 )
 @click.option(
     "--accessed-after",
     type=str,
-    help="Filter to max_atime_r after date (YYYY-MM-DD or Nyrs/Nmo)",
+    help="Filter to last access after date (YYYY-MM-DD or Nyrs/Nmo)",
+)
+@click.option(
+    "--atime-non-recursive",
+    "atime_non_recursive",
+    is_flag=True,
+    help="Apply --accessed-before/--accessed-after to the directory's own "
+         "files (max_atime_nr) instead of the whole subtree (max_atime_r)",
 )
 @click.option(
     "-v",
@@ -238,6 +245,7 @@ def query_cmd(
     output_format: str,
     accessed_before: str | None,
     accessed_after: str | None,
+    atime_non_recursive: bool,
     verbose: bool,
     leaves_only: bool,
     data_dir: Path | None,
@@ -263,7 +271,8 @@ def query_cmd(
       fs-scans query                          # All filesystems (default)
       fs-scans query asp                      # Specific filesystem
       fs-scans query -d 4 --single-owner      # Single-owner dirs at depth 4+
-      fs-scans query --accessed-before 3yrs   # Old data
+      fs-scans query --accessed-before 3yrs   # Old data (newest access in subtree)
+      fs-scans query --accessed-before 3yrs --atime-non-recursive  # Stale own-files
       fs-scans query --leaves-only            # Leaf directories only
       fs-scans query -N "*scratch*"           # Filter by name pattern
       fs-scans query -N "*scratch*" -N "*tmp*"  # Multiple patterns (OR)
@@ -398,6 +407,7 @@ def query_cmd(
         limit=limit,
         accessed_before=parsed_before,
         accessed_after=parsed_after,
+        atime_recursive=not atime_non_recursive,
         leaves_only=leaves_only,
         name_patterns=list(name_patterns) if name_patterns else None,
         name_pattern_ignorecase=ignore_case,

@@ -170,6 +170,59 @@ def test_list_directories_group_filter(collection):
     assert all(r["owner_gid"] == 2001 for r in rows)
 
 
+@pytest.fixture
+def atime_collection(tmp_path):
+    """Collection with one directory whose own files are cold (max_atime_nr =
+    2020) but whose subtree is fresh (max_atime_r = 2025), so the recursive vs
+    non-recursive access-date filter selects different rows.
+    """
+    db_path = tmp_path / "atimefs.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    session.add_all([
+        Directory(dir_id=1, parent_id=None, name="tank", depth=1),
+        Directory(dir_id=2, parent_id=1, name="cold_own_fresh_subtree", depth=2),
+    ])
+    session.add_all([
+        DirectoryStats(dir_id=1, file_count_r=100, total_size_r=1_000, owner_uid=-1,
+                       owner_gid=-1, file_count_nr=0, total_size_nr=0),
+        DirectoryStats(dir_id=2, file_count_r=100, total_size_r=1_000, owner_uid=1001,
+                       owner_gid=2001, file_count_nr=50, total_size_nr=500,
+                       max_atime_r=datetime(2025, 1, 1), max_atime_nr=datetime(2020, 1, 1)),
+    ])
+    session.add(ScanMetadata(source_file="20260115_atimefs.log", filesystem="atimefs",
+                             scan_timestamp=SCAN_DATE))
+    session.commit()
+    session.close()
+    engine.dispose()
+
+    set_data_dir(tmp_path)
+    clear_engine_cache()
+    yield "atimefs"
+    clear_engine_cache()
+    set_data_dir(None)
+
+
+def test_list_directories_atime_recursive_default(atime_collection):
+    # Recursive (default): newest access anywhere in the subtree is 2025, so a
+    # 2022 stale-cutoff does NOT match.
+    q = FsScanQueries(filesystems="atimefs")
+    cutoff = datetime(2022, 1, 1)
+    assert q.list_directories(accessed_before=cutoff, min_size=0, limit=0) == []
+
+
+def test_list_directories_atime_non_recursive(atime_collection):
+    # Non-recursive: the directory's own files were last touched in 2020, so the
+    # same 2022 cutoff DOES match it.
+    q = FsScanQueries(filesystems="atimefs")
+    cutoff = datetime(2022, 1, 1)
+    rows = q.list_directories(
+        accessed_before=cutoff, atime_recursive=False, min_size=0, limit=0
+    )
+    assert [r["path"] for r in rows] == ["/tank/cold_own_fresh_subtree"]
+
+
 # ---------------------------------------------------------------------------
 # Histograms
 # ---------------------------------------------------------------------------
