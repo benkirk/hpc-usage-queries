@@ -214,3 +214,6 @@ A fresh session executes top to bottom. Verified anchor points are in parenthese
 - Raising `work_mem` — measured irrelevant to the dominant 14 M-row walk.
 - A closure table (option A) — superseded; same walk-elimination at O(N×depth)
   storage and a new table, vs O(N) columns here.
+- A nested-set (`lft`/`rgt`) encoding — evaluated and **held**; feasible and
+  any-depth, but addresses a limitation this design has not been shown to hit.
+  See [`../FS_SCANS_NESTED_SET_CONSIDERATION.md`](../FS_SCANS_NESTED_SET_CONSIDERATION.md).

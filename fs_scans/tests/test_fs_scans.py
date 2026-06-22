@@ -246,6 +246,26 @@ class TestDirectoryQueryBuilder:
         assert "s.max_atime_r > :accessed_after" in result.sql
         assert result.params["accessed_after"] == "2024-06-01 00:00:00"
 
+    def test_accessed_before_filter_non_recursive(self):
+        """recursive=False compares against the non-recursive atime column."""
+        builder = DirectoryQueryBuilder()
+        dt = datetime(2024, 1, 15, 10, 30, 0)
+        result = builder.with_accessed_before(dt, recursive=False).build()
+
+        assert "s.max_atime_nr < :accessed_before" in result.sql
+        assert "s.max_atime_r <" not in result.sql
+        assert result.params["accessed_before"] == "2024-01-15 10:30:00"
+
+    def test_accessed_after_filter_non_recursive(self):
+        """recursive=False compares against the non-recursive atime column."""
+        builder = DirectoryQueryBuilder()
+        dt = datetime(2024, 6, 1, 0, 0, 0)
+        result = builder.with_accessed_after(dt, recursive=False).build()
+
+        assert "s.max_atime_nr > :accessed_after" in result.sql
+        assert "s.max_atime_r >" not in result.sql
+        assert result.params["accessed_after"] == "2024-06-01 00:00:00"
+
     def test_leaves_only_filter(self):
         """Test leaves only filtering."""
         builder = DirectoryQueryBuilder()
@@ -702,3 +722,61 @@ class TestQueryDirectoriesGroupFilter:
         rows = query_directories(fs_scan_session)
 
         assert {r["dir_id"] for r in rows} == {1, 2, 3}
+
+
+class TestQueryDirectoriesAtimeRecursive:
+    """query_directories(atime_recursive=...) selects which atime column the
+    accessed_before / accessed_after filters compare against.
+
+    The access-history drill-down in the SAM webapp lists a user's stale
+    directories within a band: by default (non-recursive) it matches the
+    histogram bar (the directory's OWN cold files); toggled recursive it finds
+    removable trees (nothing fresh anywhere in the subtree)."""
+
+    def _populate(self, session):
+        """Two leaves: #2 has cold OWN files but a fresh subtree; #3 is fresh
+        throughout. (max_atime_nr = own files, max_atime_r = whole subtree.)"""
+        dirs = [
+            Directory(dir_id=1, parent_id=None, name="gpfs", depth=1),
+            Directory(dir_id=2, parent_id=1, name="cold_own_files", depth=2),
+            Directory(dir_id=3, parent_id=1, name="fresh", depth=2),
+        ]
+        stats = [
+            DirectoryStats(dir_id=1, file_count_r=300, total_size_r=300000,
+                           owner_uid=-1, owner_gid=-1,
+                           max_atime_nr=datetime(2025, 1, 1),
+                           max_atime_r=datetime(2025, 1, 1)),
+            DirectoryStats(dir_id=2, file_count_r=200, total_size_r=200000,
+                           file_count_nr=200, total_size_nr=200000,
+                           owner_uid=12345, owner_gid=1000,
+                           max_atime_nr=datetime(2020, 1, 1),
+                           max_atime_r=datetime(2025, 1, 1)),
+            DirectoryStats(dir_id=3, file_count_r=100, total_size_r=100000,
+                           file_count_nr=100, total_size_nr=100000,
+                           owner_uid=67890, owner_gid=2000,
+                           max_atime_nr=datetime(2025, 1, 1),
+                           max_atime_r=datetime(2025, 1, 1)),
+        ]
+        session.add_all(dirs + stats)
+        session.commit()
+
+    def test_recursive_default_uses_subtree_atime(self, fs_scan_session):
+        self._populate(fs_scan_session)
+        cutoff = datetime(2022, 1, 1)
+
+        # Default (recursive): no directory's subtree is stale before 2022.
+        rows = query_directories(fs_scan_session, accessed_before=cutoff)
+
+        assert rows == []
+
+    def test_non_recursive_uses_own_files_atime(self, fs_scan_session):
+        self._populate(fs_scan_session)
+        cutoff = datetime(2022, 1, 1)
+
+        # Non-recursive: dir #2's OWN files are cold (2020) even though its
+        # subtree was touched in 2025 — it is the only match.
+        rows = query_directories(
+            fs_scan_session, accessed_before=cutoff, atime_recursive=False
+        )
+
+        assert [r["dir_id"] for r in rows] == [2]
