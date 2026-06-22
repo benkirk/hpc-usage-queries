@@ -162,29 +162,41 @@ class DirectoryQueryBuilder:
         self._params["group_id"] = group_id
         return self
 
-    def with_accessed_before(self, dt: datetime) -> "DirectoryQueryBuilder":
-        """Filter to directories with max_atime_r before date.
+    def with_accessed_before(
+        self, dt: datetime, recursive: bool = True
+    ) -> "DirectoryQueryBuilder":
+        """Filter to directories last accessed before date.
 
         Args:
             dt: The cutoff datetime
+            recursive: Filter on ``max_atime_r`` (newest access anywhere in the
+                subtree, the default) when True, or ``max_atime_nr`` (newest
+                access among the directory's own files) when False.
 
         Returns:
             self for chaining
         """
-        self._conditions.append("s.max_atime_r < :accessed_before")
+        col = "s.max_atime_r" if recursive else "s.max_atime_nr"
+        self._conditions.append(f"{col} < :accessed_before")
         self._params["accessed_before"] = dt.strftime("%Y-%m-%d %H:%M:%S")
         return self
 
-    def with_accessed_after(self, dt: datetime) -> "DirectoryQueryBuilder":
-        """Filter to directories with max_atime_r after date.
+    def with_accessed_after(
+        self, dt: datetime, recursive: bool = True
+    ) -> "DirectoryQueryBuilder":
+        """Filter to directories last accessed after date.
 
         Args:
             dt: The cutoff datetime
+            recursive: Filter on ``max_atime_r`` (newest access anywhere in the
+                subtree, the default) when True, or ``max_atime_nr`` (newest
+                access among the directory's own files) when False.
 
         Returns:
             self for chaining
         """
-        self._conditions.append("s.max_atime_r > :accessed_after")
+        col = "s.max_atime_r" if recursive else "s.max_atime_nr"
+        self._conditions.append(f"{col} > :accessed_after")
         self._params["accessed_after"] = dt.strftime("%Y-%m-%d %H:%M:%S")
         return self
 

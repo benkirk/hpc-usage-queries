@@ -474,6 +474,7 @@ def query_directories(
     limit: int | None = None,
     accessed_before: datetime | None = None,
     accessed_after: datetime | None = None,
+    atime_recursive: bool = True,
     leaves_only: bool = False,
     name_patterns: list[str] | None = None,
     name_pattern_ignorecase: bool = False,
@@ -497,8 +498,11 @@ def query_directories(
         exclude_paths: List of paths to exclude (with descendants)
         sort_by: Sort field (size_r, size_nr, files_r, files_nr, atime_r, path)
         limit: Maximum results to return
-        accessed_before: Filter to directories with max_atime_r before this date
-        accessed_after: Filter to directories with max_atime_r after this date
+        accessed_before: Filter to directories last accessed before this date
+        accessed_after: Filter to directories last accessed after this date
+        atime_recursive: When True (default) the access-date filters compare
+            against max_atime_r (newest access anywhere in the subtree); when
+            False they compare against max_atime_nr (the directory's own files)
         leaves_only: Only show directories with no subdirectories
         name_patterns: List of GLOB patterns to filter directory names (OR'd together)
         name_pattern_ignorecase: If True, name pattern matching is case-insensitive
@@ -537,9 +541,9 @@ def query_directories(
 
     # Apply date filters
     if accessed_before is not None:
-        builder.with_accessed_before(accessed_before)
+        builder.with_accessed_before(accessed_before, recursive=atime_recursive)
     if accessed_after is not None:
-        builder.with_accessed_after(accessed_after)
+        builder.with_accessed_after(accessed_after, recursive=atime_recursive)
 
     # Apply structural filters
     if leaves_only:
@@ -1212,6 +1216,7 @@ def query_single_filesystem(
     max_files: int | None = None,
     compute_dir_counts: bool = False,
     group_id: int | None = None,
+    atime_recursive: bool = True,
 ) -> list[dict]:
     """Query a single filesystem database.
 
@@ -1240,6 +1245,7 @@ def query_single_filesystem(
             limit=limit,
             accessed_before=accessed_before,
             accessed_after=accessed_after,
+            atime_recursive=atime_recursive,
             leaves_only=leaves_only,
             name_patterns=name_patterns,
             name_pattern_ignorecase=name_pattern_ignorecase,
