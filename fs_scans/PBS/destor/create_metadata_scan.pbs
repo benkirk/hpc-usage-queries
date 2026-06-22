@@ -1,0 +1,60 @@
+#!/bin/bash
+
+#PBS -N fs_scan
+#PBS -A SCSG0001
+#PBS -j oe
+#PBS -q casper
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=8:mpiprocs=1:ompthreads=8:mem=12G
+
+#----------------------------------------------------------------------------
+# Determine the directory containing this script, compatible with bash and zsh
+if [ -n "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION}" ]; then
+  SCRIPT_PATH="${(%):-%x}"
+else
+  echo "Unknown shell!"
+fi
+SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
+TOP_DIR=$(git rev-parse --show-toplevel)
+#----------------------------------------------------------------------------
+
+sep="#----------------------------------------------------------------------------"
+
+set -e
+
+# TARGET_DIR is the filesystem/directory to scan, passed in via:
+#   qsub -v TARGET_DIR=/lustre/desc1/p ...
+: "${TARGET_DIR:?TARGET_DIR must be set (qsub -v TARGET_DIR=...)}"
+TARGET_DIR=$(realpath ${TARGET_DIR})
+echo "TARGET_DIR=${TARGET_DIR}"
+
+source ${TOP_DIR}/etc/config_env.sh
+which python3
+
+module load peak-memusage
+hostname
+w
+free -g
+
+echo ${sep}
+
+# These scans produce a lot of data, so run inside a per-target processing
+# directory under ${TMPDIR}. The name is derived deterministically from the
+# target path (basename + short hash) so repeat runs of the same target reuse
+# the same directory -- safe because a given target is never scanned twice
+# concurrently.
+: "${TMPDIR:=/glade/derecho/scratch/${USER}/tmp}"
+target_hash=$(echo -n "${TARGET_DIR}" | sha1sum | cut -c1-12)
+proc_dir=${TMPDIR}/fs_scans/destor/$(basename ${TARGET_DIR})_${target_hash}
+mkdir -p ${proc_dir} && cd ${proc_dir}
+echo "proc_dir=${proc_dir}"
+
+echo && echo ${sep}
+# lustre_scan_depth.sh writes its YYYYMMDD_desc1_<basename>.lfs-scan into the
+# current working directory, hence the cd into ${proc_dir} above.
+time peak_memusage ${TOP_DIR}/bin/lustre_scan_depth.sh ${TARGET_DIR}
+
+echo && echo ${sep}
+ls -lh ${proc_dir}/*.lfs-scan
