@@ -67,6 +67,13 @@ class AccessHistogram:
         :data:`ATIME_BUCKETS` (the DB CASE assigns it; see
         :func:`_atime_bucket_case_sql`).
         """
+        # Postgres SUM() returns decimal.Decimal; coerce to int so the histogram
+        # dict stays integer-typed (parity with the streaming add_directory
+        # path) and never leaks a Decimal into float arithmetic downstream (the
+        # webapp chart does float += value). SQLite SUM returns int, which is
+        # why this didn't surface in the unit tests.
+        data = int(data or 0)
+        files = int(files or 0)
         if not data:
             return
         label = self.BUCKETS[int(bucket_index)][0]

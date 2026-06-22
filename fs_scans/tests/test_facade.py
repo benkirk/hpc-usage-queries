@@ -271,6 +271,23 @@ def test_access_history_slow_path_aggregates_in_sql(collection):
     assert sum(v["data"] for v in hist["buckets"].values()) == 3_000
 
 
+def test_access_histogram_add_rollup_coerces_decimal():
+    # Postgres SUM() yields decimal.Decimal (SQLite yields int, so the DB-backed
+    # tests miss this). add_rollup must coerce to int so the histogram never
+    # leaks a Decimal into the webapp chart's float arithmetic (float += value).
+    from decimal import Decimal
+    from fs_scans.queries.access_history import AccessHistogram
+
+    h = AccessHistogram(SCAN_DATE)
+    h.add_rollup(0, 1001, Decimal("3000"), Decimal("300"))
+    d = h.to_dict()
+    assert isinstance(d["total_data"], int) and d["total_data"] == 3_000
+    b = d["buckets"]["< 1 Month"]
+    assert isinstance(b["data"], int) and isinstance(b["owners"][1001]["data"], int)
+    # The original failure mode: float += Decimal. Must not raise now.
+    assert 1.5 + b["data"] == 3_001.5
+
+
 def test_compute_access_history_aggregates_buckets_and_owners(collection):
     # Direct unit test of the SQL-aggregated slow path over the whole testfs db
     # (no facade scope resolution): dir1 (size 0, skipped), alice 3000 @2025-12-01
