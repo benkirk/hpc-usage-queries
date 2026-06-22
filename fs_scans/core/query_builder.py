@@ -287,6 +287,40 @@ class DirectoryQueryBuilder:
             self._params["max_files"] = max_files
         return self
 
+    def with_avg_file_size_range(
+        self, min_avg: int | None = None, max_avg: int | None = None
+    ) -> "DirectoryQueryBuilder":
+        """Filter by a directory's average (own-file) size.
+
+        Average = ``total_size_nr / file_count_nr`` (non-recursive) — the same
+        quantity the file-size histogram buckets by, so a drill from a size band
+        returns exactly the directories that fed that bar. Bounds are
+        lower-inclusive / upper-exclusive, mirroring
+        :func:`classify_size_bucket` (``min_size <= avg < max_size``).
+
+        Dividing (rather than comparing ``total_size_nr`` to ``max_avg *
+        file_count_nr``) avoids BIGINT overflow on directories with very large
+        file counts. ``file_count_nr > 0`` guards the division.
+
+        Args:
+            min_avg: Minimum average file size in bytes (inclusive)
+            max_avg: Maximum average file size in bytes (exclusive)
+
+        Returns:
+            self for chaining
+        """
+        if min_avg is None and max_avg is None:
+            return self
+        self._conditions.append("s.file_count_nr > 0")
+        avg = "COALESCE(s.total_size_nr, 0) / s.file_count_nr"
+        if min_avg is not None:
+            self._conditions.append(f"{avg} >= :min_avg_size")
+            self._params["min_avg_size"] = min_avg
+        if max_avg is not None:
+            self._conditions.append(f"{avg} < :max_avg_size")
+            self._params["max_avg_size"] = max_avg
+        return self
+
     def with_dir_count_range(
         self, min_dirs: int | None = None, max_dirs: int | None = None
     ) -> "DirectoryQueryBuilder":

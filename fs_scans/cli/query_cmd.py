@@ -213,6 +213,19 @@ DynamicHelpCommand = make_dynamic_help_command('fs-scans query')
     help="Max recursive file count",
 )
 @click.option(
+    "--min-avg-size",
+    type=str,
+    default=None,
+    help="Min average own-file size (total_size_nr/file_count_nr; e.g. 1KiB, "
+         "1MiB) — the dimension the file-size histogram buckets by",
+)
+@click.option(
+    "--max-avg-size",
+    type=str,
+    default=None,
+    help="Max average own-file size, exclusive (e.g. 10KiB)",
+)
+@click.option(
     "--group-by",
     "group_by",
     type=click.Choice(["owner", "group"]),
@@ -257,6 +270,8 @@ def query_cmd(
     max_size: str | None,
     min_files: str | None,
     max_files: str | None,
+    min_avg_size: str | None,
+    max_avg_size: str | None,
     group_by: str | None,
     show_total: bool,
     dir_counts: bool,
@@ -273,6 +288,7 @@ def query_cmd(
       fs-scans query -d 4 --single-owner      # Single-owner dirs at depth 4+
       fs-scans query --accessed-before 3yrs   # Old data (newest access in subtree)
       fs-scans query --accessed-before 3yrs --atime-non-recursive  # Stale own-files
+      fs-scans query --min-avg-size 1KiB --max-avg-size 10KiB  # Dirs in a size band
       fs-scans query --leaves-only            # Leaf directories only
       fs-scans query -N "*scratch*"           # Filter by name pattern
       fs-scans query -N "*scratch*" -N "*tmp*"  # Multiple patterns (OR)
@@ -343,6 +359,8 @@ def query_cmd(
     parsed_max_size = parse_size(max_size) if max_size else None
     parsed_min_files = parse_file_count(min_files) if min_files else None
     parsed_max_files = parse_file_count(max_files) if max_files else None
+    parsed_min_avg_size = parse_size(min_avg_size) if min_avg_size else None
+    parsed_max_avg_size = parse_size(max_avg_size) if max_avg_size else None
 
     # Handle summary mode
     if summary:
@@ -415,6 +433,8 @@ def query_cmd(
         max_size=parsed_max_size,
         min_files=parsed_min_files,
         max_files=parsed_max_files,
+        min_avg_size=parsed_min_avg_size,
+        max_avg_size=parsed_max_avg_size,
         compute_dir_counts=dir_counts,
     )
 

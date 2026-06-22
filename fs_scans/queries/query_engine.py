@@ -482,6 +482,8 @@ def query_directories(
     max_size: int | None = None,
     min_files: int | None = None,
     max_files: int | None = None,
+    min_avg_size: int | None = None,
+    max_avg_size: int | None = None,
     compute_dir_counts: bool = False,
 ) -> list[dict]:
     """
@@ -510,6 +512,9 @@ def query_directories(
         max_size: Maximum total_size_r in bytes
         min_files: Minimum file_count_r
         max_files: Maximum file_count_r
+        min_avg_size: Minimum average own-file size (total_size_nr/file_count_nr),
+            inclusive — the dimension the file-size histogram buckets by
+        max_avg_size: Maximum average own-file size, exclusive
         compute_dir_counts: If True, compute directory counts (ndirs_r, ndirs_nr)
 
     Returns:
@@ -558,6 +563,8 @@ def query_directories(
         builder.with_size_range(min_size, max_size)
     if min_files is not None or max_files is not None:
         builder.with_file_count_range(min_files, max_files)
+    if min_avg_size is not None or max_avg_size is not None:
+        builder.with_avg_file_size_range(min_avg_size, max_avg_size)
 
     # Apply path prefix filter: fast anc_d{k} lineage predicate when possible,
     # else the recursive descendants CTE (deep scopes / older .db files).
@@ -1217,6 +1224,8 @@ def query_single_filesystem(
     compute_dir_counts: bool = False,
     group_id: int | None = None,
     atime_recursive: bool = True,
+    min_avg_size: int | None = None,
+    max_avg_size: int | None = None,
 ) -> list[dict]:
     """Query a single filesystem database.
 
@@ -1253,6 +1262,8 @@ def query_single_filesystem(
             max_size=max_size,
             min_files=min_files,
             max_files=max_files,
+            min_avg_size=min_avg_size,
+            max_avg_size=max_avg_size,
             compute_dir_counts=compute_dir_counts,
         )
     finally:
