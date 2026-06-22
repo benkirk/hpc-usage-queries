@@ -271,6 +271,7 @@ class FsScanQueries:
         limit: int | None = 50,
         accessed_before: datetime | None = None,
         accessed_after: datetime | None = None,
+        atime_recursive: bool = True,
         leaves_only: bool = False,
         name_patterns=None,
         name_pattern_ignorecase: bool = False,
@@ -286,6 +287,10 @@ class FsScanQueries:
         prefixes stripped). For a single filesystem the query runs inline; for
         multiple filesystems each is queried in parallel and the combined
         result set is re-sorted and truncated to ``limit``.
+
+        ``atime_recursive`` selects which column the ``accessed_before`` /
+        ``accessed_after`` filters compare against: ``max_atime_r`` (subtree,
+        default) or ``max_atime_nr`` (the directory's own files) when False.
         """
         scope = self._resolve_scope(path_prefixes)
         filesystems = list(scope)
@@ -311,6 +316,7 @@ class FsScanQueries:
                     limit=query_limit,
                     accessed_before=accessed_before,
                     accessed_after=accessed_after,
+                    atime_recursive=atime_recursive,
                     leaves_only=leaves_only,
                     name_patterns=list(name_patterns) if name_patterns else None,
                     name_pattern_ignorecase=name_pattern_ignorecase,
@@ -351,6 +357,7 @@ class FsScanQueries:
                     max_files,
                     compute_dir_counts,
                     group_id=group_id,
+                    atime_recursive=atime_recursive,
                 ): fs
                 for fs in filesystems
             }
