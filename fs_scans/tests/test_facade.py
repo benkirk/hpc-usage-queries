@@ -255,6 +255,45 @@ def test_access_history_path_filter_slow_path(collection):
     assert hist["renderer"] == "access_histogram"
 
 
+def test_access_history_slow_path_aggregates_in_sql(collection):
+    # The slow path now buckets + sums in SQL (GROUP BY) rather than streaming
+    # every directory row. tank/alice is a single directory: 3000 bytes / 300
+    # files, atime 2025-12-01; scan 2026-01-15 -> 45 days old -> "1-3 Months",
+    # owned by alice (uid 1001). Totals + per-owner breakdown must be exact.
+    hist = FsScanQueries(filesystems="testfs").access_history(path_prefixes=["/tank/alice"])
+    assert hist["fast_path"] is False
+    assert hist["total_data"] == 3_000
+    assert hist["total_files"] == 300
+    b = hist["buckets"]["1-3 Months"]
+    assert b["data"] == 3_000 and b["files"] == 300
+    assert b["owners"][1001] == {"data": 3_000, "files": 300}
+    # Every other band is empty (only one directory in scope).
+    assert sum(v["data"] for v in hist["buckets"].values()) == 3_000
+
+
+def test_compute_access_history_aggregates_buckets_and_owners(collection):
+    # Direct unit test of the SQL-aggregated slow path over the whole testfs db
+    # (no facade scope resolution): dir1 (size 0, skipped), alice 3000 @2025-12-01
+    # -> "1-3 Months", bob 2000 @2025-06-01 -> "6-12 Months", proj 1000 @2024-01-01
+    # with owner_uid None (counted in band totals, NOT the per-owner breakdown).
+    from fs_scans.core.database import get_session
+    from fs_scans.queries.access_history import compute_access_history
+
+    session = get_session("testfs")
+    try:
+        hist = compute_access_history(session, SCAN_DATE).to_dict()
+    finally:
+        session.close()
+
+    assert hist["total_data"] == 6_000          # dir1's 0 bytes skipped
+    assert hist["total_files"] == 600
+    assert hist["buckets"]["1-3 Months"]["data"] == 3_000
+    assert hist["buckets"]["1-3 Months"]["owners"][1001] == {"data": 3_000, "files": 300}
+    assert hist["buckets"]["6-12 Months"]["data"] == 2_000
+    owners_seen = {uid for v in hist["buckets"].values() for uid in v["owners"]}
+    assert owners_seen == {1001, 1002}          # proj's None owner excluded from breakdown
+
+
 # ---------------------------------------------------------------------------
 # Path-prefix scope resolution: collapse + whole-collection-root fast path
 # ---------------------------------------------------------------------------
