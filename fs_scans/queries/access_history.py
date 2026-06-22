@@ -57,6 +57,35 @@ class AccessHistogram:
             bucket["owners"][owner_uid]["data"] += size_nr
             bucket["owners"][owner_uid]["files"] += files_nr
 
+    def add_rollup(self, bucket_index: int, owner_uid: int | None, data: int, files: int):
+        """Add a pre-aggregated ``(bucket, owner)`` rollup.
+
+        The SQL-side equivalent of summing many :meth:`add_directory` calls for
+        the same bucket+owner: :func:`compute_access_history` aggregates with
+        ``GROUP BY`` so a large sub-path scope streams ~10 buckets x owners
+        rows instead of every directory row. ``bucket_index`` is the position in
+        :data:`ATIME_BUCKETS` (the DB CASE assigns it; see
+        :func:`_atime_bucket_case_sql`).
+        """
+        # Postgres SUM() returns decimal.Decimal; coerce to int so the histogram
+        # dict stays integer-typed (parity with the streaming add_directory
+        # path) and never leaks a Decimal into float arithmetic downstream (the
+        # webapp chart does float += value). SQLite SUM returns int, which is
+        # why this didn't surface in the unit tests.
+        data = int(data or 0)
+        files = int(files or 0)
+        if not data:
+            return
+        label = self.BUCKETS[int(bucket_index)][0]
+        self.total_data += data
+        self.total_files += files
+        bucket = self.buckets[label]
+        bucket["data"] += data
+        bucket["files"] += files
+        if owner_uid is not None and owner_uid >= 0:
+            bucket["owners"][owner_uid]["data"] += data
+            bucket["owners"][owner_uid]["files"] += files
+
     def _get_bucket(self, atime: datetime | None) -> str:
         """Determine which time bucket an access time falls into.
 
@@ -232,6 +261,38 @@ class AccessHistogram:
         return hist
 
 
+def _atime_bucket_case_sql(scan_date: datetime, col: str = "s.max_atime_nr"):
+    """Build a SQL ``CASE`` mapping a directory's atime to its
+    :data:`ATIME_BUCKETS` index, plus the bound cutoff params.
+
+    Mirrors :meth:`AccessHistogram._get_bucket`: bucket ``i`` is the first whose
+    day-threshold the age falls under (``days_old < threshold`` ⟺
+    ``atime > scan_date - threshold``). NULL atime and ages past the last
+    threshold fall in the final bucket. Doing this in SQL lets
+    :func:`compute_access_history` ``GROUP BY`` the bucket instead of streaming
+    every directory row into Python — the whole point of the slow-path
+    optimization for large sub-path scopes.
+    """
+    last_idx = len(ATIME_BUCKETS) - 1
+    whens, params = [], {}
+    for i, (_, threshold) in enumerate(ATIME_BUCKETS):
+        if threshold is None:
+            continue
+        key = f"atime_cut_{i}"
+        # Bind as a string, matching DirectoryQueryBuilder.with_accessed_before
+        # (proven on both sqlite + postgres; avoids the deprecated datetime
+        # adapter). max_atime_nr stores microseconds, but these cutoffs never
+        # sit on a sub-second boundary so lexicographic comparison is exact.
+        params[key] = (scan_date - timedelta(days=threshold)).strftime("%Y-%m-%d %H:%M:%S")
+        whens.append(f"            WHEN {col} > :{key} THEN {i}")
+    case = (
+        f"CASE WHEN {col} IS NULL THEN {last_idx}\n"
+        + "\n".join(whens)
+        + f"\n            ELSE {last_idx} END"
+    )
+    return case, params
+
+
 def compute_access_history(
     session,
     scan_date: datetime,
@@ -299,41 +360,34 @@ def compute_access_history(
     else:
         from_clause = "FROM directory_stats s"
 
+    # Bucket + sum server-side: a sub-path scope can cover millions of
+    # directories, so aggregate to a per-(bucket, owner) rollup in SQL and
+    # stream ~10 buckets x owners rows rather than every directory row (which
+    # blows the statement_timeout on large scopes). ``total_size_nr > 0``
+    # mirrors add_directory()'s "skip empty directories".
+    bucket_case, bucket_params = _atime_bucket_case_sql(scan_date)
+    params.update(bucket_params)
     query = f"""
         {cte_clause}
         SELECT
-            s.total_size_nr,
-            s.file_count_nr,
-            s.max_atime_nr,
-            s.owner_uid
+            {bucket_case} AS bucket_index,
+            s.owner_uid AS owner_uid,
+            SUM(s.total_size_nr) AS total_size,
+            SUM(s.file_count_nr) AS file_count
         {from_clause}
-        WHERE {where_clause}
+        WHERE {where_clause} AND s.total_size_nr > 0
+        GROUP BY 1, 2
     """
 
-    # Stream results in batches to avoid loading all into memory
+    # The result is already small (bucketed), but stream in batches anyway.
     result_proxy = session.execute(text(query), params)
-
-    # Process results incrementally using iterator
     batch_size = 10000
     while True:
         batch = result_proxy.fetchmany(batch_size)
         if not batch:
             break
-
         for row in batch:
-            size_nr = row[0] or 0
-            files_nr = row[1] or 0
-            atime_nr = row[2]
-            owner_uid = row[3]
-
-            # Convert string datetime if needed
-            if isinstance(atime_nr, str):
-                try:
-                    atime_nr = datetime.strptime(atime_nr.split()[0], "%Y-%m-%d")
-                except (ValueError, AttributeError):
-                    atime_nr = None
-
-            histogram.add_directory(size_nr, files_nr, atime_nr, owner_uid)
+            histogram.add_rollup(row[0], row[1], row[2] or 0, row[3] or 0)
 
     return histogram
 
