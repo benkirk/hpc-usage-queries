@@ -245,6 +245,71 @@ def test_file_size_histogram_fast_path(collection):
     assert hist["total_files"] == 500
 
 
+def test_compute_size_histogram_owner_breakdown_and_exclusions(collection):
+    # SQL-aggregated slow path over the testfs db. alice/bob/proj each average
+    # ~10 bytes/file -> "0 - 1 KiB"; dir1 (file_count_nr=0) is excluded. proj's
+    # owner is the -1 "unowned" sentinel (None coerces to -1 on insert) and,
+    # like the old streaming path, stays in the bucket breakdown.
+    from fs_scans.core.database import get_session
+    from fs_scans.queries.file_size import compute_size_histogram_from_directory_stats
+
+    session = get_session("testfs")
+    try:
+        h = compute_size_histogram_from_directory_stats(session, SCAN_DATE)
+    finally:
+        session.close()
+
+    b0 = h["0 - 1 KiB"]
+    assert b0[1001] == (300, 3_000)
+    assert b0[1002] == (200, 2_000)
+    assert b0[-1] == (100, 1_000)
+    # SUM()'s Decimal (postgres) must be coerced to int.
+    assert all(isinstance(fc, int) and isinstance(ts, int)
+               for owners in h.values() for (fc, ts) in owners.values())
+
+
+def test_compute_size_histogram_buckets_by_average_file_size(tmp_path):
+    # Validates the CASE boundaries: directories landing in three different
+    # SIZE_BUCKETS by their average file size, plus count-0 exclusion. Division
+    # (not max_size * file_count) keeps the 200 GiB dir from overflowing BIGINT.
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from fs_scans.core.models import Base, Directory, DirectoryStats
+    from fs_scans.queries.file_size import compute_size_histogram_from_directory_stats
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'sz.db'}")
+    Base.metadata.create_all(eng)
+    session = sessionmaker(bind=eng)()
+    session.add_all([
+        Directory(dir_id=1, parent_id=None, name="root", depth=1),
+        Directory(dir_id=2, parent_id=1, name="tiny", depth=2),
+        Directory(dir_id=3, parent_id=1, name="mid", depth=2),
+        Directory(dir_id=4, parent_id=1, name="huge", depth=2),
+        Directory(dir_id=5, parent_id=1, name="empty", depth=2),
+    ])
+    session.add_all([
+        DirectoryStats(dir_id=2, owner_uid=1001, file_count_nr=10,
+                       total_size_nr=50_000),                       # avg 5 KiB -> bucket 1
+        DirectoryStats(dir_id=3, owner_uid=1001, file_count_nr=2,
+                       total_size_nr=4 * 1024 * 1024),              # avg 2 MiB -> bucket 4
+        DirectoryStats(dir_id=4, owner_uid=1002, file_count_nr=1,
+                       total_size_nr=200 * 1024 ** 3),              # avg 200 GiB -> bucket 9
+        DirectoryStats(dir_id=5, owner_uid=1003, file_count_nr=0,
+                       total_size_nr=0),                            # excluded
+    ])
+    session.commit()
+    try:
+        h = compute_size_histogram_from_directory_stats(session, datetime(2026, 1, 15))
+    finally:
+        session.close()
+        eng.dispose()
+
+    assert h["1 KiB - 10 KiB"] == {1001: (10, 50_000)}
+    assert h["1 MiB - 10 MiB"] == {1001: (2, 4 * 1024 * 1024)}
+    assert h["100 GiB+"] == {1002: (1, 200 * 1024 ** 3)}
+    assert "0 - 1 KiB" not in h          # the count-0 dir produced no bucket
+
+
 def test_access_history_path_filter_slow_path(collection):
     # A genuine SUB-path (not the collection root) still takes the slow,
     # on-the-fly path. '/tank/alice' is below the root, so it can't use the
