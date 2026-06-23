@@ -61,9 +61,22 @@ done
 
 echo ${sep}
 echo "all_ids=${all_ids}"
+set -x
+collect_jobid=$(qsub -W depend=afterany:${all_ids} \
+                     -N collect_results \
+                     ${SCRIPT_DIR}/rsync_results.pbs)
+set +x
+echo collect_jobid=${collect_jobid}
 
-# Future: chain a collect/consolidate job after the imports complete, mirroring
-# the dependency pattern in fs_scans/PBS/submit_all.sh, e.g.
-# collect_jobid=$(qsub -W depend=afterany:${all_ids} \
-#                      -N collect_results \
-#                      ${SCRIPT_DIR}/rsync_results.pbs)
+
+# Optional: consolidate the published .db files into CNPG PostgreSQL after the
+# rsync collection succeeds. Disabled by default — enable with
+# FS_SCAN_ENABLE_CONSOLIDATE=1 once the per-collection performance pass and the
+# CNPG disk/role review have signed off (see the plan / fs_scans README).
+if [[ "${FS_SCAN_ENABLE_CONSOLIDATE:-}" == "1" ]]; then
+    set -x
+    qsub -W depend=afterok:${collect_jobid} \
+         -N fs_scans_consolidate \
+         ${SCRIPT_DIR}/consolidate.pbs
+    set +x
+fi
