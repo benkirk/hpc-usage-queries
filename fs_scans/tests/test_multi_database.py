@@ -7,12 +7,18 @@ without any global ``FS_SCAN_PG_DB`` swap. The selector threads from
 ``get_engine(database=...)``, where it becomes part of the engine URL and the
 engine cache key so engines for different databases never alias.
 
-These tests are connection-free: ``create_engine`` is lazy, so we can assert on
-the composed URL / cache identity without a live postgres, and the helper
-forwarding is checked by stubbing ``get_session``.
+These tests are connection-free: no live postgres is contacted. Engine
+*construction* still imports the dbapi (SQLAlchemy resolves the dialect's
+driver in ``create_engine``, not at connect time), so the one test that builds
+a postgres engine ``importorskip("psycopg2")`` — it runs under the postgres
+backend CI job and is skipped on the psycopg2-less sqlite runner. The helper
+forwarding tests stub ``get_session``/discovery and build no engine, so they
+run everywhere.
 """
 
 from unittest.mock import MagicMock
+
+import pytest
 
 import fs_scans.core.config as cfg
 from fs_scans.core.database import clear_engine_cache, get_engine
@@ -31,6 +37,9 @@ def _set_pg_config(monkeypatch):
 
 def test_get_engine_database_selects_url_and_cache_key(monkeypatch):
     """database= drives the connection URL's db name and the engine cache key."""
+    # create_engine imports the dialect's dbapi eagerly; skip where it's absent
+    # (the sqlite-backend CI job). The postgres-backend job exercises this.
+    pytest.importorskip("psycopg2")
     _set_pg_config(monkeypatch)
     clear_engine_cache()
     try:
