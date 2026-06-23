@@ -1,0 +1,90 @@
+#!/bin/bash
+
+#PBS -N fs_import
+#PBS -A SCSG0001
+#PBS -j oe
+#PBS -q casper
+#PBS -l walltime=4:00:00
+#PBS -l select=1:ncpus=16:mpiprocs=1:ompthreads=16:mem=128G
+
+#----------------------------------------------------------------------------
+# Determine the directory containing this script, compatible with bash and zsh
+if [ -n "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION}" ]; then
+  SCRIPT_PATH="${(%):-%x}"
+else
+  echo "Unknown shell!"
+fi
+SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
+TOP_DIR=$(git rev-parse --show-toplevel)
+#----------------------------------------------------------------------------
+
+sep="#----------------------------------------------------------------------------"
+
+set -e
+
+# TARGET_DIR is the same scan target passed to create_metadata_scan.pbs; it lets
+# us recompute the deterministic processing directory and locate the .lfs-scan
+# produced by the (now-completed, afterok) scan job.
+: "${TARGET_DIR:?TARGET_DIR must be set (qsub -v TARGET_DIR=...)}"
+TARGET_DIR=$(realpath ${TARGET_DIR})
+echo "TARGET_DIR=${TARGET_DIR}"
+
+source ${TOP_DIR}/etc/config_env.sh
+which python3
+
+module load peak-memusage
+hostname
+w
+free -g
+
+export COLUMNS=256
+
+echo ${sep}
+# Locate the metadata scan in the shared processing directory. Pick the most
+# recent matching .lfs-scan (repeat runs leave dated files); the glob requires
+# the target's basename so it ignores any stray empty-basename artifacts.
+source ${TOP_DIR}/fs_scans/PBS/destor/_destor_common.sh
+proc_dir=$(destor_proc_dir ${TARGET_DIR})
+scan_file=$(ls -1t ${proc_dir}/*_desc1_$(basename ${TARGET_DIR}).lfs-scan 2>/dev/null | head -n1)
+if [ -z "${scan_file}" ] || [ ! -s "${scan_file}" ]; then
+    echo "ERROR: no metadata scan found under ${proc_dir}" >&2
+    exit 1
+fi
+echo "proc_dir=${proc_dir}"
+ls -lh ${scan_file}
+
+# Import into a fresh SQLite DB on fast node-local scratch, then publish the
+# resulting .db to the repo's destor data directory. FS_SCAN_DATA_DIR points the
+# importer's .db output at work_dir, so the random-write-heavy SQLite build lands
+# on node-local NVMe rather than shared scratch.
+local_scratch=/local_scratch/pbs.${PBS_JOBID}
+work_dir=${local_scratch}/work
+rm -rf ${work_dir} && mkdir -p ${work_dir} && cd ${work_dir}
+export FS_SCAN_DATA_DIR=$(pwd)
+ls -ld ${local_scratch}
+df -h ${local_scratch}
+
+echo && echo ${sep}
+# Stage the scan onto node-local NVMe too: the importer re-reads the input file
+# on every pass (pass1 discover, pass2a stats, pass3 summaries), so a local copy
+# keeps those reads off shared scratch. Preserve the basename so the importer
+# still parses the filesystem name and scan date from it.
+local_scan=${work_dir}/$(basename ${scan_file})
+time cp -v ${scan_file} ${local_scan}
+
+echo && echo ${sep}
+time peak_memusage fs-scans-import --workers 12 --replace ${local_scan}
+
+echo && echo ${sep}
+time peak_memusage fs-scans-query
+
+echo && echo ${sep}
+time peak_memusage fs-scans-analyze --access-history
+
+echo && echo ${sep}
+mkdir -p ${TOP_DIR}/fs_scans/data/destor
+rsync -axv ./*.db ${TOP_DIR}/fs_scans/data/destor/
+
+rm -rf ${work_dir}
