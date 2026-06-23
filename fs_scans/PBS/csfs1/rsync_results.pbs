@@ -22,4 +22,4 @@ TOP_DIR=$(git rev-parse --show-toplevel)
 
 sep="#----------------------------------------------------------------------------"
 
-sudo -u csgteam rsync -axv /glade/work/benkirk/repos/hpc-usage-queries/fs_scans/data/*.db /glade/u/apps/opt/hpc-usage-queries/fs_scans/data/
+sudo -u csgteam rsync -axv /glade/work/benkirk/repos/hpc-usage-queries/fs_scans/data/csfs1/*.db /glade/u/apps/opt/hpc-usage-queries/fs_scans/data/

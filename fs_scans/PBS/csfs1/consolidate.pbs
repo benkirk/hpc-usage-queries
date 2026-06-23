@@ -47,7 +47,7 @@ set +a
 
 export FS_SCAN_DB_BACKEND=postgres
 # Consume exactly the published .db set (override with FS_SCAN_DATA_DIR if set).
-export FS_SCAN_DATA_DIR="${FS_SCAN_DATA_DIR:-${TOP_DIR}/fs_scans/data}"
+export FS_SCAN_DATA_DIR="${FS_SCAN_DATA_DIR:-${TOP_DIR}/fs_scans/data/csfs1}"
 
 echo ${sep}
 echo "Backend:   ${FS_SCAN_DB_BACKEND}"
