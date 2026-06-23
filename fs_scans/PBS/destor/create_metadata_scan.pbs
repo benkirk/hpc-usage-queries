@@ -1,0 +1,65 @@
+#!/bin/bash
+
+#PBS -N fs_scan
+#PBS -A SCSG0001
+#PBS -j oe
+#PBS -q casper
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=8:mpiprocs=1:ompthreads=8:mem=12G
+
+#----------------------------------------------------------------------------
+# Determine the directory containing this script, compatible with bash and zsh
+if [ -n "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION}" ]; then
+  SCRIPT_PATH="${(%):-%x}"
+else
+  echo "Unknown shell!"
+fi
+SCRIPT_DIR=$(realpath $(dirname ${SCRIPT_PATH}))
+TOP_DIR=$(git rev-parse --show-toplevel)
+#----------------------------------------------------------------------------
+
+sep="#----------------------------------------------------------------------------"
+
+set -e
+
+# TARGET_DIR is the filesystem/directory to scan, passed in via:
+#   qsub -v TARGET_DIR=/lustre/desc1/p ...
+: "${TARGET_DIR:?TARGET_DIR must be set (qsub -v TARGET_DIR=...)}"
+TARGET_DIR=$(realpath ${TARGET_DIR})
+echo "TARGET_DIR=${TARGET_DIR}"
+
+source ${TOP_DIR}/etc/config_env.sh
+which python3
+
+module load peak-memusage
+hostname
+w
+free -g
+
+echo ${sep}
+
+# These scans produce a lot of data, so run inside a per-target processing
+# directory on shared scratch. The path is derived deterministically from the
+# target (see _destor_common.sh) so the downstream import job locates the same
+# directory, and repeat runs of the same target reuse it.
+source ${TOP_DIR}/fs_scans/PBS/destor/_destor_common.sh
+proc_dir=$(destor_proc_dir ${TARGET_DIR})
+mkdir -p ${proc_dir} && cd ${proc_dir}
+echo "proc_dir=${proc_dir}"
+
+echo && echo ${sep}
+# lustre_scan_depth.sh writes its YYYYMMDD_desc1_<basename>.lfs-scan into the
+# current working directory, hence the cd into ${proc_dir} above.
+# Its stdout is just per-directory progress chatter -> drop it; stderr captures
+# real issues (mostly "Permission denied" on unreadable subtrees) -> scan.err.
+# NB: do not wrap this in `peak_memusage bash -c "..."` -- peak_memusage
+# re-parses/flattens its arguments and drops the quoting, which strips the
+# target path from the scanner. The walk is light on memory anyway (PBS records
+# resources_used.mem); plain `time` is enough here.
+time ${TOP_DIR}/bin/lustre_scan_depth.sh ${TARGET_DIR} 1>/dev/null 2>scan.err
+
+echo && echo ${sep}
+ls -lh ${proc_dir}/*.lfs-scan
+echo "scan.err: $(wc -l < scan.err) line(s)"
