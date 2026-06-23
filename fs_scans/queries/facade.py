@@ -142,15 +142,25 @@ class FsScanQueries:
         Optional override for the directory containing the SQLite ``*.db``
         files (ignored for the PostgreSQL backend). Applied process-wide via
         :func:`set_data_dir`, matching the CLI ``--data-dir`` option.
+    database:
+        Optional PostgreSQL database name (ignored for the SQLite backend).
+        Defaults to ``FsScanConfig.PG_DB_NAME`` (the ``FS_SCAN_PG_DB`` env var).
+        All collections in this instance are queried against this one database,
+        so a caller can hold separate ``FsScanQueries`` instances for distinct
+        CNPG databases on the same cluster — e.g. ``campaign`` (Campaign_Store)
+        and ``desc1`` (Destor) — without any global state swap. Threaded into
+        every engine/session this instance opens.
     """
 
-    def __init__(self, filesystems="all", data_dir=None):
+    def __init__(self, filesystems="all", data_dir=None, database=None):
         if data_dir is not None:
             set_data_dir(data_dir)
 
+        self.database = database
+
         if isinstance(filesystems, str):
             if filesystems.lower() == "all":
-                self.filesystems = get_all_filesystems()
+                self.filesystems = get_all_filesystems(database=database)
             else:
                 self.filesystems = [filesystems]
         else:
@@ -173,7 +183,7 @@ class FsScanQueries:
         """
         dates = []
         for fs in (filesystems if filesystems is not None else self.filesystems):
-            session = get_session(fs)
+            session = get_session(fs, database=self.database)
             try:
                 scan_date = get_scan_date(session)
                 if scan_date:
@@ -237,7 +247,7 @@ class FsScanQueries:
         """Per-filesystem summary statistics (rows tagged with ``filesystem``)."""
         rows = []
         for fs in self.filesystems:
-            session = get_session(fs)
+            session = get_session(fs, database=self.database)
             try:
                 stats = get_summary(session)
             finally:
@@ -248,11 +258,11 @@ class FsScanQueries:
 
     def resolve_usernames(self, uids) -> dict[int, str]:
         """Resolve UIDs to usernames across the configured filesystems."""
-        return resolve_usernames_across_databases(uids, self.filesystems)
+        return resolve_usernames_across_databases(uids, self.filesystems, database=self.database)
 
     def resolve_groupnames(self, gids) -> dict[int, str]:
         """Resolve GIDs to groupnames across the configured filesystems."""
-        return resolve_groupnames_across_databases(gids, self.filesystems)
+        return resolve_groupnames_across_databases(gids, self.filesystems, database=self.database)
 
     # ------------------------------------------------------------------
     # Directory listing
@@ -307,7 +317,7 @@ class FsScanQueries:
             if not filesystems:
                 return []
             fs = filesystems[0]
-            session = get_session(fs)
+            session = get_session(fs, database=self.database)
             try:
                 return query_directories(
                     session,
@@ -368,6 +378,7 @@ class FsScanQueries:
                     atime_recursive=atime_recursive,
                     min_avg_size=min_avg_size,
                     max_avg_size=max_avg_size,
+                    database=self.database,
                 ): fs
                 for fs in filesystems
             }
@@ -428,7 +439,7 @@ class FsScanQueries:
         # OwnerSummary/GroupSummary fast path; sub-paths -> dynamic).
         all_results: list[dict] = []
         for fs in filesystems:
-            session = get_session(fs)
+            session = get_session(fs, database=self.database)
             try:
                 results = query_func(
                     session,
@@ -520,11 +531,12 @@ class FsScanQueries:
         if fast_fs:
             fast_hist, _ = aggregate_histograms_across_databases(
                 filesystems=fast_fs, histogram_type="access", owner_uid=owner_uid,
+                database=self.database,
             )
             _merge_histogram(combined, fast_hist, all_uids)
 
         for fs in slow_fs:
-            session = get_session(fs)
+            session = get_session(fs, database=self.database)
             try:
                 scan_date = get_scan_date(session)
                 if not scan_date:
@@ -587,12 +599,13 @@ class FsScanQueries:
         if fast_fs:
             fast_hist, _ = aggregate_histograms_across_databases(
                 filesystems=fast_fs, histogram_type="size", owner_uid=owner_uid,
+                database=self.database,
             )
             _merge_histogram(combined, fast_hist, all_uids)
 
         # Slow collections: approximate per-filesystem size histogram (dict).
         for fs in slow_fs:
-            session = get_session(fs)
+            session = get_session(fs, database=self.database)
             try:
                 scan_date = get_scan_date(session)
                 if not scan_date:

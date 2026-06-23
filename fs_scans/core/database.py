@@ -207,6 +207,7 @@ def get_engine(
     db_path: Path | None = None,
     *,
     schema: str | None = None,
+    database: str | None = None,
 ) -> Engine:
     """Create or retrieve a cached SQLAlchemy engine for a filesystem/collection.
 
@@ -219,6 +220,12 @@ def get_engine(
         schema: PostgreSQL schema to pin via ``search_path`` (postgres backend
             only). Defaults to ``FsScanConfig.pg_schema_name(filesystem)``;
             the consolidate step passes ``"<collection>_staging"`` here.
+        database: PostgreSQL database name to connect to (postgres backend
+            only). Defaults to ``FsScanConfig.PG_DB_NAME`` (the ``FS_SCAN_PG_DB``
+            env var). Lets a single process query more than one CNPG database on
+            the same cluster — e.g. ``campaign`` (Campaign_Store) and ``desc1``
+            (Destor) — by passing a per-resource database here. It is part of
+            the engine cache key, so engines for different databases never alias.
 
     Returns:
         SQLAlchemy Engine instance (may be cached)
@@ -228,9 +235,10 @@ def get_engine(
     if config.DB_BACKEND == "postgres":
         config.validate_postgres()
         schema = schema or config.pg_schema_name(filesystem)
+        db_name = database or config.PG_DB_NAME
         cache_key = (
             "postgres", config.PG_HOST, config.PG_PORT, config.PG_USER,
-            config.PG_DB_NAME, schema, bool(config.PG_REQUIRE_SSL),
+            db_name, schema, bool(config.PG_REQUIRE_SSL),
         )
         with _engine_cache_lock:
             if cache_key not in _engine_cache:
@@ -241,7 +249,7 @@ def get_engine(
                     connect_args["sslmode"] = "require"
                 url = (
                     f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
-                    f"@{config.PG_HOST}:{config.PG_PORT}/{config.PG_DB_NAME}"
+                    f"@{config.PG_HOST}:{config.PG_PORT}/{db_name}"
                 )
                 # pool_pre_ping validates each pooled connection with a cheap
                 # liveness check at checkout and transparently reconnects a
@@ -285,7 +293,7 @@ def clear_engine_cache() -> None:
         _engine_cache.clear()
 
 
-def get_session(filesystem: str, engine=None, db_path: Path | None = None, *, schema: str | None = None):
+def get_session(filesystem: str, engine=None, db_path: Path | None = None, *, schema: str | None = None, database: str | None = None):
     """Create and return a new database session for a filesystem/collection.
 
     Args:
@@ -293,12 +301,14 @@ def get_session(filesystem: str, engine=None, db_path: Path | None = None, *, sc
         engine: Existing engine to use. If None, creates a new one.
         db_path: Explicit SQLite database path override (ignored if engine provided)
         schema: PostgreSQL schema to pin (ignored if engine provided)
+        database: PostgreSQL database name (ignored if engine provided); defaults
+            to ``FsScanConfig.PG_DB_NAME``. See :func:`get_engine`.
 
     Returns:
         SQLAlchemy Session instance
     """
     if engine is None:
-        engine = get_engine(filesystem, db_path=db_path, schema=schema)
+        engine = get_engine(filesystem, db_path=db_path, schema=schema, database=database)
 
     Session = sessionmaker(bind=engine)
     return Session()
@@ -327,13 +337,17 @@ def db_available(filesystem: str) -> bool:
 _PG_SYSTEM_SCHEMAS = {"public", "information_schema"}
 
 
-def list_pg_schemas() -> list[str]:
+def list_pg_schemas(database: str | None = None) -> list[str]:
     """Return the collection schemas in the PostgreSQL database.
 
     Excludes system schemas (``public``, ``information_schema``, ``pg_*``) and
     the transient ``*_staging`` / ``*_old`` schemas used during a swap.
+
+    ``database`` selects which CNPG database to introspect (defaults to
+    ``FsScanConfig.PG_DB_NAME``); pass e.g. ``"desc1"`` to discover Destor's
+    collections separately from ``campaign``.
     """
-    engine = get_engine("__discovery__", schema="public")
+    engine = get_engine("__discovery__", schema="public", database=database)
     with engine.connect() as conn:
         rows = conn.execute(
             text("SELECT schema_name FROM information_schema.schemata")
