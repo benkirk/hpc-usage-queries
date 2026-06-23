@@ -41,20 +41,25 @@ free -g
 echo ${sep}
 
 # These scans produce a lot of data, so run inside a per-target processing
-# directory under ${TMPDIR}. The name is derived deterministically from the
-# target path (basename + short hash) so repeat runs of the same target reuse
-# the same directory -- safe because a given target is never scanned twice
-# concurrently.
-: "${TMPDIR:=/glade/derecho/scratch/${USER}/tmp}"
-target_hash=$(echo -n "${TARGET_DIR}" | sha1sum | cut -c1-12)
-proc_dir=${TMPDIR}/fs_scans/destor/$(basename ${TARGET_DIR})_${target_hash}
+# directory on shared scratch. The path is derived deterministically from the
+# target (see _destor_common.sh) so the downstream import job locates the same
+# directory, and repeat runs of the same target reuse it.
+source ${TOP_DIR}/fs_scans/PBS/destor/_destor_common.sh
+proc_dir=$(destor_proc_dir ${TARGET_DIR})
 mkdir -p ${proc_dir} && cd ${proc_dir}
 echo "proc_dir=${proc_dir}"
 
 echo && echo ${sep}
 # lustre_scan_depth.sh writes its YYYYMMDD_desc1_<basename>.lfs-scan into the
 # current working directory, hence the cd into ${proc_dir} above.
-time peak_memusage ${TOP_DIR}/bin/lustre_scan_depth.sh ${TARGET_DIR}
+# Its stdout is just per-directory progress chatter -> drop it; stderr captures
+# real issues (mostly "Permission denied" on unreadable subtrees) -> scan.err.
+# NB: do not wrap this in `peak_memusage bash -c "..."` -- peak_memusage
+# re-parses/flattens its arguments and drops the quoting, which strips the
+# target path from the scanner. The walk is light on memory anyway (PBS records
+# resources_used.mem); plain `time` is enough here.
+time ${TOP_DIR}/bin/lustre_scan_depth.sh ${TARGET_DIR} 1>/dev/null 2>scan.err
 
 echo && echo ${sep}
 ls -lh ${proc_dir}/*.lfs-scan
+echo "scan.err: $(wc -l < scan.err) line(s)"

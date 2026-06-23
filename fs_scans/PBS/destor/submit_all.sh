@@ -35,21 +35,35 @@ for scan_dir in "${scan_dirs[@]}"; do
 
     label=$(basename ${scan_dir})
     echo ${sep}
-    echo "submitting metadata scan: ${scan_dir}"
+    echo "submitting metadata scan + import: ${scan_dir}"
 
-    jobid=$(qsub \
-                -N fs_scan_${label} \
-                -v TARGET_DIR="${scan_dir}" \
-                ${SCRIPT_DIR}/create_metadata_scan.pbs)
-    echo "  ${jobid}"
-    all_ids=${jobid}:${all_ids}
+    # 1) metadata scan (lustre_scan_depth.sh -> .lfs-scan on shared scratch)
+    scan_id=$(qsub \
+                  -N fs_scan_${label} \
+                  -v TARGET_DIR="${scan_dir}" \
+                  ${SCRIPT_DIR}/create_metadata_scan.pbs)
+    echo "  scan:   ${scan_id}"
+
+    # 2) import the just-generated scan, gated on the scan succeeding. Submitted
+    #    immediately so each target's import queues as soon as its scan lands,
+    #    rather than waiting on the whole batch.
+    import_id=$(qsub \
+                    -N fs_import_${label} \
+                    -v TARGET_DIR="${scan_dir}" \
+                    -W depend=afterok:${scan_id} \
+                    ${SCRIPT_DIR}/import_metadata_scan.pbs)
+    echo "  import: ${import_id} (afterok:${scan_id})"
+
+    # Track the import (terminal) jobs so a future collect/consolidate stage can
+    # depend on the jobs that actually produce the .db files.
+    all_ids=${import_id}:${all_ids}
 done
 
 echo ${sep}
 echo "all_ids=${all_ids}"
 
-# Future (Phase 2): chain an import job after the metadata scans complete,
-# mirroring the dependency pattern in fs_scans/PBS/submit_all.sh, e.g.
+# Future: chain a collect/consolidate job after the imports complete, mirroring
+# the dependency pattern in fs_scans/PBS/submit_all.sh, e.g.
 # collect_jobid=$(qsub -W depend=afterany:${all_ids} \
-#                      -N import_metadata_scans \
-#                      ${SCRIPT_DIR}/import_metadata_scan.pbs)
+#                      -N collect_results \
+#                      ${SCRIPT_DIR}/rsync_results.pbs)
