@@ -299,6 +299,7 @@ def aggregate_histograms_across_databases(
     filesystems: list[str],
     histogram_type: str,
     owner_uid: int | None = None,
+    database: str | None = None,
 ) -> tuple[HistogramData, dict[int, str]]:
     """Aggregate histogram data across multiple databases.
 
@@ -306,6 +307,7 @@ def aggregate_histograms_across_databases(
         filesystems: List of filesystem names to query
         histogram_type: "access" or "size"
         owner_uid: Optional owner UID filter
+        database: PostgreSQL database name (defaults to PG_DB_NAME); see get_engine.
 
     Returns:
         Tuple of (HistogramData, username_map)
@@ -321,7 +323,7 @@ def aggregate_histograms_across_databases(
     # Collect scan dates
     scan_dates = []
     for fs in filesystems:
-        session = get_session(fs)
+        session = get_session(fs, database=database)
         try:
             scan_date = get_scan_date(session)
             if scan_date:
@@ -337,7 +339,7 @@ def aggregate_histograms_across_databases(
 
     # Query each database and merge
     for fs in filesystems:
-        session = get_session(fs)
+        session = get_session(fs, database=database)
         try:
             fs_histogram = query_histogram_orm(session, histogram_type, owner_uid)
 

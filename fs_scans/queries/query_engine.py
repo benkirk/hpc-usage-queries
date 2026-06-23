@@ -87,12 +87,13 @@ def collection_for_path(path: str) -> str | None:
     return first.lower() if first else None
 
 
-def get_all_filesystems() -> list[str]:
+def get_all_filesystems(database: str | None = None) -> list[str]:
     """Discover all available filesystem/collection databases.
 
     SQLite: the ``*.db`` files in the configured data directory (via
     get_data_dir()).  PostgreSQL: the collection schemas in the configured
-    database (via list_pg_schemas()).
+    database (via list_pg_schemas()). ``database`` selects which CNPG database
+    to introspect (postgres only); defaults to ``FsScanConfig.PG_DB_NAME``.
 
     Returns:
         List of filesystem/collection names (e.g., ['asp', 'cisl', 'cgd'])
@@ -101,7 +102,7 @@ def get_all_filesystems() -> list[str]:
     from ..core.database import list_pg_schemas
 
     if FsScanConfig.DB_BACKEND == "postgres":
-        return list_pg_schemas()
+        return list_pg_schemas(database=database)
 
     data_dir = get_data_dir()
     db_files = data_dir.glob("*.db")
@@ -887,6 +888,7 @@ def get_username_map(session, uids: list[int], fallback: bool = True) -> dict[in
 def resolve_usernames_across_databases(
     uids: set[int] | list[int],
     filesystems: list[str],
+    database: str | None = None,
 ) -> dict[int, str]:
     """Resolve UIDs to usernames by searching across multiple databases.
 
@@ -914,7 +916,7 @@ def resolve_usernames_across_databases(
         if not remaining_uids:
             break  # All UIDs resolved to real names, stop early
 
-        session = get_session(fs)
+        session = get_session(fs, database=database)
         try:
             found = get_username_map(session, list(remaining_uids), fallback=False)
         finally:
@@ -1021,6 +1023,7 @@ def get_groupname_map(session, gids: list[int], fallback: bool = True) -> dict[i
 def resolve_groupnames_across_databases(
     gids: set[int] | list[int],
     filesystems: list[str],
+    database: str | None = None,
 ) -> dict[int, str]:
     """Resolve GIDs to groupnames by searching across multiple databases.
 
@@ -1046,7 +1049,7 @@ def resolve_groupnames_across_databases(
         if not remaining_gids:
             break  # All GIDs resolved to real names, stop early
 
-        session = get_session(fs)
+        session = get_session(fs, database=database)
         try:
             found = get_groupname_map(session, list(remaining_gids), fallback=False)
         finally:
@@ -1226,6 +1229,7 @@ def query_single_filesystem(
     atime_recursive: bool = True,
     min_avg_size: int | None = None,
     max_avg_size: int | None = None,
+    database: str | None = None,
 ) -> list[dict]:
     """Query a single filesystem database.
 
@@ -1234,12 +1238,13 @@ def query_single_filesystem(
 
     Args:
         filesystem: Filesystem name to query
+        database: PostgreSQL database name (defaults to PG_DB_NAME); see get_engine.
         Other args: Query parameters passed to query_directories()
 
     Returns:
         List of directory dictionaries from this filesystem
     """
-    session = get_session(filesystem)
+    session = get_session(filesystem, database=database)
     try:
         return query_directories(
             session,
