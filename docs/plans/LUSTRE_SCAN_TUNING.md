@@ -197,15 +197,44 @@ lctl set_param mdc.desc1-*.max_rpcs_in_flight=16
 
 Then set the scan's `-P ≈ 4 × max_rpcs_in_flight` (e.g. 16/MDT → `-P 64`).
 
+Then set the scan's `-P ≈ 4 × max_rpcs_in_flight` — **but see the measured result below before bothering.**
+
 **Trade-off / cautions:**
 - This raises load on the **shared** MDS; it can degrade interactive metadata performance for
   every other user of `desc1`. Coordinate with the filesystem admins; prefer running during
   low-utilization windows.
 - It is a **client tunable**, not persistent — it resets on remount. A privileged scan job would
   set it at job start (and ideally restore it at exit).
-- Validate empirically before adopting: A/B one real input dir at `max_rpcs_in_flight` 8 vs 16,
-  watching both scan wall-clock and collateral MDS impact. Diminishing returns are expected once
-  the MDS itself (not the client pipe) becomes the bottleneck.
+
+### 6.1 Measured result: 8 → 64 per MDT (2026-06-25)
+
+An admin set `max_rpcs_in_flight=64` per MDT (256 total in-flight, an 8× bump) on a client; we
+re-ran the identical P-sweep on both targets, idle nodes both times:
+
+| -P | `p` rpc=8 | `p` rpc=64 | EC rpc=8 | EC rpc=64 |
+|---|---|---|---|---|
+| 8 | 82.6 | 72.1 | 172.7 | 153.1 |
+| 16 | 64.1 | 57.3 | 140.1 | 123.9 |
+| 32 | 62.9 | 56.5 | 139.9 | 122.6 |
+| 128 | 62.2 | 54.5 | 139.5 | 122.9 |
+| 256 | 61.7 | 53.7 | 139.1 | 122.9 |
+| 512 | — | 53.9 | — | 123.1 |
+
+- **A uniform ~10–13 % speedup at every `-P`** (including P=8) — the larger per-MDT budget lets each
+  worker pipeline more RPCs (statahead), shifting the whole curve down.
+- **The knee did not move** — still ~P=16, dead-flat to P=512 despite the 8× budget. We are no longer
+  client-RPC-limited, yet extra workers still do nothing.
+- **Root cause of the residual ceiling = shared-MDS service rate, confirmed directly.** The serial
+  outer `find` is trivial (0.6 s / 1.6 s, ruled out as the limiter). A live snapshot during a P=64 run
+  showed the node **97–98 % idle**, load ~2–3 on 256 cores, and **~20 of 22 `lfs` workers in state `S`**
+  (sleeping, blocked on RPC replies) — aggregate CPU under one core. The client cannot extract more
+  metadata throughput from the shared MDS regardless of `-P` or RPC budget.
+
+**Takeaway:** the bump is a real but **modest, optional ~10–13 %** win. It does *not* change the optimal
+`-P` (keep 32) and does *not* unlock higher single-client scaling. Single-client tuning is now exhausted;
+genuine throughput gains come only from **more client nodes** (§1 lever #1), which `submit_all.sh` already
+provides. Adopt the bump only if the ~10 % is worth the privileged setup and the shared-MDS load — note
+this workload self-limits to ~20 effective concurrent ops, so the collateral impact is bounded in practice.
 
 Spreading work across multiple **nodes** (lever #1) is generally the safer scaling path because
 each node contributes an independent RPC pool without any single client hammering one MDT harder.
