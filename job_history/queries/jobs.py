@@ -492,17 +492,27 @@ class JobQueries:
             # Convert bytes to GB for memory ranges
             field = Job.reqmem / (1024**3)
 
-        # Build range case and wait time calculation
+        # Build range case and wait time calculation.
+        #
+        # Wait time is PBS's own eligible_time accrual, not start - eligible.
+        # start - eligible (i.e. start - etime) is effectively submit -> start:
+        # qtime == etime on 77,152 of 77,154 sampled derecho E records, so it
+        # counts time the job spent held, dependency-blocked, or deferred by
+        # `qsub -a` -- none of which is the site making the user wait.
+        # eligible_secs counts only time blocked on resource scarcity.
         range_case = self._build_range_case(ranges, overflow, field)
-        from .builders import _TimeDiffHours
-        wait_time_hours = _TimeDiffHours(Job.eligible, Job.start)
+        wait_time_hours = Job.eligible_secs / 3600.0
 
-        # Build subquery
+        # Build subquery.  The IS NOT NULL filter is required, not redundant:
+        # func.avg already skips NULLs, but func.count(id) below would not, so
+        # without it #-Jobs would count jobs excluded from the average.  Jobs
+        # predating `eligible_time_enable` (derecho before 2025-01-08) are
+        # dropped rather than silently mixed with a different wait definition.
         subquery = self.session.query(
             Job.id,
             range_case,
             wait_time_hours.label("wait_hours")
-        ).filter(Job.queue.in_(queues))
+        ).filter(Job.queue.in_(queues), Job.eligible_secs.isnot(None))
 
         subquery = self._apply_date_filter(subquery, start, end)
         subquery = subquery.subquery()

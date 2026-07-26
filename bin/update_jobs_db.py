@@ -30,6 +30,9 @@ ADD_COLUMNS = [
     ("daily_summary", "gpu_charges",     "REAL DEFAULT 0"),
     ("daily_summary", "memory_charges",  "REAL DEFAULT 0"),
     ("daily_summary", "qos_id",          "INTEGER"),
+    ("jobs",          "queued",          "TIMESTAMP"),
+    ("jobs",          "eligible_secs",   "INTEGER"),
+    ("jobs",          "run_count",       "INTEGER"),
 ]
 
 # ── Columns to DROP ─────────────────────────────────────────────────────────
@@ -180,6 +183,140 @@ def backfill_qos_id(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
           f"in {time.monotonic() - start:.1f}s.")
 
 
+def _executemany_update(conn, stmt, params):
+    """Run a parameterized UPDATE over many parameter sets, efficiently.
+
+    psycopg2's native ``executemany`` issues one server round-trip per row,
+    which dominates runtime on a multi-million-row backfill.  SQLAlchemy's
+    psycopg2 dialect only batches INSERT (``executemany_mode="values_only"``),
+    so UPDATE falls back to that slow path.  Use psycopg2's ``execute_batch``,
+    which coalesces many statements into a single round-trip.
+
+    SQLite's executemany is in-process and already fast, so it takes the plain
+    SQLAlchemy path.
+    """
+    if conn.dialect.name != "postgresql":
+        conn.execute(stmt, params)
+        return
+
+    try:
+        from psycopg2.extras import execute_batch
+    except ImportError:  # psycopg3 or another driver — fall back
+        conn.execute(stmt, params)
+        return
+
+    # Render the SQLAlchemy text() clause to the driver's paramstyle (pyformat).
+    compiled = stmt.compile(dialect=conn.dialect)
+    raw_cursor = conn.connection.cursor()
+    try:
+        execute_batch(raw_cursor, str(compiled), params, page_size=1000)
+    finally:
+        raw_cursor.close()
+
+
+def backfill_pbs_time_fields(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
+    """Populate jobs.queued / jobs.eligible_secs / jobs.run_count from job_records.
+
+    These three PBS accounting fields (``qtime``, ``eligible_time``,
+    ``run_count``) were parsed but discarded before this migration.  They are
+    recoverable without re-reading the accounting logs because ``job_records``
+    archives the full raw PbsRecord per job -- which also means this runs
+    against the production CNPG server with no log-archive access.
+
+    Unlike backfill_qos_id() this cannot be pure SQL: each row's blob must be
+    gunzipped and unpickled to reach the attributes.  The records are pickled
+    *unprocessed* (sync never passes ``process=True``), so the attributes are
+    raw strings and the SyncPBSLogs parsers apply directly.  Do NOT call
+    ``PbsRecord.process_record()`` here -- it rewrites ``eligible_time``
+    divided by ``_divisor`` (qhist's display time unit).
+
+    Chunked by primary-key range with per-chunk commit, for the same reasons as
+    backfill_qos_id: bounded lock duration so concurrent syncs interleave,
+    bounded WAL, resumable, and progress visible on a multi-million-row run.
+
+    Rows are considered "not yet processed" when all three columns are NULL, so
+    re-running is cheap.  ``eligible_secs`` legitimately stays NULL where PBS
+    never recorded it (derecho before 2025-01-08, when ``eligible_time_enable``
+    was off); those rows are still marked done via ``queued``/``run_count``,
+    which are present in every accounting record.
+    """
+    import gzip
+    import pickle
+    import time
+
+    from job_history.sync.pbs import SyncPBSLogs
+    from job_history.sync.utils import safe_int
+
+    with engine.connect() as conn:
+        bounds = conn.execute(text("SELECT MIN(id), MAX(id) FROM jobs")).one()
+    lo, hi = bounds[0], bounds[1]
+    if lo is None:
+        print("  jobs table is empty — nothing to backfill.")
+        return
+
+    select_sql = text("""
+        SELECT j.id, r.compressed_data
+        FROM jobs j
+        JOIN job_records r ON r.job_id = j.id
+        WHERE j.id >= :lo AND j.id < :hi
+          AND j.queued IS NULL
+          AND j.eligible_secs IS NULL
+          AND j.run_count IS NULL
+    """)
+    update_sql = text("""
+        UPDATE jobs
+        SET queued = :queued, eligible_secs = :eligible_secs, run_count = :run_count
+        WHERE id = :id
+    """)
+
+    total_chunks = (hi - lo) // chunk_size + 1
+    print(f"  Backfilling jobs.queued/eligible_secs/run_count in {total_chunks:,} chunk(s) "
+          f"of {chunk_size:,} ids over range [{lo:,}, {hi:,}] …")
+
+    start = time.monotonic()
+    total_updated = total_undecodable = 0
+    chunk_idx = 0
+    chunk_lo = lo
+    while chunk_lo <= hi:
+        chunk_hi = chunk_lo + chunk_size
+        chunk_idx += 1
+        with engine.begin() as conn:
+            rows = conn.execute(select_sql, {"lo": chunk_lo, "hi": chunk_hi}).all()
+            params = []
+            for job_pk, blob in rows:
+                try:
+                    rec = pickle.loads(gzip.decompress(blob))
+                except Exception:
+                    total_undecodable += 1
+                    continue
+                params.append({
+                    "id": job_pk,
+                    "queued": SyncPBSLogs.parse_pbs_timestamp(getattr(rec, "qtime", None)),
+                    "eligible_secs": SyncPBSLogs.parse_pbs_time(getattr(rec, "eligible_time", None)),
+                    "run_count": safe_int(getattr(rec, "run_count", None)),
+                })
+            if params:
+                _executemany_update(conn, update_sql, params)
+        n = len(params)
+        total_updated += n
+
+        is_last = chunk_hi > hi
+        if total_chunks <= 20 or chunk_idx % 10 == 0 or is_last:
+            elapsed = time.monotonic() - start
+            print(f"    chunk {chunk_idx:>5,}/{total_chunks:<5,}  "
+                  f"id [{chunk_lo:>12,}, {chunk_hi:>12,})  "
+                  f"updated {n:>7,}  "
+                  f"(total {total_updated:>10,}  "
+                  f"elapsed {elapsed:6.1f}s)")
+        chunk_lo = chunk_hi
+
+    print(f"  Done. Updated {total_updated:,} jobs row(s) total "
+          f"in {time.monotonic() - start:.1f}s.")
+    if total_undecodable:
+        print(f"  WARNING: {total_undecodable:,} job_records blob(s) could not be "
+              f"decompressed/unpickled and were skipped.")
+
+
 def migrate(machine):
     print(f"Updating: {machine}")
     engine = get_engine(machine)
@@ -199,11 +336,19 @@ def migrate(machine):
     _ensure_db_triggers(engine)
     # Backfill jobs.qos_id from existing priority + queue strings
     backfill_qos_id(engine)
+    # Backfill PBS timestamp/wait fields from archived raw records
+    backfill_pbs_time_fields(engine)
     engine.dispose()
     print()
 
 
 def main():
+    # Line-buffer stdout so per-chunk backfill progress is visible while the
+    # migration runs.  Python block-buffers when stdout is not a TTY, which
+    # hides all progress behind a redirect or a pipe — exactly the case for a
+    # long-running production backfill an operator wants to watch.
+    sys.stdout.reconfigure(line_buffering=True)
+
     machines = sys.argv[1:] or sorted(VALID_MACHINES)
     for m in machines:
         if m not in VALID_MACHINES:

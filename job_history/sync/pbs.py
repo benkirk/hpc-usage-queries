@@ -52,16 +52,27 @@ class SyncPBSLogs(SyncBase):
 
     @staticmethod
     def parse_pbs_time(time_str: str) -> int | None:
-        """Convert HH:MM:SS time string to seconds.
+        """Convert a PBS duration to seconds.
+
+        Accepts both ``HH:MM:SS`` and a bare integer count of seconds.  PBS
+        documents ``eligible_time`` both ways -- the Admin Guide's E-record
+        table calls it "in seconds" while the worked example in section
+        4.9.13.8 shows ``eligible_time=00:10:00`` -- and NCAR currently emits
+        the ``HH:MM:SS`` form.  ``Resource_List.walltime`` and
+        ``resources_used.walltime`` are always ``HH:MM:SS``.
 
         Examples:
             >>> SyncPBSLogs.parse_pbs_time("00:14:18")
+            858
+            >>> SyncPBSLogs.parse_pbs_time("858")
             858
         """
         if not time_str:
             return None
         try:
-            parts = time_str.split(":")
+            parts = str(time_str).split(":")
+            if len(parts) == 1:
+                return int(parts[0])
             if len(parts) != 3:
                 return None
             hours, minutes, seconds = map(int, parts)
@@ -238,11 +249,21 @@ class SyncPBSLogs(SyncBase):
             "queue":     pbs_record.queue,
             "status":    pbs_record.Exit_status,
             "submit":    SyncPBSLogs.parse_pbs_timestamp(pbs_record.ctime),
+            "queued":    SyncPBSLogs.parse_pbs_timestamp(getattr(pbs_record, "qtime", None)),
             "eligible":  SyncPBSLogs.parse_pbs_timestamp(pbs_record.etime),
             "start":     SyncPBSLogs.parse_pbs_timestamp(pbs_record.start),
             "end":       SyncPBSLogs.parse_pbs_timestamp(pbs_record.end),
             "walltime":  SyncPBSLogs.parse_pbs_time(resource_list.get("walltime")),
             "elapsed":   SyncPBSLogs.parse_pbs_time(resources_used.get("walltime")),
+            # PBS's own wait accrual: time blocked purely by resource scarcity.
+            # Absent on records predating `eligible_time_enable` (derecho before
+            # 2025-01-08), hence the getattr guard -- PbsRecord sets attributes
+            # dynamically from whatever the log line contains.  Parsed from the
+            # RAW string on purpose: pbsparse's process_record() rewrites this
+            # attribute divided by _divisor (qhist's display time unit), which
+            # would be a silent unit bug here.
+            "eligible_secs": SyncPBSLogs.parse_pbs_time(getattr(pbs_record, "eligible_time", None)),
+            "run_count": safe_int(getattr(pbs_record, "run_count", None)),
             "numcpus":   safe_int(resource_list.get("ncpus")),
             "numgpus":   safe_int(resource_list.get("ngpus")),
             "numnodes":  safe_int(resource_list.get("nodect")),
@@ -261,7 +282,14 @@ class SyncPBSLogs(SyncBase):
         }
 
         # Fix start=0 (Unix epoch) — calculate from end - elapsed
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        #
+        # `epoch` must be NAIVE: parse_pbs_timestamp() returns naive UTC, and in
+        # Python an aware datetime never compares equal to a naive one, so an
+        # aware sentinel here silently disables both repairs below.  Records
+        # with start=0 then fail validate_timestamp_ordering() (eligible <= start
+        # is false against 1970) and are dropped instead of reconstructed --
+        # ~0.03% of E records carry start=0.
+        epoch = datetime(1970, 1, 1)
         if result["start"] == epoch and result["end"] is not None and result["elapsed"] is not None:
             result["start"] = result["end"] - timedelta(seconds=result["elapsed"])
 

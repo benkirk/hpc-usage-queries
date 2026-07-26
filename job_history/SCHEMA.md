@@ -72,12 +72,15 @@ Core job records with foreign keys to normalized tables.
 | `qos_id` | INTEGER | FK, YES | → job_qos.id (resolved at sync time from `priority` + `queue`) |
 | `name` | TEXT | NO | Job name |
 | `status` | TEXT | YES | Completion status |
-| `submit` | DATETIME | YES | Submission time (naive UTC — see note below) |
-| `eligible` | DATETIME | NO | Eligible time (naive UTC) |
+| `submit` | DATETIME | YES | PBS `ctime` — job creation (naive UTC — see note below) |
+| `queued` | DATETIME | NO | PBS `qtime` — entered *current* queue; reset by routing |
+| `eligible` | DATETIME | NO | PBS `etime` — reset by queue move **and** hold/release |
 | `start` | DATETIME | YES | Start time (naive UTC) |
 | `end` | DATETIME | YES | End time (naive UTC) |
 | `elapsed` | INTEGER | NO | Runtime (seconds) |
 | `walltime` | INTEGER | NO | Requested walltime (seconds) |
+| `eligible_secs` | INTEGER | NO | PBS `eligible_time` — resource-blocked wait (seconds); see note |
+| `run_count` | INTEGER | NO | PBS `run_count`; `> 1` means the job was requeued |
 | `numcpus` | INTEGER | NO | CPUs allocated |
 | `numgpus` | INTEGER | NO | GPUs allocated |
 | `numnodes` | INTEGER | NO | Nodes allocated |
@@ -102,6 +105,51 @@ Core job records with foreign keys to normalized tables.
 > the server's local timezone first, causing a skew (e.g., 6 hours on a
 > Mountain-Time server).  Naive values are stored and compared as-is on both
 > SQLite and PostgreSQL regardless of server timezone.
+
+#### Wait time: use `eligible_secs`, not `start - submit`
+
+`eligible_secs` is PBS's own `eligible_time` accrual: the cumulative wall time a
+job was blocked **purely by resource scarcity**.  Time blocked by user or system
+holds, unsatisfied dependencies, `qsub -a` start-time deferral, or project/user/
+group run limits accrues instead to PBS's `ineligible_time`, which PBS **never**
+writes to accounting logs.  `eligible_time` survives requeue and `qmove` — PBS
+guarantees it only ever increases over a job's life.
+
+Neither `submit` nor `eligible` is a substitute:
+
+- `start - submit` counts held, dependency-blocked, and deferred time as if the
+  site had made the user wait.
+- `start - eligible` looks better but is *the same measurement in practice*:
+  `qtime == etime` on 77,152 of 77,154 sampled derecho E records, and
+  `eligible == submit` on 98.7% of rows in the live DB.  Measured against
+  `eligible_time` on 77k records, the medians are 141 s vs 30 s and the p90s are
+  23,437 s vs 11,721 s; 27% of non-array jobs disagree by more than 60 s.  For
+  unconstrained jobs the two agree within ~2 s — the entire divergence is a
+  negative tail, e.g. a job showing a 35-day `start - submit` wait has 17 s of
+  eligible time.
+
+`NULL` means "PBS did not record it" and is distinct from `0`.  Availability is
+gated by the `eligible_time_enable` server attribute, which was enabled at
+different times per machine:
+
+| machine | `queued` / `run_count` | `eligible_secs` |
+|---|---|---|
+| casper | all history (2024-01 →) | all history (2024-01 →) |
+| derecho | all history (2024-01 →) | **2025-01-08 →** only |
+
+`JobQueries.job_waits_by_resource()` filters `eligible_secs IS NOT NULL`, so
+derecho reports covering dates before 2025-01-08 exclude those jobs rather than
+silently mixing two different wait definitions.
+
+> **Array-parent caveat**: array-*parent* rows (job ids like `6896760[].desched1`,
+> ~1% of rows) carry an `eligible_time` accrued across the whole array's
+> lifetime, so it can exceed that record's own `start - submit` by hours.  Array
+> subjobs and ordinary jobs are well behaved (median +2 s).
+
+> **Do not** derive `eligible_secs` from `pbsparse`'s processed record.
+> `PbsRecord.process_record()` rewrites the `eligible_time` attribute *divided by*
+> `self._divisor` (qhist's display time unit: 1 = s, 60 = min, 3600 = hr).  Sync
+> parses the raw `HH:MM:SS` string instead.
 
 ### users, accounts, queues
 
@@ -314,19 +362,25 @@ ORDER BY s.date;
 
 ### Queue Wait Times
 
+Portable across SQLite and PostgreSQL — `eligible_secs` is already an integer
+count of seconds, so no dialect-specific date arithmetic is needed.
+
 ```sql
 SELECT q.queue_name,
        COUNT(*) as jobs,
-       AVG(strftime('%s', j.start) - strftime('%s', j.submit))/60.0 as avg_wait_min,
-       MEDIAN(strftime('%s', j.start) - strftime('%s', j.submit))/60.0 as median_wait_min
+       AVG(j.eligible_secs)/60.0 as avg_wait_min,
+       MAX(j.eligible_secs)/60.0 as max_wait_min
 FROM jobs j
 JOIN queues q ON j.queue_id = q.id
-WHERE j.start IS NOT NULL
-  AND j.submit IS NOT NULL
+WHERE j.eligible_secs IS NOT NULL
   AND j.end >= '2025-01-01'
 GROUP BY q.queue_name
 ORDER BY avg_wait_min DESC;
 ```
+
+The `IS NOT NULL` guard matters: without it `COUNT(*)` counts jobs that `AVG`
+skipped.  See *Wait time: use `eligible_secs`* above for why `start - submit` is
+not a valid substitute.
 
 ## Performance Characteristics
 

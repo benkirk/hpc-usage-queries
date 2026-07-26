@@ -256,9 +256,13 @@ If the underlying query method needs the `--group-by` value as a
 - FKs: `user_id`, `account_id`, `queue_id` → lookup tables
 - Hybrid properties `user`, `account`, `queue` — read/write text transparently
 - Resource fields: `numcpus`, `numgpus`, `numnodes`, `memory`, `cputype`, `gputype`
-- **Naive UTC timestamps**: `submit`, `eligible`, `start`, `end` stored as timezone-naive
-  UTC datetimes so they round-trip correctly through both PostgreSQL (any server timezone)
-  and SQLite without conversion skew
+- **Naive UTC timestamps**: `submit`, `queued`, `eligible`, `start`, `end` stored as
+  timezone-naive UTC datetimes so they round-trip correctly through both PostgreSQL
+  (any server timezone) and SQLite without conversion skew
+- **Wait time is `eligible_secs`** (PBS `eligible_time`), not `start - submit`: it counts
+  only time blocked on resource scarcity, excluding holds, dependencies, and `qsub -a`
+  deferral.  NULL where PBS never recorded it (derecho before 2025-01-08).
+  See `SCHEMA.md` § *Wait time: use `eligible_secs`*
 - Unique constraint on `(job_id, submit)` prevents duplicates
 
 **users / accounts / queues** — Normalized lookup tables (integer FK joins)
