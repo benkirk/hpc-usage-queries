@@ -236,7 +236,7 @@ def backfill_pbs_time_fields(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK
 
     Rows are considered "not yet processed" when all three columns are NULL, so
     re-running is cheap.  ``eligible_secs`` legitimately stays NULL where PBS
-    never recorded it (derecho before 2025-01-08, when ``eligible_time_enable``
+    never recorded it (derecho before 2025-01-07 17:47:50 UTC, when ``eligible_time_enable``
     was off); those rows are still marked done via ``queued``/``run_count``,
     which are present in every accounting record.
     """

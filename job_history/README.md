@@ -261,7 +261,7 @@ If the underlying query method needs the `--group-by` value as a
   (any server timezone) and SQLite without conversion skew
 - **Wait time is `eligible_secs`** (PBS `eligible_time`), not `start - submit`: it counts
   only time blocked on resource scarcity, excluding holds, dependencies, and `qsub -a`
-  deferral.  NULL where PBS never recorded it (derecho before 2025-01-08).
+  deferral.  NULL where PBS never recorded it (derecho before 2025-01-07 17:47:50 UTC).
   See `SCHEMA.md` § *Wait time: use `eligible_secs`*
 - Unique constraint on `(job_id, submit)` prevents duplicates
 

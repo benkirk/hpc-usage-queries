@@ -453,7 +453,7 @@ class TestPbsWaitFields:
         """Records predating eligible_time_enable have no such attribute.
 
         PbsRecord sets attributes dynamically from the log line, so derecho
-        records before 2025-01-08 simply lack eligible_time entirely.
+        records before 2025-01-07 17:47:50 UTC simply lack eligible_time entirely.
         """
         result = parse_pbs_record(self._record(), "derecho")
         assert result["eligible_secs"] is None

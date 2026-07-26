@@ -506,7 +506,8 @@ class JobQueries:
         # Build subquery.  The IS NOT NULL filter is required, not redundant:
         # func.avg already skips NULLs, but func.count(id) below would not, so
         # without it #-Jobs would count jobs excluded from the average.  Jobs
-        # predating `eligible_time_enable` (derecho before 2025-01-08) are
+        # predating `eligible_time_enable` (derecho before 2025-01-07
+        # 17:47:50 UTC) are
         # dropped rather than silently mixed with a different wait definition.
         subquery = self.session.query(
             Job.id,

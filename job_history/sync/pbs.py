@@ -257,7 +257,7 @@ class SyncPBSLogs(SyncBase):
             "elapsed":   SyncPBSLogs.parse_pbs_time(resources_used.get("walltime")),
             # PBS's own wait accrual: time blocked purely by resource scarcity.
             # Absent on records predating `eligible_time_enable` (derecho before
-            # 2025-01-08), hence the getattr guard -- PbsRecord sets attributes
+            # 2025-01-07 17:47:50 UTC), hence the getattr guard -- PbsRecord sets
             # dynamically from whatever the log line contains.  Parsed from the
             # RAW string on purpose: pbsparse's process_record() rewrites this
             # attribute divided by _divisor (qhist's display time unit), which

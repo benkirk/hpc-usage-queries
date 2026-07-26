@@ -135,10 +135,10 @@ different times per machine:
 | machine | `queued` / `run_count` | `eligible_secs` |
 |---|---|---|
 | casper | all history (2024-01 →) | all history (2024-01 →) |
-| derecho | all history (2024-01 →) | **2025-01-08 →** only |
+| derecho | all history | **2025-01-07 17:47:50 UTC →** only |
 
 `JobQueries.job_waits_by_resource()` filters `eligible_secs IS NOT NULL`, so
-derecho reports covering dates before 2025-01-08 exclude those jobs rather than
+derecho reports covering dates before 2025-01-07 17:47:50 UTC exclude those jobs rather than
 silently mixing two different wait definitions.
 
 > **Array-parent caveat**: array-*parent* rows (job ids like `6896760[].desched1`,

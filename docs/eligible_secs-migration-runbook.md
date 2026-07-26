@@ -34,18 +34,21 @@ Three new `jobs` columns, all populated from the PBS `E` record:
 
 ## State as of 2026-07-26
 
-| target | schema | backfill |
-|---|---|---|
-| local dev PG (containers) | done, both machines | **complete**, both — acceptance passed |
-| **prod CNPG derecho** (15.73M rows) | **done** | **in progress**, ~45% |
-| **prod CNPG casper** (26.65M rows) | not started | not started |
+| target | schema | backfill | vacuum |
+|---|---|---|---|
+| local dev PG (containers) | done, both | **complete**, both — acceptance passed | done |
+| **prod CNPG derecho** (15.73M rows) | **done** | **complete** — acceptance passed, 48.2% `eligible_secs` | done |
+| **prod CNPG casper** (26.65M rows) | **done** | **in progress** | pending |
 
-Prod backfill was running from a laptop over the WAN at ~3,600–3,970 rows/s
-(local was 10,441/s). Not the bottleneck it might have been; see
+Prod derecho took 4,468 s (74.5 min) at 3,521 rows/s from a laptop over the WAN;
+local was 10,441 rows/s. Not the bottleneck it might have been; see
 [performance](#performance-notes).
 
-Not yet done anywhere on prod: `VACUUM (ANALYZE) jobs`, and deploying this branch
-so that *newly synced* jobs populate the columns going forward.
+**Still outstanding on prod:** casper backfill + vacuum, and deploying this branch
+where sync runs. Until that deploy, every newly synced job lands with the three
+columns NULL — prod derecho already had 35 such rows within minutes of finishing.
+They are swept by simply re-running `bin/update_jobs_db.py <machine>` after the
+deploy, so plan on one final pass per machine.
 
 ---
 
@@ -165,11 +168,14 @@ part of that.
 
 ## The derecho history gap (not a bug)
 
-`eligible_secs` is **permanently NULL for derecho jobs before 2025-01-08.**
+`eligible_secs` is **permanently NULL for derecho jobs ending before
+2025-01-07 17:47:50 UTC.**
 
 PBS only accrues and emits `eligible_time` when the `eligible_time_enable` server
-attribute is True; it defaults to False. Someone enabled it on derecho's PBS
-server around 2025-01-07. Per the PBS Admin Guide §4.9.13.6:
+attribute is True; it defaults to False. It was switched on for derecho's PBS
+server at **2025-01-07 17:47:50 UTC** (10:47 Mountain) — pinned exactly from prod,
+where the first row with a non-null `eligible_secs` is `id = 8,145,518`. Per the
+PBS Admin Guide §4.9.13.6:
 
 > When `eligible_time_enable` is set to False, PBS does not track `eligible_time`.
 > … Accounting logs do not show `eligible_time` for any job submitted before or
