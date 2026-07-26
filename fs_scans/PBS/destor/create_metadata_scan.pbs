@@ -5,7 +5,7 @@
 #PBS -j oe
 #PBS -q casper
 #PBS -l walltime=24:00:00
-#PBS -l select=1:ncpus=8:mpiprocs=1:ompthreads=8:mem=12G
+#PBS -l select=1:ncpus=16:mpiprocs=1:ompthreads=16:mem=12G
 
 #----------------------------------------------------------------------------
 # Determine the directory containing this script, compatible with bash and zsh
@@ -31,9 +31,6 @@ TARGET_DIR=$(realpath ${TARGET_DIR})
 echo "TARGET_DIR=${TARGET_DIR}"
 
 source ${TOP_DIR}/etc/config_env.sh
-which python3
-
-module load peak-memusage
 hostname
 w
 free -g
@@ -58,7 +55,9 @@ echo && echo ${sep}
 # re-parses/flattens its arguments and drops the quoting, which strips the
 # target path from the scanner. The walk is light on memory anyway (PBS records
 # resources_used.mem); plain `time` is enough here.
-time ${TOP_DIR}/bin/lustre_scan_depth.sh ${TARGET_DIR} 1>/dev/null 2>scan.err
+
+setfacl -RPm u:csgteam:rwX . || true
+time sudo -u csgteam ${TOP_DIR}/bin/lustre_scan_depth.sh ${TARGET_DIR} 1>/dev/null 2>scan.err
 
 echo && echo ${sep}
 ls -lh ${proc_dir}/*.lfs-scan

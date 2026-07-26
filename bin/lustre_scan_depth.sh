@@ -10,6 +10,14 @@ echo scan_dirname=${scan_dirname}
 ofile="$(date +%Y%m%d)_desc1_${scan_dirname}.lfs-scan"
 echo "ofile=${ofile}"
 
+# Number of parallel xargs workers. The scan is MDS-RPC-latency-bound, not
+# CPU-bound: the useful ceiling is the client's in-flight metadata RPC budget
+# (desc1 = 4 MDTs x max_rpcs_in_flight 8 = 32), so 32 matches the default cap.
+# Raise alongside `lctl set_param mdc.*.max_rpcs_in_flight` if running privileged.
+# See docs/plans/LUSTRE_SCAN_TUNING.md.
+nprocs="${LUSTRE_SCAN_NPROCS:-32}"
+echo "nprocs=${nprocs}"
+
 rm -f ${ofile}*
 
 # lfs find command to inspect a single directory to be
@@ -59,7 +67,7 @@ EOF
 
 #----------------------------------------------
 find ${path} -depth -type d -readable -print0 | \
-    xargs -0 -n 1 -P 8 --process-slot-var=XARGS_RANK \
+    xargs -0 -n 1 -P ${nprocs} --process-slot-var=XARGS_RANK \
           bash -c 'lfs_cmd ${@}' _
 
 #----------------------------------------------
