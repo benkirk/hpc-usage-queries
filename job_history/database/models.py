@@ -333,14 +333,22 @@ class Job(LookupMixin, Base):
     status = Column(Text, index=True)
 
     # Timestamps (stored in UTC)
-    submit = Column(DateTime, index=True)
-    eligible = Column(DateTime)
+    submit = Column(DateTime, index=True)   # PBS ctime — job creation; never reset
+    queued = Column(DateTime)               # PBS qtime — entered *current* queue; reset by routing
+    eligible = Column(DateTime)             # PBS etime — reset by queue move AND hold/release
     start = Column(DateTime, index=True)
     end = Column(DateTime, index=True)
 
     # Time metrics (in seconds)
     elapsed = Column(Integer)
     walltime = Column(Integer)
+    # PBS eligible_time: cumulative wall time blocked *purely by resource
+    # scarcity*.  Time blocked by holds, dependencies, `qsub -a` deferral, or
+    # user/group run limits accrues to PBS's ineligible_time, which is never
+    # written to accounting logs.  Survives requeue and qmove.  NULL means "PBS
+    # did not record it" (eligible_time_enable was off) and is distinct from 0.
+    eligible_secs = Column(Integer)
+    run_count = Column(Integer)             # PBS run_count; > 1 means requeued
 
     # Resource allocation
     numcpus = Column(Integer)

@@ -28,8 +28,8 @@ MACHINE_SCHEDULERS = {
 
 # Job fields updated during an upsert (excludes identity/key columns).
 UPDATABLE_JOB_FIELDS = frozenset({
-    "start", "eligible",                                         # correctable timestamps
-    "elapsed", "walltime",                                       # timing metrics
+    "start", "eligible", "queued",                               # correctable timestamps
+    "elapsed", "walltime", "eligible_secs", "run_count",         # timing metrics
     "numcpus", "numgpus", "numnodes", "mpiprocs", "ompthreads",  # resources
     "reqmem", "memory", "vmemory",                               # memory
     "cputype", "gputype",                                        # type inference
