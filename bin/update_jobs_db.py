@@ -239,6 +239,16 @@ def backfill_pbs_time_fields(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK
     never recorded it (derecho before 2025-01-07 17:47:50 UTC, when ``eligible_time_enable``
     was off); those rows are still marked done via ``queued``/``run_count``,
     which are present in every accounting record.
+
+    Operational note for a repeat of this kind of migration: any job synced by
+    the *old* code between this backfill finishing and the new code going live
+    lands with the columns NULL, and needs a second pass to sweep.  Deploying
+    while the backfill is still running avoids that window entirely -- when this
+    ran against prod, casper was deployed mid-backfill and ended with zero
+    stragglers, while derecho finished ~2 h before its deploy and accrued ~650.
+    The sweep is cheap either way: the chunk query filters on the NULL guard
+    before PostgreSQL materializes ``compressed_data``, so blobs move only for
+    rows that actually need updating.
     """
     import gzip
     import pickle
