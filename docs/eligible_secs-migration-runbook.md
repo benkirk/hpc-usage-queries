@@ -34,21 +34,30 @@ Three new `jobs` columns, all populated from the PBS `E` record:
 
 ## State as of 2026-07-26
 
-| target | schema | backfill | vacuum |
-|---|---|---|---|
-| local dev PG (containers) | done, both | **complete**, both — acceptance passed | done |
-| **prod CNPG derecho** (15.73M rows) | **done** | **complete** — acceptance passed, 48.2% `eligible_secs` | done |
-| **prod CNPG casper** (26.65M rows) | **done** | **in progress** | pending |
+| target | schema | backfill | vacuum | acceptance |
+|---|---|---|---|---|
+| local dev PG (containers) | done | done, both | done | passed |
+| **prod CNPG derecho** (15.73M rows) | done | done — 4,468 s @ 3,521 rows/s | done | **passed**, 48.2% `eligible_secs` |
+| **prod CNPG casper** (26.66M rows) | done | done — 7,167 s @ 3,720 rows/s | done | **passed**, 100% `eligible_secs` |
 
-Prod derecho took 4,468 s (74.5 min) at 3,521 rows/s from a laptop over the WAN;
-local was 10,441 rows/s. Not the bottleneck it might have been; see
-[performance](#performance-notes).
+The branch is deployed on casper and derecho and runs from cron at 5-minute
+intervals; new jobs land with all three columns populated (verified live).
 
-**Still outstanding on prod:** casper backfill + vacuum, and deploying this branch
-where sync runs. Until that deploy, every newly synced job lands with the three
-columns NULL — prod derecho already had 35 such rows within minutes of finishing.
-They are swept by simply re-running `bin/update_jobs_db.py <machine>` after the
-deploy, so plan on one final pass per machine.
+**One item outstanding: sweep derecho's 652 straggler rows.**
+
+```bash
+python bin/update_jobs_db.py derecho     # minutes, not hours
+```
+
+Those are rows synced by the *old* code between derecho's backfill finishing and
+the deploy going live. The set is closed — it stopped growing the moment cron
+picked up the new code — so this can wait indefinitely. Casper has **zero**
+stragglers because the deploy landed while its backfill was still running.
+
+The sweep is cheap because the chunk query filters `queued IS NULL` before
+PostgreSQL materializes `compressed_data`, so blobs move only for the few
+straggler rows. For scale reference, casper's `qos_id` pass — the same 267-chunk
+scan with zero matches — took 177 s.
 
 ---
 
