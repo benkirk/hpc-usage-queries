@@ -56,7 +56,7 @@ echo && echo ${sep}
 # target path from the scanner. The walk is light on memory anyway (PBS records
 # resources_used.mem); plain `time` is enough here.
 
-setfacl -RPm u:csgteam:rwX .
+setfacl -RPm u:csgteam:rwX . || true
 time sudo -u csgteam ${TOP_DIR}/bin/lustre_scan_depth.sh ${TARGET_DIR} 1>/dev/null 2>scan.err
 
 echo && echo ${sep}
