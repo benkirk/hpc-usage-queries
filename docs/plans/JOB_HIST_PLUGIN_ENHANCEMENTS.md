@@ -24,6 +24,11 @@ wait/resource range filters, plus a new `jobs_facets()` for live filter-dropdown
 counts — all sharing one filter helper so a paginated UI's total can never
 disagree with its rows.
 
+**The plugin and SAM will be deployed together**, and SAM can pin any plugin SHA
+via `HPC_USAGE_QUERIES_REF` for local dev. So this PR takes three deliberately
+breaking cleanups (§7) instead of adding compatibility shims for warts we
+control both ends of.
+
 ## Measured cost (local dev PG 18, derecho 13.0M rows; one month = 304k rows)
 
 Everything below is warm, machine-wide, on the localhost dev container.
@@ -119,6 +124,9 @@ min_eligible_secs, max_eligible_secs,
 min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus
 ```
 
+and, per §7, **remove** `has_gpus` and **rename** `status` → `exit_status`
+across the same three signatures.
+
 Flat scalar kwargs, not a `{'nodes': (1, 8)}` dict: the published JSON `filters`
 contract is flat, the Click options are flat, every existing filter on this
 method is flat, and a keyword-only signature turns a typo into an instant
@@ -149,11 +157,9 @@ silently returning a total that disagrees with the page.
   (`AVG` skips NULLs, `COUNT(id)` doesn't). Here `jobs_count` runs the identical
   predicate through the same helper, so the count is the row count by
   construction.
-- `min_gpus=1` ≡ `has_gpus=True`. `max_gpus=0` is **not** `has_gpus=False`: the
-  latter unions in `numgpus IS NULL`. Keep the range filters NULL-strict —
-  `numnodes IS NULL` genuinely means "unknown" — document the asymmetry rather
-  than papering over it with `coalesce`. In practice no row has a NULL here, so
-  this is theoretical.
+- Range filters are NULL-strict (`numnodes IS NULL` genuinely means "unknown").
+  With `has_gpus` removed (§7b) there is no longer a competing NULL-inclusive
+  variant to reconcile, so this is uniform across all six bounds.
 - SQLite `GLOB` honours `[abc]` character classes; the PG regex path treats `[`
   as a literal. Inherited from fs_scans. Document; stick to `*` and `?`.
 
@@ -163,7 +169,7 @@ Placed after `jobs_count`. Signature mirrors the full filter set exactly (so it
 can never drift from the rows it describes), plus:
 
 ```python
-facets: Sequence[str] = DEFAULT_FACETS,   # ('queue', 'qos', 'status')
+facets: Sequence[str] = DEFAULT_FACETS,   # ('queue', 'qos', 'exit_status')
 self_exclude: bool = True,
 limit: Optional[int] = None,
 ```
@@ -226,7 +232,8 @@ Each new option must also be added to the `filters={...}` dict in
 one silently drops it from the published envelope. Normalize Click's `()` to
 `None` so "unset" stays `null` rather than becoming `[]`.
 
-`has_gpus`/`offset`/`sort_by`/`sort_dir` stay API-only as today.
+`offset`/`sort_by`/`sort_dir` stay API-only as today. `--status` becomes
+`--exit-status` (§7c).
 
 Document the unindexed-scan reality in three places: the `-N`/`--min-*` help
 text, the `search` command docstring (Click prints it above the options), and
@@ -242,9 +249,9 @@ the `jobs_search` docstring.
 - **Delete `_TimeDiffHours`** (`queries/builders.py:79-105`). Dead since `b044414`
   replaced its only call site. The SAM-consumer check that was deferred came
   back clean: no `julianday`/`EXTRACT(EPOCH` counterpart anywhere in SAM's `src/`.
-- **Fix the `status` docstrings** — `queries/jobs.py:999,1028,1111` and
-  `cli/cmds/jobhist.py:211` say *"e.g. 'F' for finished"*. It's PBS
-  `Exit_status`. Say so, and note `'0'` is success.
+- The wrong *"e.g. 'F' for finished"* docstrings (`queries/jobs.py:999,1028,1111`,
+  `cli/cmds/jobhist.py:211`) are subsumed by the §7c rename — fix the prose in
+  the same pass, and note `'0'` is success.
 
 ## 6. Docs
 
@@ -252,13 +259,92 @@ the `jobs_search` docstring.
   correction.
 - `CLAUDE.md:134` — currently credits only `fs_scans/core/query_builder.py` with
   dialect-aware GLOB/regex; `job_history/queries/builders.py` now has it too.
+- `CLAUDE.md` — record the new public `job_history.columns` export (§7a) in the
+  key-files table, since it becomes part of the SAM-facing contract.
+
+## 7. Breaking cleanups (coordinated deploy)
+
+All three are cheap to land and each removes something actively misleading. The
+full blast radius is 8 plugin sites and 4 SAM sites; verified by grep, listed
+below so nothing is discovered late.
+
+### 7a. Promote the column registry out of `cli/`
+
+Move `job_history/cli/search/columns.py` → **`job_history/columns.py`** and
+re-export `COLUMNS`, `DEFAULT_COLUMNS`, `VERBOSE_COLUMNS`, `project_row` from
+`job_history/__init__.py` (which today exports only `database` + `JobQueries`
+symbols).
+
+This isn't cosmetic. The registry is query-layer metadata that happens to live
+in the CLI package, which forces `queries/jobs.py` to import it *lazily inside
+function bodies* at `:33` and `:1148` — the comment there says so outright:
+*"Local import keeps the queries package importable without cli/."* Moving it
+lets both become normal module-level imports and deletes the cycle.
+
+Update, then delete the old module (no shim):
+`queries/jobs.py:33,1085,1148`, `cli/search/__init__.py:3`,
+`cli/search/builders.py:10`, `cli/search/commands.py:16`,
+`tests/test_jobs_search.py:13`. SAM: the function-local import at
+`webapp/jobs/routes.py:312`.
+
+### 7b. Remove `has_gpus`
+
+Superseded by `min_gpus`/`max_gpus`. Its one distinguishing behaviour —
+`has_gpus=False` matching `numgpus IS NULL` — has never matched a row (0 NULLs
+in 34M). Removing it deletes the `max_gpus=0` ≠ `has_gpus=False` asymmetry that
+would otherwise need a docstring paragraph and a test to pin.
+
+Plugin: `queries/jobs.py:1073,1112,1182,1208,1224,1248,1273-1275`; the four
+`test_has_gpus_*` tests at `tests/test_jobs_search.py:437-461` and the assertions
+at `:642-643` are rewritten against `min_gpus`/`max_gpus`.
+
+SAM: `webapp/jobs/service.py:73,99,141,161,178,194`. Note `:194` — `has_gpus` is
+one of the predicates that makes `count_jobs` abandon the fast
+`comp_charge_summary` path and fall through to the plugin; that predicate must
+switch to the new kwargs, not silently drop.
+
+**Do not touch SAM's other `has_gpus`.** `system_status/queries/user_proj_queues.py`,
+`webapp/dashboards/charts.py`, `dashboards/status/blueprint.py`, and two
+`status/partials/*.html` templates use the same identifier for an unrelated
+"does this scope have GPU activity" flag. Same name, different feature.
+
+### 7c. Rename `status` → `exit_status`
+
+`Job.status` is PBS `Exit_status` (`sync/pbs.py:250`) — all-numeric, 192/135
+distinct values, zero non-numeric across both machines. The name invites exactly
+the mistake the current docstrings make.
+
+Rename the **user-facing surfaces only**: the `COLUMNS` key (`source` stays
+`"job.status"`), the `jobs_search`/`jobs_count`/`jobs_facets` parameter, the
+facet dimension name, and the CLI flag `--status` → `--exit-status`. Also rename
+on the legacy `jobs_by_user`/`jobs_by_account` (`jobs.py:990,1020`) for
+consistency — unused by SAM, cheap to keep in step.
+
+**Deliberately not renamed: the DB column and the ORM attribute.** Keeping
+`Job.status` mapped to column `status` means no prod migration, and leaves
+`sync/pbs.py:250` and the `Job.__table__.columns` filtering in
+`_bulk_insert_jobs` (`sync/base.py:648`) untouched — that path keys off column
+names, so an attribute rename there is a real risk for no user-visible gain.
+Add a one-line comment on the model saying the attribute mirrors the DB column
+while the query API says `exit_status`.
+
+Plugin: `queries/jobs.py:990,999,1020,1028,1072,1111,1182,1207,1224`,
+`cli/cmds/jobhist.py:210,236`, `cli/search/commands.py:29,49`, the `COLUMNS` key.
+SAM: `webapp/jobs/service.py:137`, `routes.py:68` (`_VERBOSE_EXTRAS`), `:172`
+(request arg), `cli/accounting/commands.py:1788` (`JOB_COLUMNS`).
+
+Because the `COLUMNS` key is also the **row-dict key** returned by `jobs_search`,
+SAM's column tuples must change in the same deploy or its table renders a blank
+column. That is the one place the coordination actually matters.
 
 ## Explicitly out of scope
 
-- **All SAM-side work.** Noted for whoever picks it up: `_VERBOSE_EXTRAS`
-  (`webapp/jobs/routes.py:67-76`) doesn't list `queued`/`eligible_secs`/`run_count`
-  yet, and `_SORT_WHITELIST` derives from `_DEFAULT_COLS`. Exit-code bucketing
-  for a human-readable status facet belongs in SAM, not here.
+- **SAM-side feature work.** The §7 renames require mechanical SAM edits in the
+  same deploy (enumerated above), but nothing beyond that. Still SAM's job, not
+  this PR's: adding `queued`/`eligible_secs`/`run_count` to `_VERBOSE_EXTRAS`
+  (`webapp/jobs/routes.py:67-76`, which also feeds `_SORT_WHITELIST` via
+  `_DEFAULT_COLS`), wiring the glob into a search box, calling `jobs_facets`,
+  caching, and bucketing raw exit codes into human labels.
 - **No index on `Job.name`** — decided after measuring. A plain B-tree can't
   serve `LIKE 'foo%'` at all under the `en_US.utf8` collation (would need
   `text_pattern_ops`), and even then only helps left-anchored patterns, never
@@ -298,7 +384,13 @@ the `jobs_search` docstring.
    aggregate statement against `jobs`, and assert it contains `jobs.queue_id` but
    **not** `SELECT queues.queue_name`. That's the regression guard that matters
    most; it fails loudly if someone "simplifies" the FK back to the hybrid.
-7. **End-to-end against local dev PG** (13M/21M rows, `.env` on localhost):
+7. **Breaking-change sweep.** After §7, grep both repos for the retired names —
+   `has_gpus` (excluding SAM's unrelated `system_status`/`charts`/`status`
+   usages), `status=` as a search kwarg, and `cli.search.columns` — and confirm
+   zero stale references. Import `job_history` in a fresh interpreter to prove
+   the `queries`↔`cli` cycle is gone and the local imports at `jobs.py:33,1148`
+   can be module-level.
+8. **End-to-end against local dev PG** (13M/21M rows, `.env` on localhost):
    ```
    jobhist search -m derecho --start-date 2026-06-01 --end-date 2026-06-30 \
        -N 'cesm_*' -i --min-wait-hours 1 --min-nodes 2 --limit 20
@@ -307,3 +399,7 @@ the `jobs_search` docstring.
    ```
    Confirm a facets call over the same window lands near the measured
    ~150-200 ms.
+9. **SAM smoke test** by pinning `HPC_USAGE_QUERIES_REF` to this branch's SHA
+   and loading the existing jobs drill-down drawer — it exercises `jobs_search`,
+   `jobs_count`, `list_qos_names`, and the `COLUMNS` import in one page, so it
+   catches all three §7 renames at once.
