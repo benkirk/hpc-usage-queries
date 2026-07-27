@@ -251,6 +251,21 @@ def daily_summary(jh_ctx: Context):
 @click.option("--max-gpus", type=click.IntRange(min=0), default=None,
               help="Only jobs using at most N GPUs (--max-gpus 0 selects "
                    "CPU-only jobs).")
+@click.option("--min-elapsed-hours", type=click.FloatRange(min=0), default=None,
+              metavar="H",
+              help="Only jobs that ran (elapsed walltime used) at least H "
+                   "hours. UNINDEXED - pair with --start-date/--end-date.")
+@click.option("--max-elapsed-hours", type=click.FloatRange(min=0), default=None,
+              metavar="H",
+              help="Only jobs that ran at most H hours.")
+@click.option("--min-reqmem-gb", type=click.FloatRange(min=0), default=None,
+              metavar="GB",
+              help="Only jobs that REQUESTED at least GB gigabytes of memory "
+                   "(PBS Resource_List.mem, not memory used). UNINDEXED - "
+                   "pair with --start-date/--end-date.")
+@click.option("--max-reqmem-gb", type=click.FloatRange(min=0), default=None,
+              metavar="GB",
+              help="Only jobs that requested at most GB gigabytes of memory.")
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Show all columns instead of the default subset.")
 @click.option("--display", default=None,
@@ -262,6 +277,7 @@ def search(jh_ctx: Context, start_date, end_date, machine,
            user, account, queue, qos, exit_status, job_id,
            name, ignore_case, min_wait_hours, max_wait_hours,
            min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus,
+           min_elapsed_hours, max_elapsed_hours, min_reqmem_gb, max_reqmem_gb,
            verbose, display, limit):
     """List individual job records matching the filters.
 
@@ -285,6 +301,8 @@ def search(jh_ctx: Context, start_date, end_date, machine,
         min_nodes=min_nodes, max_nodes=max_nodes,
         min_cpus=min_cpus, max_cpus=max_cpus,
         min_gpus=min_gpus, max_gpus=max_gpus,
+        min_elapsed_hours=min_elapsed_hours, max_elapsed_hours=max_elapsed_hours,
+        min_reqmem_gb=min_reqmem_gb, max_reqmem_gb=max_reqmem_gb,
         verbose=verbose, display=display, limit=limit,
     )
     _close_session(jh_ctx)

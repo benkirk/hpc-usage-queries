@@ -1130,6 +1130,10 @@ class JobQueries:
         max_cpus: Optional[int] = None,
         min_gpus: Optional[int] = None,
         max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
         columns: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         offset: int = 0,
@@ -1227,14 +1231,25 @@ class JobQueries:
             min_cpus / max_cpus: Inclusive bounds on ``Job.numcpus``.
             min_gpus / max_gpus: Inclusive bounds on ``Job.numgpus``.
                 ``min_gpus=1`` selects GPU jobs; ``max_gpus=0`` selects
-                CPU-only jobs. All six are NULL-strict.
+                CPU-only jobs.
+            min_elapsed / max_elapsed: Inclusive bounds on ``Job.elapsed``
+                (walltime actually used), in **seconds**. Distinct from
+                ``Job.walltime``, the walltime *requested*.
+            min_reqmem / max_reqmem: Inclusive bounds on ``Job.reqmem``
+                (memory *requested* at submit), in **bytes**. Requested,
+                not used — used memory is ``Job.memory``, which has no
+                filter here.
+
+                All ten range bounds are NULL-strict: a NULL column value
+                fails both comparisons and the row drops out.
 
                 Performance: ``name``, ``eligible_secs``, ``numnodes``,
-                ``numcpus`` and ``numgpus`` are **unindexed**. Each of these
-                filters is evaluated as a scan of whatever slice
-                ``start``/``end`` leave behind (via ``ix_jobs_end``).
-                Production derecho holds ~15.7M rows and casper ~26.7M, so
-                always pass a bounded date window alongside them.
+                ``numcpus``, ``numgpus``, ``elapsed`` and ``reqmem`` are
+                **unindexed**. Each of these filters is evaluated as a scan
+                of whatever slice ``start``/``end`` leave behind (via
+                ``ix_jobs_end``). Production derecho holds ~15.7M rows and
+                casper ~26.7M, so always pass a bounded date window
+                alongside them.
             columns: Optional sequence of column keys to project.
                 When None, returns DEFAULT_COLUMNS. Unknown keys raise ValueError.
             limit: Optional max number of rows to return. Applied as a SQL
@@ -1286,6 +1301,8 @@ class JobQueries:
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
         )
 
         if sort_by is None:
@@ -1321,6 +1338,10 @@ class JobQueries:
         max_cpus: Optional[int] = None,
         min_gpus: Optional[int] = None,
         max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
     ) -> int:
         """Count rows that ``jobs_search`` would return under the same filters.
 
@@ -1349,6 +1370,8 @@ class JobQueries:
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
         )
         return int(query.scalar() or 0)
 
@@ -1373,6 +1396,10 @@ class JobQueries:
         max_cpus: Optional[int] = None,
         min_gpus: Optional[int] = None,
         max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
         facets: Sequence[str] = DEFAULT_FACETS,
         self_exclude: bool = True,
         limit: Optional[int] = None,
@@ -1456,6 +1483,8 @@ class JobQueries:
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
         )
         # Faceted dimensions that carry a filter and are not a security scope:
         # their predicate leaves the WHERE clause and is re-applied in the fold.
@@ -1540,6 +1569,7 @@ class JobQueries:
         job_id, name, ignore_case,
         min_eligible_secs, max_eligible_secs,
         min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus,
+        min_elapsed, max_elapsed, min_reqmem, max_reqmem,
     ):
         """Apply the shared filter set used by jobs_search/count/facets.
 
@@ -1613,6 +1643,8 @@ class JobQueries:
             (Job.numnodes,      min_nodes,         max_nodes),
             (Job.numcpus,       min_cpus,          max_cpus),
             (Job.numgpus,       min_gpus,          max_gpus),
+            (Job.elapsed,       min_elapsed,       max_elapsed),
+            (Job.reqmem,        min_reqmem,        max_reqmem),
         ):
             if _lo is not None:
                 query = query.filter(_column >= _lo)

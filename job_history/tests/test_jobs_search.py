@@ -863,6 +863,100 @@ class TestJobsSearchWaitFilters:
             assert q.jobs_count(**kw) == len(q.jobs_search(**kw))
 
 
+_GIB = 1024 ** 3  # matches sync/charging.BYTES_PER_GB
+
+
+@pytest.fixture
+def elapsed_reqmem_jobs(in_memory_session):
+    """Jobs with distinct (elapsed, reqmem), including NULLs and a zero.
+
+    The zero-elapsed row exists for the falsy-zero guard (``max_elapsed=0``
+    must not be treated as unset); the NULL rows pin the NULL-strict
+    semantics for both new bound pairs.
+    """
+    base = datetime(2025, 5, 1, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    specs = [
+        ("500.desched1", 0,     4 * _GIB),    # zero elapsed
+        ("501.desched1", 3600,  64 * _GIB),
+        ("502.desched1", 86400, 512 * _GIB),
+        ("503.desched1", None,  16 * _GIB),   # NULL elapsed
+        ("504.desched1", 7200,  None),        # NULL reqmem
+    ]
+    jobs = [
+        Job(job_id=jid, short_id=500 + i, name=f"er{i}", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=base, start=base, end=base + timedelta(hours=i + 1),
+            elapsed=elapsed, reqmem=reqmem,
+            numcpus=128, numgpus=0, numnodes=1)
+        for i, (jid, elapsed, reqmem) in enumerate(specs)
+    ]
+    for j in jobs:
+        in_memory_session.add(j)
+    in_memory_session.commit()
+    return jobs
+
+
+class TestJobsSearchElapsedReqmemFilters:
+    """(elapsed s, reqmem GiB) = (0,4), (3600,64), (86400,512), (None,16), (7200,None)."""
+
+    def test_min_elapsed_excludes_shorter(self, in_memory_session, elapsed_reqmem_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_elapsed=3600, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {
+            "501.desched1", "502.desched1", "504.desched1"}
+
+    def test_max_elapsed_excludes_longer(self, in_memory_session, elapsed_reqmem_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            max_elapsed=3600, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {"500.desched1", "501.desched1"}
+
+    def test_elapsed_bounds_inclusive(self, in_memory_session, elapsed_reqmem_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(min_elapsed=3600, max_elapsed=3600) == 1
+
+    def test_max_elapsed_zero_is_not_treated_as_unset(
+            self, in_memory_session, elapsed_reqmem_jobs):
+        # 0 is falsy — guards against an `if max_elapsed:` regression.
+        assert JobQueries(in_memory_session).jobs_count(max_elapsed=0) == 1
+
+    def test_null_elapsed_excluded_by_both_bounds(
+            self, in_memory_session, elapsed_reqmem_jobs):
+        q = JobQueries(in_memory_session)
+        assert "503.desched1" not in {
+            r["job_id"] for r in q.jobs_search(min_elapsed=0)}
+        assert "503.desched1" not in {
+            r["job_id"] for r in q.jobs_search(max_elapsed=10 ** 6)}
+
+    def test_min_reqmem_excludes_smaller(self, in_memory_session, elapsed_reqmem_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_reqmem=64 * _GIB, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {"501.desched1", "502.desched1"}
+
+    def test_max_reqmem_excludes_larger(self, in_memory_session, elapsed_reqmem_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            max_reqmem=16 * _GIB, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {"500.desched1", "503.desched1"}
+
+    def test_reqmem_bounds_inclusive(self, in_memory_session, elapsed_reqmem_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(min_reqmem=64 * _GIB, max_reqmem=64 * _GIB) == 1
+
+    def test_null_reqmem_excluded_by_both_bounds(
+            self, in_memory_session, elapsed_reqmem_jobs):
+        q = JobQueries(in_memory_session)
+        assert "504.desched1" not in {
+            r["job_id"] for r in q.jobs_search(min_reqmem=0)}
+        assert "504.desched1" not in {
+            r["job_id"] for r in q.jobs_search(max_reqmem=1024 * _GIB)}
+
+    def test_count_agrees_with_search(self, in_memory_session, elapsed_reqmem_jobs):
+        q = JobQueries(in_memory_session)
+        for kw in ({"min_elapsed": 3600}, {"max_reqmem": 64 * _GIB},
+                   {"min_elapsed": 0, "max_elapsed": 86400},
+                   {"min_reqmem": 4 * _GIB, "max_reqmem": 512 * _GIB}):
+            assert q.jobs_count(**kw) == len(q.jobs_search(**kw))
+
+
 class TestFilterSignatureParity:
     """jobs_search / jobs_count / jobs_facets / the helper must stay in sync.
 

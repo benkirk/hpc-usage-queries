@@ -222,6 +222,12 @@ job id) there are:
 - `--min-nodes/--max-nodes`, `--min-cpus/--max-cpus`,
   `--min-gpus/--max-gpus` — inclusive, NULL-strict. `--min-gpus 1`
   selects GPU jobs, `--max-gpus 0` CPU-only ones.
+- `--min-elapsed-hours` / `--max-elapsed-hours` — bounds on walltime
+  actually used (`Job.elapsed`). The CLI takes hours; the API takes
+  `min_/max_elapsed` in seconds.
+- `--min-reqmem-gb` / `--max-reqmem-gb` — bounds on memory *requested* at
+  submit (`Job.reqmem`, PBS `Resource_List.mem`), not memory used. The CLI
+  takes GB; the API takes `min_/max_reqmem` in bytes (1 GB = 1024³).
 
 All of these hit unindexed columns, so they scan whatever slice the date
 window leaves behind — always pass `--start-date`/`--end-date`.

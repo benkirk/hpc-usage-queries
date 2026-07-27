@@ -257,6 +257,32 @@ class TestSearchCommand:
         for key in ("max_gpus", "min_nodes", "max_nodes", "min_cpus", "max_cpus"):
             assert parsed["filters"][key] is None
 
+    def test_elapsed_hours_converted_to_seconds_in_filters(self, search_ctx, capsys):
+        # search_db elapsed values: 3600 (alice), 7200 (bob). A 1.5 h floor
+        # keeps only bob, and the envelope publishes resolved seconds.
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(min_elapsed_hours=1.5) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [r["job_id"] for r in parsed["rows"]] == ["201.desched1"]
+        assert parsed["filters"]["min_elapsed"] == 5400
+        assert parsed["filters"]["max_elapsed"] is None
+
+    def test_zero_elapsed_hours_is_not_treated_as_unset(self, search_ctx, capsys):
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(max_elapsed_hours=0.0) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["filters"]["max_elapsed"] == 0
+        assert parsed["rows"] == []  # both fixture jobs have elapsed > 0
+
+    def test_reqmem_gb_converted_to_bytes_in_filters(self, search_ctx, capsys):
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(min_reqmem_gb=2.0) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["filters"]["min_reqmem"] == 2 * 1024 ** 3
+        assert parsed["filters"]["max_reqmem"] is None
+        # Fixture jobs carry no reqmem → NULL-strict bounds drop them.
+        assert parsed["rows"] == []
+
 
 # ---------------------------------------------------------------------------
 # CliRunner — Click integration through the new entry point

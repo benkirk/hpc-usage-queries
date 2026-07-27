@@ -15,6 +15,10 @@ from ..core import (
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS, VERBOSE_COLUMNS
 from . import builders
 
+# Matches sync/charging.BYTES_PER_GB (1 GB = 1024^3 bytes). Redefined here
+# rather than imported: the CLI layer must not pull in the sync package.
+_BYTES_PER_GB = 1024 * 1024 * 1024
+
 
 class SearchCommand(BaseHistoryCommand):
     """Drives the ``jobhist search`` subcommand."""
@@ -38,6 +42,10 @@ class SearchCommand(BaseHistoryCommand):
         max_cpus: Optional[int] = None,
         min_gpus: Optional[int] = None,
         max_gpus: Optional[int] = None,
+        min_elapsed_hours: Optional[float] = None,
+        max_elapsed_hours: Optional[float] = None,
+        min_reqmem_gb: Optional[float] = None,
+        max_reqmem_gb: Optional[float] = None,
         verbose: bool = False,
         display: Optional[str] = None,
         limit: Optional[int] = None,
@@ -58,6 +66,20 @@ class SearchCommand(BaseHistoryCommand):
         )
         max_eligible_secs = (
             int(max_wait_hours * 3600) if max_wait_hours is not None else None
+        )
+        # Same boundary conversion for the elapsed (hours → seconds) and
+        # requested-memory (GB → bytes) pairs; the query API is native-unit.
+        min_elapsed = (
+            int(min_elapsed_hours * 3600) if min_elapsed_hours is not None else None
+        )
+        max_elapsed = (
+            int(max_elapsed_hours * 3600) if max_elapsed_hours is not None else None
+        )
+        min_reqmem = (
+            int(min_reqmem_gb * _BYTES_PER_GB) if min_reqmem_gb is not None else None
+        )
+        max_reqmem = (
+            int(max_reqmem_gb * _BYTES_PER_GB) if max_reqmem_gb is not None else None
         )
         # Click's multiple=True yields () when -N is not supplied; normalize to
         # None so the envelope keeps its "null means unset" convention rather
@@ -81,6 +103,8 @@ class SearchCommand(BaseHistoryCommand):
                 min_nodes=min_nodes, max_nodes=max_nodes,
                 min_cpus=min_cpus, max_cpus=max_cpus,
                 min_gpus=min_gpus, max_gpus=max_gpus,
+                min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+                min_reqmem=min_reqmem, max_reqmem=max_reqmem,
                 columns=cols,
                 limit=limit,
             )
@@ -105,6 +129,10 @@ class SearchCommand(BaseHistoryCommand):
                     "max_cpus": max_cpus,
                     "min_gpus": min_gpus,
                     "max_gpus": max_gpus,
+                    "min_elapsed": min_elapsed,
+                    "max_elapsed": max_elapsed,
+                    "min_reqmem": min_reqmem,
+                    "max_reqmem": max_reqmem,
                     "limit": limit,
                 },
             )
