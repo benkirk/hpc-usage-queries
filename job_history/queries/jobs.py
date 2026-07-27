@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Sequence, Union
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, and_, or_
+from sqlalchemy import func, and_, or_, false
 from sqlalchemy.orm import Session
 
 from ..database import Job, DailySummary, JobCharge, JobQoS
@@ -110,6 +110,34 @@ def _bucket_case(field, buckets):
     return case(*whens, else_=buckets[-1][0]).label("bucket_label")
 
 
+#: Ranking metrics accepted by ``jobs_usage_by(sort_by=...)`` and
+#: ``jobs_histogram(owners_sort_by=...)``. ``hours`` is the historical
+#: default: combined ``cpu_hours + gpu_hours``.
+_USAGE_SORT_KEYS = ("hours", "cpu_hours", "gpu_hours", "job_count")
+
+
+def _check_usage_sort_key(sort_by: str, param: str) -> None:
+    """Validate a ``_USAGE_SORT_KEYS`` selection, naming the offending kwarg."""
+    if sort_by not in _USAGE_SORT_KEYS:
+        valid = ", ".join(_USAGE_SORT_KEYS)
+        raise ValueError(f"Unknown {param}: {sort_by!r}. Valid keys: {valid}")
+
+
+def _usage_rank(sort_by: str, job_count, cpu_hours, gpu_hours) -> float:
+    """The ranking metric's value, so both call sites agree on ``hours``.
+
+    Shared by ``jobs_usage_by``'s row ranking and ``jobs_histogram``'s
+    per-bucket owner ranking — the same vocabulary must mean the same thing
+    in both, or a dashboard's pie and its stacked bars disagree about who
+    the top consumers are.
+    """
+    if sort_by == "hours":
+        return cpu_hours + gpu_hours
+    if sort_by == "job_count":
+        return job_count
+    return cpu_hours if sort_by == "cpu_hours" else gpu_hours
+
+
 def _sort_expression(sort_by: str):
     """Map a ``COLUMNS`` key to a SQLAlchemy expression suitable for ORDER BY.
 
@@ -117,6 +145,13 @@ def _sort_expression(sort_by: str):
     ``Job`` / ``JobCharge`` column. Computed ``*_charges`` keys sort on the
     underlying ``hours × COALESCE(qos_factor, 1)`` product, matching the
     formula in :func:`project_row`.
+
+    Lookup-backed keys (``user``/``account``/``queue``/``qos``) must NOT
+    resolve here: ``getattr(Job, 'user')`` returns the text hybrid, whose
+    SQL side is a correlated scalar subquery re-evaluated per scanned row
+    (measured 10x slower — see :data:`_FACET_SPECS`).
+    :meth:`JobQueries.jobs_search` routes them through
+    :data:`_LOOKUP_DIMS` instead.
     """
     spec = COLUMNS[sort_by]
     kind, attr = spec["source"].split(".", 1)
@@ -132,6 +167,25 @@ def _sort_expression(sort_by: str):
     if hours_attr is None:
         raise ValueError(f"Cannot sort by computed column {sort_by!r}")
     return getattr(JobCharge, hours_attr) * func.coalesce(JobCharge.qos_factor, 1.0)
+
+
+#: The four query dimensions whose ``COLUMNS`` source is a text hybrid over
+#: a lookup FK: ``(lookup model, Job FK column, name column)``.
+#:
+#: Every one of those hybrids compiles to a correlated scalar subquery
+#: re-evaluated per scanned row, so neither ORDER BY nor WHERE may touch
+#: them. ``jobs_search`` joins the lookup once and orders by its name column;
+#: ``_apply_jobs_search_filters`` resolves the name to an id once and filters
+#: the integer FK. Measured on derecho over a one-month window:
+#: ``jobs_count(user=…)`` 406 ms → 16 ms, ``jobs_count(account=[3])``
+#: 274 ms → 48 ms; ``EXPLAIN`` swaps ``Seq Scan … Filter: ((SubPlan 1) = …)``
+#: for a bitmap index scan on ``ix_jobs_user_account``.
+_LOOKUP_DIMS = {
+    "user":    (User,    Job.user_id,    User.username),
+    "account": (Account, Job.account_id, Account.account_name),
+    "queue":   (Queue,   Job.queue_id,   Queue.queue_name),
+    "qos":     (JobQoS,  Job.qos_id,     JobQoS.name),
+}
 
 
 def _account_to_facility(account):
@@ -1526,7 +1580,16 @@ class JobQueries:
         if sort_by is None:
             query = query.order_by(Job.end.desc())
         else:
-            expr = _sort_expression(sort_by)
+            lookup = _LOOKUP_DIMS.get(sort_by)
+            if lookup is not None:
+                # OUTER join (the FKs are nullable — an inner join would
+                # drop rows and break jobs_search ↔ jobs_count agreement)
+                # and no added select entity: the (Job, JobCharge) tuple
+                # unpacked below must keep its arity.
+                model, fk_col, expr = lookup
+                query = query.outerjoin(model, fk_col == model.id)
+            else:
+                expr = _sort_expression(sort_by)
             query = query.order_by(expr.desc() if sort_dir == 'desc' else expr.asc())
 
         if limit is not None:
@@ -1797,6 +1860,8 @@ class JobQueries:
         max_memory_used: Optional[int] = None,
         min_memory_wasted: Optional[int] = None,
         max_memory_wasted: Optional[int] = None,
+        owners_limit: Optional[int] = None,
+        owners_sort_by: str = "hours",
     ) -> Dict[str, Any]:
         """Distribution histogram over one job dimension, for dashboards.
 
@@ -1818,6 +1883,18 @@ class JobQueries:
                 — jobs that used more than they requested — and rows with
                 a NULL in either column land in ``null_count``). Names
                 match the SAM dashboard vocabulary, not column names.
+            owners_limit: When set, each bucket additionally carries an
+                ``owners`` mapping — its top-N users. ``None`` (the
+                default) leaves the envelope as before.
+            owners_sort_by: Which metric decides *which* N users survive:
+                ``'hours'`` (the default, ``cpu_hours + gpu_hours``),
+                ``'cpu_hours'``, ``'gpu_hours'``, or ``'job_count'`` — the
+                same vocabulary as :meth:`jobs_usage_by`. A consumer
+                stacking a bar by GPU hours must pass ``'gpu_hours'``, for
+                the reason spelled out there: ranked by combined hours, the
+                top-5 owners of a ``wait`` or ``duration`` band cover ~0% of
+                that band's GPU hours on derecho, so every bar renders as
+                "Other". Ignored when *owners_limit* is None.
 
         Returns::
 
@@ -1857,6 +1934,42 @@ class JobQueries:
         what they say. A caller who wants the histogram unconstrained by its
         own dimension's bounds simply omits those kwargs.
 
+        With ``owners_limit=N`` every bucket dict gains an appended
+        ``owners`` key::
+
+            "owners": {"alice": {"job_count": 8,
+                                 "cpu_hours": 120.0, "gpu_hours": 4.0},
+                       ...}    # top-N, insertion-ordered by rank
+
+        Owners are ranked per bucket by *owners_sort_by* (descending; name
+        asc tie-break, the facet convention). Bucket totals stay
+        authoritative: the long tail beyond N — and any rows with a NULL
+        ``user_id`` — is exactly ``bucket totals − Σ owners``, derivable,
+        never synthesized. Zero-count buckets carry ``owners: {}``. The
+        NULL *dimension* band still folds into ``null_count`` and never
+        carries owners.
+
+        Every listed owner replays exactly: ``jobs_count(user=name,
+        **{min_param: lo, max_param: hi}, **filters)`` equals that owner's
+        ``job_count``, the third level of a bin → user → jobs drill-down.
+        Pinned by ``test_owners_round_trip_into_filters``.
+
+        Still one aggregate statement — the GROUP BY grows a ``user_id``
+        key (the 1:1 charge join keeps COUNT/SUM exact) plus the usual
+        post-aggregation name lookup — but not the same cost: the group
+        cardinality goes from one row per bucket to buckets × distinct
+        users, and the Python fold below grows with it. Measured ~1.4× on
+        derecho over a one-month window (``cpus`` 761 → 1085 ms, ``wait``
+        1202 → 1647 ms).
+
+        Every ``job_count`` — per bucket, ``null_count``, ``total_count`` —
+        is identical to the ``owners_limit=None`` envelope. The hour sums
+        are equal only to within float rounding: this path adds N per-user
+        partial ``SUM``s in Python instead of taking one SQL ``SUM``, and
+        float addition is not associative, so they can differ in the last
+        ULP (~1e-7 relative, observed on every dimension against real
+        data). Compare hours with a tolerance, never ``==``.
+
         Cost: one aggregate statement — a CASE label + COUNT + two SUMs over
         a LEFT OUTER JOIN to ``job_charges`` (1:1 on the PK), grouped by the
         label. Like :meth:`jobs_facets` it scans every row in the date
@@ -1869,7 +1982,8 @@ class JobQueries:
         QoS-weighted charges), matching :meth:`job_sizes_by_resource`.
 
         Raises:
-            ValueError: on an unknown *dimension*.
+            ValueError: on an unknown *dimension* or *owners_sort_by*, or a
+                non-positive *owners_limit*.
         """
         spec = _HISTOGRAM_SPECS.get(dimension)
         if spec is None:
@@ -1877,16 +1991,31 @@ class JobQueries:
             raise ValueError(
                 f"Unknown dimension: {dimension!r}. Valid dimensions: {valid}"
             )
+        if owners_limit is not None and (
+            not isinstance(owners_limit, int) or owners_limit <= 0
+        ):
+            raise ValueError(
+                f"owners_limit must be a positive integer, got {owners_limit!r}"
+            )
+        _check_usage_sort_key(owners_sort_by, "owners_sort_by")
         column, buckets, unit, min_param, max_param = spec
 
         bucket_label = _bucket_case(column, buckets)
+        select_cols = [
+            bucket_label,
+            func.count(Job.id),
+            func.sum(JobCharge.cpu_hours),
+            func.sum(JobCharge.gpu_hours),
+        ]
+        group_cols = [bucket_label]
+        if owners_limit is not None:
+            # Group the integer FK, never the Job.user text hybrid — see
+            # _FACET_SPECS. The 1:1 charge join keeps every aggregate exact
+            # under the extra key.
+            select_cols.insert(1, Job.user_id)
+            group_cols.append(Job.user_id)
         query = (
-            self.session.query(
-                bucket_label,
-                func.count(Job.id),
-                func.sum(JobCharge.cpu_hours),
-                func.sum(JobCharge.gpu_hours),
-            )
+            self.session.query(*select_cols)
             .outerjoin(JobCharge, Job.id == JobCharge.job_id)
         )
         query = self._apply_jobs_search_filters(
@@ -1905,26 +2034,80 @@ class JobQueries:
             min_memory_wasted=min_memory_wasted,
             max_memory_wasted=max_memory_wasted,
         )
-        rows = query.group_by(bucket_label).all()
+        rows = query.group_by(*group_cols).all()
 
         # Zero-fill from the spec table, in order; SUM over an all-NULL
         # charge group is NULL, hence the `or 0.0`. The NULL band routes to
         # null_count — its hour sums are deliberately dropped (unmeasured
         # rows are excluded from the distribution, not smeared into it).
-        by_label = {label: (count, cpu, gpu) for label, count, cpu, gpu in rows}
-        null_count = int(by_label.pop(_NULL_BUCKET, (0, None, None))[0])
+        owners_by_label: Dict[str, Dict[Any, List[float]]] = {}
+        if owners_limit is None:
+            by_label = {
+                label: (count, cpu, gpu) for label, count, cpu, gpu in rows
+            }
+            null_count = int(by_label.pop(_NULL_BUCKET, (0, None, None))[0])
+        else:
+            # Per-user rows: re-fold bucket totals (identical arithmetic to
+            # the ungrouped shape) and keep the per-user split on the side.
+            # NULL-user rows count toward totals but are never owner
+            # candidates — they live in the derivable remainder.
+            by_label = {}
+            null_count = 0
+            for label, user_id, count, cpu, gpu in rows:
+                if label == _NULL_BUCKET:
+                    null_count += int(count)
+                    continue
+                t_count, t_cpu, t_gpu = by_label.get(label, (0, 0.0, 0.0))
+                by_label[label] = (
+                    t_count + int(count),
+                    t_cpu + float(cpu or 0.0),
+                    t_gpu + float(gpu or 0.0),
+                )
+                if user_id is not None:
+                    per_user = owners_by_label.setdefault(label, {})
+                    agg = per_user.setdefault(user_id, [0, 0.0, 0.0])
+                    agg[0] += int(count)
+                    agg[1] += float(cpu or 0.0)
+                    agg[2] += float(gpu or 0.0)
+            names = self._resolve_lookup_names(
+                User, User.username,
+                {uid for per_user in owners_by_label.values() for uid in per_user},
+            )
 
         out_buckets = []
         for label, lo, hi in buckets:
             count, cpu, gpu = by_label.get(label, (0, None, None))
-            out_buckets.append({
+            bucket = {
                 "label": label,
                 "lo": lo,
                 "hi": hi,
                 "job_count": int(count),
                 "cpu_hours": float(cpu or 0.0),
                 "gpu_hours": float(gpu or 0.0),
-            })
+            }
+            if owners_limit is not None:
+                # Rank by the caller's metric desc, then name asc (the facet
+                # tie-break, minus the None arm — NULL users never rank). The
+                # display name is resolved once and used for both the tie-break
+                # and the output key, so an id the lookup can't resolve sorts
+                # and renders under the same string.
+                named = [
+                    (str(names.get(uid, uid)), agg)
+                    for uid, agg in owners_by_label.get(label, {}).items()
+                ]
+                ranked = sorted(named, key=lambda na: (
+                    -_usage_rank(owners_sort_by, na[1][0], na[1][1], na[1][2]),
+                    na[0],
+                ))[:owners_limit]
+                bucket["owners"] = {
+                    name: {
+                        "job_count": agg[0],
+                        "cpu_hours": agg[1],
+                        "gpu_hours": agg[2],
+                    }
+                    for name, agg in ranked
+                }
+            out_buckets.append(bucket)
 
         total = sum(b["job_count"] for b in out_buckets) + null_count
         return {
@@ -1969,6 +2152,7 @@ class JobQueries:
         min_memory_wasted: Optional[int] = None,
         max_memory_wasted: Optional[int] = None,
         limit: Optional[int] = None,
+        sort_by: str = "hours",
     ) -> Dict[str, Any]:
         """Per-entity usage (job count + hours) for one dimension.
 
@@ -1995,12 +2179,21 @@ class JobQueries:
                 consumer's "Other" slice is exactly
                 ``totals − Σ returned rows``, an invariant rather than a
                 guess.
+            sort_by: The ranking metric — and therefore *which* top-N
+                survives ``limit``: ``'hours'`` (the default,
+                ``cpu_hours + gpu_hours``), ``'cpu_hours'``,
+                ``'gpu_hours'``, or ``'job_count'``. A consumer showing a
+                GPU-hours view must rank by ``'gpu_hours'``, or a pure-GPU
+                user can vanish beneath ``limit`` CPU-heavy ones. Same
+                vocabulary as :meth:`jobs_histogram`'s ``owners_sort_by``
+                — and *not* the same as :meth:`jobs_search`'s ``sort_by``,
+                which takes ``COLUMNS`` keys.
 
         Returns::
 
             {
               "dimension": "user",
-              "rows": [   # (cpu_hours + gpu_hours) desc, value asc, None last
+              "rows": [   # sort_by metric desc, value asc, None last
                 {"value": "alice", "job_count": 812,
                  "cpu_hours": 91234.5, "gpu_hours": 120.0},
                 ...
@@ -2025,7 +2218,8 @@ class JobQueries:
         the same slice — the charge join is the difference).
 
         Raises:
-            ValueError: on an unknown *dimension* or non-positive *limit*.
+            ValueError: on an unknown *dimension*, non-positive *limit*, or
+                unknown *sort_by*.
         """
         spec = _FACET_SPECS.get(dimension)
         if spec is None:
@@ -2035,6 +2229,7 @@ class JobQueries:
             )
         if limit is not None and (not isinstance(limit, int) or limit <= 0):
             raise ValueError(f"limit must be a positive integer, got {limit!r}")
+        _check_usage_sort_key(sort_by, "sort_by")
         group_col, model, name_col = spec
 
         query = (
@@ -2079,10 +2274,12 @@ class JobQueries:
                 "cpu_hours": float(cpu or 0.0),
                 "gpu_hours": float(gpu or 0.0),
             })
-        # Usage desc, then value asc with None last — the facet tie-break
-        # convention, keyed on hours instead of count.
+        # sort_by metric desc, then value asc with None last — the facet
+        # tie-break convention, keyed on the caller's ranking metric.
         rows.sort(key=lambda r: (
-            -(r["cpu_hours"] + r["gpu_hours"]), r["value"] is None, str(r["value"])
+            -_usage_rank(sort_by, r["job_count"], r["cpu_hours"], r["gpu_hours"]),
+            r["value"] is None,
+            str(r["value"]),
         ))
 
         totals = {
@@ -2107,6 +2304,30 @@ class JobQueries:
         if len(ids) <= _LOOKUP_FETCH_ALL_THRESHOLD:
             query = query.filter(model.id.in_(ids))
         return dict(query.all())
+
+    def _lookup_fk_clause(self, dim: str, value):
+        """Filter clause matching a lookup dimension by *name*, via its FK.
+
+        The inverse of :meth:`_resolve_lookup_names`: one indexed probe of
+        the unique name column, then an integer-FK predicate — instead of
+        ``Job.user == name``, whose hybrid re-runs a correlated subquery for
+        every scanned row (see :data:`_LOOKUP_DIMS` for the measurements).
+
+        *value* is a single name or a sequence of them. Semantics match the
+        hybrid comparison exactly: a name with no lookup row matches nothing,
+        so an unresolvable name — or an empty sequence — yields ``false()``
+        rather than silently dropping the filter. Rows with a NULL FK are
+        excluded either way (``NULL = 'x'`` is not true).
+        """
+        model, fk_col, name_col = _LOOKUP_DIMS[dim]
+        names = (value,) if isinstance(value, str) else tuple(value)
+        if not names:
+            return false()
+        ids = [i for (i,) in
+               self.session.query(model.id).filter(name_col.in_(names))]
+        if not ids:
+            return false()
+        return fk_col == ids[0] if len(ids) == 1 else fk_col.in_(ids)
 
     def list_qos_names(self, *, active_only: bool = True) -> List[str]:
         """Return JobQoS names from the lookup table, alphabetically ordered.
@@ -2144,24 +2365,25 @@ class JobQueries:
         ``TestFilterSignatureParity`` enforces the same invariant statically.
         """
         query = self._apply_date_filter(query, start, end)
+        # user/account/queue/qos filter through `_lookup_fk_clause`, never
+        # the `Job.user`-style text hybrids: those stay the *display* path,
+        # but in a WHERE clause they compile to a correlated subquery run
+        # once per scanned row and force a full Seq Scan. See _LOOKUP_DIMS.
         if user:
-            query = query.filter(Job.user == user)
+            query = query.filter(self._lookup_fk_clause("user", user))
         if account is not None:
             # `account` accepts a single projcode or a sequence — sequence
             # form lets callers pull every projcode in a project tree
             # (parent + descendants) in one query. `str` is iterable so it
             # has to be detected first. An empty sequence is treated as
-            # "no rows" (`IN ()`), not "no filter" — callers asking for an
-            # empty tree get an empty result, not the whole table.
-            if isinstance(account, str):
-                if account:
-                    query = query.filter(Job.account == account)
-            else:
-                query = query.filter(Job.account.in_(account))
+            # "no rows", not "no filter" — callers asking for an empty tree
+            # get an empty result, not the whole table.
+            if not (isinstance(account, str) and not account):
+                query = query.filter(self._lookup_fk_clause("account", account))
         if queue:
-            query = query.filter(Job.queue == queue)
+            query = query.filter(self._lookup_fk_clause("queue", queue))
         if qos:
-            query = query.filter(Job.qos == qos)
+            query = query.filter(self._lookup_fk_clause("qos", qos))
         if exit_status:
             query = query.filter(Job.status == exit_status)
         if job_id:

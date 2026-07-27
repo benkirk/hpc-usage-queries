@@ -261,12 +261,32 @@ already serve the terminal case:
   `memory_wasted`), and self-describing `min_param`/`max_param` so a
   clicked bar replays as `jobs_search` bounds. One CASE-grouped aggregate
   scan.
+  - `owners_limit=N` appends each bucket's top-N users as
+    `{username: {job_count, cpu_hours, gpu_hours}}` — the second level of a
+    bin → user → jobs drill-down. Still one aggregate statement (the GROUP
+    BY grows the `user_id` FK), but not the same cost: group cardinality
+    goes from one row per bucket to buckets × distinct users, measured
+    ~1.4× on a one-month derecho window. Every listed owner replays as
+    `jobs_count(user=…, min_param=lo, max_param=hi)`. Bucket totals stay
+    authoritative — the tail beyond N is `totals − Σ owners`.
+  - `owners_sort_by` picks the ranking metric (`hours` default, or
+    `cpu_hours`/`gpu_hours`/`job_count`) and therefore *which* N survive.
+    **A GPU-hours view must pass `'gpu_hours'`**: ranked by combined hours,
+    the top-5 owners of a `wait` or `duration` band cover ~0% of that
+    band's GPU hours on derecho, so every bar renders as "Other".
+  - Counts are identical with and without `owners_limit`; hour sums agree
+    only to float rounding (the owners path folds N partial sums in
+    Python). Compare hours with a tolerance.
 - `JobQueries.jobs_usage_by(dimension, …)` — per-entity `job_count` +
   `cpu_hours`/`gpu_hours` for a usage pie (`user` is the dashboard case).
   No self-exclusion of any kind: every filter, `account` included, always
   applies (the same security property `_FACET_SCOPE_DIMS` protects).
   `totals` is computed before any `limit` truncation, so an "Other" slice
-  is exactly `totals − Σ rows`.
+  is exactly `totals − Σ rows`. `sort_by` takes the same metric vocabulary
+  as `owners_sort_by` above and ranks *before* `limit` truncates — pass the
+  metric the consumer is actually displaying, or a pure-GPU user falls
+  below a combined-hours cut. (Note this is a different vocabulary from
+  `jobs_search(sort_by=…)`, which takes `COLUMNS` keys.)
 
 All of them scan every row in the date slice — always pass a bounded
 `start`/`end`.
