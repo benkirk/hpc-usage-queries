@@ -1176,7 +1176,7 @@ class TestFilterSignatureParity:
 
     SEARCH_ONLY = {"columns", "limit", "offset", "sort_by", "sort_dir"}
     FACET_ONLY = {"facets", "self_exclude", "limit"}
-    HIST_ONLY = {"dimension", "owners_limit", "owners_sort_by"}
+    HIST_ONLY = {"dimension", "owners_limit", "owners_sort_by", "owners_by"}
     USAGE_ONLY = {"dimension", "limit", "sort_by"}
 
     @staticmethod
@@ -1788,6 +1788,98 @@ class TestJobsHistogramOwners:
         with pytest.raises(ValueError, match="owners_limit"):
             JobQueries(in_memory_session).jobs_histogram(
                 "wait", owners_limit=0)
+
+    def test_owners_by_defaults_to_user(self, in_memory_session, histogram_jobs):
+        """Explicit owners_by='user' is byte-identical to the default —
+        same code path both times, so exact equality is safe here."""
+        q = JobQueries(in_memory_session)
+        assert q.jobs_histogram("wait", owners_limit=10) == \
+            q.jobs_histogram("wait", owners_limit=10, owners_by="user")
+
+    def test_owners_by_account_shape_and_rank(
+            self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram(
+            "wait", owners_limit=10, owners_by="account")
+        band = self._band(out, "<1m")
+        assert list(band["owners"]) == ["NCAR0001", "NCAR0002"]  # 10 cpu-h > 0
+        assert band["owners"]["NCAR0001"] == {
+            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0}
+        assert band["owners"]["NCAR0002"] == {
+            "job_count": 1, "cpu_hours": 0.0, "gpu_hours": 0.0}
+
+    def test_owners_by_account_merges_users_within_account(
+            self, in_memory_session, histogram_jobs):
+        """The nodes '1' band holds alice(NCAR0001) + bob×2 + carol(NCAR0002):
+        the two NCAR0002 users must fold into ONE account owner, ranked
+        above NCAR0001 by combined hours (91 > 10)."""
+        out = JobQueries(in_memory_session).jobs_histogram(
+            "nodes", owners_limit=10, owners_by="account")
+        band = self._band(out, "1")
+        assert list(band["owners"]) == ["NCAR0002", "NCAR0001"]
+        assert band["owners"]["NCAR0002"] == {
+            "job_count": 3, "cpu_hours": 31.0, "gpu_hours": 60.0}
+        assert band["owners"]["NCAR0001"] == {
+            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0}
+
+    def test_owners_by_account_totals_unchanged(
+            self, in_memory_session, histogram_jobs):
+        """Bucket totals / null_count / total_count never depend on the
+        owner dimension — only the appended owners key differs."""
+        q = JobQueries(in_memory_session)
+        by_user = q.jobs_histogram("wait", owners_limit=10)
+        by_acct = q.jobs_histogram("wait", owners_limit=10, owners_by="account")
+        assert by_acct["null_count"] == by_user["null_count"]
+        assert by_acct["total_count"] == by_user["total_count"]
+        for got, want in zip(by_acct["buckets"], by_user["buckets"]):
+            assert got["job_count"] == want["job_count"]
+            assert got["cpu_hours"] == pytest.approx(want["cpu_hours"])
+            assert got["gpu_hours"] == pytest.approx(want["gpu_hours"])
+
+    def test_bad_owners_by_raises(self, in_memory_session, histogram_jobs):
+        with pytest.raises(ValueError, match="owners_by"):
+            JobQueries(in_memory_session).jobs_histogram(
+                "wait", owners_limit=10, owners_by="queue")
+
+    def test_account_owners_round_trip_into_filters(
+            self, in_memory_session, histogram_jobs, floor_band_jobs):
+        """The account-mode drill: jobs_count(account=name, **band bounds)
+        equals each listed owner's job_count — the analogue of
+        test_owners_round_trip_into_filters."""
+        q = JobQueries(in_memory_session)
+        checked = 0
+        for dim in _HISTOGRAM_SPECS:
+            out = q.jobs_histogram(dim, owners_limit=10, owners_by="account")
+            for band in out["buckets"]:
+                kw = {out["min_param"]: band["lo"]}
+                if band["hi"] is not None:
+                    kw[out["max_param"]] = band["hi"]
+                for name, agg in band["owners"].items():
+                    assert q.jobs_count(account=name, **kw) == \
+                        agg["job_count"], f"{dim}/{band['label']}/{name}"
+                    checked += 1
+        assert checked > 0
+
+    def test_one_aggregate_scan_account_owners(
+            self, in_memory_session, histogram_jobs):
+        from sqlalchemy import event
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_histogram(
+                "wait", owners_limit=10, owners_by="account")
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        aggregates = [s for s in statements
+                      if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+        assert len(aggregates) == 1, \
+            f"expected 1 aggregate scan, got {len(aggregates)}:\n{aggregates}"
+        assert "jobs.account_id" in aggregates[0]
+        assert "account_name" not in aggregates[0]
 
     def test_one_aggregate_scan_with_owners(
             self, in_memory_session, histogram_jobs):
