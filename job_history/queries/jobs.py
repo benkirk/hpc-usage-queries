@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Sequence, Union
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, and_, or_
+from sqlalchemy import func, and_, or_, false
 from sqlalchemy.orm import Session
 
 from ..database import Job, DailySummary, JobCharge, JobQoS
@@ -151,7 +151,7 @@ def _sort_expression(sort_by: str):
     SQL side is a correlated scalar subquery re-evaluated per scanned row
     (measured 10x slower — see :data:`_FACET_SPECS`).
     :meth:`JobQueries.jobs_search` routes them through
-    :data:`_SORT_LOOKUP_JOINS` instead.
+    :data:`_LOOKUP_DIMS` instead.
     """
     spec = COLUMNS[sort_by]
     kind, attr = spec["source"].split(".", 1)
@@ -169,11 +169,18 @@ def _sort_expression(sort_by: str):
     return getattr(JobCharge, hours_attr) * func.coalesce(JobCharge.qos_factor, 1.0)
 
 
-#: ``sort_by`` keys whose ``COLUMNS`` source is a text hybrid over a lookup
-#: FK: ``(lookup model, Job FK column, name column)``. ``jobs_search`` joins
-#: the lookup once and orders by its name column instead of the hybrid's
-#: per-row correlated subquery.
-_SORT_LOOKUP_JOINS = {
+#: The four query dimensions whose ``COLUMNS`` source is a text hybrid over
+#: a lookup FK: ``(lookup model, Job FK column, name column)``.
+#:
+#: Every one of those hybrids compiles to a correlated scalar subquery
+#: re-evaluated per scanned row, so neither ORDER BY nor WHERE may touch
+#: them. ``jobs_search`` joins the lookup once and orders by its name column;
+#: ``_apply_jobs_search_filters`` resolves the name to an id once and filters
+#: the integer FK. Measured on derecho over a one-month window:
+#: ``jobs_count(user=…)`` 406 ms → 16 ms, ``jobs_count(account=[3])``
+#: 274 ms → 48 ms; ``EXPLAIN`` swaps ``Seq Scan … Filter: ((SubPlan 1) = …)``
+#: for a bitmap index scan on ``ix_jobs_user_account``.
+_LOOKUP_DIMS = {
     "user":    (User,    Job.user_id,    User.username),
     "account": (Account, Job.account_id, Account.account_name),
     "queue":   (Queue,   Job.queue_id,   Queue.queue_name),
@@ -1573,7 +1580,7 @@ class JobQueries:
         if sort_by is None:
             query = query.order_by(Job.end.desc())
         else:
-            lookup = _SORT_LOOKUP_JOINS.get(sort_by)
+            lookup = _LOOKUP_DIMS.get(sort_by)
             if lookup is not None:
                 # OUTER join (the FKs are nullable — an inner join would
                 # drop rows and break jobs_search ↔ jobs_count agreement)
@@ -2298,6 +2305,30 @@ class JobQueries:
             query = query.filter(model.id.in_(ids))
         return dict(query.all())
 
+    def _lookup_fk_clause(self, dim: str, value):
+        """Filter clause matching a lookup dimension by *name*, via its FK.
+
+        The inverse of :meth:`_resolve_lookup_names`: one indexed probe of
+        the unique name column, then an integer-FK predicate — instead of
+        ``Job.user == name``, whose hybrid re-runs a correlated subquery for
+        every scanned row (see :data:`_LOOKUP_DIMS` for the measurements).
+
+        *value* is a single name or a sequence of them. Semantics match the
+        hybrid comparison exactly: a name with no lookup row matches nothing,
+        so an unresolvable name — or an empty sequence — yields ``false()``
+        rather than silently dropping the filter. Rows with a NULL FK are
+        excluded either way (``NULL = 'x'`` is not true).
+        """
+        model, fk_col, name_col = _LOOKUP_DIMS[dim]
+        names = (value,) if isinstance(value, str) else tuple(value)
+        if not names:
+            return false()
+        ids = [i for (i,) in
+               self.session.query(model.id).filter(name_col.in_(names))]
+        if not ids:
+            return false()
+        return fk_col == ids[0] if len(ids) == 1 else fk_col.in_(ids)
+
     def list_qos_names(self, *, active_only: bool = True) -> List[str]:
         """Return JobQoS names from the lookup table, alphabetically ordered.
 
@@ -2334,24 +2365,25 @@ class JobQueries:
         ``TestFilterSignatureParity`` enforces the same invariant statically.
         """
         query = self._apply_date_filter(query, start, end)
+        # user/account/queue/qos filter through `_lookup_fk_clause`, never
+        # the `Job.user`-style text hybrids: those stay the *display* path,
+        # but in a WHERE clause they compile to a correlated subquery run
+        # once per scanned row and force a full Seq Scan. See _LOOKUP_DIMS.
         if user:
-            query = query.filter(Job.user == user)
+            query = query.filter(self._lookup_fk_clause("user", user))
         if account is not None:
             # `account` accepts a single projcode or a sequence — sequence
             # form lets callers pull every projcode in a project tree
             # (parent + descendants) in one query. `str` is iterable so it
             # has to be detected first. An empty sequence is treated as
-            # "no rows" (`IN ()`), not "no filter" — callers asking for an
-            # empty tree get an empty result, not the whole table.
-            if isinstance(account, str):
-                if account:
-                    query = query.filter(Job.account == account)
-            else:
-                query = query.filter(Job.account.in_(account))
+            # "no rows", not "no filter" — callers asking for an empty tree
+            # get an empty result, not the whole table.
+            if not (isinstance(account, str) and not account):
+                query = query.filter(self._lookup_fk_clause("account", account))
         if queue:
-            query = query.filter(Job.queue == queue)
+            query = query.filter(self._lookup_fk_clause("queue", queue))
         if qos:
-            query = query.filter(Job.qos == qos)
+            query = query.filter(self._lookup_fk_clause("qos", qos))
         if exit_status:
             query = query.filter(Job.status == exit_status)
         if job_id:

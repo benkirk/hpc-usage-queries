@@ -11,7 +11,7 @@ import pytest
 from job_history.database import Job, JobCharge
 from job_history.queries import JobQueries
 from job_history.queries.jobs import (
-    QueryConfig, _HISTOGRAM_SPECS, _SORT_LOOKUP_JOINS, _USAGE_SORT_KEYS,
+    QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _USAGE_SORT_KEYS,
 )
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS
 
@@ -113,8 +113,9 @@ class TestJobsSearchFilters:
         assert [r["user"] for r in rows] == ["bob"]
 
     def test_project_filter_empty_sequence(self, in_memory_session, search_jobs):
-        # Empty sequence → `IN ()` → no rows. Sanity check that we don't
-        # silently fall through to "no filter".
+        # Empty sequence → no rows. Sanity check that we don't silently fall
+        # through to "no filter" — including on the FK path, where there are
+        # no ids to look up and the clause must still be false.
         rows = JobQueries(in_memory_session).jobs_search(account=[])
         assert rows == []
 
@@ -134,6 +135,56 @@ class TestJobsSearchFilters:
     def test_qos_filter_combined_with_user(self, in_memory_session, search_jobs):
         rows = JobQueries(in_memory_session).jobs_search(user="alice", qos="economy")
         assert [r["job_id"] for r in rows] == ["101.desched1"]
+
+    @pytest.mark.parametrize("dim", sorted(_LOOKUP_DIMS))
+    def test_lookup_filter_unresolvable_name_matches_nothing(
+            self, in_memory_session, search_jobs, dim):
+        # The FK path resolves the name to an id first. A name with no
+        # lookup row must mean "no rows" — exactly what `Job.user == name`
+        # meant — and never "drop the filter".
+        q = JobQueries(in_memory_session)
+        assert q.jobs_search(**{dim: "no-such-value"}) == []
+        assert q.jobs_count(**{dim: "no-such-value"}) == 0
+
+    def test_account_sequence_ignores_unresolvable_members(
+            self, in_memory_session, search_jobs):
+        # A project tree may name a projcode with no jobs on this machine;
+        # the resolvable members must still match, as under the hybrid's
+        # `IN (…)`.
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(account=["NCAR0002", "NO-SUCH-PROJ"]) == \
+            q.jobs_count(account=["NCAR0002"]) == 1
+
+    @pytest.mark.parametrize("dim", sorted(_LOOKUP_DIMS))
+    def test_lookup_filter_uses_the_fk_not_a_correlated_subquery(
+            self, in_memory_session, search_jobs, dim):
+        """The WHERE-clause counterpart of the ORDER BY guard above.
+
+        `Job.user`-style hybrids compile to a correlated scalar subquery
+        that PostgreSQL cannot turn into an index lookup — it plans a Seq
+        Scan with a per-row SubPlan (measured 406 ms vs 16 ms for the FK
+        form on a one-month derecho window). Pin the emitted shape so a
+        "simplification" back to the hybrid fails loudly.
+        """
+        from sqlalchemy import event
+        model, fk_col, name_col = _LOOKUP_DIMS[dim]
+        value = {"user": "alice", "account": "NCAR0001",
+                 "queue": "main", "qos": "premium"}[dim]
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            assert JobQueries(in_memory_session).jobs_count(**{dim: value}) > 0
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        table = model.__tablename__
+        scan = next(s for s in statements if " jobs" in s.lower())
+        assert f"jobs.{fk_col.key}" in scan
+        assert f"(SELECT {table}.{name_col.key}" not in scan
 
     def test_combined_filters(self, in_memory_session, search_jobs):
         rows = JobQueries(in_memory_session).jobs_search(
@@ -420,7 +471,7 @@ class TestJobsSearchPagination:
             "102.desched1",  # 64
         ]
 
-    @pytest.mark.parametrize("dim", sorted(_SORT_LOOKUP_JOINS))
+    @pytest.mark.parametrize("dim", sorted(_LOOKUP_DIMS))
     def test_sort_by_lookup_column_asc(self, in_memory_session, search_jobs, dim):
         rows = JobQueries(in_memory_session).jobs_search(
             sort_by=dim, sort_dir="asc", columns=("job_id", dim),
@@ -429,21 +480,21 @@ class TestJobsSearchPagination:
         assert values == sorted(values)
         assert len(set(values)) > 1, "fixture must span >1 value to order by"
 
-    @pytest.mark.parametrize("dim", sorted(_SORT_LOOKUP_JOINS))
+    @pytest.mark.parametrize("dim", sorted(_LOOKUP_DIMS))
     def test_sort_by_lookup_column_desc(self, in_memory_session, search_jobs, dim):
         q = JobQueries(in_memory_session)
         values = [r[dim] for r in q.jobs_search(
             sort_by=dim, sort_dir="desc", columns=("job_id", dim))]
         assert values == sorted(values, reverse=True)
 
-    @pytest.mark.parametrize("dim", sorted(_SORT_LOOKUP_JOINS))
+    @pytest.mark.parametrize("dim", sorted(_LOOKUP_DIMS))
     def test_sort_by_lookup_joins_instead_of_correlated_subquery(
             self, in_memory_session, search_jobs, dim):
         # The Job.user/account/queue/qos hybrids' SQL side is a correlated
         # scalar subquery, re-evaluated per row (measured 10x slower).
         # Sorting must join the lookup table instead — pin the emitted shape.
         from sqlalchemy import event
-        model, _fk_col, name_col = _SORT_LOOKUP_JOINS[dim]
+        model, _fk_col, name_col = _LOOKUP_DIMS[dim]
         statements = []
 
         @event.listens_for(in_memory_session.bind, "before_cursor_execute")
@@ -460,7 +511,7 @@ class TestJobsSearchPagination:
         assert f"JOIN {table}" in stmt
         assert f"(SELECT {table}.{name_col.key}" not in stmt
 
-    @pytest.mark.parametrize("dim", sorted(_SORT_LOOKUP_JOINS))
+    @pytest.mark.parametrize("dim", sorted(_LOOKUP_DIMS))
     def test_sort_by_lookup_keeps_count_agreement(
             self, in_memory_session, search_jobs, dim):
         # OUTER join: a lookup sort must never drop rows vs jobs_count.
