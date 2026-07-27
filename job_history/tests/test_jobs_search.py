@@ -418,6 +418,47 @@ class TestJobsSearchPagination:
             "102.desched1",  # 64
         ]
 
+    def test_sort_by_user_asc(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            sort_by="user", sort_dir="asc", columns=("job_id", "user"),
+        )
+        users = [r["user"] for r in rows]
+        assert users == sorted(users)
+        assert set(users) == {"alice", "bob"}
+
+    def test_sort_by_user_desc(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            sort_by="user", sort_dir="desc", columns=("job_id", "user"),
+        )
+        assert rows[0]["user"] == "bob"
+
+    def test_sort_by_user_joins_instead_of_correlated_subquery(
+            self, in_memory_session, search_jobs):
+        # The Job.user hybrid's SQL side is a correlated scalar subquery,
+        # re-evaluated per row (measured 10x slower). Sorting must join the
+        # lookup table instead — pin the emitted shape.
+        from sqlalchemy import event
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_search(sort_by="user")
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        stmt = next(s for s in statements if "ORDER BY" in s.upper())
+        assert "JOIN users" in stmt
+        assert "(SELECT users.username" not in stmt
+
+    def test_sort_by_user_keeps_count_agreement(
+            self, in_memory_session, search_jobs):
+        # OUTER join: a lookup sort must never drop rows vs jobs_count.
+        q = JobQueries(in_memory_session)
+        assert len(q.jobs_search(sort_by="user")) == q.jobs_count()
+
     def test_sort_by_unknown_raises(self, in_memory_session, search_jobs):
         with pytest.raises(ValueError, match="Unknown sort_by"):
             JobQueries(in_memory_session).jobs_search(sort_by="not_a_column")
@@ -1076,8 +1117,8 @@ class TestFilterSignatureParity:
 
     SEARCH_ONLY = {"columns", "limit", "offset", "sort_by", "sort_dir"}
     FACET_ONLY = {"facets", "self_exclude", "limit"}
-    HIST_ONLY = {"dimension"}
-    USAGE_ONLY = {"dimension", "limit"}
+    HIST_ONLY = {"dimension", "owners_limit"}
+    USAGE_ONLY = {"dimension", "limit", "sort_by"}
 
     @staticmethod
     def _params(fn):
@@ -1606,6 +1647,132 @@ class TestJobsHistogram:
         assert "SELECT queues.queue_name" not in aggregates[0]
 
 
+class TestJobsHistogramOwners:
+    """owners_limit on jobs_histogram (histogram_jobs fixture).
+
+    Wait-dimension shape: '<1m' band holds 700 (alice, 10 cpu-h) and 705
+    (carol, charge-less); 703 (bob) has a NULL wait → null_count.
+    """
+
+    @staticmethod
+    def _band(out, label):
+        return next(b for b in out["buckets"] if b["label"] == label)
+
+    def test_owners_absent_by_default(self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram("wait")
+        assert all("owners" not in b for b in out["buckets"])
+
+    def test_envelope_identical_modulo_owners(
+            self, in_memory_session, histogram_jobs):
+        # The owners variant must be the plain envelope plus one appended
+        # key per bucket — nothing else may move.
+        q = JobQueries(in_memory_session)
+        plain = q.jobs_histogram("wait")
+        rich = q.jobs_histogram("wait", owners_limit=10)
+        stripped = {
+            **rich,
+            "buckets": [
+                {k: v for k, v in b.items() if k != "owners"}
+                for b in rich["buckets"]
+            ],
+        }
+        assert stripped == plain
+        assert all(list(b)[-1] == "owners" for b in rich["buckets"])
+
+    def test_owners_shape_and_rank(self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram(
+            "wait", owners_limit=10)
+        band = self._band(out, "<1m")
+        assert list(band["owners"]) == ["alice", "carol"]  # 10 cpu-h > 0
+        assert band["owners"]["alice"] == {
+            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0}
+        assert band["owners"]["carol"] == {
+            "job_count": 1, "cpu_hours": 0.0, "gpu_hours": 0.0}
+
+    def test_owners_limit_truncates_but_totals_authoritative(
+            self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram(
+            "wait", owners_limit=1)
+        band = self._band(out, "<1m")
+        assert list(band["owners"]) == ["alice"]
+        # Band totals still cover the truncated tail — the consumer's
+        # remainder is totals − Σ owners, an invariant not a guess.
+        assert band["job_count"] == 2
+        assert band["job_count"] - sum(
+            o["job_count"] for o in band["owners"].values()) == 1
+
+    def test_null_band_folds_into_null_count(
+            self, in_memory_session, histogram_jobs):
+        q = JobQueries(in_memory_session)
+        rich = q.jobs_histogram("wait", owners_limit=10)
+        assert rich["null_count"] == q.jobs_histogram("wait")["null_count"] == 1
+        assert rich["total_count"] == 6
+
+    def test_zero_count_bucket_has_empty_owners(
+            self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram(
+            "wait", owners_limit=10)
+        empty = [b for b in out["buckets"] if b["job_count"] == 0]
+        assert empty and all(b["owners"] == {} for b in empty)
+
+    def test_bad_owners_limit_raises(self, in_memory_session, histogram_jobs):
+        with pytest.raises(ValueError, match="owners_limit"):
+            JobQueries(in_memory_session).jobs_histogram(
+                "wait", owners_limit=0)
+
+    def test_one_aggregate_scan_with_owners(
+            self, in_memory_session, histogram_jobs):
+        from sqlalchemy import event
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_histogram(
+                "wait", owners_limit=10)
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        aggregates = [s for s in statements
+                      if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+        assert len(aggregates) == 1, \
+            f"expected 1 aggregate scan, got {len(aggregates)}:\n{aggregates}"
+        assert "jobs.user_id" in aggregates[0]
+        assert "SELECT users.username" not in aggregates[0]
+
+
+@pytest.fixture
+def usage_sort_jobs(in_memory_session):
+    """The sort_by regression shape: cpuking dominates combined hours with
+    one job; gpuqueen dominates gpu_hours AND job_count with two."""
+    base = datetime(2025, 9, 1, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    specs = [
+        # (jid, user, cpu_hours, gpu_hours)
+        ("900.desched1", "cpuking",  1000.0, 0.0),
+        ("901.desched1", "gpuqueen", 5.0,    250.0),
+        ("902.desched1", "gpuqueen", 5.0,    250.0),
+    ]
+    jobs = [
+        Job(job_id=jid, short_id=900 + i, name=f"u{i}", user=u,
+            account="NCAR0009", queue="main", status="0",
+            submit=base, start=base, end=base + timedelta(hours=i + 1),
+            eligible_secs=60, numnodes=1, numcpus=8, numgpus=0,
+            elapsed=600, reqmem=_GIB, memory=_GIB // 2)
+        for i, (jid, u, _cpu, _gpu) in enumerate(specs)
+    ]
+    for j in jobs:
+        in_memory_session.add(j)
+    in_memory_session.flush()
+    for j, (_jid, _u, cpu, gpu) in zip(jobs, specs):
+        in_memory_session.add(JobCharge(
+            job_id=j.id, cpu_hours=cpu, gpu_hours=gpu,
+            memory_hours=0.0, qos_factor=1.0, charge_version=1))
+    in_memory_session.commit()
+    return jobs
+
+
 class TestJobsUsageBy:
     """Uses histogram_jobs: alice 3 jobs (5110 cpu-h, 400 gpu-h), bob 2
     (31 cpu-h, 60 gpu-h), carol 1 (charge-less)."""
@@ -1685,6 +1852,40 @@ class TestJobsUsageBy:
     def test_bad_limit_raises(self, in_memory_session, histogram_jobs):
         with pytest.raises(ValueError, match="positive integer"):
             JobQueries(in_memory_session).jobs_usage_by("user", limit=0)
+
+    def test_sort_by_default_is_combined_hours(
+            self, in_memory_session, usage_sort_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by("user")
+        assert [r["value"] for r in out["rows"]] == ["cpuking", "gpuqueen"]
+
+    def test_sort_by_gpu_hours_reorders(self, in_memory_session, usage_sort_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by(
+            "user", sort_by="gpu_hours")
+        assert [r["value"] for r in out["rows"]] == ["gpuqueen", "cpuking"]
+
+    def test_sort_by_job_count_reorders(self, in_memory_session, usage_sort_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by(
+            "user", sort_by="job_count")
+        assert [r["value"] for r in out["rows"]] == ["gpuqueen", "cpuking"]
+
+    def test_sort_by_decides_which_top_n_survives_limit(
+            self, in_memory_session, usage_sort_jobs):
+        # The dashboard bug this parameter exists for: ranked by combined
+        # hours, a pure-GPU user falls below the cut and a GPU-hours view
+        # shows almost nobody. Ranking by the viewed metric keeps them.
+        q = JobQueries(in_memory_session)
+        by_hours = q.jobs_usage_by("user", limit=1)
+        assert [r["value"] for r in by_hours["rows"]] == ["cpuking"]
+        by_gpu = q.jobs_usage_by("user", limit=1, sort_by="gpu_hours")
+        assert [r["value"] for r in by_gpu["rows"]] == ["gpuqueen"]
+        # Totals stay pre-truncation in both rankings.
+        assert by_gpu["totals"]["gpu_hours"] == pytest.approx(500.0)
+        assert by_gpu["totals"]["job_count"] == 3
+
+    def test_bad_sort_by_raises(self, in_memory_session, histogram_jobs):
+        with pytest.raises(ValueError, match="Unknown sort_by"):
+            JobQueries(in_memory_session).jobs_usage_by(
+                "user", sort_by="memory_hours")
 
     def test_one_aggregate_scan_groups_the_fk(self, in_memory_session, histogram_jobs):
         from sqlalchemy import event

@@ -110,6 +110,11 @@ def _bucket_case(field, buckets):
     return case(*whens, else_=buckets[-1][0]).label("bucket_label")
 
 
+#: Ranking metrics accepted by ``jobs_usage_by(sort_by=...)``. ``hours``
+#: is the historical default: combined ``cpu_hours + gpu_hours``.
+_USAGE_SORT_KEYS = ("hours", "cpu_hours", "gpu_hours", "job_count")
+
+
 def _sort_expression(sort_by: str):
     """Map a ``COLUMNS`` key to a SQLAlchemy expression suitable for ORDER BY.
 
@@ -117,6 +122,13 @@ def _sort_expression(sort_by: str):
     ``Job`` / ``JobCharge`` column. Computed ``*_charges`` keys sort on the
     underlying ``hours × COALESCE(qos_factor, 1)`` product, matching the
     formula in :func:`project_row`.
+
+    Lookup-backed keys (``user``/``account``/``queue``/``qos``) must NOT
+    resolve here: ``getattr(Job, 'user')`` returns the text hybrid, whose
+    SQL side is a correlated scalar subquery re-evaluated per scanned row
+    (measured 10x slower — see :data:`_FACET_SPECS`).
+    :meth:`JobQueries.jobs_search` routes them through
+    :data:`_SORT_LOOKUP_JOINS` instead.
     """
     spec = COLUMNS[sort_by]
     kind, attr = spec["source"].split(".", 1)
@@ -132,6 +144,18 @@ def _sort_expression(sort_by: str):
     if hours_attr is None:
         raise ValueError(f"Cannot sort by computed column {sort_by!r}")
     return getattr(JobCharge, hours_attr) * func.coalesce(JobCharge.qos_factor, 1.0)
+
+
+#: ``sort_by`` keys whose ``COLUMNS`` source is a text hybrid over a lookup
+#: FK: ``(lookup model, Job FK column, name column)``. ``jobs_search`` joins
+#: the lookup once and orders by its name column instead of the hybrid's
+#: per-row correlated subquery.
+_SORT_LOOKUP_JOINS = {
+    "user":    (User,    Job.user_id,    User.username),
+    "account": (Account, Job.account_id, Account.account_name),
+    "queue":   (Queue,   Job.queue_id,   Queue.queue_name),
+    "qos":     (JobQoS,  Job.qos_id,     JobQoS.name),
+}
 
 
 def _account_to_facility(account):
@@ -1526,7 +1550,16 @@ class JobQueries:
         if sort_by is None:
             query = query.order_by(Job.end.desc())
         else:
-            expr = _sort_expression(sort_by)
+            lookup = _SORT_LOOKUP_JOINS.get(sort_by)
+            if lookup is not None:
+                # OUTER join (the FKs are nullable — an inner join would
+                # drop rows and break jobs_search ↔ jobs_count agreement)
+                # and no added select entity: the (Job, JobCharge) tuple
+                # unpacked below must keep its arity.
+                model, fk_col, expr = lookup
+                query = query.outerjoin(model, fk_col == model.id)
+            else:
+                expr = _sort_expression(sort_by)
             query = query.order_by(expr.desc() if sort_dir == 'desc' else expr.asc())
 
         if limit is not None:
@@ -1797,6 +1830,7 @@ class JobQueries:
         max_memory_used: Optional[int] = None,
         min_memory_wasted: Optional[int] = None,
         max_memory_wasted: Optional[int] = None,
+        owners_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Distribution histogram over one job dimension, for dashboards.
 
@@ -1818,6 +1852,9 @@ class JobQueries:
                 — jobs that used more than they requested — and rows with
                 a NULL in either column land in ``null_count``). Names
                 match the SAM dashboard vocabulary, not column names.
+            owners_limit: When set, each bucket additionally carries an
+                ``owners`` mapping — its top-N users. ``None`` (the
+                default) leaves the envelope exactly as before.
 
         Returns::
 
@@ -1857,6 +1894,24 @@ class JobQueries:
         what they say. A caller who wants the histogram unconstrained by its
         own dimension's bounds simply omits those kwargs.
 
+        With ``owners_limit=N`` every bucket dict gains an appended
+        ``owners`` key::
+
+            "owners": {"alice": {"job_count": 8,
+                                 "cpu_hours": 120.0, "gpu_hours": 4.0},
+                       ...}    # top-N, insertion-ordered by rank
+
+        Owners are ranked per bucket by combined ``cpu_hours + gpu_hours``
+        (descending; name asc tie-break, the facet convention). Bucket
+        totals stay authoritative: the long tail beyond N — and any rows
+        with a NULL ``user_id`` — is exactly ``bucket totals − Σ owners``,
+        derivable, never synthesized. Zero-count buckets carry
+        ``owners: {}``. The NULL *dimension* band still folds into
+        ``null_count`` and never carries owners. Cost is unchanged — the
+        aggregate grows a ``user_id`` GROUP BY key (the 1:1 charge join
+        keeps COUNT/SUM exact) plus the usual post-aggregation name
+        lookup.
+
         Cost: one aggregate statement — a CASE label + COUNT + two SUMs over
         a LEFT OUTER JOIN to ``job_charges`` (1:1 on the PK), grouped by the
         label. Like :meth:`jobs_facets` it scans every row in the date
@@ -1869,7 +1924,8 @@ class JobQueries:
         QoS-weighted charges), matching :meth:`job_sizes_by_resource`.
 
         Raises:
-            ValueError: on an unknown *dimension*.
+            ValueError: on an unknown *dimension* or non-positive
+                *owners_limit*.
         """
         spec = _HISTOGRAM_SPECS.get(dimension)
         if spec is None:
@@ -1877,16 +1933,30 @@ class JobQueries:
             raise ValueError(
                 f"Unknown dimension: {dimension!r}. Valid dimensions: {valid}"
             )
+        if owners_limit is not None and (
+            not isinstance(owners_limit, int) or owners_limit <= 0
+        ):
+            raise ValueError(
+                f"owners_limit must be a positive integer, got {owners_limit!r}"
+            )
         column, buckets, unit, min_param, max_param = spec
 
         bucket_label = _bucket_case(column, buckets)
+        select_cols = [
+            bucket_label,
+            func.count(Job.id),
+            func.sum(JobCharge.cpu_hours),
+            func.sum(JobCharge.gpu_hours),
+        ]
+        group_cols = [bucket_label]
+        if owners_limit is not None:
+            # Group the integer FK, never the Job.user text hybrid — see
+            # _FACET_SPECS. The 1:1 charge join keeps every aggregate exact
+            # under the extra key.
+            select_cols.insert(1, Job.user_id)
+            group_cols.append(Job.user_id)
         query = (
-            self.session.query(
-                bucket_label,
-                func.count(Job.id),
-                func.sum(JobCharge.cpu_hours),
-                func.sum(JobCharge.gpu_hours),
-            )
+            self.session.query(*select_cols)
             .outerjoin(JobCharge, Job.id == JobCharge.job_id)
         )
         query = self._apply_jobs_search_filters(
@@ -1905,26 +1975,75 @@ class JobQueries:
             min_memory_wasted=min_memory_wasted,
             max_memory_wasted=max_memory_wasted,
         )
-        rows = query.group_by(bucket_label).all()
+        rows = query.group_by(*group_cols).all()
 
         # Zero-fill from the spec table, in order; SUM over an all-NULL
         # charge group is NULL, hence the `or 0.0`. The NULL band routes to
         # null_count — its hour sums are deliberately dropped (unmeasured
         # rows are excluded from the distribution, not smeared into it).
-        by_label = {label: (count, cpu, gpu) for label, count, cpu, gpu in rows}
-        null_count = int(by_label.pop(_NULL_BUCKET, (0, None, None))[0])
+        owners_by_label: Dict[str, Dict[Any, List[float]]] = {}
+        if owners_limit is None:
+            by_label = {
+                label: (count, cpu, gpu) for label, count, cpu, gpu in rows
+            }
+            null_count = int(by_label.pop(_NULL_BUCKET, (0, None, None))[0])
+        else:
+            # Per-user rows: re-fold bucket totals (identical arithmetic to
+            # the ungrouped shape) and keep the per-user split on the side.
+            # NULL-user rows count toward totals but are never owner
+            # candidates — they live in the derivable remainder.
+            by_label = {}
+            null_count = 0
+            for label, user_id, count, cpu, gpu in rows:
+                if label == _NULL_BUCKET:
+                    null_count += int(count)
+                    continue
+                t_count, t_cpu, t_gpu = by_label.get(label, (0, 0.0, 0.0))
+                by_label[label] = (
+                    t_count + int(count),
+                    t_cpu + float(cpu or 0.0),
+                    t_gpu + float(gpu or 0.0),
+                )
+                if user_id is not None:
+                    per_user = owners_by_label.setdefault(label, {})
+                    agg = per_user.setdefault(user_id, [0, 0.0, 0.0])
+                    agg[0] += int(count)
+                    agg[1] += float(cpu or 0.0)
+                    agg[2] += float(gpu or 0.0)
+            names = self._resolve_lookup_names(
+                User, User.username,
+                {uid for per_user in owners_by_label.values() for uid in per_user},
+            )
 
         out_buckets = []
         for label, lo, hi in buckets:
             count, cpu, gpu = by_label.get(label, (0, None, None))
-            out_buckets.append({
+            bucket = {
                 "label": label,
                 "lo": lo,
                 "hi": hi,
                 "job_count": int(count),
                 "cpu_hours": float(cpu or 0.0),
                 "gpu_hours": float(gpu or 0.0),
-            })
+            }
+            if owners_limit is not None:
+                # Rank by combined hours desc, then name asc (the facet
+                # tie-break, minus the None arm — NULL users never rank).
+                ranked = sorted(
+                    owners_by_label.get(label, {}).items(),
+                    key=lambda kv: (
+                        -(kv[1][1] + kv[1][2]), str(names.get(kv[0]))
+                    ),
+                )[:owners_limit]
+                bucket["owners"] = {
+                    str(names.get(uid, uid)): {
+                        "job_count": agg[0],
+                        "cpu_hours": agg[1],
+                        "gpu_hours": agg[2],
+                    }
+                    for uid, agg in ranked
+                }
+            out_buckets.append(bucket)
 
         total = sum(b["job_count"] for b in out_buckets) + null_count
         return {
@@ -1969,6 +2088,7 @@ class JobQueries:
         min_memory_wasted: Optional[int] = None,
         max_memory_wasted: Optional[int] = None,
         limit: Optional[int] = None,
+        sort_by: str = "hours",
     ) -> Dict[str, Any]:
         """Per-entity usage (job count + hours) for one dimension.
 
@@ -1995,12 +2115,18 @@ class JobQueries:
                 consumer's "Other" slice is exactly
                 ``totals − Σ returned rows``, an invariant rather than a
                 guess.
+            sort_by: The ranking metric — and therefore *which* top-N
+                survives ``limit``: ``'hours'`` (the default,
+                ``cpu_hours + gpu_hours``), ``'cpu_hours'``,
+                ``'gpu_hours'``, or ``'job_count'``. A consumer showing a
+                GPU-hours view must rank by ``'gpu_hours'``, or a pure-GPU
+                user can vanish beneath ``limit`` CPU-heavy ones.
 
         Returns::
 
             {
               "dimension": "user",
-              "rows": [   # (cpu_hours + gpu_hours) desc, value asc, None last
+              "rows": [   # sort_by metric desc, value asc, None last
                 {"value": "alice", "job_count": 812,
                  "cpu_hours": 91234.5, "gpu_hours": 120.0},
                 ...
@@ -2025,7 +2151,8 @@ class JobQueries:
         the same slice — the charge join is the difference).
 
         Raises:
-            ValueError: on an unknown *dimension* or non-positive *limit*.
+            ValueError: on an unknown *dimension*, non-positive *limit*, or
+                unknown *sort_by*.
         """
         spec = _FACET_SPECS.get(dimension)
         if spec is None:
@@ -2035,6 +2162,11 @@ class JobQueries:
             )
         if limit is not None and (not isinstance(limit, int) or limit <= 0):
             raise ValueError(f"limit must be a positive integer, got {limit!r}")
+        if sort_by not in _USAGE_SORT_KEYS:
+            valid = ", ".join(_USAGE_SORT_KEYS)
+            raise ValueError(
+                f"Unknown sort_by: {sort_by!r}. Valid keys: {valid}"
+            )
         group_col, model, name_col = spec
 
         query = (
@@ -2079,10 +2211,14 @@ class JobQueries:
                 "cpu_hours": float(cpu or 0.0),
                 "gpu_hours": float(gpu or 0.0),
             })
-        # Usage desc, then value asc with None last — the facet tie-break
-        # convention, keyed on hours instead of count.
+        # sort_by metric desc, then value asc with None last — the facet
+        # tie-break convention, keyed on the caller's ranking metric.
+        if sort_by == "hours":
+            rank = lambda r: r["cpu_hours"] + r["gpu_hours"]  # noqa: E731
+        else:
+            rank = lambda r: r[sort_by]  # noqa: E731
         rows.sort(key=lambda r: (
-            -(r["cpu_hours"] + r["gpu_hours"]), r["value"] is None, str(r["value"])
+            -rank(r), r["value"] is None, str(r["value"])
         ))
 
         totals = {
