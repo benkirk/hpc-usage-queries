@@ -348,3 +348,185 @@ class TestResourceTypeResolver:
 
         # Should produce same results (case-insensitive in QueryConfig.get_cpu_queues)
         assert queues_upper == queues_lower or set(queues_upper) == set(queues_lower)
+
+
+class TestGlobTranslation:
+    """Pure translation functions.
+
+    Mirrors fs_scans/tests/test_fs_scans.py::test_glob_to_posix_regex_escapes_metacharacters,
+    plus the LIKE-escaping this copy adds deliberately.
+    """
+
+    def test_glob_to_posix_regex_escapes_metacharacters(self):
+        from job_history.queries.builders import glob_to_posix_regex
+
+        assert glob_to_posix_regex("a.b+c") == r"^a\.b\+c$"
+        assert glob_to_posix_regex("*.log") == r"^.*\.log$"
+        assert glob_to_posix_regex("data_?") == r"^data_.$"
+        # `_` and `%` are not regex metacharacters — untouched on this path.
+        assert glob_to_posix_regex("wrf_100%") == r"^wrf_100%$"
+
+    def test_glob_to_sql_like_escapes_like_wildcards(self):
+        """The divergence from fs_scans: a literal `_` must not wildcard."""
+        from job_history.queries.builders import glob_to_sql_like
+
+        assert glob_to_sql_like("wrf_*") == "wrf!_%"
+        assert glob_to_sql_like("*100%*") == "%100!%%"
+        assert glob_to_sql_like("a?b") == "a_b"
+        assert glob_to_sql_like("bang!") == "bang!!"
+        assert glob_to_sql_like("cesm_b1850") == "cesm!_b1850"
+
+
+class TestGlobMatchClause:
+    """Dialect dispatch.
+
+    The suite runs on SQLite, so the PostgreSQL branches are only reachable by
+    compiling the expression offline against postgresql.dialect() and asserting
+    on the emitted SQL plus bind values.
+    """
+
+    @staticmethod
+    def _compile(expr, dialect_cls):
+        compiled = expr.compile(dialect=dialect_cls())
+        return str(compiled), compiled.params
+
+    def test_returns_none_for_empty_patterns(self):
+        from job_history.database import Job
+        from job_history.queries.builders import glob_match_clause
+
+        assert glob_match_clause(Job.name, (), dialect="sqlite") is None
+        assert glob_match_clause(Job.name, ("",), dialect="sqlite") is None
+
+    def test_sqlite_case_sensitive_uses_glob_verbatim(self):
+        from job_history.database import Job
+        from job_history.queries.builders import glob_match_clause
+
+        sql, params = self._compile(
+            glob_match_clause(Job.name, ["wrf_*"], dialect="sqlite"),
+            sqlite_dialect,
+        )
+        assert "GLOB" in sql and "LIKE" not in sql
+        # GLOB takes the glob unmodified — no `_`/`%` translation at all.
+        assert list(params.values()) == ["wrf_*"]
+
+    def test_postgres_case_sensitive_uses_anchored_regex(self):
+        from job_history.database import Job
+        from job_history.queries.builders import glob_match_clause
+
+        sql, params = self._compile(
+            glob_match_clause(Job.name, ["*scratch*", "tmp?"], dialect="postgresql"),
+            pg_dialect,
+        )
+        assert " ~ " in sql
+        assert "GLOB" not in sql and "LIKE" not in sql
+        assert sorted(params.values()) == sorted(["^.*scratch.*$", "^tmp.$"])
+
+    def test_postgres_ignore_case_uses_ilike(self):
+        from job_history.database import Job
+        from job_history.queries.builders import glob_match_clause
+
+        sql, params = self._compile(
+            glob_match_clause(Job.name, ["*TMP*"], dialect="postgresql",
+                              ignore_case=True),
+            pg_dialect,
+        )
+        assert "ILIKE" in sql
+        assert "ESCAPE '!'" in sql
+        assert list(params.values()) == ["%TMP%"]
+
+    def test_sqlite_ignore_case_lowers_both_sides(self):
+        """SQLAlchemy's portable ilike(): no hand-rolled dialect branch needed."""
+        from job_history.database import Job
+        from job_history.queries.builders import glob_match_clause
+
+        sql, params = self._compile(
+            glob_match_clause(Job.name, ["*TMP*"], dialect="sqlite",
+                              ignore_case=True),
+            sqlite_dialect,
+        )
+        assert "lower(jobs.name) LIKE lower(" in sql
+        assert "ESCAPE '!'" in sql
+        assert list(params.values()) == ["%TMP%"]
+
+    def test_ignore_case_escapes_underscore_on_both_dialects(self):
+        """Regression guard for the `_` leak inherited from fs_scans.
+
+        Also pins the escape character: `!` renders byte-identically compiled
+        offline and against a live connection, whereas a backslash would be
+        doubled by the PG compiler while _backslash_escapes is True — making
+        an offline assertion green against SQL production never emits.
+        """
+        from job_history.database import Job
+        from job_history.queries.builders import glob_match_clause
+
+        for dialect_name, dialect_cls in (("sqlite", sqlite_dialect),
+                                          ("postgresql", pg_dialect)):
+            sql, params = self._compile(
+                glob_match_clause(Job.name, ["cesm_b*"], dialect=dialect_name,
+                                  ignore_case=True),
+                dialect_cls,
+            )
+            assert list(params.values()) == ["cesm!_b%"]
+            assert "ESCAPE '!'" in sql
+
+    def test_multiple_patterns_are_ored(self):
+        from job_history.database import Job
+        from job_history.queries.builders import glob_match_clause
+
+        sql, _ = self._compile(
+            glob_match_clause(Job.name, ["a*", "b*"], dialect="sqlite"),
+            sqlite_dialect,
+        )
+        assert " OR " in sql
+
+
+class TestBucketCase:
+    """Offline dialect compiles of the histogram bucket CASE.
+
+    The suite runs on SQLite; compiling against ``postgresql.dialect()`` is
+    the only way to see the PG-emitted SQL. Beyond the CASE itself the
+    histogram statement is CASE + COUNT + SUM over an outer join — all
+    dialect-neutral and production-proven via ``job_sizes_by_resource`` —
+    so shape assertions on the CASE are the whole PG story here.
+    """
+
+    @staticmethod
+    def _literal_sql(expr, dialect_cls):
+        return str(expr.compile(
+            dialect=dialect_cls(), compile_kwargs={"literal_binds": True}))
+
+    @pytest.mark.parametrize("dialect_cls", [sqlite_dialect, pg_dialect])
+    def test_null_arm_first_then_ascending_ladder(self, dialect_cls):
+        from job_history.database import Job
+        from job_history.queries.jobs import _bucket_case, QueryConfig
+
+        sql = self._literal_sql(
+            _bucket_case(Job.eligible_secs, QueryConfig.WAIT_BUCKETS),
+            dialect_cls)
+        # NULL routing must be the first WHEN — otherwise NULL rows would
+        # fall through every <= comparison into the ELSE overflow band.
+        assert "IS NULL" in sql
+        assert sql.index("IS NULL") < sql.index("<= 59")
+        # Ascending <= ladder: each threshold appears, in band order.
+        positions = [sql.index(f"<= {hi}") for hi in (59, 299, 899, 86399, 172799)]
+        assert positions == sorted(positions)
+        # Overflow band is the ELSE, labelled with the last band's label.
+        # (The `AS bucket_label` alias only renders inside a SELECT; the
+        # live one-aggregate-scan test in test_jobs_search.py covers it.)
+        assert "ELSE '>2d'" in sql
+
+    @pytest.mark.parametrize("dialect_cls", [sqlite_dialect, pg_dialect])
+    def test_every_bucket_table_compiles(self, dialect_cls):
+        from job_history.database import Job
+        from job_history.queries.jobs import _bucket_case, QueryConfig
+
+        for column, table in (
+            (Job.eligible_secs, QueryConfig.WAIT_BUCKETS),
+            (Job.numnodes,      QueryConfig.NODE_HIST_BUCKETS),
+            (Job.numcpus,       QueryConfig.CPU_HIST_BUCKETS),
+            (Job.numgpus,       QueryConfig.GPU_HIST_BUCKETS),
+            (Job.reqmem,        QueryConfig.REQMEM_HIST_BUCKETS),
+            (Job.elapsed,       QueryConfig.DURATION_HIST_BUCKETS),
+        ):
+            sql = self._literal_sql(_bucket_case(column, table), dialect_cls)
+            assert f"ELSE '{table[-1][0]}'" in sql

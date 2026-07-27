@@ -5,7 +5,7 @@ common query patterns like period-based grouping and resource type resolution.
 """
 
 from typing import Tuple, Dict, Any, List
-from sqlalchemy import func, cast, Integer, String
+from sqlalchemy import func, cast, Integer, String, or_
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.expression import FunctionElement
 
@@ -76,33 +76,138 @@ def _compile_quarter_pg(element, compiler, **kw):
     return compiler.process(expr, **kw)
 
 
-class _TimeDiffHours(FunctionElement):
-    """Difference between two timestamp columns, expressed in hours.
+# ---------------------------------------------------------------------------
+# Shell-glob → SQL pattern translation
+# ---------------------------------------------------------------------------
+#
+# Deliberately NOT a @compiles FunctionElement like the classes above. Those
+# rewrite the *operator* per dialect; a glob has to rewrite the *bound value*
+# (glob → POSIX regex on PostgreSQL). A bindparam's value is not part of the
+# compiled-SQL cache key, so two different globs would share one cache entry
+# and a compiler-side value rewrite would silently serve the wrong pattern.
+# Translating in Python at query-build time keeps each pattern its own
+# correctly-cached bindparam.
+#
+# This is a deliberate near-duplicate of fs_scans.core.query_builder
+# (glob_to_posix_regex / with_name_patterns). The two packages have no
+# cross-imports and different substrates (raw SQL text there, ORM here), so
+# they are kept independent. Two intentional divergences:
+#   * glob_to_sql_like() escapes literal % and _ (fs_scans does not).
+#   * The case-insensitive path uses one portable ColumnOperators.ilike()
+#     instead of a hand-rolled LIKE/ILIKE dialect branch.
 
-    SQLite:     (julianday(col2) - julianday(col1)) * 24
-    PostgreSQL: EXTRACT(EPOCH FROM (col2 - col1)) / 3600
+# Regex metacharacters to escape when translating a shell glob to a POSIX
+# regex for PostgreSQL. ``*`` and ``?`` are handled separately as wildcards.
+_REGEX_META = set(r".\+()[]{}^$|")
+
+# LIKE/ILIKE escape character. ``!`` rather than the conventional backslash on
+# purpose: SQLAlchemy's PostgreSQL compiler doubles backslashes in rendered
+# literals while ``dialect._backslash_escapes`` is True (it is, until a live
+# connection reports standard_conforming_strings=on), so ``ESCAPE '\'`` renders
+# as ``ESCAPE '\\'`` when compiled offline. ``!`` renders byte-identically on
+# both dialects, connected or not, which keeps the compiled-SQL tests
+# trustworthy. ``!`` is never special in LIKE; a literal ``!`` is escaped below.
+LIKE_ESCAPE = "!"
+
+
+def glob_to_posix_regex(pattern: str) -> str:
+    """Translate a shell-style glob into an anchored POSIX regex.
+
+    Mirrors the wildcard subset SQLite ``GLOB`` supports: ``*`` → ``.*`` and
+    ``?`` → ``.``. All other regex metacharacters are escaped, so ``[...]``
+    character classes become literals.
+
+    Note the resulting asymmetry: SQLite ``GLOB`` *does* honour ``[abc]``
+    character classes, PostgreSQL (via this function) does not. A pattern using
+    ``[...]`` therefore matches differently on the two backends. Inherited from
+    ``fs_scans`` and kept for parity — ``[`` is rare enough in job names not to
+    warrant a hand-written character-class translator.
     """
-    inherit_cache = True
-    name = 'time_diff_hours'
-
-    def __init__(self, col_start, col_end):
-        self.col_start = col_start
-        self.col_end = col_end
-        super().__init__(col_start, col_end)
-
-
-@compiles(_TimeDiffHours)
-def _compile_time_diff_hours_default(element, compiler, **kw):
-    """Default (SQLite): (julianday(end) - julianday(start)) * 24"""
-    expr = (func.julianday(element.col_end) - func.julianday(element.col_start)) * 24
-    return compiler.process(expr, **kw)
+    out = ["^"]
+    for ch in pattern:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        elif ch in _REGEX_META:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    out.append("$")
+    return "".join(out)
 
 
-@compiles(_TimeDiffHours, 'postgresql')
-def _compile_time_diff_hours_pg(element, compiler, **kw):
-    """PostgreSQL: EXTRACT(EPOCH FROM (end - start)) / 3600"""
-    expr = func.extract('epoch', element.col_end - element.col_start) / 3600
-    return compiler.process(expr, **kw)
+def glob_to_sql_like(pattern: str) -> str:
+    """Translate a shell-style glob into a LIKE pattern with escaped literals.
+
+    ``*`` → ``%``, ``?`` → ``_``; a *literal* ``%``, ``_`` or ``!`` in the input
+    is prefixed with :data:`LIKE_ESCAPE`. Must be paired with
+    ``escape=LIKE_ESCAPE`` on the ``.like()`` / ``.ilike()`` call.
+
+    The escaping is why this is not the bare
+    ``pattern.replace("*", "%").replace("?", "_")`` that
+    ``fs_scans.core.query_builder.with_name_patterns`` uses. Job names contain
+    underscores constantly (``wrf_cycle_01``, ``cesm_b1850``); without the
+    escape, ``-N 'cesm_b*' -i`` would also match ``cesmXb1850``.
+    """
+    out = []
+    for ch in pattern:
+        if ch == "*":
+            out.append("%")
+        elif ch == "?":
+            out.append("_")
+        elif ch in ("%", "_", LIKE_ESCAPE):
+            out.append(LIKE_ESCAPE + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def glob_match_clause(column, patterns, *, dialect: str, ignore_case: bool = False):
+    """Build an OR'd shell-glob match against *column*.
+
+    Returns a SQLAlchemy boolean expression, or ``None`` when *patterns* is
+    empty or contains only empty strings (the caller then applies no filter).
+
+    Three cases, not four. The case-*insensitive* path needs no dialect branch:
+    ``ColumnOperators.ilike()`` already compiles to native ``ILIKE`` on
+    PostgreSQL and ``lower(col) LIKE lower(?)`` on SQLite. Only the
+    case-*sensitive* path has to branch, because there is no portable
+    case-sensitive pattern operator — SQLite ``LIKE`` is case-insensitive for
+    ASCII, so SQLite needs ``GLOB`` while PostgreSQL needs POSIX regex ``~``.
+
+    NULL handling: all three operators yield NULL against a NULL column value,
+    so rows with a NULL *column* are excluded by every branch. That is the
+    intended semantics ("a job with no recorded name matches no name pattern")
+    and needs no explicit guard — but it does mean a pattern can never be used
+    to *find* unnamed rows.
+
+    Args:
+        column: SQLAlchemy column to match (e.g. ``Job.name``).
+        patterns: Iterable of shell-glob patterns, OR'd together.
+        dialect: ``session.get_bind().dialect.name`` — ``"postgresql"`` selects
+            the regex branch, anything else the GLOB branch.
+        ignore_case: Case-insensitive matching (portable LIKE/ILIKE path).
+    """
+    clauses = []
+    for pattern in patterns:
+        if not pattern:
+            continue
+        if ignore_case:
+            clauses.append(
+                column.ilike(glob_to_sql_like(pattern), escape=LIKE_ESCAPE)
+            )
+        elif dialect == "postgresql":
+            # is_comparison=True types the operator as Boolean so it composes
+            # inside or_() without a NullType coercion warning.
+            clauses.append(
+                column.op("~", is_comparison=True)(glob_to_posix_regex(pattern))
+            )
+        else:
+            clauses.append(column.op("GLOB", is_comparison=True)(pattern))
+    if not clauses:
+        return None
+    return or_(*clauses)
 
 
 # ---------------------------------------------------------------------------

@@ -194,10 +194,10 @@ class TestJobQueries:
         assert all(j.end <= datetime.combine(end, datetime.max.time()) for j in jobs)
 
     def test_jobs_by_user_with_status(self, in_memory_session, sample_jobs):
-        """Test user job query with status filter."""
+        """Test user job query with exit-status filter."""
         queries = JobQueries(in_memory_session)
 
-        jobs = queries.jobs_by_user("alice", status="F")
+        jobs = queries.jobs_by_user("alice", exit_status="F")
 
         assert len(jobs) == 3
         assert all(j.status == "F" for j in jobs)

@@ -4,7 +4,7 @@ Resolves the column set (default / verbose / custom ``--display``), calls
 :meth:`JobQueries.jobs_search`, and emits the standard JSON envelope.
 """
 
-from typing import Optional
+from typing import Optional, Sequence
 
 from ..core import (
     BaseHistoryCommand,
@@ -12,8 +12,12 @@ from ..core import (
     EXIT_SUCCESS,
     ExporterRegistry,
 )
+from job_history.columns import COLUMNS, DEFAULT_COLUMNS, VERBOSE_COLUMNS
 from . import builders
-from .columns import COLUMNS, DEFAULT_COLUMNS, VERBOSE_COLUMNS
+
+# Matches sync/charging.BYTES_PER_GB (1 GB = 1024^3 bytes). Redefined here
+# rather than imported: the CLI layer must not pull in the sync package.
+_BYTES_PER_GB = 1024 * 1024 * 1024
 
 
 class SearchCommand(BaseHistoryCommand):
@@ -26,8 +30,26 @@ class SearchCommand(BaseHistoryCommand):
         account: Optional[str] = None,
         queue: Optional[str] = None,
         qos: Optional[str] = None,
-        status: Optional[str] = None,
+        exit_status: Optional[str] = None,
         job_id: Optional[str] = None,
+        name: Sequence[str] = (),
+        ignore_case: bool = False,
+        min_wait_hours: Optional[float] = None,
+        max_wait_hours: Optional[float] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed_hours: Optional[float] = None,
+        max_elapsed_hours: Optional[float] = None,
+        min_reqmem_gb: Optional[float] = None,
+        max_reqmem_gb: Optional[float] = None,
+        min_memory_used_gb: Optional[float] = None,
+        max_memory_used_gb: Optional[float] = None,
+        min_memory_wasted_gb: Optional[float] = None,
+        max_memory_wasted_gb: Optional[float] = None,
         verbose: bool = False,
         display: Optional[str] = None,
         limit: Optional[int] = None,
@@ -38,6 +60,54 @@ class SearchCommand(BaseHistoryCommand):
             self.ctx.stderr_console.print(f"❌ {exc}", style="bold red")
             return EXIT_ERROR
 
+        # The CLI talks hours ("jobs that waited more than 6h"); the column and
+        # the query API talk seconds. Convert at the boundary and publish the
+        # *resolved* seconds in the envelope, so a consumer can replay
+        # ``filters`` straight into jobs_search() without redoing the
+        # conversion. 0.0 is a meaningful bound, hence ``is not None``.
+        min_eligible_secs = (
+            int(min_wait_hours * 3600) if min_wait_hours is not None else None
+        )
+        max_eligible_secs = (
+            int(max_wait_hours * 3600) if max_wait_hours is not None else None
+        )
+        # Same boundary conversion for the elapsed (hours → seconds) and
+        # requested-memory (GB → bytes) pairs; the query API is native-unit.
+        min_elapsed = (
+            int(min_elapsed_hours * 3600) if min_elapsed_hours is not None else None
+        )
+        max_elapsed = (
+            int(max_elapsed_hours * 3600) if max_elapsed_hours is not None else None
+        )
+        min_reqmem = (
+            int(min_reqmem_gb * _BYTES_PER_GB) if min_reqmem_gb is not None else None
+        )
+        max_reqmem = (
+            int(max_reqmem_gb * _BYTES_PER_GB) if max_reqmem_gb is not None else None
+        )
+        # The wasted pair may be negative (used more than requested);
+        # int() truncates toward zero, which is symmetric for both signs.
+        min_memory_used = (
+            int(min_memory_used_gb * _BYTES_PER_GB)
+            if min_memory_used_gb is not None else None
+        )
+        max_memory_used = (
+            int(max_memory_used_gb * _BYTES_PER_GB)
+            if max_memory_used_gb is not None else None
+        )
+        min_memory_wasted = (
+            int(min_memory_wasted_gb * _BYTES_PER_GB)
+            if min_memory_wasted_gb is not None else None
+        )
+        max_memory_wasted = (
+            int(max_memory_wasted_gb * _BYTES_PER_GB)
+            if max_memory_wasted_gb is not None else None
+        )
+        # Click's multiple=True yields () when -N is not supplied; normalize to
+        # None so the envelope keeps its "null means unset" convention rather
+        # than emitting an empty array.
+        name_patterns = tuple(name) if name else None
+
         try:
             rows = self.get_queries().jobs_search(
                 start=self.ctx.start_date,
@@ -46,8 +116,21 @@ class SearchCommand(BaseHistoryCommand):
                 account=account,
                 queue=queue,
                 qos=qos,
-                status=status,
+                exit_status=exit_status,
                 job_id=job_id,
+                name=name_patterns,
+                ignore_case=ignore_case,
+                min_eligible_secs=min_eligible_secs,
+                max_eligible_secs=max_eligible_secs,
+                min_nodes=min_nodes, max_nodes=max_nodes,
+                min_cpus=min_cpus, max_cpus=max_cpus,
+                min_gpus=min_gpus, max_gpus=max_gpus,
+                min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+                min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+                min_memory_used=min_memory_used,
+                max_memory_used=max_memory_used,
+                min_memory_wasted=min_memory_wasted,
+                max_memory_wasted=max_memory_wasted,
                 columns=cols,
                 limit=limit,
             )
@@ -60,8 +143,26 @@ class SearchCommand(BaseHistoryCommand):
                     "account": account,
                     "queue": queue,
                     "qos": qos,
-                    "status": status,
+                    "exit_status": exit_status,
                     "job_id": job_id,
+                    "name": list(name_patterns) if name_patterns else None,
+                    "ignore_case": ignore_case,
+                    "min_eligible_secs": min_eligible_secs,
+                    "max_eligible_secs": max_eligible_secs,
+                    "min_nodes": min_nodes,
+                    "max_nodes": max_nodes,
+                    "min_cpus": min_cpus,
+                    "max_cpus": max_cpus,
+                    "min_gpus": min_gpus,
+                    "max_gpus": max_gpus,
+                    "min_elapsed": min_elapsed,
+                    "max_elapsed": max_elapsed,
+                    "min_reqmem": min_reqmem,
+                    "max_reqmem": max_reqmem,
+                    "min_memory_used": min_memory_used,
+                    "max_memory_used": max_memory_used,
+                    "min_memory_wasted": min_memory_wasted,
+                    "max_memory_wasted": max_memory_wasted,
                     "limit": limit,
                 },
             )

@@ -112,7 +112,9 @@ any shims. See `_get_record_class()` in `sync/pbs.py`.
 |------|------|
 | `job_history/database/models.py` | ORM models: Job, JobCharge, DailySummary, JobRecord, lookup tables |
 | `job_history/database/session.py` | Engine/session factory, `db_available()`, PRAGMA tuning, `init_db` |
-| `job_history/queries/jobs.py` | `JobQueries` class — high-level query API |
+| `job_history/queries/jobs.py` | `JobQueries` class — high-level query API; `jobs_search`/`jobs_count`/`jobs_facets`/`jobs_histogram`/`jobs_usage_by` all share `_apply_jobs_search_filters` (no defaults there, on purpose); histogram bucket tables live on `QueryConfig` as `(label, lo, hi)` triples |
+| `job_history/queries/builders.py` | Period grouping + `glob_match_clause()` (dialect-aware GLOB/regex/ILIKE for job-name patterns) |
+| `job_history/columns.py` | Column registry (`COLUMNS`, `DEFAULT_COLUMNS`, `project_row`). **Public contract** — re-exported from `job_history` and consumed by SAM for table headers. Lives at the package root, not under `cli/`, because `jobs_search` projects and sorts through it |
 | `job_history/database/session.py` | Engine/session factory, `_ensure_db_triggers()`, `init_db()` |
 | `job_history/sync/base.py` | `SyncBase` ABC; full sync lifecycle; `_compute_charges_for_jobs()`, `_upsert_charges()`, `_fill_missing_charges()`, `_recalculate_charges()`; `UPDATABLE_JOB_FIELDS` |
 | `job_history/sync/pbs.py` | PBS field parsers, `SyncPBSLogs` driver; `parse_pbs_timestamp()` → naive UTC |
@@ -131,7 +133,7 @@ any shims. See `_get_record_class()` in `sync/pbs.py`.
 | `fs_scans/core/config.py` | `FsScanConfig` — backend selection (`FS_SCAN_DB_BACKEND`) + `FS_SCAN_PG_*` settings |
 | `fs_scans/core/database.py` | Backend-aware engine/session factory, discovery helpers (`list_pg_schemas`, `filesystem_available`, `describe_databases`) |
 | `fs_scans/core/models.py` | ORM models: Directory, DirectoryStats, histograms |
-| `fs_scans/core/query_builder.py` | `DirectoryQueryBuilder` — fluent filter API (dialect-aware GLOB/regex; `dir_id` tiebreaker) |
+| `fs_scans/core/query_builder.py` | `DirectoryQueryBuilder` — fluent filter API (dialect-aware GLOB/regex; `dir_id` tiebreaker). `job_history/queries/builders.py` has a deliberate near-duplicate for job names — no cross-imports between the modules; note the job_history copy escapes literal `%`/`_` on the LIKE path and this one does not |
 | `fs_scans/importers/importer.py` | Multi-pass import (directory discovery → stats → aggregation) |
 | `fs_scans/parsers/` | GPFS, Lustre, POSIX parsers |
 | `fs_scans/queries/` | Query engine + histogram analytics |
