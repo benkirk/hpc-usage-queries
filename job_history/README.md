@@ -234,9 +234,9 @@ window leaves behind — always pass `--start-date`/`--end-date`.
 
 ### Dashboard aggregations (API-only)
 
-Two aggregation methods share the exact same filter set (same helper, same
+Three aggregation methods share the exact same filter set (same helper, same
 signature-parity test) so what they describe can never drift from the rows
-`jobs_search` returns. Both are API-only — the `jobhist resource` reports
+`jobs_search` returns. All are API-only — the `jobhist resource` reports
 already serve the terminal case:
 
 - `JobQueries.jobs_facets()` — per-dimension value counts for filter
@@ -249,9 +249,15 @@ already serve the terminal case:
   rows whose column is NULL (derecho waits before 2025-01-07), and
   self-describing `min_param`/`max_param` so a clicked bar replays as
   `jobs_search` bounds. One CASE-grouped aggregate scan.
+- `JobQueries.jobs_usage_by(dimension, …)` — per-entity `job_count` +
+  `cpu_hours`/`gpu_hours` for a usage pie (`user` is the dashboard case).
+  No self-exclusion of any kind: every filter, `account` included, always
+  applies (the same security property `_FACET_SCOPE_DIMS` protects).
+  `totals` is computed before any `limit` truncation, so an "Other" slice
+  is exactly `totals − Σ rows`.
 
-Like the facets, both scan every row in the date slice — always pass a
-bounded `start`/`end`.
+All of them scan every row in the date slice — always pass a bounded
+`start`/`end`.
 
 ### Adding a new history subcommand
 

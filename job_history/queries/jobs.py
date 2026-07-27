@@ -1836,6 +1836,153 @@ class JobQueries:
             "total_count": total,
         }
 
+    def jobs_usage_by(
+        self,
+        dimension: str,
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
+        queue: Optional[str] = None,
+        qos: Optional[str] = None,
+        exit_status: Optional[str] = None,
+        job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Per-entity usage (job count + hours) for one dimension.
+
+        The data behind a "By User" usage pie: for each distinct value of
+        *dimension* within the filtered slice, the job count and summed raw
+        ``cpu_hours``/``gpu_hours``. Filter shape mirrors
+        :meth:`jobs_search` / :meth:`jobs_count` exactly (same helper).
+
+        This is deliberately **not** ``jobs_facets(include_hours=True)``:
+        facet self-exclusion is wrong for usage (hours attributed under a
+        self-excluded dimension would describe rows the current filters
+        exclude), and there is **no self-exclusion of any kind here** —
+        every filter, ``account`` included, always applies. That is the
+        same security property :data:`_FACET_SCOPE_DIMS` protects: SAM pins
+        ``account`` as its authorization scope, and this method can never
+        emit usage for projects outside it.
+
+        Args:
+            dimension: Any :data:`_FACET_SPECS` key — ``user`` (the pie
+                case), ``account``, ``queue``, ``qos``, ``exit_status``.
+            limit: Optional top-N truncation, applied after sorting. The
+                tail is dropped with no synthetic "other" row, but
+                ``totals`` is computed **before** truncation — so a
+                consumer's "Other" slice is exactly
+                ``totals − Σ returned rows``, an invariant rather than a
+                guess.
+
+        Returns::
+
+            {
+              "dimension": "user",
+              "rows": [   # (cpu_hours + gpu_hours) desc, value asc, None last
+                {"value": "alice", "job_count": 812,
+                 "cpu_hours": 91234.5, "gpu_hours": 120.0},
+                ...
+              ],
+              "totals": {"job_count": 40213,
+                         "cpu_hours": 5432100.0, "gpu_hours": 21000.0},
+            }
+
+        ``value`` is ``None`` for a NULL FK (kept, not dropped — dropping
+        would make rows under-sum against ``totals``). Hours are raw
+        ``cpu_hours``/``gpu_hours``, not QoS-weighted charges, matching
+        :meth:`job_sizes_by_resource`; ``memory_hours`` is omitted until a
+        consumer needs it. ``totals["job_count"]`` equals
+        :meth:`jobs_count` under the same filters by construction.
+
+        Cost: one aggregate statement — grouped on the integer FK (never
+        the text hybrid; see :data:`_FACET_SPECS`), COUNT + two SUMs over a
+        LEFT OUTER JOIN to ``job_charges``, names resolved after
+        aggregation. Scans every row in the date slice, so always pass a
+        bounded ``start``/``end``.
+
+        Raises:
+            ValueError: on an unknown *dimension* or non-positive *limit*.
+        """
+        spec = _FACET_SPECS.get(dimension)
+        if spec is None:
+            valid = ", ".join(sorted(_FACET_SPECS))
+            raise ValueError(
+                f"Unknown dimension: {dimension!r}. Valid dimensions: {valid}"
+            )
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ValueError(f"limit must be a positive integer, got {limit!r}")
+        group_col, model, name_col = spec
+
+        query = (
+            self.session.query(
+                group_col,
+                func.count(Job.id),
+                func.sum(JobCharge.cpu_hours),
+                func.sum(JobCharge.gpu_hours),
+            )
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+        )
+        query = self._apply_jobs_search_filters(
+            query, start=start, end=end, user=user, account=account,
+            queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
+            name=name, ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+        )
+        raw = query.group_by(group_col).all()
+
+        names = {}
+        if model is not None:
+            names = self._resolve_lookup_names(
+                model, name_col, {r[0] for r in raw if r[0] is not None}
+            )
+
+        rows = []
+        for key, count, cpu, gpu in raw:
+            value = names.get(key) if model is not None else key
+            rows.append({
+                "value": value,
+                "job_count": int(count),
+                "cpu_hours": float(cpu or 0.0),
+                "gpu_hours": float(gpu or 0.0),
+            })
+        # Usage desc, then value asc with None last — the facet tie-break
+        # convention, keyed on hours instead of count.
+        rows.sort(key=lambda r: (
+            -(r["cpu_hours"] + r["gpu_hours"]), r["value"] is None, str(r["value"])
+        ))
+
+        totals = {
+            "job_count": sum(r["job_count"] for r in rows),
+            "cpu_hours": sum(r["cpu_hours"] for r in rows),
+            "gpu_hours": sum(r["gpu_hours"] for r in rows),
+        }
+        if limit is not None:
+            rows = rows[:limit]
+
+        return {"dimension": dimension, "rows": rows, "totals": totals}
+
     def _resolve_lookup_names(self, model, name_col, ids) -> Dict[Any, Any]:
         """``{id: display_name}`` for a lookup table, post-aggregation.
 

@@ -971,6 +971,7 @@ class TestFilterSignatureParity:
     SEARCH_ONLY = {"columns", "limit", "offset", "sort_by", "sort_dir"}
     FACET_ONLY = {"facets", "self_exclude", "limit"}
     HIST_ONLY = {"dimension"}
+    USAGE_ONLY = {"dimension", "limit"}
 
     @staticmethod
     def _params(fn):
@@ -988,6 +989,10 @@ class TestFilterSignatureParity:
     def test_jobs_histogram_accepts_every_jobs_search_filter(self):
         search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
         assert search == self._params(JobQueries.jobs_histogram) - self.HIST_ONLY
+
+    def test_jobs_usage_by_accepts_every_jobs_search_filter(self):
+        search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
+        assert search == self._params(JobQueries.jobs_usage_by) - self.USAGE_ONLY
 
     def test_helper_covers_exactly_the_filter_set(self):
         search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
@@ -1355,3 +1360,106 @@ class TestJobsHistogram:
         assert "job_charges" in aggregates[0]
         assert "SELECT users.username" not in aggregates[0]
         assert "SELECT queues.queue_name" not in aggregates[0]
+
+
+class TestJobsUsageBy:
+    """Uses histogram_jobs: alice 3 jobs (5110 cpu-h, 400 gpu-h), bob 2
+    (31 cpu-h, 60 gpu-h), carol 1 (charge-less)."""
+
+    def test_row_contract_and_hours_desc_ordering(
+            self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by("user")
+        assert out["dimension"] == "user"
+        for row in out["rows"]:
+            assert set(row) == {"value", "job_count", "cpu_hours", "gpu_hours"}
+        assert [r["value"] for r in out["rows"]] == ["alice", "bob", "carol"]
+
+    def test_totals_match_jobs_count_and_rows_sum(
+            self, in_memory_session, histogram_jobs):
+        q = JobQueries(in_memory_session)
+        out = q.jobs_usage_by("user")
+        assert out["totals"]["job_count"] == q.jobs_count() == 6
+        assert out["totals"]["cpu_hours"] == pytest.approx(5141.0)
+        assert out["totals"]["gpu_hours"] == pytest.approx(460.0)
+        assert sum(r["job_count"] for r in out["rows"]) == \
+            out["totals"]["job_count"]
+        assert sum(r["cpu_hours"] for r in out["rows"]) == \
+            pytest.approx(out["totals"]["cpu_hours"])
+
+    def test_chargeless_job_counts_with_zero_hours(
+            self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by("user")
+        carol = next(r for r in out["rows"] if r["value"] == "carol")
+        assert carol["job_count"] == 1
+        assert carol["cpu_hours"] == 0.0
+        assert carol["gpu_hours"] == 0.0
+
+    def test_limit_truncates_rows_but_not_totals(
+            self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by("user", limit=1)
+        assert [r["value"] for r in out["rows"]] == ["alice"]
+        # totals still describe the WHOLE filtered slice — the consumer's
+        # "Other" slice is totals − Σ rows, an invariant not a guess.
+        assert out["totals"]["job_count"] == 6
+        assert sum(r["job_count"] for r in out["rows"]) <= \
+            out["totals"]["job_count"]
+
+    def test_account_scoping_always_applied(self, in_memory_session, histogram_jobs):
+        # Security mirror of test_account_is_never_self_excluded: with an
+        # account scope pinned, no foreign user or project may appear —
+        # even when the dimension IS account.
+        q = JobQueries(in_memory_session)
+        by_user = q.jobs_usage_by("user", account="NCAR0001")
+        assert [r["value"] for r in by_user["rows"]] == ["alice"]
+        assert by_user["totals"]["job_count"] == 3
+        by_account = q.jobs_usage_by("account", account="NCAR0001")
+        assert [r["value"] for r in by_account["rows"]] == ["NCAR0001"]
+
+    def test_filters_apply(self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by("user", min_gpus=1)
+        assert {r["value"] for r in out["rows"]} == {"alice", "bob"}
+        assert out["totals"]["job_count"] == 2   # 702 and 704
+
+    def test_exit_status_groups_text_directly(self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by("exit_status")
+        assert [r["value"] for r in out["rows"]] == ["0"]
+        assert out["rows"][0]["job_count"] == 6
+
+    def test_null_fk_surfaces_as_none_last(self, in_memory_session, facet_jobs):
+        # facet_jobs: carol's job has queue=None; no charges exist, so all
+        # hours are 0.0 and ordering falls back to value asc, None last.
+        out = JobQueries(in_memory_session).jobs_usage_by("queue")
+        counts = {r["value"]: r["job_count"] for r in out["rows"]}
+        assert counts == {"main": 3, "gpudev": 2, None: 1}
+        assert out["rows"][-1]["value"] is None
+        assert out["totals"]["job_count"] == 6
+
+    def test_unknown_dimension_raises(self, in_memory_session, histogram_jobs):
+        with pytest.raises(ValueError, match="Unknown dimension"):
+            JobQueries(in_memory_session).jobs_usage_by("facility")
+
+    def test_bad_limit_raises(self, in_memory_session, histogram_jobs):
+        with pytest.raises(ValueError, match="positive integer"):
+            JobQueries(in_memory_session).jobs_usage_by("user", limit=0)
+
+    def test_one_aggregate_scan_groups_the_fk(self, in_memory_session, histogram_jobs):
+        from sqlalchemy import event
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_usage_by(
+                "user", account="NCAR0001")
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        aggregates = [s for s in statements
+                      if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+        assert len(aggregates) == 1, \
+            f"expected 1 aggregate scan, got {len(aggregates)}:\n{aggregates}"
+        assert "jobs.user_id" in aggregates[0]
+        assert "job_charges" in aggregates[0]
+        assert "SELECT users.username" not in aggregates[0]
