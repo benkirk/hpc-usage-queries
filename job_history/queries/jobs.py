@@ -1767,8 +1767,11 @@ class JobQueries:
         label. Like :meth:`jobs_facets` it scans every row in the date
         slice, so the window is the cost lever: always pass ``start``/
         ``end`` (facets measured ~200 s unbounded over full history).
-        Hours are raw ``cpu_hours``/``gpu_hours`` (not QoS-weighted
-        charges), matching :meth:`job_sizes_by_resource`.
+        Measured on PostgreSQL over a 308k-row month, machine-wide:
+        ~570 ms warm regardless of dimension, against ~150 ms for
+        ``jobs_facets`` on the same slice — the charge join is the
+        difference. Hours are raw ``cpu_hours``/``gpu_hours`` (not
+        QoS-weighted charges), matching :meth:`job_sizes_by_resource`.
 
         Raises:
             ValueError: on an unknown *dimension*.
@@ -1914,7 +1917,9 @@ class JobQueries:
         the text hybrid; see :data:`_FACET_SPECS`), COUNT + two SUMs over a
         LEFT OUTER JOIN to ``job_charges``, names resolved after
         aggregation. Scans every row in the date slice, so always pass a
-        bounded ``start``/``end``.
+        bounded ``start``/``end``. Measured on PostgreSQL over a 308k-row
+        month, machine-wide: ~545 ms warm (~150 ms for ``jobs_facets`` on
+        the same slice — the charge join is the difference).
 
         Raises:
             ValueError: on an unknown *dimension* or non-positive *limit*.

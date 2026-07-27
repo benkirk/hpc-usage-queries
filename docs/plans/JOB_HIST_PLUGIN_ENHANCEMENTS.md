@@ -44,8 +44,9 @@ Everything below is warm, machine-wide, on the localhost dev container.
 | facets, 5 dimensions as 5 separate queries | 714 ms |
 | facets, 5 dimensions via `GROUPING SETS` | 182 ms |
 | `GROUP BY queue_id` vs `GROUP BY <hybrid property>` | **122 ms vs 1,223 ms (10×)** |
-| `jobs_histogram`, 1 month, machine-wide (§8) | _tbd — measured after §8 lands_ |
-| `jobs_usage_by('user')`, 1 month, machine-wide (§8) | _tbd — measured after §8 lands_ |
+| `jobs_histogram`, 1 month (308k rows), machine-wide (§8) | ~570 ms warm, any dimension |
+| `jobs_usage_by('user')`, same slice (§8) | ~545 ms warm |
+| (facets on the same slice, for ratio) | ~150 ms — the 1:1 `job_charges` outer join is the §8 delta; noted, not redesigned |
 
 Two conclusions that drive the design:
 
