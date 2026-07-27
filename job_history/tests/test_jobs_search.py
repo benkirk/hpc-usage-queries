@@ -958,6 +958,112 @@ class TestJobsSearchElapsedReqmemFilters:
             assert q.jobs_count(**kw) == len(q.jobs_search(**kw))
 
 
+@pytest.fixture
+def memory_jobs(in_memory_session):
+    """Jobs with distinct (reqmem, memory) pairs pinning the wasted delta.
+
+    Includes an over-request row (used > requested → negative wasted), an
+    exact-fit row (wasted == 0, guarding the falsy-zero bound), and a NULL
+    in each column separately — either NULL must make the delta NULL.
+    """
+    base = datetime(2025, 5, 2, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    specs = [
+        # (jid, reqmem, memory)              wasted = reqmem − memory
+        ("600.desched1", 4 * _GIB,  2 * _GIB),    # 2 GiB
+        ("601.desched1", 64 * _GIB, 4 * _GIB),    # 60 GiB
+        ("602.desched1", 8 * _GIB,  12 * _GIB),   # −4 GiB (over request)
+        ("603.desched1", None,      16 * _GIB),   # NULL reqmem → NULL delta
+        ("604.desched1", 32 * _GIB, None),        # NULL memory → NULL delta
+        ("605.desched1", 2 * _GIB,  2 * _GIB),    # 0 (exact fit)
+    ]
+    jobs = [
+        Job(job_id=jid, short_id=600 + i, name=f"mem{i}", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=base, start=base, end=base + timedelta(hours=i + 1),
+            elapsed=3600, reqmem=reqmem, memory=memory,
+            numcpus=128, numgpus=0, numnodes=1)
+        for i, (jid, reqmem, memory) in enumerate(specs)
+    ]
+    for j in jobs:
+        in_memory_session.add(j)
+    in_memory_session.commit()
+    return jobs
+
+
+class TestJobsSearchMemoryFilters:
+    """(reqmem, memory) GiB = (4,2), (64,4), (8,12), (None,16), (32,None), (2,2)."""
+
+    def test_min_memory_used_excludes_smaller(self, in_memory_session, memory_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_memory_used=4 * _GIB, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {
+            "601.desched1", "602.desched1", "603.desched1"}
+
+    def test_max_memory_used_excludes_larger(self, in_memory_session, memory_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            max_memory_used=2 * _GIB, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {"600.desched1", "605.desched1"}
+
+    def test_memory_used_bounds_inclusive(self, in_memory_session, memory_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(min_memory_used=4 * _GIB,
+                            max_memory_used=4 * _GIB) == 1
+
+    def test_null_memory_excluded_by_both_bounds(
+            self, in_memory_session, memory_jobs):
+        q = JobQueries(in_memory_session)
+        assert "604.desched1" not in {
+            r["job_id"] for r in q.jobs_search(min_memory_used=0)}
+        assert "604.desched1" not in {
+            r["job_id"] for r in q.jobs_search(max_memory_used=1024 * _GIB)}
+
+    def test_min_wasted_zero_excludes_over_request(
+            self, in_memory_session, memory_jobs):
+        # min=0 keeps exact-fit and under-use, drops the negative delta and
+        # both NULL-delta rows. 0 is falsy — also guards the `is not None`
+        # convention for the new pair.
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_memory_wasted=0, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {
+            "600.desched1", "601.desched1", "605.desched1"}
+
+    def test_negative_max_selects_over_request_jobs(
+            self, in_memory_session, memory_jobs):
+        # The 'over request' histogram band replays as max_memory_wasted=-1.
+        rows = JobQueries(in_memory_session).jobs_search(
+            max_memory_wasted=-1, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {"602.desched1"}
+
+    def test_negative_min_is_not_clamped(self, in_memory_session, memory_jobs):
+        # A negative floor must include the over-request row — clamping
+        # negatives to zero would silently hide those jobs.
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_memory_wasted=-(4 * _GIB), columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {
+            "600.desched1", "601.desched1", "602.desched1", "605.desched1"}
+
+    def test_wasted_bounds_inclusive(self, in_memory_session, memory_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(min_memory_wasted=-(4 * _GIB),
+                            max_memory_wasted=-(4 * _GIB)) == 1
+
+    def test_either_null_column_nulls_the_delta(
+            self, in_memory_session, memory_jobs):
+        # SQL NULL propagation: reqmem − NULL and NULL − memory are both
+        # NULL, so 603 AND 604 drop out under any wasted bound.
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_memory_wasted=-(10 ** 15), columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {
+            "600.desched1", "601.desched1", "602.desched1", "605.desched1"}
+
+    def test_count_agrees_with_search(self, in_memory_session, memory_jobs):
+        q = JobQueries(in_memory_session)
+        for kw in ({"min_memory_used": 4 * _GIB}, {"max_memory_used": 2 * _GIB},
+                   {"max_memory_wasted": -1},
+                   {"min_memory_wasted": -(4 * _GIB), "max_memory_wasted": 60 * _GIB}):
+            assert q.jobs_count(**kw) == len(q.jobs_search(**kw))
+
+
 class TestFilterSignatureParity:
     """jobs_search / jobs_count / jobs_facets / the helper must stay in sync.
 
@@ -1305,6 +1411,75 @@ class TestJobsHistogram:
         assert by["<1GB"]["job_count"] == 1
         assert by["500-1000GB"]["job_count"] == 1
         assert by[">1000GB"]["job_count"] == 0
+
+    def test_memory_used_buckets_memory_not_reqmem(
+            self, in_memory_session, histogram_jobs):
+        # The mirror of test_memory_buckets_reqmem_not_memory: 703's 600 GiB
+        # USED lands in '500-1000GB' even though it requested < 1 GiB, and
+        # 702's 100 GiB used (512 GiB requested) sits at the inclusive top
+        # of '50-100GB'. 704 has NULL memory → null_count, never a band.
+        out = JobQueries(in_memory_session).jobs_histogram("memory_used")
+        by = self._by_label(out)
+        assert by["500-1000GB"]["job_count"] == 1
+        assert by["50-100GB"]["job_count"] == 1
+        assert by["1-10GB"]["job_count"] == 3    # 2, 4 and 1 GiB used
+        assert by["<1GB"]["job_count"] == 0
+        assert out["null_count"] == 1
+        assert out["total_count"] == 6
+
+    def test_memory_wasted_over_request_band_leads(
+            self, in_memory_session, histogram_jobs):
+        # 703 used 600 GiB against a <1 GiB request → negative delta, caught
+        # by the leading 'over request' band, which replays as
+        # max_memory_wasted=-1 with NO min bound (lo is None).
+        out = JobQueries(in_memory_session).jobs_histogram("memory_wasted")
+        first = out["buckets"][0]
+        assert first["label"] == "over request"
+        assert (first["lo"], first["hi"]) == (None, -1)
+        assert first["job_count"] == 1
+
+    def test_memory_wasted_counts_and_null_propagation(
+            self, in_memory_session, histogram_jobs):
+        # Deltas: 700→2 GiB, 701→60 GiB, 702→412 GiB, 705→1 GiB,
+        # 703→negative, 704→NULL (both columns NULL → NULL delta).
+        out = JobQueries(in_memory_session).jobs_histogram("memory_wasted")
+        by = self._by_label(out)
+        assert by["1-10GB"]["job_count"] == 2
+        assert by["50-100GB"]["job_count"] == 1
+        assert by["100-500GB"]["job_count"] == 1
+        assert out["null_count"] == 1
+        assert out["total_count"] == 6
+
+    def test_memory_wasted_envelope_and_one_aggregate_scan(
+            self, in_memory_session, histogram_jobs):
+        # The computed-expression dimension must still be one CASE-grouped
+        # statement (no per-row subqueries) and self-describe its column.
+        from sqlalchemy import event
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            out = JobQueries(in_memory_session).jobs_histogram("memory_wasted")
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        assert (out["column"], out["unit"]) == ("memory_wasted", "bytes")
+        assert (out["min_param"], out["max_param"]) == \
+            ("min_memory_wasted", "max_memory_wasted")
+
+        aggregates = [s for s in statements
+                      if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+        assert len(aggregates) == 1
+        assert "reqmem" in aggregates[0] and "memory" in aggregates[0]
+
+    def test_memory_used_envelope(self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram("memory_used")
+        assert (out["column"], out["unit"]) == ("memory", "bytes")
+        assert (out["min_param"], out["max_param"]) == \
+            ("min_memory_used", "max_memory_used")
 
     def test_gpus_zero_band_not_overflow(self, in_memory_session, histogram_jobs):
         by = self._by_label(JobQueries(in_memory_session).jobs_histogram("gpus"))

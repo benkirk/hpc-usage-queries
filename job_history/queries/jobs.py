@@ -333,6 +333,18 @@ class QueryConfig:
         (">1000GB",    1000 * _GIB + 1,  None),
     ]
 
+    # Used-memory bands: the same GiB boundaries as REQMEM_HIST_BUCKETS —
+    # requested vs used on a shared x-axis is the point of the pair.
+    MEMUSED_HIST_BUCKETS = list(REQMEM_HIST_BUCKETS)
+
+    # Requested-minus-used bands. The leading "over request" band catches
+    # negative deltas (the job used MORE memory than it requested —
+    # ~0.3-0.4% of production rows on both machines); lo=None keeps it open
+    # from below, so it round-trips as max_memory_wasted=-1 with no min
+    # bound. _bucket_case's ascending `<= hi` ladder handles the negative
+    # band with no special casing.
+    MEMWASTED_HIST_BUCKETS = [("over request", None, -1)] + REQMEM_HIST_BUCKETS
+
     # Duration buckets (in seconds)
     @staticmethod
     def get_duration_buckets():
@@ -415,6 +427,15 @@ class QueryConfig:
         }
 
 
+#: Requested-minus-used memory delta, in bytes. SQL NULL propagation makes
+#: it NULL-strict for free: NULL in either column yields a NULL delta, which
+#: range bounds exclude and the histogram routes to ``null_count``. Negative
+#: values are legal and meaningful (the job used more than it requested), so
+#: nothing here clamps at zero. The Label supplies the ``column`` name in
+#: the histogram envelope; in WHERE/CASE contexts it compiles to the bare
+#: expression (no AS clause).
+_MEMORY_WASTED = (Job.reqmem - Job.memory).label('memory_wasted')
+
 #: jobs_histogram dimension → (column, bucket table, unit, min/max kwargs).
 #:
 #: Dimension names are deliberately the SAM dashboard's tab/pill vocabulary,
@@ -422,9 +443,9 @@ class QueryConfig:
 #: self-describing: a consumer turns a clicked bar into
 #: ``jobs_search(**{min_param: lo, max_param: hi})`` without hardcoding the
 #: dimension→filter map. ``memory`` buckets REQUESTED memory (``reqmem``) —
-#: the dashboard ask is "resource needs"; used-memory physics belongs to
-#: job_memory_per_rank. A future ``memory_used`` dimension would be one more
-#: row here, not a repurposing of this one.
+#: the dashboard ask is "resource needs" — while ``memory_used`` buckets the
+#: memory actually consumed (``Job.memory``) and ``memory_wasted`` their
+#: difference; per-rank used-memory physics stays with job_memory_per_rank.
 _HISTOGRAM_SPECS: Dict[str, Tuple[Any, List[tuple], str, str, str]] = {
     'wait':     (Job.eligible_secs, QueryConfig.WAIT_BUCKETS,
                  'seconds', 'min_eligible_secs', 'max_eligible_secs'),
@@ -438,6 +459,10 @@ _HISTOGRAM_SPECS: Dict[str, Tuple[Any, List[tuple], str, str, str]] = {
                  'bytes',   'min_reqmem',        'max_reqmem'),
     'duration': (Job.elapsed,       QueryConfig.DURATION_HIST_BUCKETS,
                  'seconds', 'min_elapsed',       'max_elapsed'),
+    'memory_used':   (Job.memory,     QueryConfig.MEMUSED_HIST_BUCKETS,
+                      'bytes', 'min_memory_used',   'max_memory_used'),
+    'memory_wasted': (_MEMORY_WASTED, QueryConfig.MEMWASTED_HIST_BUCKETS,
+                      'bytes', 'min_memory_wasted', 'max_memory_wasted'),
 }
 
 
@@ -1286,6 +1311,10 @@ class JobQueries:
         max_elapsed: Optional[int] = None,
         min_reqmem: Optional[int] = None,
         max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
         columns: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         offset: int = 0,
@@ -1389,19 +1418,30 @@ class JobQueries:
                 ``Job.walltime``, the walltime *requested*.
             min_reqmem / max_reqmem: Inclusive bounds on ``Job.reqmem``
                 (memory *requested* at submit), in **bytes**. Requested,
-                not used — used memory is ``Job.memory``, which has no
-                filter here.
+                not used — used memory is ``Job.memory``, filtered by
+                ``min_/max_memory_used`` below.
+            min_memory_used / max_memory_used: Inclusive bounds on
+                ``Job.memory`` (peak memory actually *used*, PBS
+                ``resources_used.mem``), in **bytes**.
+            min_memory_wasted / max_memory_wasted: Inclusive bounds on the
+                computed ``Job.reqmem - Job.memory`` delta (requested minus
+                used), in **bytes**. The delta may legitimately be
+                **negative** — the job used more than it requested — so
+                ``max_memory_wasted=-1`` selects exactly those over-request
+                jobs, and neither bound clamps at zero. A NULL in *either*
+                column makes the delta NULL, so those rows drop out under
+                either bound (standard NULL-strict rules).
 
-                All ten range bounds are NULL-strict: a NULL column value
-                fails both comparisons and the row drops out.
+                All fourteen range bounds are NULL-strict: a NULL column
+                value fails both comparisons and the row drops out.
 
                 Performance: ``name``, ``eligible_secs``, ``numnodes``,
-                ``numcpus``, ``numgpus``, ``elapsed`` and ``reqmem`` are
-                **unindexed**. Each of these filters is evaluated as a scan
-                of whatever slice ``start``/``end`` leave behind (via
-                ``ix_jobs_end``). Production derecho holds ~15.7M rows and
-                casper ~26.7M, so always pass a bounded date window
-                alongside them.
+                ``numcpus``, ``numgpus``, ``elapsed``, ``reqmem`` and
+                ``memory`` are **unindexed**. Each of these filters is
+                evaluated as a scan of whatever slice ``start``/``end``
+                leave behind (via ``ix_jobs_end``). Production derecho
+                holds ~15.7M rows and casper ~26.7M, so always pass a
+                bounded date window alongside them.
             columns: Optional sequence of column keys to project.
                 When None, returns DEFAULT_COLUMNS. Unknown keys raise ValueError.
             limit: Optional max number of rows to return. Applied as a SQL
@@ -1455,6 +1495,10 @@ class JobQueries:
             min_gpus=min_gpus, max_gpus=max_gpus,
             min_elapsed=min_elapsed, max_elapsed=max_elapsed,
             min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
         )
 
         if sort_by is None:
@@ -1494,6 +1538,10 @@ class JobQueries:
         max_elapsed: Optional[int] = None,
         min_reqmem: Optional[int] = None,
         max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
     ) -> int:
         """Count rows that ``jobs_search`` would return under the same filters.
 
@@ -1524,6 +1572,10 @@ class JobQueries:
             min_gpus=min_gpus, max_gpus=max_gpus,
             min_elapsed=min_elapsed, max_elapsed=max_elapsed,
             min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
         )
         return int(query.scalar() or 0)
 
@@ -1552,6 +1604,10 @@ class JobQueries:
         max_elapsed: Optional[int] = None,
         min_reqmem: Optional[int] = None,
         max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
         facets: Sequence[str] = DEFAULT_FACETS,
         self_exclude: bool = True,
         limit: Optional[int] = None,
@@ -1637,6 +1693,10 @@ class JobQueries:
             min_gpus=min_gpus, max_gpus=max_gpus,
             min_elapsed=min_elapsed, max_elapsed=max_elapsed,
             min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
         )
         # Faceted dimensions that carry a filter and are not a security scope:
         # their predicate leaves the WHERE clause and is re-applied in the fold.
@@ -1711,6 +1771,10 @@ class JobQueries:
         max_elapsed: Optional[int] = None,
         min_reqmem: Optional[int] = None,
         max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Distribution histogram over one job dimension, for dashboards.
 
@@ -1725,8 +1789,13 @@ class JobQueries:
         Args:
             dimension: One of ``wait`` (``eligible_secs``), ``nodes``,
                 ``cpus``, ``gpus``, ``memory`` (**requested** memory,
-                ``reqmem``) or ``duration`` (``elapsed``). Names match the
-                SAM dashboard vocabulary, not column names.
+                ``reqmem``), ``duration`` (``elapsed``), ``memory_used``
+                (peak memory actually consumed, ``Job.memory``) or
+                ``memory_wasted`` (the computed ``reqmem - memory`` delta;
+                its leading ``over request`` band collects negative deltas
+                — jobs that used more than they requested — and rows with
+                a NULL in either column land in ``null_count``). Names
+                match the SAM dashboard vocabulary, not column names.
 
         Returns::
 
@@ -1805,6 +1874,10 @@ class JobQueries:
             min_gpus=min_gpus, max_gpus=max_gpus,
             min_elapsed=min_elapsed, max_elapsed=max_elapsed,
             min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
         )
         rows = query.group_by(bucket_label).all()
 
@@ -1865,6 +1938,10 @@ class JobQueries:
         max_elapsed: Optional[int] = None,
         min_reqmem: Optional[int] = None,
         max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Per-entity usage (job count + hours) for one dimension.
@@ -1954,6 +2031,10 @@ class JobQueries:
             min_gpus=min_gpus, max_gpus=max_gpus,
             min_elapsed=min_elapsed, max_elapsed=max_elapsed,
             min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
         )
         raw = query.group_by(group_col).all()
 
@@ -2025,6 +2106,8 @@ class JobQueries:
         min_eligible_secs, max_eligible_secs,
         min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus,
         min_elapsed, max_elapsed, min_reqmem, max_reqmem,
+        min_memory_used, max_memory_used,
+        min_memory_wasted, max_memory_wasted,
     ):
         """Apply the shared filter set used by jobs_search/count/facets.
 
@@ -2100,6 +2183,8 @@ class JobQueries:
             (Job.numgpus,       min_gpus,          max_gpus),
             (Job.elapsed,       min_elapsed,       max_elapsed),
             (Job.reqmem,        min_reqmem,        max_reqmem),
+            (Job.memory,        min_memory_used,   max_memory_used),
+            (_MEMORY_WASTED,    min_memory_wasted, max_memory_wasted),
         ):
             if _lo is not None:
                 query = query.filter(_column >= _lo)

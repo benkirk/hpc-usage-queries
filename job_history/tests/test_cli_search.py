@@ -283,6 +283,25 @@ class TestSearchCommand:
         # Fixture jobs carry no reqmem → NULL-strict bounds drop them.
         assert parsed["rows"] == []
 
+    def test_memory_used_gb_converted_to_bytes_in_filters(self, search_ctx, capsys):
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(max_memory_used_gb=1.5) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["filters"]["max_memory_used"] == int(1.5 * 1024 ** 3)
+        assert parsed["filters"]["min_memory_used"] is None
+        # Fixture jobs carry no memory → NULL-strict bounds drop them.
+        assert parsed["rows"] == []
+
+    def test_memory_wasted_gb_accepts_negative_bound(self, search_ctx, capsys):
+        # The over-request selector: a negative ceiling must convert to
+        # negative bytes, not be clamped or rejected.
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(max_memory_wasted_gb=-1.0) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["filters"]["max_memory_wasted"] == -(1024 ** 3)
+        assert parsed["filters"]["min_memory_wasted"] is None
+        assert parsed["rows"] == []
+
 
 # ---------------------------------------------------------------------------
 # CliRunner — Click integration through the new entry point
@@ -310,8 +329,33 @@ class TestJobhistSearchCli:
                     "--min-wait-hours", "--max-wait-hours",
                     "--min-nodes", "--max-nodes", "--min-cpus", "--max-cpus",
                     "--min-gpus", "--max-gpus",
+                    "--min-memory-used-gb", "--max-memory-used-gb",
+                    "--min-memory-wasted-gb", "--max-memory-wasted-gb",
                     "-v, --verbose", "--display"):
             assert opt in result.output
+
+    def test_memory_wasted_flag_parses_negative_value(self):
+        # Click must not mistake a negative bound for an option token; the
+        # `=` form is unambiguous. Failure past parsing (no DB in this
+        # environment) is fine — a parse error would exit 2 with a usage
+        # message instead.
+        from click.testing import CliRunner
+        from job_history.cli.cmds.jobhist import cli
+
+        result = CliRunner().invoke(
+            cli, ["search", "--max-memory-wasted-gb=-1.5", "--help"]
+        )
+        assert result.exit_code == 0
+
+    def test_memory_used_rejects_negative_value(self):
+        from click.testing import CliRunner
+        from job_history.cli.cmds.jobhist import cli
+
+        result = CliRunner().invoke(
+            cli, ["search", "--min-memory-used-gb=-1"]
+        )
+        assert result.exit_code != 0
+        assert "Invalid value" in result.output
 
     def test_invalid_date_format(self):
         from click.testing import CliRunner

@@ -228,6 +228,15 @@ job id) there are:
 - `--min-reqmem-gb` / `--max-reqmem-gb` — bounds on memory *requested* at
   submit (`Job.reqmem`, PBS `Resource_List.mem`), not memory used. The CLI
   takes GB; the API takes `min_/max_reqmem` in bytes (1 GB = 1024³).
+- `--min-memory-used-gb` / `--max-memory-used-gb` — bounds on peak memory
+  actually *used* (`Job.memory`, PBS `resources_used.mem`). Same GB↔bytes
+  convention (API: `min_/max_memory_used`).
+- `--min-memory-wasted-gb` / `--max-memory-wasted-gb` — bounds on the
+  computed requested−used delta (API: `min_/max_memory_wasted`, bytes).
+  May be **negative**: the job used more than it requested, so
+  `--max-memory-wasted-gb=-1` selects exactly those over-request jobs
+  (use the `=` form for negative values). A NULL in either memory column
+  makes the delta NULL and the row drops out under either bound.
 
 All of these hit unindexed columns, so they scan whatever slice the date
 window leaves behind — always pass `--start-date`/`--end-date`.
@@ -244,11 +253,14 @@ already serve the terminal case:
   dimensions are requested.
 - `JobQueries.jobs_histogram(dimension, …)` — distribution histogram over
   `wait` / `nodes` / `cpus` / `gpus` / `memory` (requested, bytes) /
-  `duration`. Returns the full bucket vector (zeros included) with
-  per-bucket `job_count` + `cpu_hours`/`gpu_hours`, a `null_count` for
-  rows whose column is NULL (derecho waits before 2025-01-07), and
-  self-describing `min_param`/`max_param` so a clicked bar replays as
-  `jobs_search` bounds. One CASE-grouped aggregate scan.
+  `duration` / `memory_used` (bytes) / `memory_wasted` (requested−used
+  delta, bytes; a leading `over request` band collects negative deltas).
+  Returns the full bucket vector (zeros included) with per-bucket
+  `job_count` + `cpu_hours`/`gpu_hours`, a `null_count` for rows whose
+  column is NULL (derecho waits before 2025-01-07; either-column NULLs for
+  `memory_wasted`), and self-describing `min_param`/`max_param` so a
+  clicked bar replays as `jobs_search` bounds. One CASE-grouped aggregate
+  scan.
 - `JobQueries.jobs_usage_by(dimension, …)` — per-entity `job_count` +
   `cpu_hours`/`gpu_hours` for a usage pie (`user` is the dashboard case).
   No self-exclusion of any kind: every filter, `account` included, always

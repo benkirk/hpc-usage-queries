@@ -377,6 +377,17 @@ duration`, mapped by a module-level `_HISTOGRAM_SPECS` table to
 self-describing — it carries `column`, `unit`, and the `min_param`/
 `max_param` kwarg names — so SAM never hardcodes the dimension→filter map.
 
+> **Round-2 addendum (2026-07-27, SAM follow-ups):** two more dimensions —
+> `memory_used` (`Job.memory`, same GiB bands as `memory`) and
+> `memory_wasted` (computed `reqmem − memory` delta; a leading
+> `over request` band with `lo=None, hi=-1` collects negative deltas, and
+> either-column NULLs land in `null_count`) — plus the matching
+> `min_/max_memory_used` + `min_/max_memory_wasted` range filters across
+> all five query methods and `--min/max-memory-used-gb` /
+> `--min/max-memory-wasted-gb` CLI flags (the wasted pair accepts
+> negatives). Same bounds-round-trip invariant; the parity tests forced the
+> full fan-out.
+
 **One statement**: a CASE label + `COUNT` + `SUM(cpu_hours)` +
 `SUM(gpu_hours)` over a LEFT OUTER JOIN to `job_charges`, filtered by
 `_apply_jobs_search_filters`, grouped by the label. Decisions, in the order

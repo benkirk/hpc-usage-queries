@@ -46,6 +46,10 @@ class SearchCommand(BaseHistoryCommand):
         max_elapsed_hours: Optional[float] = None,
         min_reqmem_gb: Optional[float] = None,
         max_reqmem_gb: Optional[float] = None,
+        min_memory_used_gb: Optional[float] = None,
+        max_memory_used_gb: Optional[float] = None,
+        min_memory_wasted_gb: Optional[float] = None,
+        max_memory_wasted_gb: Optional[float] = None,
         verbose: bool = False,
         display: Optional[str] = None,
         limit: Optional[int] = None,
@@ -81,6 +85,24 @@ class SearchCommand(BaseHistoryCommand):
         max_reqmem = (
             int(max_reqmem_gb * _BYTES_PER_GB) if max_reqmem_gb is not None else None
         )
+        # The wasted pair may be negative (used more than requested);
+        # int() truncates toward zero, which is symmetric for both signs.
+        min_memory_used = (
+            int(min_memory_used_gb * _BYTES_PER_GB)
+            if min_memory_used_gb is not None else None
+        )
+        max_memory_used = (
+            int(max_memory_used_gb * _BYTES_PER_GB)
+            if max_memory_used_gb is not None else None
+        )
+        min_memory_wasted = (
+            int(min_memory_wasted_gb * _BYTES_PER_GB)
+            if min_memory_wasted_gb is not None else None
+        )
+        max_memory_wasted = (
+            int(max_memory_wasted_gb * _BYTES_PER_GB)
+            if max_memory_wasted_gb is not None else None
+        )
         # Click's multiple=True yields () when -N is not supplied; normalize to
         # None so the envelope keeps its "null means unset" convention rather
         # than emitting an empty array.
@@ -105,6 +127,10 @@ class SearchCommand(BaseHistoryCommand):
                 min_gpus=min_gpus, max_gpus=max_gpus,
                 min_elapsed=min_elapsed, max_elapsed=max_elapsed,
                 min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+                min_memory_used=min_memory_used,
+                max_memory_used=max_memory_used,
+                min_memory_wasted=min_memory_wasted,
+                max_memory_wasted=max_memory_wasted,
                 columns=cols,
                 limit=limit,
             )
@@ -133,6 +159,10 @@ class SearchCommand(BaseHistoryCommand):
                     "max_elapsed": max_elapsed,
                     "min_reqmem": min_reqmem,
                     "max_reqmem": max_reqmem,
+                    "min_memory_used": min_memory_used,
+                    "max_memory_used": max_memory_used,
+                    "min_memory_wasted": min_memory_wasted,
+                    "max_memory_wasted": max_memory_wasted,
                     "limit": limit,
                 },
             )

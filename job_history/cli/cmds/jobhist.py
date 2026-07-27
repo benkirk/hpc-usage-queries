@@ -266,6 +266,25 @@ def daily_summary(jh_ctx: Context):
 @click.option("--max-reqmem-gb", type=click.FloatRange(min=0), default=None,
               metavar="GB",
               help="Only jobs that requested at most GB gigabytes of memory.")
+@click.option("--min-memory-used-gb", type=click.FloatRange(min=0), default=None,
+              metavar="GB",
+              help="Only jobs that USED at least GB gigabytes of memory "
+                   "(PBS resources_used.mem, not memory requested). "
+                   "UNINDEXED - pair with --start-date/--end-date.")
+@click.option("--max-memory-used-gb", type=click.FloatRange(min=0), default=None,
+              metavar="GB",
+              help="Only jobs that used at most GB gigabytes of memory.")
+@click.option("--min-memory-wasted-gb", type=float, default=None,
+              metavar="GB",
+              help="Only jobs whose requested-minus-used memory is at least "
+                   "GB gigabytes. May be NEGATIVE (the job used more than "
+                   "it requested); jobs missing either measurement are "
+                   "excluded. UNINDEXED - pair with --start-date/--end-date.")
+@click.option("--max-memory-wasted-gb", type=float, default=None,
+              metavar="GB",
+              help="Only jobs whose requested-minus-used memory is at most "
+                   "GB gigabytes. A negative bound selects over-request "
+                   "jobs (used more than requested).")
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Show all columns instead of the default subset.")
 @click.option("--display", default=None,
@@ -278,6 +297,8 @@ def search(jh_ctx: Context, start_date, end_date, machine,
            name, ignore_case, min_wait_hours, max_wait_hours,
            min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus,
            min_elapsed_hours, max_elapsed_hours, min_reqmem_gb, max_reqmem_gb,
+           min_memory_used_gb, max_memory_used_gb,
+           min_memory_wasted_gb, max_memory_wasted_gb,
            verbose, display, limit):
     """List individual job records matching the filters.
 
@@ -303,6 +324,10 @@ def search(jh_ctx: Context, start_date, end_date, machine,
         min_gpus=min_gpus, max_gpus=max_gpus,
         min_elapsed_hours=min_elapsed_hours, max_elapsed_hours=max_elapsed_hours,
         min_reqmem_gb=min_reqmem_gb, max_reqmem_gb=max_reqmem_gb,
+        min_memory_used_gb=min_memory_used_gb,
+        max_memory_used_gb=max_memory_used_gb,
+        min_memory_wasted_gb=min_memory_wasted_gb,
+        max_memory_wasted_gb=max_memory_wasted_gb,
         verbose=verbose, display=display, limit=limit,
     )
     _close_session(jh_ctx)
