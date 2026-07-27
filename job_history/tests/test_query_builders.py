@@ -478,3 +478,55 @@ class TestGlobMatchClause:
             sqlite_dialect,
         )
         assert " OR " in sql
+
+
+class TestBucketCase:
+    """Offline dialect compiles of the histogram bucket CASE.
+
+    The suite runs on SQLite; compiling against ``postgresql.dialect()`` is
+    the only way to see the PG-emitted SQL. Beyond the CASE itself the
+    histogram statement is CASE + COUNT + SUM over an outer join — all
+    dialect-neutral and production-proven via ``job_sizes_by_resource`` —
+    so shape assertions on the CASE are the whole PG story here.
+    """
+
+    @staticmethod
+    def _literal_sql(expr, dialect_cls):
+        return str(expr.compile(
+            dialect=dialect_cls(), compile_kwargs={"literal_binds": True}))
+
+    @pytest.mark.parametrize("dialect_cls", [sqlite_dialect, pg_dialect])
+    def test_null_arm_first_then_ascending_ladder(self, dialect_cls):
+        from job_history.database import Job
+        from job_history.queries.jobs import _bucket_case, QueryConfig
+
+        sql = self._literal_sql(
+            _bucket_case(Job.eligible_secs, QueryConfig.WAIT_BUCKETS),
+            dialect_cls)
+        # NULL routing must be the first WHEN — otherwise NULL rows would
+        # fall through every <= comparison into the ELSE overflow band.
+        assert "IS NULL" in sql
+        assert sql.index("IS NULL") < sql.index("<= 59")
+        # Ascending <= ladder: each threshold appears, in band order.
+        positions = [sql.index(f"<= {hi}") for hi in (59, 299, 899, 86399, 172799)]
+        assert positions == sorted(positions)
+        # Overflow band is the ELSE, labelled with the last band's label.
+        # (The `AS bucket_label` alias only renders inside a SELECT; the
+        # live one-aggregate-scan test in test_jobs_search.py covers it.)
+        assert "ELSE '>2d'" in sql
+
+    @pytest.mark.parametrize("dialect_cls", [sqlite_dialect, pg_dialect])
+    def test_every_bucket_table_compiles(self, dialect_cls):
+        from job_history.database import Job
+        from job_history.queries.jobs import _bucket_case, QueryConfig
+
+        for column, table in (
+            (Job.eligible_secs, QueryConfig.WAIT_BUCKETS),
+            (Job.numnodes,      QueryConfig.NODE_HIST_BUCKETS),
+            (Job.numcpus,       QueryConfig.CPU_HIST_BUCKETS),
+            (Job.numgpus,       QueryConfig.GPU_HIST_BUCKETS),
+            (Job.reqmem,        QueryConfig.REQMEM_HIST_BUCKETS),
+            (Job.elapsed,       QueryConfig.DURATION_HIST_BUCKETS),
+        ):
+            sql = self._literal_sql(_bucket_case(column, table), dialect_cls)
+            assert f"ELSE '{table[-1][0]}'" in sql

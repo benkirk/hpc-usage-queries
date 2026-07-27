@@ -139,7 +139,10 @@ different times per machine:
 
 `JobQueries.job_waits_by_resource()` filters `eligible_secs IS NOT NULL`, so
 derecho reports covering dates before 2025-01-07 17:47:50 UTC exclude those jobs rather than
-silently mixing two different wait definitions.
+silently mixing two different wait definitions. `JobQueries.jobs_histogram('wait', …)`
+makes the same exclusion visible instead of silent: NULL rows are counted into the
+response's `null_count` (the dashboard's "N jobs unmeasured" caption), never into
+a wait band.
 
 > **Array-parent caveat**: array-*parent* rows (job ids like `6896760[].desched1`,
 > ~1% of rows) carry an `eligible_time` accrued across the whole array's

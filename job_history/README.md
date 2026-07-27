@@ -232,10 +232,26 @@ job id) there are:
 All of these hit unindexed columns, so they scan whatever slice the date
 window leaves behind — always pass `--start-date`/`--end-date`.
 
-`JobQueries.jobs_facets()` returns per-dimension value counts for the same
-filter set (for filter dropdowns with live counts). It costs one aggregate
-scan regardless of how many dimensions are requested, and it is API-only —
-there is no CLI surface.
+### Dashboard aggregations (API-only)
+
+Two aggregation methods share the exact same filter set (same helper, same
+signature-parity test) so what they describe can never drift from the rows
+`jobs_search` returns. Both are API-only — the `jobhist resource` reports
+already serve the terminal case:
+
+- `JobQueries.jobs_facets()` — per-dimension value counts for filter
+  dropdowns with live counts. One aggregate scan regardless of how many
+  dimensions are requested.
+- `JobQueries.jobs_histogram(dimension, …)` — distribution histogram over
+  `wait` / `nodes` / `cpus` / `gpus` / `memory` (requested, bytes) /
+  `duration`. Returns the full bucket vector (zeros included) with
+  per-bucket `job_count` + `cpu_hours`/`gpu_hours`, a `null_count` for
+  rows whose column is NULL (derecho waits before 2025-01-07), and
+  self-describing `min_param`/`max_param` so a clicked bar replays as
+  `jobs_search` bounds. One CASE-grouped aggregate scan.
+
+Like the facets, both scan every row in the date slice — always pass a
+bounded `start`/`end`.
 
 ### Adding a new history subcommand
 

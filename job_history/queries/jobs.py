@@ -73,6 +73,32 @@ def _facet_rows(counts: Dict[Any, int], limit: Optional[int]) -> List[Dict[str, 
     return [{"value": value, "count": count} for value, count in ordered]
 
 
+#: 1 GB = 1024^3 bytes. Mirrors ``sync/charging.BYTES_PER_GB`` — redefined
+#: here because importing the sync package would pull the PBS/Slurm parsers
+#: into the queries import path.
+_GIB = 1024 ** 3
+
+#: CASE label emitted for rows whose histogram column is NULL. Routed to the
+#: response's top-level ``null_count`` by the fold, never surfaced as a
+#: bucket label.
+_NULL_BUCKET = "__null__"
+
+
+def _bucket_case(field, buckets):
+    """CASE labelling *field* into ``(label, lo, hi)`` buckets; NULL first.
+
+    The ascending ``field <= hi`` ladder (rather than per-band BETWEENs)
+    means every non-NULL value lands in exactly one bucket: values below the
+    first band's ``lo`` are claimed by its ``<= hi`` arm, so nothing can
+    leak into the ``else_`` overflow from below the way
+    ``_build_range_case``'s band arithmetic allows. The ``lo`` values are
+    reporting metadata (and drill-down filter bounds), not SQL.
+    """
+    whens = [(field.is_(None), _NULL_BUCKET)]
+    whens += [(field <= hi, label) for label, _lo, hi in buckets if hi is not None]
+    return case(*whens, else_=buckets[-1][0]).label("bucket_label")
+
+
 def _sort_expression(sort_by: str):
     """Map a ``COLUMNS`` key to a SQLAlchemy expression suitable for ORDER BY.
 
@@ -214,22 +240,122 @@ class QueryConfig:
     ]
     MEMORY_OVERFLOW = ">1000"
 
+    # ------------------------------------------------------------------
+    # Histogram bucket tables — (label, lo, hi) triples, bounds inclusive,
+    # hi=None open-ended. The same triple shape as fs_scans' SIZE_BUCKETS,
+    # which SAM already band-drills against. Consumed by
+    # JobQueries.jobs_histogram via _HISTOGRAM_SPECS; lo/hi round-trip
+    # into the matching min_*/max_* jobs_search filters.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ranges_to_buckets(ranges, overflow_label, overflow_lo):
+        """Derive (label, lo, hi) triples from legacy (lo, hi) range pairs.
+
+        Labels reproduce ``_build_range_case`` exactly ('1', '2', '3-4', …)
+        so the histogram API and the legacy resource reports agree on
+        vocabulary.
+        """
+        buckets = [
+            (f"{lo}-{hi}" if lo != hi else str(lo), lo, hi)
+            for lo, hi in ranges
+        ]
+        buckets.append((overflow_label, overflow_lo, None))
+        return buckets
+
+    # Queue-wait distribution buckets (seconds). eligible_secs masses near
+    # zero with a tail out to days, so log-ish spacing gives resolution at
+    # both ends. A NEW table: job_waits_by_resource buckets by *size* and
+    # averages the wait — a distribution needs wait-valued bands.
+    WAIT_BUCKETS = [
+        ("<1m",    0,      59),
+        ("1-5m",   60,     299),
+        ("5-15m",  300,    899),
+        ("15-30m", 900,    1799),
+        ("30-60m", 1800,   3599),
+        ("1-2h",   3600,   7199),
+        ("2-4h",   7200,   14399),
+        ("4-8h",   14400,  28799),
+        ("8-12h",  28800,  43199),
+        ("12-24h", 43200,  86399),
+        ("1-2d",   86400,  172799),
+        (">2d",    172800, None),
+    ]
+
+    # Elapsed-runtime distribution buckets (seconds). Labels and integer
+    # band edges are identical to the historical get_duration_buckets()
+    # dict, which is now DERIVED from this table — single source of truth.
+    DURATION_HIST_BUCKETS = [
+        ("<30s",    0,     29),
+        ("30s-30m", 30,    1799),
+        ("30-60m",  1800,  3599),
+        ("1-5h",    3600,  17999),
+        ("5-12h",   18000, 43199),
+        ("12-18h",  43200, 64799),
+        (">18h",    64800, None),
+    ]
+
+    NODE_HIST_BUCKETS = _ranges_to_buckets(NODE_RANGES, NODE_OVERFLOW, 2049)
+
+    # Deliberately NOT derived from CORE_RANGES: its >128 overflow would
+    # swallow every multi-node derecho job (128 cpus is one derecho node).
+    # Within-node resolution matches CORE_RANGES, then ×4 steps keep the
+    # tail wide enough for 2000+-node jobs without a dozen more bars.
+    CPU_HIST_BUCKETS = [
+        ("1", 1, 1), ("2", 2, 2), ("3-4", 3, 4), ("5-8", 5, 8),
+        ("9-16", 9, 16), ("17-32", 17, 32), ("33-64", 33, 64),
+        ("65-128", 65, 128), ("129-512", 129, 512),
+        ("513-2048", 513, 2048), ("2049-8192", 2049, 8192),
+        ("8193-32768", 8193, 32768), (">32768", 32769, None),
+    ]
+
+    # Deliberately NOT derived from GPU_RANGES (starts at 4 — derecho-shaped):
+    # explicit 0/1/2 buckets keep casper's small GPU jobs and the CPU/GPU
+    # split visible. min_gpus=1 composes to drop the zero bucket.
+    GPU_HIST_BUCKETS = [
+        ("0", 0, 0), ("1", 1, 1), ("2", 2, 2), ("3-4", 3, 4),
+        ("5-8", 5, 8), ("9-16", 9, 16), ("17-32", 17, 32),
+        ("33-64", 33, 64), ("65-128", 65, 128), ("129-256", 129, 256),
+        (">256", 257, None),
+    ]
+
+    # Requested-memory bands: raw bytes at GiB boundaries so returned
+    # bounds round-trip exactly into min_reqmem/max_reqmem (no division in
+    # SQL, no unit drift). Gains the <1GB band that the legacy
+    # MEMORY_RANGES CASE folds into its ">1000" overflow.
+    REQMEM_HIST_BUCKETS = [
+        ("<1GB",       0,                _GIB - 1),
+        ("1-10GB",     _GIB,             10 * _GIB),
+        ("10-50GB",    10 * _GIB + 1,    50 * _GIB),
+        ("50-100GB",   50 * _GIB + 1,    100 * _GIB),
+        ("100-500GB",  100 * _GIB + 1,   500 * _GIB),
+        ("500-1000GB", 500 * _GIB + 1,   1000 * _GIB),
+        (">1000GB",    1000 * _GIB + 1,  None),
+    ]
+
     # Duration buckets (in seconds)
     @staticmethod
     def get_duration_buckets():
-        """Get duration bucket definitions.
+        """Get duration bucket definitions, derived from DURATION_HIST_BUCKETS.
+
+        The label → SQL-condition dict shape predates the histogram table;
+        deriving it keeps the labels and band edges in one place. The
+        derivation reproduces the original conditions row-for-row: no lower
+        bound on the first band, no upper bound on the last, and
+        ``Job.elapsed`` is INTEGER seconds so ``<= 29`` ≡ the original
+        ``< 30``.
 
         Returns as a static method to avoid issues with Job reference at import time.
         """
-        return {
-            "<30s": Job.elapsed < 30,
-            "30s-30m": and_(Job.elapsed >= 30, Job.elapsed < 1800),
-            "30-60m": and_(Job.elapsed >= 1800, Job.elapsed < 3600),
-            "1-5h": and_(Job.elapsed >= 3600, Job.elapsed < 18000),
-            "5-12h": and_(Job.elapsed >= 18000, Job.elapsed < 43200),
-            "12-18h": and_(Job.elapsed >= 43200, Job.elapsed < 64800),
-            ">18h": Job.elapsed >= 64800,
-        }
+        buckets = {}
+        for label, lo, hi in QueryConfig.DURATION_HIST_BUCKETS:
+            conds = []
+            if lo > 0:
+                conds.append(Job.elapsed >= lo)
+            if hi is not None:
+                conds.append(Job.elapsed <= hi)
+            buckets[label] = and_(*conds) if len(conds) > 1 else conds[0]
+        return buckets
 
     @staticmethod
     def get_memory_per_rank_buckets():
@@ -287,6 +413,32 @@ class QueryConfig:
             ),
             ">256GB": Job.memory / (Job.mpiprocs * Job.ompthreads * Job.numnodes) >= (256 * BYTES_PER_GB),
         }
+
+
+#: jobs_histogram dimension → (column, bucket table, unit, min/max kwargs).
+#:
+#: Dimension names are deliberately the SAM dashboard's tab/pill vocabulary,
+#: not column names. ``min_param``/``max_param`` make each response
+#: self-describing: a consumer turns a clicked bar into
+#: ``jobs_search(**{min_param: lo, max_param: hi})`` without hardcoding the
+#: dimension→filter map. ``memory`` buckets REQUESTED memory (``reqmem``) —
+#: the dashboard ask is "resource needs"; used-memory physics belongs to
+#: job_memory_per_rank. A future ``memory_used`` dimension would be one more
+#: row here, not a repurposing of this one.
+_HISTOGRAM_SPECS: Dict[str, Tuple[Any, List[tuple], str, str, str]] = {
+    'wait':     (Job.eligible_secs, QueryConfig.WAIT_BUCKETS,
+                 'seconds', 'min_eligible_secs', 'max_eligible_secs'),
+    'nodes':    (Job.numnodes,      QueryConfig.NODE_HIST_BUCKETS,
+                 'count',   'min_nodes',         'max_nodes'),
+    'cpus':     (Job.numcpus,       QueryConfig.CPU_HIST_BUCKETS,
+                 'count',   'min_cpus',          'max_cpus'),
+    'gpus':     (Job.numgpus,       QueryConfig.GPU_HIST_BUCKETS,
+                 'count',   'min_gpus',          'max_gpus'),
+    'memory':   (Job.reqmem,        QueryConfig.REQMEM_HIST_BUCKETS,
+                 'bytes',   'min_reqmem',        'max_reqmem'),
+    'duration': (Job.elapsed,       QueryConfig.DURATION_HIST_BUCKETS,
+                 'seconds', 'min_elapsed',       'max_elapsed'),
+}
 
 
 class JobQueries:
@@ -1532,6 +1684,157 @@ class JobQueries:
                 buckets[dim][labels[i]] = buckets[dim].get(labels[i], 0) + count
 
         return {d: _facet_rows(buckets[d], limit) for d in dims}
+
+    def jobs_histogram(
+        self,
+        dimension: str,
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
+        queue: Optional[str] = None,
+        qos: Optional[str] = None,
+        exit_status: Optional[str] = None,
+        job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Distribution histogram over one job dimension, for dashboards.
+
+        Buckets every job matching the filter set into fixed bands of
+        *dimension* and returns the **full band vector in band order,
+        zero-count bands included** — a chart gets a stable x-axis without
+        knowing which bands are populated. Filter shape mirrors
+        :meth:`jobs_search` / :meth:`jobs_count` exactly (same
+        ``_apply_jobs_search_filters`` helper), so a histogram can never
+        disagree with the job table it sits next to.
+
+        Args:
+            dimension: One of ``wait`` (``eligible_secs``), ``nodes``,
+                ``cpus``, ``gpus``, ``memory`` (**requested** memory,
+                ``reqmem``) or ``duration`` (``elapsed``). Names match the
+                SAM dashboard vocabulary, not column names.
+
+        Returns::
+
+            {
+              "dimension": "wait",
+              "column": "eligible_secs",
+              "unit": "seconds",                # 'seconds' | 'count' | 'bytes'
+              "min_param": "min_eligible_secs", # jobs_search kwargs that
+              "max_param": "max_eligible_secs", #   replay one band as filters
+              "buckets": [
+                {"label": "<1m", "lo": 0, "hi": 59,
+                 "job_count": 12, "cpu_hours": 190.0, "gpu_hours": 0.0},
+                ...                             # full vector, band order
+              ],
+              "null_count": 2,                  # filters matched, column NULL
+              "total_count": 14,                # Σ job_count + null_count
+            }
+
+        ``lo``/``hi`` are inclusive native-unit bounds (``hi`` is None on
+        the open-ended last band); replaying a band is
+        ``jobs_search(**{min_param: lo, max_param: hi}, ...)`` (omit the max
+        when ``hi`` is None), and ``total_count == jobs_count(**filters)``
+        by construction.
+
+        ``null_count`` is the "N jobs unmeasured" story: rows that match
+        the filters but have a NULL *dimension* column land there, never in
+        a band. In practice only ``wait`` has them — derecho did not record
+        ``eligible_time`` before 2025-01-07 17:47:50 UTC (casper history is
+        complete), and ``numnodes``/``numcpus``/``numgpus``/``name`` are
+        NULL-free across 34M production rows.
+
+        There is no ``self_exclude`` and no ``limit``: filters mean exactly
+        what they say. A caller who wants the histogram unconstrained by its
+        own dimension's bounds simply omits those kwargs.
+
+        Cost: one aggregate statement — a CASE label + COUNT + two SUMs over
+        a LEFT OUTER JOIN to ``job_charges`` (1:1 on the PK), grouped by the
+        label. Like :meth:`jobs_facets` it scans every row in the date
+        slice, so the window is the cost lever: always pass ``start``/
+        ``end`` (facets measured ~200 s unbounded over full history).
+        Hours are raw ``cpu_hours``/``gpu_hours`` (not QoS-weighted
+        charges), matching :meth:`job_sizes_by_resource`.
+
+        Raises:
+            ValueError: on an unknown *dimension*.
+        """
+        spec = _HISTOGRAM_SPECS.get(dimension)
+        if spec is None:
+            valid = ", ".join(sorted(_HISTOGRAM_SPECS))
+            raise ValueError(
+                f"Unknown dimension: {dimension!r}. Valid dimensions: {valid}"
+            )
+        column, buckets, unit, min_param, max_param = spec
+
+        bucket_label = _bucket_case(column, buckets)
+        query = (
+            self.session.query(
+                bucket_label,
+                func.count(Job.id),
+                func.sum(JobCharge.cpu_hours),
+                func.sum(JobCharge.gpu_hours),
+            )
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+        )
+        query = self._apply_jobs_search_filters(
+            query, start=start, end=end, user=user, account=account,
+            queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
+            name=name, ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+        )
+        rows = query.group_by(bucket_label).all()
+
+        # Zero-fill from the spec table, in order; SUM over an all-NULL
+        # charge group is NULL, hence the `or 0.0`. The NULL band routes to
+        # null_count — its hour sums are deliberately dropped (unmeasured
+        # rows are excluded from the distribution, not smeared into it).
+        by_label = {label: (count, cpu, gpu) for label, count, cpu, gpu in rows}
+        null_count = int(by_label.pop(_NULL_BUCKET, (0, None, None))[0])
+
+        out_buckets = []
+        for label, lo, hi in buckets:
+            count, cpu, gpu = by_label.get(label, (0, None, None))
+            out_buckets.append({
+                "label": label,
+                "lo": lo,
+                "hi": hi,
+                "job_count": int(count),
+                "cpu_hours": float(cpu or 0.0),
+                "gpu_hours": float(gpu or 0.0),
+            })
+
+        total = sum(b["job_count"] for b in out_buckets) + null_count
+        return {
+            "dimension": dimension,
+            "column": column.key,
+            "unit": unit,
+            "min_param": min_param,
+            "max_param": max_param,
+            "buckets": out_buckets,
+            "null_count": null_count,
+            "total_count": total,
+        }
 
     def _resolve_lookup_names(self, model, name_col, ids) -> Dict[Any, Any]:
         """``{id: display_name}`` for a lookup table, post-aggregation.

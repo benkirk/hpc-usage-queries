@@ -10,6 +10,7 @@ import pytest
 
 from job_history.database import Job, JobCharge
 from job_history.queries import JobQueries
+from job_history.queries.jobs import QueryConfig, _HISTOGRAM_SPECS
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS
 
 
@@ -969,6 +970,7 @@ class TestFilterSignatureParity:
 
     SEARCH_ONLY = {"columns", "limit", "offset", "sort_by", "sort_dir"}
     FACET_ONLY = {"facets", "self_exclude", "limit"}
+    HIST_ONLY = {"dimension"}
 
     @staticmethod
     def _params(fn):
@@ -982,6 +984,10 @@ class TestFilterSignatureParity:
     def test_jobs_facets_accepts_every_jobs_search_filter(self):
         search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
         assert search == self._params(JobQueries.jobs_facets) - self.FACET_ONLY
+
+    def test_jobs_histogram_accepts_every_jobs_search_filter(self):
+        search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
+        assert search == self._params(JobQueries.jobs_histogram) - self.HIST_ONLY
 
     def test_helper_covers_exactly_the_filter_set(self):
         search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
@@ -1152,3 +1158,200 @@ class TestJobsFacets:
             assert fk in aggregates[0], f"{fk} missing — grouping on the hybrid?"
         assert "SELECT queues.queue_name" not in aggregates[0]
         assert "SELECT users.username" not in aggregates[0]
+
+
+@pytest.fixture
+def histogram_jobs(in_memory_session):
+    """Six jobs spanning several bands on all six histogram dimensions.
+
+    Deliberate edge rows: a NULL ``eligible_secs`` (pre-2025 derecho), a
+    NULL ``reqmem``, a job with **no JobCharge row** (must count but add
+    0.0 hours), a ``numgpus=0`` row (pins the GPU '0' band), and a
+    small-reqmem/large-``memory`` row (pins requested-vs-used).
+    """
+    base = datetime(2025, 7, 1, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    specs = [
+        # (jid, user, acct, elig, nodes, cpus, gpus, elapsed, reqmem, memory)
+        ("700.desched1", "alice", "NCAR0001", 30,     1,  128,  0, 20,
+         4 * _GIB,   2 * _GIB),
+        ("701.desched1", "alice", "NCAR0001", 120,    2,  256,  0, 3600,
+         64 * _GIB,  4 * _GIB),
+        ("702.desched1", "alice", "NCAR0001", 7200,   16, 2048, 4, 90000,
+         512 * _GIB, 100 * _GIB),
+        # NULL wait; reqmem < 1 GiB while USED memory is 600 GiB.
+        ("703.desched1", "bob",   "NCAR0002", None,   1,  1,    0, 30,
+         _GIB // 2,  600 * _GIB),
+        # NULL reqmem; wait beyond 2 days.
+        ("704.desched1", "bob",   "NCAR0002", 200000, 1,  64,   2, 1800,
+         None,       None),
+        # Zero wait and zero elapsed; carries NO JobCharge row.
+        ("705.desched1", "carol", "NCAR0002", 0,      1,  1,    0, 0,
+         2 * _GIB,   _GIB),
+    ]
+    jobs = [
+        Job(job_id=jid, short_id=700 + i, name=f"h{i}", user=u, account=a,
+            queue="main", status="0",
+            submit=base, start=base, end=base + timedelta(hours=i + 1),
+            eligible_secs=elig, numnodes=nodes, numcpus=cpus, numgpus=gpus,
+            elapsed=elapsed, reqmem=reqmem, memory=memory)
+        for i, (jid, u, a, elig, nodes, cpus, gpus, elapsed, reqmem, memory)
+        in enumerate(specs)
+    ]
+    for j in jobs:
+        in_memory_session.add(j)
+    in_memory_session.flush()
+
+    hours = {  # job_id -> (cpu_hours, gpu_hours); 705 stays charge-less
+        "700.desched1": (10.0, 0.0),
+        "701.desched1": (100.0, 0.0),
+        "702.desched1": (5000.0, 400.0),
+        "703.desched1": (1.0, 0.0),
+        "704.desched1": (30.0, 60.0),
+    }
+    for j in jobs:
+        if j.job_id in hours:
+            cpu, gpu = hours[j.job_id]
+            in_memory_session.add(JobCharge(
+                job_id=j.id, cpu_hours=cpu, gpu_hours=gpu,
+                memory_hours=0.0, qos_factor=1.0, charge_version=1))
+    in_memory_session.commit()
+    return jobs
+
+
+class TestJobsHistogram:
+    """(wait, nodes, cpus, gpus, elapsed, reqmem) per the histogram_jobs docstring."""
+
+    @staticmethod
+    def _by_label(out):
+        return {b["label"]: b for b in out["buckets"]}
+
+    def test_bucket_vector_complete_ordered_with_zeros(
+            self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram("wait")
+        assert [b["label"] for b in out["buckets"]] == \
+            [label for label, _lo, _hi in QueryConfig.WAIT_BUCKETS]
+        # Unpopulated bands are present with explicit zeros.
+        empty = self._by_label(out)["12-24h"]
+        assert (empty["job_count"], empty["cpu_hours"], empty["gpu_hours"]) == \
+            (0, 0.0, 0.0)
+
+    def test_wait_counts_per_bucket(self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram("wait")
+        by = self._by_label(out)
+        assert by["<1m"]["job_count"] == 2      # 30 s and 0 s
+        assert by["1-5m"]["job_count"] == 1     # 120 s
+        assert by["2-4h"]["job_count"] == 1     # 7200 s
+        assert by[">2d"]["job_count"] == 1      # 200000 s
+        assert out["null_count"] == 1
+        assert out["total_count"] == 6
+
+    def test_each_dimension_buckets_its_own_column(
+            self, in_memory_session, histogram_jobs):
+        q = JobQueries(in_memory_session)
+        checks = {           # dimension -> (band, expected job_count)
+            "nodes":    ("1", 4),
+            "cpus":     ("65-128", 1),
+            "gpus":     ("0", 4),
+            "duration": ("<30s", 2),           # 20 s and 0 s
+            "memory":   ("1-10GB", 2),         # 4 GiB and 2 GiB requested
+        }
+        for dim, (label, expected) in checks.items():
+            out = q.jobs_histogram(dim)
+            assert self._by_label(out)[label]["job_count"] == expected, dim
+
+    def test_hours_summed_and_chargeless_job_adds_zero(
+            self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram("wait")
+        band = self._by_label(out)["<1m"]
+        # 700 contributes 10.0 cpu-h; charge-less 705 contributes the count
+        # and 0.0 hours (outer join, SUM ignores its NULL charge row).
+        assert band["job_count"] == 2
+        assert band["cpu_hours"] == pytest.approx(10.0)
+        assert band["gpu_hours"] == pytest.approx(0.0)
+
+    def test_null_row_in_no_bucket_and_total_identity(
+            self, in_memory_session, histogram_jobs):
+        q = JobQueries(in_memory_session)
+        out = q.jobs_histogram("wait")
+        assert sum(b["job_count"] for b in out["buckets"]) == 5
+        assert out["null_count"] == 1
+        assert out["total_count"] == q.jobs_count()
+
+    def test_bounds_round_trip_into_filters(self, in_memory_session, histogram_jobs):
+        # THE contract test: every non-empty band replays as jobs_search
+        # bounds and reproduces its own count, across all six dimensions.
+        # This is what forces min/max_elapsed + min/max_reqmem to exist.
+        q = JobQueries(in_memory_session)
+        for dim in _HISTOGRAM_SPECS:
+            out = q.jobs_histogram(dim)
+            for band in out["buckets"]:
+                if band["job_count"] == 0:
+                    continue
+                kw = {out["min_param"]: band["lo"]}
+                if band["hi"] is not None:
+                    kw[out["max_param"]] = band["hi"]
+                assert q.jobs_count(**kw) == band["job_count"], \
+                    (dim, band["label"])
+
+    def test_memory_buckets_reqmem_not_memory(self, in_memory_session, histogram_jobs):
+        # 703 REQUESTED < 1 GiB but USED 600 GiB — it must land in "<1GB".
+        # 702's 512 GiB request (100 GiB used) pins the other direction.
+        by = self._by_label(JobQueries(in_memory_session).jobs_histogram("memory"))
+        assert by["<1GB"]["job_count"] == 1
+        assert by["500-1000GB"]["job_count"] == 1
+        assert by[">1000GB"]["job_count"] == 0
+
+    def test_gpus_zero_band_not_overflow(self, in_memory_session, histogram_jobs):
+        by = self._by_label(JobQueries(in_memory_session).jobs_histogram("gpus"))
+        assert by["0"]["job_count"] == 4
+        assert by[">256"]["job_count"] == 0
+
+    def test_filters_apply(self, in_memory_session, histogram_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram("wait", user="alice")
+        assert out["total_count"] == 3
+        assert out["null_count"] == 0
+
+    def test_account_scope_always_applies(self, in_memory_session, histogram_jobs):
+        # No self-exclusion machinery exists here: account (the SAM
+        # authorization boundary) constrains the histogram unconditionally.
+        out = JobQueries(in_memory_session).jobs_histogram(
+            "duration", account=["NCAR0002"])
+        assert out["total_count"] == 3
+
+    def test_envelope_is_self_describing(self, in_memory_session, histogram_jobs):
+        q = JobQueries(in_memory_session)
+        wait = q.jobs_histogram("wait")
+        assert (wait["column"], wait["unit"]) == ("eligible_secs", "seconds")
+        assert (wait["min_param"], wait["max_param"]) == \
+            ("min_eligible_secs", "max_eligible_secs")
+        mem = q.jobs_histogram("memory")
+        assert (mem["column"], mem["unit"]) == ("reqmem", "bytes")
+
+    def test_unknown_dimension_raises(self, in_memory_session, histogram_jobs):
+        with pytest.raises(ValueError, match="Unknown dimension"):
+            JobQueries(in_memory_session).jobs_histogram("walltime")
+
+    def test_one_aggregate_scan(self, in_memory_session, histogram_jobs):
+        """The histogram must be one CASE-grouped statement over jobs +
+        job_charges, with no hybrid scalar subqueries."""
+        from sqlalchemy import event
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_histogram(
+                "wait", account="NCAR0001")
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        aggregates = [s for s in statements
+                      if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+        assert len(aggregates) == 1, \
+            f"expected 1 aggregate scan, got {len(aggregates)}:\n{aggregates}"
+        assert "CASE" in aggregates[0].upper()
+        assert "job_charges" in aggregates[0]
+        assert "SELECT users.username" not in aggregates[0]
+        assert "SELECT queues.queue_name" not in aggregates[0]
