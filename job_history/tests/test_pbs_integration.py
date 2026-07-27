@@ -78,6 +78,26 @@ class TestDerechodPBSParsing:
         charge_count = test_db.query(JobCharge).count()
         assert charge_count == stats["inserted"], "Should calculate charges for all jobs"
 
+    def test_sync_persists_pbs_wait_fields(self, test_db):
+        """qtime / eligible_time / run_count survive the full sync into columns.
+
+        The 2026 fixture logs postdate `eligible_time_enable` on derecho, so
+        every record carries all three fields.
+        """
+        fixture_dir = Path(__file__).parent / "fixtures/pbs_logs/derecho"
+
+        SyncPBSLogs(test_db, "derecho").sync(
+            log_dir=str(fixture_dir), period="2026-01-29", verbose=False
+        )
+
+        jobs = test_db.query(Job).all()
+        assert jobs, "Should have synced jobs"
+        assert all(j.queued is not None for j in jobs)
+        assert all(j.run_count is not None for j in jobs)
+        assert all(j.eligible_secs is not None for j in jobs)
+        # Real accrual values, not all-zero placeholders
+        assert any(j.eligible_secs > 0 for j in jobs)
+
 
 class TestCasperPBSParsing:
     """Tests for Casper PBS log parsing."""

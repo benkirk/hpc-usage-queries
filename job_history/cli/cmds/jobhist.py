@@ -207,14 +207,84 @@ def daily_summary(jh_ctx: Context):
 @click.option("--queue", default=None, help="Filter by queue name.")
 @click.option("--qos", default=None,
               help="Filter by QoS / priority class name (e.g. premium, regular, economy, special, uncharged).")
-@click.option("--status", default=None,
-              help="Filter by job status (e.g. 'F' for finished).")
+@click.option("--exit-status", "exit_status", default=None, metavar="CODE",
+              help="Filter by PBS exit status. This is an exit CODE, not a "
+                   "job state: '0' is success, non-zero is a failure or "
+                   "signal (e.g. '1', '271', '143').")
 @click.option("--job-id", "job_id", default=None, metavar="ID",
               help="Filter by job id. Digits alone (e.g. '6049117') match "
                    "the scalar form and every array element/parent; a "
                    "partial array form ('6049117[28]', '6049117[]') matches "
                    "that variant across hosts; supplying the host suffix "
                    "('6049117[28].desched1') does an exact match.")
+@click.option("-N", "--name-pattern", "name", multiple=True, metavar="GLOB",
+              help="Filter by job name using a shell glob ('*' any run of "
+                   "characters, '?' exactly one). Repeat to OR patterns: "
+                   "-N 'wrf_*' -N '*.restart'. Case-sensitive unless -i is "
+                   "given. UNINDEXED - pair with --start-date/--end-date.")
+@click.option("-i", "--ignore-case", "ignore_case", is_flag=True, default=False,
+              help="Make -N/--name-pattern matching case-insensitive.")
+@click.option("--min-wait-hours", type=click.FloatRange(min=0), default=None,
+              metavar="H",
+              help="Only jobs whose PBS eligible_time (queue wait caused by "
+                   "resource scarcity) was at least H hours. Jobs with no "
+                   "recorded eligible_time are excluded - derecho did not "
+                   "record it before 2025-01-07.")
+@click.option("--max-wait-hours", type=click.FloatRange(min=0), default=None,
+              metavar="H",
+              help="Only jobs whose PBS eligible_time was at most H hours. "
+                   "Jobs with no recorded eligible_time are excluded, NOT "
+                   "treated as a zero wait.")
+@click.option("--min-nodes", type=click.IntRange(min=0), default=None,
+              help="Only jobs using at least N nodes. UNINDEXED - pair with "
+                   "--start-date/--end-date.")
+@click.option("--max-nodes", type=click.IntRange(min=0), default=None,
+              help="Only jobs using at most N nodes.")
+@click.option("--min-cpus", type=click.IntRange(min=0), default=None,
+              help="Only jobs using at least N CPUs. UNINDEXED - pair with "
+                   "--start-date/--end-date.")
+@click.option("--max-cpus", type=click.IntRange(min=0), default=None,
+              help="Only jobs using at most N CPUs.")
+@click.option("--min-gpus", type=click.IntRange(min=0), default=None,
+              help="Only jobs using at least N GPUs (--min-gpus 1 selects "
+                   "GPU jobs). UNINDEXED - pair with --start-date/--end-date.")
+@click.option("--max-gpus", type=click.IntRange(min=0), default=None,
+              help="Only jobs using at most N GPUs (--max-gpus 0 selects "
+                   "CPU-only jobs).")
+@click.option("--min-elapsed-hours", type=click.FloatRange(min=0), default=None,
+              metavar="H",
+              help="Only jobs that ran (elapsed walltime used) at least H "
+                   "hours. UNINDEXED - pair with --start-date/--end-date.")
+@click.option("--max-elapsed-hours", type=click.FloatRange(min=0), default=None,
+              metavar="H",
+              help="Only jobs that ran at most H hours.")
+@click.option("--min-reqmem-gb", type=click.FloatRange(min=0), default=None,
+              metavar="GB",
+              help="Only jobs that REQUESTED at least GB gigabytes of memory "
+                   "(PBS Resource_List.mem, not memory used). UNINDEXED - "
+                   "pair with --start-date/--end-date.")
+@click.option("--max-reqmem-gb", type=click.FloatRange(min=0), default=None,
+              metavar="GB",
+              help="Only jobs that requested at most GB gigabytes of memory.")
+@click.option("--min-memory-used-gb", type=click.FloatRange(min=0), default=None,
+              metavar="GB",
+              help="Only jobs that USED at least GB gigabytes of memory "
+                   "(PBS resources_used.mem, not memory requested). "
+                   "UNINDEXED - pair with --start-date/--end-date.")
+@click.option("--max-memory-used-gb", type=click.FloatRange(min=0), default=None,
+              metavar="GB",
+              help="Only jobs that used at most GB gigabytes of memory.")
+@click.option("--min-memory-wasted-gb", type=float, default=None,
+              metavar="GB",
+              help="Only jobs whose requested-minus-used memory is at least "
+                   "GB gigabytes. May be NEGATIVE (the job used more than "
+                   "it requested); jobs missing either measurement are "
+                   "excluded. UNINDEXED - pair with --start-date/--end-date.")
+@click.option("--max-memory-wasted-gb", type=float, default=None,
+              metavar="GB",
+              help="Only jobs whose requested-minus-used memory is at most "
+                   "GB gigabytes. A negative bound selects over-request "
+                   "jobs (used more than requested).")
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Show all columns instead of the default subset.")
 @click.option("--display", default=None,
@@ -223,8 +293,20 @@ def daily_summary(jh_ctx: Context):
               help="Truncate results to at most N rows (SQL LIMIT, server-side).")
 @click.pass_obj
 def search(jh_ctx: Context, start_date, end_date, machine,
-           user, account, queue, qos, status, job_id, verbose, display, limit):
-    """List individual job records matching the filters."""
+           user, account, queue, qos, exit_status, job_id,
+           name, ignore_case, min_wait_hours, max_wait_hours,
+           min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus,
+           min_elapsed_hours, max_elapsed_hours, min_reqmem_gb, max_reqmem_gb,
+           min_memory_used_gb, max_memory_used_gb,
+           min_memory_wasted_gb, max_memory_wasted_gb,
+           verbose, display, limit):
+    """List individual job records matching the filters.
+
+    The name, wait and size filters are evaluated against unindexed columns,
+    so they scan whatever slice --start-date/--end-date leave behind.
+    Production tables hold 16-27M rows: always bound the date window when
+    using them.
+    """
     jh_ctx.start_date = start_date
     jh_ctx.end_date = end_date
     jh_ctx.machine = machine
@@ -233,8 +315,19 @@ def search(jh_ctx: Context, start_date, end_date, machine,
     from job_history.database import get_session
     jh_ctx.session = get_session(machine)
     code = SearchCommand(jh_ctx).execute(
-        user=user, account=account, queue=queue, qos=qos, status=status,
-        job_id=job_id,
+        user=user, account=account, queue=queue, qos=qos,
+        exit_status=exit_status, job_id=job_id,
+        name=name, ignore_case=ignore_case,
+        min_wait_hours=min_wait_hours, max_wait_hours=max_wait_hours,
+        min_nodes=min_nodes, max_nodes=max_nodes,
+        min_cpus=min_cpus, max_cpus=max_cpus,
+        min_gpus=min_gpus, max_gpus=max_gpus,
+        min_elapsed_hours=min_elapsed_hours, max_elapsed_hours=max_elapsed_hours,
+        min_reqmem_gb=min_reqmem_gb, max_reqmem_gb=max_reqmem_gb,
+        min_memory_used_gb=min_memory_used_gb,
+        max_memory_used_gb=max_memory_used_gb,
+        min_memory_wasted_gb=min_memory_wasted_gb,
+        max_memory_wasted_gb=max_memory_wasted_gb,
         verbose=verbose, display=display, limit=limit,
     )
     _close_session(jh_ctx)

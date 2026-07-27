@@ -51,8 +51,13 @@ def derecho_jobs(in_memory_session):
       CPU queues: 'cpu', 'cpudev'
       GPU queues: 'gpu', 'gpudev'
 
-    All jobs include eligible/start/end timestamps (for wait-time queries) and
+    All jobs include eligible/start/end timestamps plus eligible_secs (PBS
+    eligible_time, which is what the wait-time queries actually aggregate) and
     mpiprocs/ompthreads/memory (for memory-per-rank queries).
+
+    eligible_secs is set to match start - eligible for each job so the wait
+    values stay intuitive; in production the two diverge whenever a job was
+    held, dependency-blocked, or deferred.
     """
     t0 = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -65,7 +70,7 @@ def derecho_jobs(in_memory_session):
             eligible=t0 + timedelta(minutes=10),
             start=t0 + timedelta(minutes=30),
             end=t0 + timedelta(hours=2),
-            elapsed=5400,
+            elapsed=5400, eligible_secs=1200,
             numcpus=128, numgpus=0, numnodes=1,
             mpiprocs=128, ompthreads=1,
             memory=50 * 1024**3,
@@ -77,7 +82,7 @@ def derecho_jobs(in_memory_session):
             eligible=t0 + timedelta(hours=1, minutes=5),
             start=t0 + timedelta(hours=1, minutes=30),
             end=t0 + timedelta(hours=5),
-            elapsed=12600,
+            elapsed=12600, eligible_secs=1500,
             numcpus=256, numgpus=0, numnodes=2,
             mpiprocs=128, ompthreads=1,
             memory=100 * 1024**3,
@@ -90,7 +95,7 @@ def derecho_jobs(in_memory_session):
             eligible=t0 + timedelta(hours=2, minutes=2),
             start=t0 + timedelta(hours=2, minutes=15),
             end=t0 + timedelta(hours=3),
-            elapsed=2700,
+            elapsed=2700, eligible_secs=780,
             numcpus=32, numgpus=0, numnodes=1,
             mpiprocs=32, ompthreads=1,
             memory=16 * 1024**3,
@@ -103,7 +108,7 @@ def derecho_jobs(in_memory_session):
             eligible=t0 + timedelta(days=1, minutes=20),
             start=t0 + timedelta(days=1, hours=1),
             end=t0 + timedelta(days=1, hours=3),
-            elapsed=7200,
+            elapsed=7200, eligible_secs=2400,
             numcpus=64, numgpus=4, numnodes=1,
             mpiprocs=64, ompthreads=1,
             memory=80 * 1024**3,
@@ -115,7 +120,7 @@ def derecho_jobs(in_memory_session):
             eligible=t0 + timedelta(days=2, minutes=5),
             start=t0 + timedelta(days=2, hours=2),
             end=t0 + timedelta(days=2, hours=5),
-            elapsed=10800,
+            elapsed=10800, eligible_secs=6900,
             numcpus=64, numgpus=8, numnodes=1,
             mpiprocs=64, ompthreads=1,
             memory=120 * 1024**3,

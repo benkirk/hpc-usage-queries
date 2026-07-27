@@ -70,14 +70,17 @@ Core job records with foreign keys to normalized tables.
 | `account_id` | INTEGER | FK, YES | → accounts.id |
 | `queue_id` | INTEGER | FK, YES | → queues.id |
 | `qos_id` | INTEGER | FK, YES | → job_qos.id (resolved at sync time from `priority` + `queue`) |
-| `name` | TEXT | NO | Job name |
-| `status` | TEXT | YES | Completion status |
-| `submit` | DATETIME | YES | Submission time (naive UTC — see note below) |
-| `eligible` | DATETIME | NO | Eligible time (naive UTC) |
+| `name` | TEXT | NO | Job name — filterable by shell glob via `jobs_search(name=…)` / `jobhist search -N` (see note below) |
+| `status` | TEXT | YES | PBS `Exit_status` — an exit **code**, not a state (see note below). Exposed as `exit_status` on every query/CLI surface |
+| `submit` | DATETIME | YES | PBS `ctime` — job creation (naive UTC — see note below) |
+| `queued` | DATETIME | NO | PBS `qtime` — entered *current* queue; reset by routing |
+| `eligible` | DATETIME | NO | PBS `etime` — reset by queue move **and** hold/release |
 | `start` | DATETIME | YES | Start time (naive UTC) |
 | `end` | DATETIME | YES | End time (naive UTC) |
 | `elapsed` | INTEGER | NO | Runtime (seconds) |
 | `walltime` | INTEGER | NO | Requested walltime (seconds) |
+| `eligible_secs` | INTEGER | NO | PBS `eligible_time` — resource-blocked wait (seconds); see note |
+| `run_count` | INTEGER | NO | PBS `run_count`; `> 1` means the job was requeued |
 | `numcpus` | INTEGER | NO | CPUs allocated |
 | `numgpus` | INTEGER | NO | GPUs allocated |
 | `numnodes` | INTEGER | NO | Nodes allocated |
@@ -102,6 +105,90 @@ Core job records with foreign keys to normalized tables.
 > the server's local timezone first, causing a skew (e.g., 6 hours on a
 > Mountain-Time server).  Naive values are stored and compared as-is on both
 > SQLite and PostgreSQL regardless of server timezone.
+
+#### Wait time: use `eligible_secs`, not `start - submit`
+
+`eligible_secs` is PBS's own `eligible_time` accrual: the cumulative wall time a
+job was blocked **purely by resource scarcity**.  Time blocked by user or system
+holds, unsatisfied dependencies, `qsub -a` start-time deferral, or project/user/
+group run limits accrues instead to PBS's `ineligible_time`, which PBS **never**
+writes to accounting logs.  `eligible_time` survives requeue and `qmove` — PBS
+guarantees it only ever increases over a job's life.
+
+Neither `submit` nor `eligible` is a substitute:
+
+- `start - submit` counts held, dependency-blocked, and deferred time as if the
+  site had made the user wait.
+- `start - eligible` looks better but is *the same measurement in practice*:
+  `qtime == etime` on 77,152 of 77,154 sampled derecho E records, and
+  `eligible == submit` on 98.7% of rows in the live DB.  Measured against
+  `eligible_time` on 77k records, the medians are 141 s vs 30 s and the p90s are
+  23,437 s vs 11,721 s; 27% of non-array jobs disagree by more than 60 s.  For
+  unconstrained jobs the two agree within ~2 s — the entire divergence is a
+  negative tail, e.g. a job showing a 35-day `start - submit` wait has 17 s of
+  eligible time.
+
+`NULL` means "PBS did not record it" and is distinct from `0`.  Availability is
+gated by the `eligible_time_enable` server attribute, which was enabled at
+different times per machine:
+
+| machine | `queued` / `run_count` | `eligible_secs` |
+|---|---|---|
+| casper | all history (2024-01 →) | all history (2024-01 →) |
+| derecho | all history | **2025-01-07 17:47:50 UTC →** only |
+
+`JobQueries.job_waits_by_resource()` filters `eligible_secs IS NOT NULL`, so
+derecho reports covering dates before 2025-01-07 17:47:50 UTC exclude those jobs rather than
+silently mixing two different wait definitions. `JobQueries.jobs_histogram('wait', …)`
+makes the same exclusion visible instead of silent: NULL rows are counted into the
+response's `null_count` (the dashboard's "N jobs unmeasured" caption), never into
+a wait band.
+
+> **Array-parent caveat**: array-*parent* rows (job ids like `6896760[].desched1`,
+> ~1% of rows) carry an `eligible_time` accrued across the whole array's
+> lifetime, so it can exceed that record's own `start - submit` by hours.  Array
+> subjobs and ordinary jobs are well behaved (median +2 s).
+
+> **Do not** derive `eligible_secs` from `pbsparse`'s processed record.
+> `PbsRecord.process_record()` rewrites the `eligible_time` attribute *divided by*
+> `self._divisor` (qhist's display time unit: 1 = s, 60 = min, 3600 = hr).  Sync
+> parses the raw `HH:MM:SS` string instead.
+
+#### `status` holds an exit code, not a job state
+
+`Job.status` is populated from the PBS `Exit_status` field (`sync/pbs.py`).  It is
+a numeric exit code stored as text — `'0'` is success, non-zero is a failure or a
+signal.  It is **not** a state letter: across all 34M rows on both production
+machines there are **zero** non-numeric values (192 distinct codes on derecho,
+135 on casper; the most common are `'0'`, `'1'`, `'-29'`, `'271'`, `'255'`,
+`'143'`).  A filter for `'F'` matches nothing, ever.
+
+The ORM attribute stays `Job.status` to match the DB column, but every query and
+CLI surface names it `exit_status` — `jobs_search(exit_status=…)`,
+`jobhist search --exit-status`, the `exit_status` column key, and the
+`exit_status` facet dimension.
+
+#### Job-name glob filtering
+
+`jobs_search` / `jobs_count` / `jobs_facets` accept `name=` — one shell-glob
+pattern or a sequence of them, OR'd (`jobhist search -N 'wrf_*' -N '*.restart'`).
+`*` matches any run of characters and `?` exactly one; `ignore_case=True`
+(`-i`) switches to case-insensitive matching.
+
+Dialect-aware, in `job_history/queries/builders.py`: SQLite compiles to `GLOB`,
+PostgreSQL to an anchored POSIX regex (`~`), and the case-insensitive path to
+portable `ILIKE`/`lower() LIKE` with literal `%` and `_` escaped.  One asymmetry
+to know: SQLite `GLOB` honours `[abc]` character classes while the PostgreSQL
+regex path treats `[` as a literal — stick to `*` and `?` for identical results
+on both backends.  Rows with a NULL `name` never match any pattern.
+
+`jobs.name` is **not indexed**, so a glob is evaluated across whatever slice
+`start`/`end` leave behind via `ix_jobs_end`.  Measured on 13M rows: a
+one-month window costs ~107 ms with the glob versus ~100 ms without (i.e. free),
+while an unbounded full-history glob costs 1.5-2.4 s.  Always bound the date
+window.  A B-tree would not help — under a non-`C` collation PostgreSQL cannot
+use one for `LIKE 'foo%'` at all without `text_pattern_ops`, and even then only
+for left-anchored patterns; the substring case would need a `pg_trgm` GIN index.
 
 ### users, accounts, queues
 
@@ -314,19 +401,25 @@ ORDER BY s.date;
 
 ### Queue Wait Times
 
+Portable across SQLite and PostgreSQL — `eligible_secs` is already an integer
+count of seconds, so no dialect-specific date arithmetic is needed.
+
 ```sql
 SELECT q.queue_name,
        COUNT(*) as jobs,
-       AVG(strftime('%s', j.start) - strftime('%s', j.submit))/60.0 as avg_wait_min,
-       MEDIAN(strftime('%s', j.start) - strftime('%s', j.submit))/60.0 as median_wait_min
+       AVG(j.eligible_secs)/60.0 as avg_wait_min,
+       MAX(j.eligible_secs)/60.0 as max_wait_min
 FROM jobs j
 JOIN queues q ON j.queue_id = q.id
-WHERE j.start IS NOT NULL
-  AND j.submit IS NOT NULL
+WHERE j.eligible_secs IS NOT NULL
   AND j.end >= '2025-01-01'
 GROUP BY q.queue_name
 ORDER BY avg_wait_min DESC;
 ```
+
+The `IS NOT NULL` guard matters: without it `COUNT(*)` counts jobs that `AVG`
+skipped.  See *Wait time: use `eligible_secs`* above for why `start - submit` is
+not a valid substitute.
 
 ## Performance Characteristics
 

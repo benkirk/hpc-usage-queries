@@ -1,5 +1,7 @@
 # Database files
 data/*.db
+data/*.db-shm
+data/*.db-wal
 
 # Python
 __pycache__/

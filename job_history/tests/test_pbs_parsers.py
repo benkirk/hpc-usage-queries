@@ -1,11 +1,16 @@
 """Unit tests for PBS log parsers."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from job_history.sync.pbs import SyncPBSLogs
+
+# Sentinel for "this attribute is absent from the record entirely" — PbsRecord
+# sets attributes dynamically from the log line, so a missing PBS field means a
+# missing Python attribute, not a None value.
+_ABSENT = object()
 
 parse_pbs_time        = SyncPBSLogs.parse_pbs_time
 parse_pbs_memory_kb   = SyncPBSLogs.parse_pbs_memory_kb
@@ -47,6 +52,21 @@ class TestPbsTime:
         """Return None for invalid format."""
         assert parse_pbs_time("invalid") is None
         assert parse_pbs_time("12:34") is None  # Missing seconds
+
+    def test_parse_bare_seconds(self):
+        """Parse a bare integer count of seconds.
+
+        PBS documents eligible_time both as "in seconds" (Admin Guide E-record
+        table) and as HH:MM:SS (the worked example in section 4.9.13.8).
+        NCAR emits HH:MM:SS, but accept both.
+        """
+        assert parse_pbs_time("4822") == 4822
+        assert parse_pbs_time("0") == 0
+        assert parse_pbs_time(4822) == 4822
+
+    def test_parse_eligible_time_form(self):
+        """Parse the HH:MM:SS form PBS uses for eligible_time."""
+        assert parse_pbs_time("01:20:22") == 4822
 
 
 class TestPbsMemoryKb:
@@ -382,6 +402,86 @@ class TestParsePbsRecord:
         result = parse_pbs_record(record, "derecho")
 
         assert result["priority"] == "premium"
+
+
+class TestPbsWaitFields:
+    """Tests for qtime / eligible_time / run_count capture."""
+
+    @staticmethod
+    def _record(**overrides):
+        class MockRecord:
+            id = "123.desched1"
+            short_id = "123"
+            account = '"TEST0001"'
+            user = "testuser"
+            queue = "cpu"
+            jobname = "test"
+            ctime = "1769670000"
+            qtime = "1769670000"
+            etime = "1769670000"
+            start = "1769670600"
+            end = "1769671200"
+            Exit_status = "0"
+            run_count = "1"
+            Resource_List = {"select": "1:ncpus=1"}
+            resources_used = {"walltime": "00:10:00"}
+
+        record = MockRecord()
+        for key, value in overrides.items():
+            if value is _ABSENT:
+                delattr(type(record), key)
+            else:
+                setattr(record, key, value)
+        return record
+
+    def test_eligible_time_hhmmss(self):
+        """PBS eligible_time in HH:MM:SS lands as seconds."""
+        result = parse_pbs_record(self._record(eligible_time="01:20:22"), "derecho")
+        assert result["eligible_secs"] == 4822
+
+    def test_eligible_time_bare_seconds(self):
+        """PBS eligible_time as a bare integer lands as seconds."""
+        result = parse_pbs_record(self._record(eligible_time="4822"), "derecho")
+        assert result["eligible_secs"] == 4822
+
+    def test_eligible_time_zero_is_not_null(self):
+        """Zero accrual is a real value, distinct from 'PBS did not record it'."""
+        result = parse_pbs_record(self._record(eligible_time="00:00:00"), "derecho")
+        assert result["eligible_secs"] == 0
+
+    def test_eligible_time_absent(self):
+        """Records predating eligible_time_enable have no such attribute.
+
+        PbsRecord sets attributes dynamically from the log line, so derecho
+        records before 2025-01-07 17:47:50 UTC simply lack eligible_time entirely.
+        """
+        result = parse_pbs_record(self._record(), "derecho")
+        assert result["eligible_secs"] is None
+
+    def test_qtime_and_run_count(self):
+        """qtime becomes `queued`; run_count is carried through as an int."""
+        result = parse_pbs_record(
+            self._record(qtime="1769670300", run_count="12"), "derecho"
+        )
+        assert result["queued"] == datetime(2026, 1, 29, 7, 5, 0)  # naive UTC
+        assert result["run_count"] == 12
+
+    def test_qtime_absent(self):
+        """A record with no qtime yields queued=None rather than raising."""
+        result = parse_pbs_record(self._record(qtime=_ABSENT), "derecho")
+        assert result["queued"] is None
+
+    def test_start_zero_is_repaired_not_dropped(self):
+        """start=0 is reconstructed from end - elapsed.
+
+        The repair compares against a naive epoch; an aware sentinel would
+        never match a naive parsed value, leaving start at 1970 so that
+        validate_timestamp_ordering() drops the record entirely.
+        """
+        result = parse_pbs_record(self._record(start="0"), "derecho")
+        assert result["start"] == result["end"] - timedelta(seconds=result["elapsed"])
+        assert result["start"].year == 2026
+
 
 class TestIntegrationWithSampleData:
     """Integration tests using actual sample data."""

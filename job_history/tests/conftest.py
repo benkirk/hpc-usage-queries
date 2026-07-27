@@ -86,11 +86,14 @@ def sample_parsed_record():
         "queue": "main",
         "status": "0",
         "submit": datetime(2025, 1, 15, 17, 0, 0, tzinfo=timezone.utc),  # MST+7
+        "queued": datetime(2025, 1, 15, 17, 0, 0, tzinfo=timezone.utc),
         "eligible": datetime(2025, 1, 15, 17, 1, 0, tzinfo=timezone.utc),
         "start": datetime(2025, 1, 15, 17, 2, 0, tzinfo=timezone.utc),
         "end": datetime(2025, 1, 15, 18, 2, 0, tzinfo=timezone.utc),
         "elapsed": 3600,  # seconds
         "walltime": 7200,  # seconds
+        "eligible_secs": 60,  # PBS eligible_time accrual (seconds)
+        "run_count": 1,
         "numcpus": 256,
         "numgpus": 0,
         "numnodes": 2,

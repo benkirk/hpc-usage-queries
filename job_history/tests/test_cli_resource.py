@@ -30,6 +30,7 @@ from job_history.cli.resource import (
 )
 from job_history.exporters import DatExporter, CSVExporter
 from job_history.queries import JobQueries
+from types import SimpleNamespace
 
 
 # Make sure the file exporters are registered for every test run, even if
@@ -346,3 +347,52 @@ class TestJobhistResourceCli:
         result = CliRunner().invoke(cli, ["history", "-m", "all", "daily-summary"])
         assert result.exit_code != 0
         assert "Invalid value" in result.output or "invalid choice" in result.output.lower()
+
+
+class TestExporterNullHandling:
+    """NULL cells must render as blanks, not raise.
+
+    ``format(None, '<9d')`` raises TypeError. Several projected columns are
+    legitimately NULL — ``eligible_secs`` is NULL for every derecho job that
+    ended before PBS ``eligible_time_enable`` was switched on, and
+    ``short_id`` is NULL on every array-job row — so ``jobhist search -v
+    --format dat`` on derecho hit this reliably.
+    """
+
+    COLUMNS = [
+        SimpleNamespace(key="name",          header="Name",     width=12, format="s"),
+        SimpleNamespace(key="eligible_secs", header="EligWait", width=9,  format="d"),
+        SimpleNamespace(key="cpu_hours",     header="CPU-h",    width=10, format=".2f"),
+        SimpleNamespace(key="run_count",     header="Runs",     width=0,  format="d"),
+    ]
+    ROWS = [
+        {"name": "wrf", "eligible_secs": 42, "cpu_hours": 1.5, "run_count": 1},
+        {"name": None, "eligible_secs": None, "cpu_hours": None, "run_count": None},
+    ]
+
+    def test_dat_exporter_renders_nulls_as_blanks(self, tmp_path):
+        from job_history.exporters import DatExporter
+
+        path = tmp_path / "nulls.dat"
+        DatExporter().export(self.ROWS, self.COLUMNS, str(path))
+        lines = path.read_text().splitlines()
+        assert lines[1].startswith("wrf")
+        # Every NULL renders empty; the fixed-width layout is preserved, so
+        # the padded row is all spaces and the unpadded last column is empty.
+        assert lines[2].strip() == ""
+        assert len(lines[2]) == sum(c.width for c in self.COLUMNS)
+
+    def test_markdown_exporter_renders_nulls_as_blanks(self, tmp_path):
+        from job_history.exporters import MarkdownExporter
+
+        path = tmp_path / "nulls.md"
+        MarkdownExporter().export(self.ROWS, self.COLUMNS, str(path))
+        rows = [ln for ln in path.read_text().splitlines() if ln.startswith("|")]
+        assert rows[-1] == "|  |  |  |  |"
+
+    def test_numeric_formats_still_applied(self, tmp_path):
+        from job_history.exporters import MarkdownExporter
+
+        path = tmp_path / "fmt.md"
+        MarkdownExporter().export(self.ROWS, self.COLUMNS, str(path))
+        assert "1.50" in path.read_text()

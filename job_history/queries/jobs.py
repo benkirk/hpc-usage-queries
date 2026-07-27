@@ -15,10 +15,99 @@ from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session
 
 from ..database import Job, DailySummary, JobCharge, JobQoS
+from ..database.models import User, Account, Queue
 from ..database.config import JobHistoryConfig
+from ..columns import COLUMNS, DEFAULT_COLUMNS, project_row
+from .builders import glob_match_clause
 
 
 from sqlalchemy import case
+
+
+#: Facet dimension -> (GROUP BY column, lookup model or None, name column).
+#:
+#: Grouping goes through the integer FK on purpose. The text-valued
+#: ``Job.user`` / ``account`` / ``queue`` / ``qos`` hybrids compile to a
+#: correlated scalar subquery (see LookupMixin in database/models.py) that
+#: SQLAlchemy emits *twice* — select list and GROUP BY — and PostgreSQL
+#: re-evaluates per scanned row with no memoization. Measured 10x slower on a
+#: 304k-row slice, and it degrades the group key from int4 to collation-aware
+#: text. The FK columns are indexed; names are resolved after aggregation.
+_FACET_SPECS: Dict[str, Tuple[Any, Any, Any]] = {
+    'queue':       (Job.queue_id,   Queue,   Queue.queue_name),
+    'qos':         (Job.qos_id,     JobQoS,  JobQoS.name),
+    'exit_status': (Job.status,     None,    None),
+    'user':        (Job.user_id,    User,    User.username),
+    'account':     (Job.account_id, Account, Account.account_name),
+}
+
+#: Cheap dimensions a filter bar needs. ``user`` / ``account`` are opt-in — not
+#: because grouping them is expensive (cardinality measured free) but because
+#: self-excluding a *selective* filter can flip the query plan.
+DEFAULT_FACETS = ('queue', 'qos', 'exit_status')
+
+#: Dimensions whose own filter is NEVER dropped under ``self_exclude``.
+#: ``account`` is a security scope in every real caller — SAM pins it for
+#: authorization — so self-excluding it would emit counts for projects the
+#: requester cannot see. Faceting ``account`` therefore means "which projcodes
+#: within my scope", which is what a project-tree drill-down wants.
+_FACET_SCOPE_DIMS = frozenset({'account'})
+
+#: Above this many distinct ids, read the whole lookup table (a few thousand
+#: rows) instead of building an IN-list — cheaper, and it keeps the statement
+#: cache from filling with one plan per distinct id-count.
+_LOOKUP_FETCH_ALL_THRESHOLD = 500
+
+
+def _facet_rows(counts: Dict[Any, int], limit: Optional[int]) -> List[Dict[str, Any]]:
+    """Sort a ``{value: count}`` map into the facet row contract.
+
+    Count desc, then value asc so the order is stable across calls with equal
+    counts. ``None`` (NULL FK) sorts last within its count group.
+    """
+    ordered = sorted(
+        counts.items(), key=lambda kv: (-kv[1], kv[0] is None, str(kv[0]))
+    )
+    if limit is not None:
+        ordered = ordered[:limit]
+    return [{"value": value, "count": count} for value, count in ordered]
+
+
+#: 1 GB = 1024^3 bytes. Mirrors ``sync/charging.BYTES_PER_GB`` — redefined
+#: here because importing the sync package would pull the PBS/Slurm parsers
+#: into the queries import path.
+_GIB = 1024 ** 3
+
+#: CASE label emitted for rows whose histogram column is NULL. Routed to the
+#: response's top-level ``null_count`` by the fold, never surfaced as a
+#: bucket label.
+_NULL_BUCKET = "__null__"
+
+
+def _bucket_case(field, buckets):
+    """CASE labelling *field* into ``(label, lo, hi)`` buckets; NULL first.
+
+    The ascending ``field <= hi`` ladder (rather than per-band BETWEENs)
+    means every non-NULL value lands in exactly one bucket, with no gaps for
+    a value to fall through the way ``_build_range_case``'s band arithmetic
+    allows. The ``lo`` values are reporting metadata (and drill-down filter
+    bounds), not SQL.
+
+    That makes the ladder *total* but not automatically *faithful*, and the
+    bucket table owns the difference. Only ``hi`` is tested, so a value
+    below the first band's ``lo`` is still claimed by that band's arm, and a
+    value above the last band's ``hi`` falls to ``else_`` — in both cases
+    labelled with a band whose advertised ``lo``/``hi`` would exclude it,
+    breaking the histogram's bar↔``jobs_search`` round-trip (a bar counting
+    rows the replayed filters don't return). So every table must be
+    *closed*: the first band reaches the column's domain floor (``lo=0``, or
+    ``lo=None`` for a signed dimension like ``memory_wasted``) and the last
+    band is open-ended (``hi=None``). Pinned by
+    ``test_bucket_tables_are_closed_and_contiguous``.
+    """
+    whens = [(field.is_(None), _NULL_BUCKET)]
+    whens += [(field <= hi, label) for label, _lo, hi in buckets if hi is not None]
+    return case(*whens, else_=buckets[-1][0]).label("bucket_label")
 
 
 def _sort_expression(sort_by: str):
@@ -29,9 +118,6 @@ def _sort_expression(sort_by: str):
     underlying ``hours × COALESCE(qos_factor, 1)`` product, matching the
     formula in :func:`project_row`.
     """
-    # Local import avoids a queries → cli circular import.
-    from job_history.cli.search.columns import COLUMNS
-
     spec = COLUMNS[sort_by]
     kind, attr = spec["source"].split(".", 1)
     if kind == "job":
@@ -165,22 +251,145 @@ class QueryConfig:
     ]
     MEMORY_OVERFLOW = ">1000"
 
+    # ------------------------------------------------------------------
+    # Histogram bucket tables — (label, lo, hi) triples, bounds inclusive,
+    # hi=None open-ended. The same triple shape as fs_scans' SIZE_BUCKETS,
+    # which SAM already band-drills against. Consumed by
+    # JobQueries.jobs_histogram via _HISTOGRAM_SPECS; lo/hi round-trip
+    # into the matching min_*/max_* jobs_search filters.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ranges_to_buckets(ranges, overflow_label, overflow_lo):
+        """Derive (label, lo, hi) triples from legacy (lo, hi) range pairs.
+
+        Labels reproduce ``_build_range_case`` exactly ('1', '2', '3-4', …)
+        so the histogram API and the legacy resource reports agree on
+        vocabulary.
+        """
+        buckets = [
+            (f"{lo}-{hi}" if lo != hi else str(lo), lo, hi)
+            for lo, hi in ranges
+        ]
+        buckets.append((overflow_label, overflow_lo, None))
+        return buckets
+
+    # Queue-wait distribution buckets (seconds). eligible_secs masses near
+    # zero with a tail out to days, so log-ish spacing gives resolution at
+    # both ends. A NEW table: job_waits_by_resource buckets by *size* and
+    # averages the wait — a distribution needs wait-valued bands.
+    WAIT_BUCKETS = [
+        ("<1m",    0,      59),
+        ("1-5m",   60,     299),
+        ("5-15m",  300,    899),
+        ("15-30m", 900,    1799),
+        ("30-60m", 1800,   3599),
+        ("1-2h",   3600,   7199),
+        ("2-4h",   7200,   14399),
+        ("4-8h",   14400,  28799),
+        ("8-12h",  28800,  43199),
+        ("12-24h", 43200,  86399),
+        ("1-2d",   86400,  172799),
+        (">2d",    172800, None),
+    ]
+
+    # Elapsed-runtime distribution buckets (seconds). Labels and integer
+    # band edges are identical to the historical get_duration_buckets()
+    # dict, which is now DERIVED from this table — single source of truth.
+    DURATION_HIST_BUCKETS = [
+        ("<30s",    0,     29),
+        ("30s-30m", 30,    1799),
+        ("30-60m",  1800,  3599),
+        ("1-5h",    3600,  17999),
+        ("5-12h",   18000, 43199),
+        ("12-18h",  43200, 64799),
+        (">18h",    64800, None),
+    ]
+
+    # NODE_RANGES starts at 1, but a bucket table must reach the column's
+    # domain floor or _bucket_case's `<= hi` ladder folds sub-floor values
+    # into the first band while its advertised lo/hi excludes them (see the
+    # leading-band note there). Hence the explicit zero band, matching
+    # GPU_HIST_BUCKETS. No numnodes=0 rows exist today; numcpus=0 does.
+    NODE_HIST_BUCKETS = (
+        [("0", 0, 0)] + _ranges_to_buckets(NODE_RANGES, NODE_OVERFLOW, 2049)
+    )
+
+    # Deliberately NOT derived from CORE_RANGES: its >128 overflow would
+    # swallow every multi-node derecho job (128 cpus is one derecho node).
+    # Within-node resolution matches CORE_RANGES, then ×4 steps keep the
+    # tail wide enough for 2000+-node jobs without a dozen more bars.
+    # The zero band is load-bearing, not symmetry: 404 derecho / 21 casper
+    # production rows carry numcpus=0, and without it they were counted in
+    # the "1" bar while min_cpus=1/max_cpus=1 excluded them.
+    CPU_HIST_BUCKETS = [
+        ("0", 0, 0),
+        ("1", 1, 1), ("2", 2, 2), ("3-4", 3, 4), ("5-8", 5, 8),
+        ("9-16", 9, 16), ("17-32", 17, 32), ("33-64", 33, 64),
+        ("65-128", 65, 128), ("129-512", 129, 512),
+        ("513-2048", 513, 2048), ("2049-8192", 2049, 8192),
+        ("8193-32768", 8193, 32768), (">32768", 32769, None),
+    ]
+
+    # Deliberately NOT derived from GPU_RANGES (starts at 4 — derecho-shaped):
+    # explicit 0/1/2 buckets keep casper's small GPU jobs and the CPU/GPU
+    # split visible. min_gpus=1 composes to drop the zero bucket.
+    GPU_HIST_BUCKETS = [
+        ("0", 0, 0), ("1", 1, 1), ("2", 2, 2), ("3-4", 3, 4),
+        ("5-8", 5, 8), ("9-16", 9, 16), ("17-32", 17, 32),
+        ("33-64", 33, 64), ("65-128", 65, 128), ("129-256", 129, 256),
+        (">256", 257, None),
+    ]
+
+    # Requested-memory bands: raw bytes at GiB boundaries so returned
+    # bounds round-trip exactly into min_reqmem/max_reqmem (no division in
+    # SQL, no unit drift). Gains the <1GB band that the legacy
+    # MEMORY_RANGES CASE folds into its ">1000" overflow.
+    REQMEM_HIST_BUCKETS = [
+        ("<1GB",       0,                _GIB - 1),
+        ("1-10GB",     _GIB,             10 * _GIB),
+        ("10-50GB",    10 * _GIB + 1,    50 * _GIB),
+        ("50-100GB",   50 * _GIB + 1,    100 * _GIB),
+        ("100-500GB",  100 * _GIB + 1,   500 * _GIB),
+        ("500-1000GB", 500 * _GIB + 1,   1000 * _GIB),
+        (">1000GB",    1000 * _GIB + 1,  None),
+    ]
+
+    # Used-memory bands: the same GiB boundaries as REQMEM_HIST_BUCKETS —
+    # requested vs used on a shared x-axis is the point of the pair.
+    MEMUSED_HIST_BUCKETS = list(REQMEM_HIST_BUCKETS)
+
+    # Requested-minus-used bands. The leading "over request" band catches
+    # negative deltas (the job used MORE memory than it requested —
+    # ~0.3-0.4% of production rows on both machines); lo=None keeps it open
+    # from below, so it round-trips as max_memory_wasted=-1 with no min
+    # bound. _bucket_case's ascending `<= hi` ladder handles the negative
+    # band with no special casing.
+    MEMWASTED_HIST_BUCKETS = [("over request", None, -1)] + REQMEM_HIST_BUCKETS
+
     # Duration buckets (in seconds)
     @staticmethod
     def get_duration_buckets():
-        """Get duration bucket definitions.
+        """Get duration bucket definitions, derived from DURATION_HIST_BUCKETS.
+
+        The label → SQL-condition dict shape predates the histogram table;
+        deriving it keeps the labels and band edges in one place. The
+        derivation reproduces the original conditions row-for-row: no lower
+        bound on the first band, no upper bound on the last, and
+        ``Job.elapsed`` is INTEGER seconds so ``<= 29`` ≡ the original
+        ``< 30``.
 
         Returns as a static method to avoid issues with Job reference at import time.
         """
-        return {
-            "<30s": Job.elapsed < 30,
-            "30s-30m": and_(Job.elapsed >= 30, Job.elapsed < 1800),
-            "30-60m": and_(Job.elapsed >= 1800, Job.elapsed < 3600),
-            "1-5h": and_(Job.elapsed >= 3600, Job.elapsed < 18000),
-            "5-12h": and_(Job.elapsed >= 18000, Job.elapsed < 43200),
-            "12-18h": and_(Job.elapsed >= 43200, Job.elapsed < 64800),
-            ">18h": Job.elapsed >= 64800,
-        }
+        buckets = {}
+        for label, lo, hi in QueryConfig.DURATION_HIST_BUCKETS:
+            conds = []
+            if lo > 0:
+                conds.append(Job.elapsed >= lo)
+            if hi is not None:
+                conds.append(Job.elapsed <= hi)
+            buckets[label] = and_(*conds) if len(conds) > 1 else conds[0]
+        return buckets
 
     @staticmethod
     def get_memory_per_rank_buckets():
@@ -238,6 +447,45 @@ class QueryConfig:
             ),
             ">256GB": Job.memory / (Job.mpiprocs * Job.ompthreads * Job.numnodes) >= (256 * BYTES_PER_GB),
         }
+
+
+#: Requested-minus-used memory delta, in bytes. SQL NULL propagation makes
+#: it NULL-strict for free: NULL in either column yields a NULL delta, which
+#: range bounds exclude and the histogram routes to ``null_count``. Negative
+#: values are legal and meaningful (the job used more than it requested), so
+#: nothing here clamps at zero. The Label supplies the ``column`` name in
+#: the histogram envelope; in WHERE/CASE contexts it compiles to the bare
+#: expression (no AS clause).
+_MEMORY_WASTED = (Job.reqmem - Job.memory).label('memory_wasted')
+
+#: jobs_histogram dimension → (column, bucket table, unit, min/max kwargs).
+#:
+#: Dimension names are deliberately the SAM dashboard's tab/pill vocabulary,
+#: not column names. ``min_param``/``max_param`` make each response
+#: self-describing: a consumer turns a clicked bar into
+#: ``jobs_search(**{min_param: lo, max_param: hi})`` without hardcoding the
+#: dimension→filter map. ``memory`` buckets REQUESTED memory (``reqmem``) —
+#: the dashboard ask is "resource needs" — while ``memory_used`` buckets the
+#: memory actually consumed (``Job.memory``) and ``memory_wasted`` their
+#: difference; per-rank used-memory physics stays with job_memory_per_rank.
+_HISTOGRAM_SPECS: Dict[str, Tuple[Any, List[tuple], str, str, str]] = {
+    'wait':     (Job.eligible_secs, QueryConfig.WAIT_BUCKETS,
+                 'seconds', 'min_eligible_secs', 'max_eligible_secs'),
+    'nodes':    (Job.numnodes,      QueryConfig.NODE_HIST_BUCKETS,
+                 'count',   'min_nodes',         'max_nodes'),
+    'cpus':     (Job.numcpus,       QueryConfig.CPU_HIST_BUCKETS,
+                 'count',   'min_cpus',          'max_cpus'),
+    'gpus':     (Job.numgpus,       QueryConfig.GPU_HIST_BUCKETS,
+                 'count',   'min_gpus',          'max_gpus'),
+    'memory':   (Job.reqmem,        QueryConfig.REQMEM_HIST_BUCKETS,
+                 'bytes',   'min_reqmem',        'max_reqmem'),
+    'duration': (Job.elapsed,       QueryConfig.DURATION_HIST_BUCKETS,
+                 'seconds', 'min_elapsed',       'max_elapsed'),
+    'memory_used':   (Job.memory,     QueryConfig.MEMUSED_HIST_BUCKETS,
+                      'bytes', 'min_memory_used',   'max_memory_used'),
+    'memory_wasted': (_MEMORY_WASTED, QueryConfig.MEMWASTED_HIST_BUCKETS,
+                      'bytes', 'min_memory_wasted', 'max_memory_wasted'),
+}
 
 
 class JobQueries:
@@ -492,17 +740,28 @@ class JobQueries:
             # Convert bytes to GB for memory ranges
             field = Job.reqmem / (1024**3)
 
-        # Build range case and wait time calculation
+        # Build range case and wait time calculation.
+        #
+        # Wait time is PBS's own eligible_time accrual, not start - eligible.
+        # start - eligible (i.e. start - etime) is effectively submit -> start:
+        # qtime == etime on 77,152 of 77,154 sampled derecho E records, so it
+        # counts time the job spent held, dependency-blocked, or deferred by
+        # `qsub -a` -- none of which is the site making the user wait.
+        # eligible_secs counts only time blocked on resource scarcity.
         range_case = self._build_range_case(ranges, overflow, field)
-        from .builders import _TimeDiffHours
-        wait_time_hours = _TimeDiffHours(Job.eligible, Job.start)
+        wait_time_hours = Job.eligible_secs / 3600.0
 
-        # Build subquery
+        # Build subquery.  The IS NOT NULL filter is required, not redundant:
+        # func.avg already skips NULLs, but func.count(id) below would not, so
+        # without it #-Jobs would count jobs excluded from the average.  Jobs
+        # predating `eligible_time_enable` (derecho before 2025-01-07
+        # 17:47:50 UTC) are
+        # dropped rather than silently mixed with a different wait definition.
         subquery = self.session.query(
             Job.id,
             range_case,
             wait_time_hours.label("wait_hours")
-        ).filter(Job.queue.in_(queues))
+        ).filter(Job.queue.in_(queues), Job.eligible_secs.isnot(None))
 
         subquery = self._apply_date_filter(subquery, start, end)
         subquery = subquery.subquery()
@@ -976,7 +1235,7 @@ class JobQueries:
         user: str,
         start: Optional[date] = None,
         end: Optional[date] = None,
-        status: Optional[str] = None,
+        exit_status: Optional[str] = None,
         queue: Optional[str] = None,
     ) -> List[Job]:
         """Get all jobs for a user, optionally filtered by date range and other criteria.
@@ -985,7 +1244,7 @@ class JobQueries:
             user: Username to query
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
-            status: Optional job status filter (e.g., 'F' for finished)
+            exit_status: Optional PBS ``Exit_status`` filter ('0' == success)
             queue: Optional queue name filter
 
         Returns:
@@ -994,8 +1253,8 @@ class JobQueries:
         query = self.session.query(Job).filter(Job.user == user)
 
         query = self._apply_date_filter(query, start, end)
-        if status:
-            query = query.filter(Job.status == status)
+        if exit_status:
+            query = query.filter(Job.status == exit_status)
         if queue:
             query = query.filter(Job.queue == queue)
 
@@ -1006,7 +1265,7 @@ class JobQueries:
         account: str,
         start: Optional[date] = None,
         end: Optional[date] = None,
-        status: Optional[str] = None,
+        exit_status: Optional[str] = None,
     ) -> List[Job]:
         """Get all jobs for an account, optionally filtered by date range.
 
@@ -1014,7 +1273,7 @@ class JobQueries:
             account: Account name to query
             start: Optional start date (inclusive) - filters on job end time
             end: Optional end date (inclusive) - filters on job end time
-            status: Optional job status filter (e.g., 'F' for finished)
+            exit_status: Optional PBS ``Exit_status`` filter ('0' == success)
 
         Returns:
             List of Job objects matching the criteria
@@ -1022,8 +1281,8 @@ class JobQueries:
         query = self.session.query(Job).filter(Job.account == account)
 
         query = self._apply_date_filter(query, start, end)
-        if status:
-            query = query.filter(Job.status == status)
+        if exit_status:
+            query = query.filter(Job.status == exit_status)
 
         return query.order_by(Job.end.desc()).all()
 
@@ -1058,9 +1317,26 @@ class JobQueries:
         account: Optional[Union[str, Sequence[str]]] = None,
         queue: Optional[str] = None,
         qos: Optional[str] = None,
-        status: Optional[str] = None,
-        has_gpus: Optional[bool] = None,
+        exit_status: Optional[str] = None,
         job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
         columns: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         offset: int = 0,
@@ -1071,8 +1347,7 @@ class JobQueries:
 
         Returns a ``list[dict]`` with one entry per matching job; the dict
         keys are controlled by the ``columns`` parameter and default to
-        :data:`job_history.cli.search.columns.DEFAULT_COLUMNS`. Filters
-        compose via AND.
+        :data:`job_history.columns.DEFAULT_COLUMNS`. Filters compose via AND.
 
         This is the job-level companion to :meth:`daily_summary_report`,
         which returns per-day *aggregated* rows. The two row shapes share
@@ -1097,9 +1372,10 @@ class JobQueries:
             qos: Optional QoS / priority-class filter (text; resolved via FK
                 hybrid against the ``job_qos`` lookup — e.g. ``"premium"``,
                 ``"regular"``, ``"economy"``, ``"special"``, ``"uncharged"``).
-            status: Optional job-status filter (e.g. 'F' for finished)
-            has_gpus: ``None`` ignore; ``True`` → ``Job.numgpus > 0`` (GPU jobs
-                only); ``False`` → ``numgpus == 0`` (CPU-only jobs).
+            exit_status: Optional PBS ``Exit_status`` filter. This is an
+                exit *code*, not a job state — ``'0'`` is success, non-zero
+                is a failure or signal (e.g. ``'271'``, ``'143'``). Stored
+                as text in ``Job.status``.
             job_id: Optional job-id filter, classified by input shape:
 
                 * Has a ``.`` (e.g. ``"6049117[28].desched1"``) → exact match
@@ -1117,6 +1393,77 @@ class JobQueries:
                 leaves it ``NULL`` on every array-job row, so a
                 ``short_id``-based path would miss the dominant
                 "match all elements of my array job" use case.
+            name: Optional job-name glob filter on ``Job.name``. Accepts a
+                single pattern (``"wrf_*"``) or a sequence of patterns
+                (``["wrf_*", "*.restart"]``) OR'd together. Shell-glob
+                syntax: ``*`` matches any run of characters, ``?`` exactly
+                one. Case-sensitive unless ``ignore_case``.
+
+                Unlike ``account``, an **empty sequence means "no filter"**,
+                not "no rows" — Click's ``multiple=True`` hands us ``()``
+                when ``-N`` is simply not supplied, so the empty case has to
+                be the identity or a plain ``jobhist search --user alice``
+                would return nothing.
+
+                Backend note: on SQLite this compiles to ``GLOB`` (which
+                additionally honours ``[abc]`` character classes); on
+                PostgreSQL to an anchored POSIX regex (``~``) in which ``[``
+                and ``]`` are literals. Stick to ``*`` and ``?`` for
+                identical results on both. Jobs with a NULL ``Job.name``
+                never match any pattern.
+            ignore_case: Case-insensitive matching for ``name`` only.
+                Default False, matching the ``fs-scans query -N/-i`` pair.
+            min_eligible_secs: Lower bound (inclusive) on
+                ``Job.eligible_secs`` — PBS ``eligible_time``, i.e. wall time
+                blocked purely by resource scarcity.
+            max_eligible_secs: Upper bound (inclusive) on the same column.
+
+                **Both bounds exclude jobs with a NULL ``eligible_secs``.**
+                That is plain SQL three-valued logic and it is the behaviour
+                we want: ``eligible_time_enable`` was off on derecho until
+                2025-01-07 17:47:50 UTC, so every job ending before then has
+                *no wait measurement at all* — not a wait of zero. Folding
+                those into a ``max_eligible_secs`` result would claim "these
+                jobs waited less than N" about jobs whose wait is unknown.
+                :meth:`job_waits_by_resource` makes the same exclusion
+                explicit because ``AVG`` and ``COUNT`` disagreed about NULLs;
+                here the comparison operator does it, and because
+                :meth:`jobs_count` shares this exact predicate the count can
+                never drift from the row set.
+            min_nodes / max_nodes: Inclusive bounds on ``Job.numnodes``.
+            min_cpus / max_cpus: Inclusive bounds on ``Job.numcpus``.
+            min_gpus / max_gpus: Inclusive bounds on ``Job.numgpus``.
+                ``min_gpus=1`` selects GPU jobs; ``max_gpus=0`` selects
+                CPU-only jobs.
+            min_elapsed / max_elapsed: Inclusive bounds on ``Job.elapsed``
+                (walltime actually used), in **seconds**. Distinct from
+                ``Job.walltime``, the walltime *requested*.
+            min_reqmem / max_reqmem: Inclusive bounds on ``Job.reqmem``
+                (memory *requested* at submit), in **bytes**. Requested,
+                not used — used memory is ``Job.memory``, filtered by
+                ``min_/max_memory_used`` below.
+            min_memory_used / max_memory_used: Inclusive bounds on
+                ``Job.memory`` (peak memory actually *used*, PBS
+                ``resources_used.mem``), in **bytes**.
+            min_memory_wasted / max_memory_wasted: Inclusive bounds on the
+                computed ``Job.reqmem - Job.memory`` delta (requested minus
+                used), in **bytes**. The delta may legitimately be
+                **negative** — the job used more than it requested — so
+                ``max_memory_wasted=-1`` selects exactly those over-request
+                jobs, and neither bound clamps at zero. A NULL in *either*
+                column makes the delta NULL, so those rows drop out under
+                either bound (standard NULL-strict rules).
+
+                All fourteen range bounds are NULL-strict: a NULL column
+                value fails both comparisons and the row drops out.
+
+                Performance: ``name``, ``eligible_secs``, ``numnodes``,
+                ``numcpus``, ``numgpus``, ``elapsed``, ``reqmem`` and
+                ``memory`` are **unindexed**. Each of these filters is
+                evaluated as a scan of whatever slice ``start``/``end``
+                leave behind (via ``ix_jobs_end``). Production derecho
+                holds ~15.7M rows and casper ~26.7M, so always pass a
+                bounded date window alongside them.
             columns: Optional sequence of column keys to project.
                 When None, returns DEFAULT_COLUMNS. Unknown keys raise ValueError.
             limit: Optional max number of rows to return. Applied as a SQL
@@ -1133,13 +1480,6 @@ class JobQueries:
             Each dict contains exactly the requested column keys, with values
             pulled from ``Job`` columns or the outer-joined ``JobCharge`` row.
         """
-        # Local import keeps the queries package importable without cli/.
-        from job_history.cli.search.columns import (
-            COLUMNS,
-            DEFAULT_COLUMNS,
-            project_row,
-        )
-
         cols = tuple(columns) if columns is not None else DEFAULT_COLUMNS
         unknown = [c for c in cols if c not in COLUMNS]
         if unknown:
@@ -1168,8 +1508,19 @@ class JobQueries:
         )
         query = self._apply_jobs_search_filters(
             query, start=start, end=end, user=user, account=account,
-            queue=queue, qos=qos, status=status, has_gpus=has_gpus,
-            job_id=job_id,
+            queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
+            name=name, ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
         )
 
         if sort_by is None:
@@ -1193,9 +1544,26 @@ class JobQueries:
         account: Optional[Union[str, Sequence[str]]] = None,
         queue: Optional[str] = None,
         qos: Optional[str] = None,
-        status: Optional[str] = None,
-        has_gpus: Optional[bool] = None,
+        exit_status: Optional[str] = None,
         job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
     ) -> int:
         """Count rows that ``jobs_search`` would return under the same filters.
 
@@ -1206,14 +1574,539 @@ class JobQueries:
         accepts a single projcode or a sequence (see :meth:`jobs_search`);
         ``job_id`` matches the shape-classifier described in
         :meth:`jobs_search`.
+
+        The NULL-exclusion built into ``min_/max_eligible_secs`` applies
+        identically here — this method and ``jobs_search`` push the *same*
+        predicates through :meth:`_apply_jobs_search_filters`, so there is no
+        ``AVG``-skips-NULL / ``COUNT``-doesn't split like the one
+        :meth:`job_waits_by_resource` had to guard against. The count is
+        always exactly the row count.
         """
         query = self.session.query(func.count(Job.id))
         query = self._apply_jobs_search_filters(
             query, start=start, end=end, user=user, account=account,
-            queue=queue, qos=qos, status=status, has_gpus=has_gpus,
-            job_id=job_id,
+            queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
+            name=name, ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
         )
         return int(query.scalar() or 0)
+
+    def jobs_facets(
+        self,
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
+        queue: Optional[str] = None,
+        qos: Optional[str] = None,
+        exit_status: Optional[str] = None,
+        job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
+        facets: Sequence[str] = DEFAULT_FACETS,
+        self_exclude: bool = True,
+        limit: Optional[int] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Per-dimension value counts for the *current* filter set.
+
+        Lets a UI populate filter dropdowns with live counts ("regular
+        (1,204)") and grey out zero-count options, instead of the static
+        catalog :meth:`list_qos_names` returns. Filter shape mirrors
+        :meth:`jobs_search` / :meth:`jobs_count` exactly — the same
+        ``_apply_jobs_search_filters`` helper is used, so facets can never
+        drift from the rows they describe.
+
+        Returns ``{dimension: [{'value': ..., 'count': int}, ...]}`` with one
+        key per entry in *facets*, each list sorted by count desc then value
+        asc (``None`` last) so equal counts do not reshuffle between calls.
+        ``value`` is ``None`` for a NULL FK. Only values present in the
+        filtered slice appear — a zero-count value is simply absent, which is
+        what lets the caller grey it out against the catalog.
+
+        Cost — read this before enabling more facets:
+
+        * **One** SQL statement regardless of how many dimensions are
+          requested (plus one trivial lookup-table read per name-resolved
+          dimension). All dimensions are grouped simultaneously and folded in
+          Python. Measured on PostgreSQL over a 304k-row month: 154 ms for
+          one dimension, 154 ms for three, 201 ms for five — against 714 ms
+          for the same five run as separate queries.
+        * Grouping goes through the integer FK, never the text hybrid.
+          ``GROUP BY Job.queue`` compiles to a correlated scalar subquery
+          emitted twice and re-evaluated per scanned row: measured 1,223 ms
+          vs 122 ms for ``GROUP BY Job.queue_id`` on the same slice.
+        * The statement scans **every row in the date slice**. This is the
+          first method here that does — ``jobs_search(limit=N)`` walks
+          ``ix_jobs_end`` and stops at N, and ``jobs_count`` is index-only.
+        * The date window is the only cost lever that matters by an order of
+          magnitude: unbounded over full history measured ~200 s. Pass a
+          bounded ``start``/``end``.
+
+        Args:
+            facets: Dimensions to count. Valid keys are in
+                :data:`_FACET_SPECS` — queue, qos, exit_status, user,
+                account. Defaults to the low-cardinality set.
+            self_exclude: When True (default, and the standard faceted-search
+                behaviour), a dimension's own filter does not constrain its
+                own counts — with ``queue='main'`` set, the ``queue`` facet
+                still lists every queue so the user can switch to one, while
+                the other facets stay restricted to ``main``. Implemented by
+                moving those predicates out of SQL and into the fold, so it
+                costs **no extra query**. It does mean the scan is no longer
+                narrowed by them, and self-excluding a *selective indexed*
+                filter can flip the plan from an index seek to a slice scan.
+                ``account`` is never self-excluded (see
+                :data:`_FACET_SCOPE_DIMS`).
+            limit: Optional per-dimension top-N truncation, applied after
+                sorting. The tail is dropped rather than folded into an
+                "other" bucket, so rows sum to at most ``jobs_count``, never
+                to a synthetic total. Use it for ``user`` / ``exit_status``.
+
+        Raises:
+            ValueError: on an unknown facet name or a non-positive ``limit``.
+        """
+        dims = tuple(facets)
+        unknown = [d for d in dims if d not in _FACET_SPECS]
+        if unknown:
+            valid = ", ".join(sorted(_FACET_SPECS))
+            raise ValueError(
+                f"Unknown facet(s): {', '.join(unknown)}. Valid facets: {valid}"
+            )
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ValueError(f"limit must be a positive integer, got {limit!r}")
+        if not dims:
+            return {}
+
+        filters = dict(
+            start=start, end=end, user=user, account=account, queue=queue,
+            qos=qos, exit_status=exit_status, job_id=job_id, name=name,
+            ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
+        )
+        # Faceted dimensions that carry a filter and are not a security scope:
+        # their predicate leaves the WHERE clause and is re-applied in the fold.
+        excluded = {
+            d for d in dims
+            if self_exclude and filters.get(d) and d not in _FACET_SCOPE_DIMS
+        }
+        sql_filters = {
+            k: (None if k in excluded else v) for k, v in filters.items()
+        }
+
+        group_cols = [_FACET_SPECS[d][0] for d in dims]
+        query = self.session.query(*group_cols, func.count(Job.id))
+        query = self._apply_jobs_search_filters(query, **sql_filters)
+        rows = query.group_by(*group_cols).all()
+
+        # id -> name, once per dimension over distinct ids (10^1..10^3) rather
+        # than once per scanned row (10^6).
+        names: Dict[str, Dict[Any, Any]] = {}
+        for pos, dim in enumerate(dims):
+            _, model, name_col = _FACET_SPECS[dim]
+            if model is not None:
+                names[dim] = self._resolve_lookup_names(
+                    model, name_col, {r[pos] for r in rows if r[pos] is not None}
+                )
+
+        # Filter values for the excluded dimensions, as display labels.
+        wanted: Dict[str, set] = {}
+        for dim in excluded:
+            value = filters[dim]
+            wanted[dim] = {value} if isinstance(value, str) else set(value)
+
+        buckets: Dict[str, Dict[Any, int]] = {d: {} for d in dims}
+        for row in rows:
+            count = row[-1]
+            labels = [
+                names[d].get(row[i]) if d in names else row[i]
+                for i, d in enumerate(dims)
+            ]
+            for i, dim in enumerate(dims):
+                # Every *other* excluded dimension's filter still applies.
+                if any(labels[j] not in wanted[d]
+                       for j, d in enumerate(dims) if d in wanted and d != dim):
+                    continue
+                buckets[dim][labels[i]] = buckets[dim].get(labels[i], 0) + count
+
+        return {d: _facet_rows(buckets[d], limit) for d in dims}
+
+    def jobs_histogram(
+        self,
+        dimension: str,
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
+        queue: Optional[str] = None,
+        qos: Optional[str] = None,
+        exit_status: Optional[str] = None,
+        job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Distribution histogram over one job dimension, for dashboards.
+
+        Buckets every job matching the filter set into fixed bands of
+        *dimension* and returns the **full band vector in band order,
+        zero-count bands included** — a chart gets a stable x-axis without
+        knowing which bands are populated. Filter shape mirrors
+        :meth:`jobs_search` / :meth:`jobs_count` exactly (same
+        ``_apply_jobs_search_filters`` helper), so a histogram can never
+        disagree with the job table it sits next to.
+
+        Args:
+            dimension: One of ``wait`` (``eligible_secs``), ``nodes``,
+                ``cpus``, ``gpus``, ``memory`` (**requested** memory,
+                ``reqmem``), ``duration`` (``elapsed``), ``memory_used``
+                (peak memory actually consumed, ``Job.memory``) or
+                ``memory_wasted`` (the computed ``reqmem - memory`` delta;
+                its leading ``over request`` band collects negative deltas
+                — jobs that used more than they requested — and rows with
+                a NULL in either column land in ``null_count``). Names
+                match the SAM dashboard vocabulary, not column names.
+
+        Returns::
+
+            {
+              "dimension": "wait",
+              "column": "eligible_secs",
+              "unit": "seconds",                # 'seconds' | 'count' | 'bytes'
+              "min_param": "min_eligible_secs", # jobs_search kwargs that
+              "max_param": "max_eligible_secs", #   replay one band as filters
+              "buckets": [
+                {"label": "<1m", "lo": 0, "hi": 59,
+                 "job_count": 12, "cpu_hours": 190.0, "gpu_hours": 0.0},
+                ...                             # full vector, band order
+              ],
+              "null_count": 2,                  # filters matched, column NULL
+              "total_count": 14,                # Σ job_count + null_count
+            }
+
+        ``lo``/``hi`` are inclusive native-unit bounds. Either may be None
+        where the band is open-ended: always ``hi`` on the last band, and
+        ``lo`` on ``memory_wasted``'s leading ``over request`` band, the one
+        dimension unbounded below. Replaying a band is
+        ``jobs_search(**{min_param: lo, max_param: hi}, ...)``, dropping
+        whichever bound is None (passing it through as None is equivalent —
+        the filters treat None as unset). Every band replays to exactly its
+        own ``job_count``, and ``total_count == jobs_count(**filters)``;
+        both are pinned by tests.
+
+        ``null_count`` is the "N jobs unmeasured" story: rows that match
+        the filters but have a NULL *dimension* column land there, never in
+        a band. In practice only ``wait`` has them — derecho did not record
+        ``eligible_time`` before 2025-01-07 17:47:50 UTC (casper history is
+        complete), and ``numnodes``/``numcpus``/``numgpus``/``name`` are
+        NULL-free across 34M production rows.
+
+        There is no ``self_exclude`` and no ``limit``: filters mean exactly
+        what they say. A caller who wants the histogram unconstrained by its
+        own dimension's bounds simply omits those kwargs.
+
+        Cost: one aggregate statement — a CASE label + COUNT + two SUMs over
+        a LEFT OUTER JOIN to ``job_charges`` (1:1 on the PK), grouped by the
+        label. Like :meth:`jobs_facets` it scans every row in the date
+        slice, so the window is the cost lever: always pass ``start``/
+        ``end`` (facets measured ~200 s unbounded over full history).
+        Measured on PostgreSQL over a 308k-row month, machine-wide:
+        ~570 ms warm regardless of dimension, against ~150 ms for
+        ``jobs_facets`` on the same slice — the charge join is the
+        difference. Hours are raw ``cpu_hours``/``gpu_hours`` (not
+        QoS-weighted charges), matching :meth:`job_sizes_by_resource`.
+
+        Raises:
+            ValueError: on an unknown *dimension*.
+        """
+        spec = _HISTOGRAM_SPECS.get(dimension)
+        if spec is None:
+            valid = ", ".join(sorted(_HISTOGRAM_SPECS))
+            raise ValueError(
+                f"Unknown dimension: {dimension!r}. Valid dimensions: {valid}"
+            )
+        column, buckets, unit, min_param, max_param = spec
+
+        bucket_label = _bucket_case(column, buckets)
+        query = (
+            self.session.query(
+                bucket_label,
+                func.count(Job.id),
+                func.sum(JobCharge.cpu_hours),
+                func.sum(JobCharge.gpu_hours),
+            )
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+        )
+        query = self._apply_jobs_search_filters(
+            query, start=start, end=end, user=user, account=account,
+            queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
+            name=name, ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
+        )
+        rows = query.group_by(bucket_label).all()
+
+        # Zero-fill from the spec table, in order; SUM over an all-NULL
+        # charge group is NULL, hence the `or 0.0`. The NULL band routes to
+        # null_count — its hour sums are deliberately dropped (unmeasured
+        # rows are excluded from the distribution, not smeared into it).
+        by_label = {label: (count, cpu, gpu) for label, count, cpu, gpu in rows}
+        null_count = int(by_label.pop(_NULL_BUCKET, (0, None, None))[0])
+
+        out_buckets = []
+        for label, lo, hi in buckets:
+            count, cpu, gpu = by_label.get(label, (0, None, None))
+            out_buckets.append({
+                "label": label,
+                "lo": lo,
+                "hi": hi,
+                "job_count": int(count),
+                "cpu_hours": float(cpu or 0.0),
+                "gpu_hours": float(gpu or 0.0),
+            })
+
+        total = sum(b["job_count"] for b in out_buckets) + null_count
+        return {
+            "dimension": dimension,
+            "column": column.key,
+            "unit": unit,
+            "min_param": min_param,
+            "max_param": max_param,
+            "buckets": out_buckets,
+            "null_count": null_count,
+            "total_count": total,
+        }
+
+    def jobs_usage_by(
+        self,
+        dimension: str,
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
+        queue: Optional[str] = None,
+        qos: Optional[str] = None,
+        exit_status: Optional[str] = None,
+        job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Per-entity usage (job count + hours) for one dimension.
+
+        The data behind a "By User" usage pie: for each distinct value of
+        *dimension* within the filtered slice, the job count and summed raw
+        ``cpu_hours``/``gpu_hours``. Filter shape mirrors
+        :meth:`jobs_search` / :meth:`jobs_count` exactly (same helper).
+
+        This is deliberately **not** ``jobs_facets(include_hours=True)``:
+        facet self-exclusion is wrong for usage (hours attributed under a
+        self-excluded dimension would describe rows the current filters
+        exclude), and there is **no self-exclusion of any kind here** —
+        every filter, ``account`` included, always applies. That is the
+        same security property :data:`_FACET_SCOPE_DIMS` protects: SAM pins
+        ``account`` as its authorization scope, and this method can never
+        emit usage for projects outside it.
+
+        Args:
+            dimension: Any :data:`_FACET_SPECS` key — ``user`` (the pie
+                case), ``account``, ``queue``, ``qos``, ``exit_status``.
+            limit: Optional top-N truncation, applied after sorting. The
+                tail is dropped with no synthetic "other" row, but
+                ``totals`` is computed **before** truncation — so a
+                consumer's "Other" slice is exactly
+                ``totals − Σ returned rows``, an invariant rather than a
+                guess.
+
+        Returns::
+
+            {
+              "dimension": "user",
+              "rows": [   # (cpu_hours + gpu_hours) desc, value asc, None last
+                {"value": "alice", "job_count": 812,
+                 "cpu_hours": 91234.5, "gpu_hours": 120.0},
+                ...
+              ],
+              "totals": {"job_count": 40213,
+                         "cpu_hours": 5432100.0, "gpu_hours": 21000.0},
+            }
+
+        ``value`` is ``None`` for a NULL FK (kept, not dropped — dropping
+        would make rows under-sum against ``totals``). Hours are raw
+        ``cpu_hours``/``gpu_hours``, not QoS-weighted charges, matching
+        :meth:`job_sizes_by_resource`; ``memory_hours`` is omitted until a
+        consumer needs it. ``totals["job_count"]`` equals
+        :meth:`jobs_count` under the same filters by construction.
+
+        Cost: one aggregate statement — grouped on the integer FK (never
+        the text hybrid; see :data:`_FACET_SPECS`), COUNT + two SUMs over a
+        LEFT OUTER JOIN to ``job_charges``, names resolved after
+        aggregation. Scans every row in the date slice, so always pass a
+        bounded ``start``/``end``. Measured on PostgreSQL over a 308k-row
+        month, machine-wide: ~545 ms warm (~150 ms for ``jobs_facets`` on
+        the same slice — the charge join is the difference).
+
+        Raises:
+            ValueError: on an unknown *dimension* or non-positive *limit*.
+        """
+        spec = _FACET_SPECS.get(dimension)
+        if spec is None:
+            valid = ", ".join(sorted(_FACET_SPECS))
+            raise ValueError(
+                f"Unknown dimension: {dimension!r}. Valid dimensions: {valid}"
+            )
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ValueError(f"limit must be a positive integer, got {limit!r}")
+        group_col, model, name_col = spec
+
+        query = (
+            self.session.query(
+                group_col,
+                func.count(Job.id),
+                func.sum(JobCharge.cpu_hours),
+                func.sum(JobCharge.gpu_hours),
+            )
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+        )
+        query = self._apply_jobs_search_filters(
+            query, start=start, end=end, user=user, account=account,
+            queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
+            name=name, ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
+        )
+        raw = query.group_by(group_col).all()
+
+        names = {}
+        if model is not None:
+            names = self._resolve_lookup_names(
+                model, name_col, {r[0] for r in raw if r[0] is not None}
+            )
+
+        rows = []
+        for key, count, cpu, gpu in raw:
+            value = names.get(key) if model is not None else key
+            rows.append({
+                "value": value,
+                "job_count": int(count),
+                "cpu_hours": float(cpu or 0.0),
+                "gpu_hours": float(gpu or 0.0),
+            })
+        # Usage desc, then value asc with None last — the facet tie-break
+        # convention, keyed on hours instead of count.
+        rows.sort(key=lambda r: (
+            -(r["cpu_hours"] + r["gpu_hours"]), r["value"] is None, str(r["value"])
+        ))
+
+        totals = {
+            "job_count": sum(r["job_count"] for r in rows),
+            "cpu_hours": sum(r["cpu_hours"] for r in rows),
+            "gpu_hours": sum(r["gpu_hours"] for r in rows),
+        }
+        if limit is not None:
+            rows = rows[:limit]
+
+        return {"dimension": dimension, "rows": rows, "totals": totals}
+
+    def _resolve_lookup_names(self, model, name_col, ids) -> Dict[Any, Any]:
+        """``{id: display_name}`` for a lookup table, post-aggregation.
+
+        Deliberately not a join into the aggregate query: a join probes the
+        lookup once per *scanned* row, this runs once per *distinct id*.
+        """
+        if not ids:
+            return {}
+        query = self.session.query(model.id, name_col)
+        if len(ids) <= _LOOKUP_FETCH_ALL_THRESHOLD:
+            query = query.filter(model.id.in_(ids))
+        return dict(query.all())
 
     def list_qos_names(self, *, active_only: bool = True) -> List[str]:
         """Return JobQoS names from the lookup table, alphabetically ordered.
@@ -1234,10 +2127,22 @@ class JobQueries:
         return [name for (name,) in query.order_by(JobQoS.name).all()]
 
     def _apply_jobs_search_filters(
-        self, query, *, start, end, user, account, queue, qos, status, has_gpus,
-        job_id,
+        self, query, *, start, end, user, account, queue, qos, exit_status,
+        job_id, name, ignore_case,
+        min_eligible_secs, max_eligible_secs,
+        min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus,
+        min_elapsed, max_elapsed, min_reqmem, max_reqmem,
+        min_memory_used, max_memory_used,
+        min_memory_wasted, max_memory_wasted,
     ):
-        """Apply the shared filter set used by jobs_search + jobs_count."""
+        """Apply the shared filter set used by jobs_search/count/facets.
+
+        Every parameter is required (no defaults) on purpose: adding a filter
+        to ``jobs_search`` and forgetting it in ``jobs_count`` then fails
+        loudly with a TypeError on the first count call, instead of silently
+        returning a page total that disagrees with the page.
+        ``TestFilterSignatureParity`` enforces the same invariant statically.
+        """
         query = self._apply_date_filter(query, start, end)
         if user:
             query = query.filter(Job.user == user)
@@ -1257,12 +2162,8 @@ class JobQueries:
             query = query.filter(Job.queue == queue)
         if qos:
             query = query.filter(Job.qos == qos)
-        if status:
-            query = query.filter(Job.status == status)
-        if has_gpus is True:
-            query = query.filter(Job.numgpus > 0)
-        elif has_gpus is False:
-            query = query.filter(or_(Job.numgpus == 0, Job.numgpus.is_(None)))
+        if exit_status:
+            query = query.filter(Job.status == exit_status)
         if job_id:
             jid = job_id.strip()
             if '.' in jid:
@@ -1282,6 +2183,39 @@ class JobQueries:
                     Job.job_id.like(f"{jid}.%"),   # scalar form
                     Job.job_id.like(f"{jid}[%"),   # array forms (parent + elements)
                 ))
+        if name:
+            # `str` is iterable, so the single-pattern form must be detected
+            # first — same trap as `account` above. UNLIKE `account`, an empty
+            # sequence is "no filter", not "no rows": Click's multiple=True
+            # yields () for an unsupplied -N, so the empty case has to be the
+            # identity or the CLI default would return nothing. That inversion
+            # is deliberate; see the jobs_search docstring.
+            patterns = (name,) if isinstance(name, str) else tuple(name)
+            # Resolve the dialect lazily — only pattern matching needs it.
+            clause = glob_match_clause(
+                Job.name, patterns,
+                dialect=self.session.get_bind().dialect.name,
+                ignore_case=ignore_case,
+            )
+            if clause is not None:
+                query = query.filter(clause)
+        # Numeric range bounds: all inclusive, all NULL-strict (a NULL column
+        # value fails both comparisons, so those rows drop out). `is not None`
+        # rather than truthiness throughout — 0 is a meaningful bound.
+        for _column, _lo, _hi in (
+            (Job.eligible_secs, min_eligible_secs, max_eligible_secs),
+            (Job.numnodes,      min_nodes,         max_nodes),
+            (Job.numcpus,       min_cpus,          max_cpus),
+            (Job.numgpus,       min_gpus,          max_gpus),
+            (Job.elapsed,       min_elapsed,       max_elapsed),
+            (Job.reqmem,        min_reqmem,        max_reqmem),
+            (Job.memory,        min_memory_used,   max_memory_used),
+            (_MEMORY_WASTED,    min_memory_wasted, max_memory_wasted),
+        ):
+            if _lo is not None:
+                query = query.filter(_column >= _lo)
+            if _hi is not None:
+                query = query.filter(_column <= _hi)
         return query
 
     def usage_summary(
