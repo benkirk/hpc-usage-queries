@@ -1329,12 +1329,57 @@ def histogram_jobs(in_memory_session):
     return jobs
 
 
+@pytest.fixture
+def floor_band_jobs(in_memory_session):
+    """Two jobs pinning the *domain floor* of every histogram dimension.
+
+    ``_bucket_case`` tests only ``hi``, so a value below the first band's
+    ``lo`` is still claimed by that band's arm — labelled with a band whose
+    advertised bounds exclude it. Production carries exactly that shape:
+    404 derecho / 21 casper rows have ``numcpus=0`` while ``CPU_HIST_BUCKETS``
+    used to start at 1, so the "1" bar over-counted and clicking it returned
+    fewer rows than it claimed.
+
+    ``zero`` sits at the floor of all seven columns, ``one`` one step above
+    it. They must land in *different* bands on every dimension.
+    """
+    base = datetime(2025, 8, 1, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    specs = [
+        # (jid, elig, nodes, cpus, gpus, elapsed, reqmem, memory)
+        ("800.desched1", 0,  0, 0, 0, 0,  0,    0),
+        ("801.desched1", 60, 1, 1, 1, 30, _GIB, _GIB),
+    ]
+    for i, (jid, elig, nodes, cpus, gpus, elapsed, reqmem, memory) in enumerate(specs):
+        in_memory_session.add(Job(
+            job_id=jid, short_id=800 + i, name=f"f{i}", user="dave",
+            account="NCAR0003", queue="main", status="0",
+            submit=base, start=base, end=base + timedelta(hours=i + 1),
+            eligible_secs=elig, numnodes=nodes, numcpus=cpus, numgpus=gpus,
+            elapsed=elapsed, reqmem=reqmem, memory=memory))
+    in_memory_session.commit()
+
+
 class TestJobsHistogram:
     """(wait, nodes, cpus, gpus, elapsed, reqmem) per the histogram_jobs docstring."""
 
     @staticmethod
     def _by_label(out):
         return {b["label"]: b for b in out["buckets"]}
+
+    @staticmethod
+    def _assert_bands_round_trip(q):
+        """Every non-empty band replays as jobs_search bounds and reproduces
+        its own count, on every dimension."""
+        for dim in _HISTOGRAM_SPECS:
+            out = q.jobs_histogram(dim)
+            for band in out["buckets"]:
+                if band["job_count"] == 0:
+                    continue
+                kw = {out["min_param"]: band["lo"]}
+                if band["hi"] is not None:
+                    kw[out["max_param"]] = band["hi"]
+                assert q.jobs_count(**kw) == band["job_count"], \
+                    (dim, band["label"])
 
     def test_bucket_vector_complete_ordered_with_zeros(
             self, in_memory_session, histogram_jobs):
@@ -1392,17 +1437,41 @@ class TestJobsHistogram:
         # THE contract test: every non-empty band replays as jobs_search
         # bounds and reproduces its own count, across all six dimensions.
         # This is what forces min/max_elapsed + min/max_reqmem to exist.
+        self._assert_bands_round_trip(JobQueries(in_memory_session))
+
+    def test_bounds_round_trip_at_the_domain_floor(
+            self, in_memory_session, floor_band_jobs):
+        # The same contract where histogram_jobs cannot reach it: a value at
+        # the floor of each column. Regression for numcpus=0 being counted
+        # in the "1" bar while min_cpus=1/max_cpus=1 excluded it.
+        self._assert_bands_round_trip(JobQueries(in_memory_session))
+
+    def test_domain_floor_gets_its_own_band(
+            self, in_memory_session, floor_band_jobs):
+        # Every count-valued table must reach 0, or _bucket_case folds the
+        # zero row into the band above it (see the leading-band note there).
         q = JobQueries(in_memory_session)
-        for dim in _HISTOGRAM_SPECS:
-            out = q.jobs_histogram(dim)
-            for band in out["buckets"]:
-                if band["job_count"] == 0:
-                    continue
-                kw = {out["min_param"]: band["lo"]}
-                if band["hi"] is not None:
-                    kw[out["max_param"]] = band["hi"]
-                assert q.jobs_count(**kw) == band["job_count"], \
-                    (dim, band["label"])
+        for dim in ("cpus", "nodes", "gpus"):
+            by = self._by_label(q.jobs_histogram(dim))
+            assert by["0"]["job_count"] == 1, dim
+            assert by["1"]["job_count"] == 1, dim
+
+    def test_bucket_tables_are_closed_and_contiguous(self):
+        # Structural guard on the tables themselves, so a new dimension
+        # cannot reintroduce the numcpus=0 bug. _bucket_case's ladder tests
+        # only `hi`, so a table that fails to reach its column's floor
+        # mislabels sub-floor rows, and one that fails to end open-ended
+        # mislabels over-range rows into else_ — both breaking the bar↔
+        # jobs_search round-trip while leaving total_count intact.
+        for dim, (_col, buckets, _unit, _mn, _mx) in _HISTOGRAM_SPECS.items():
+            first, last = buckets[0], buckets[-1]
+            # lo=None is the signed-dimension floor (memory_wasted); every
+            # other column is non-negative, so its floor is 0.
+            assert first[1] in (0, None), (dim, "first band misses the floor")
+            assert last[2] is None, (dim, "last band is not open-ended")
+            for (label, _lo, hi), (nxt, lo_next, _hi) in zip(buckets, buckets[1:]):
+                assert hi is not None, (dim, label, "gap: closed mid-table band")
+                assert lo_next == hi + 1, (dim, label, nxt, "bands not contiguous")
 
     def test_memory_buckets_reqmem_not_memory(self, in_memory_session, histogram_jobs):
         # 703 REQUESTED < 1 GiB but USED 600 GiB — it must land in "<1GB".

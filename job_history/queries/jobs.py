@@ -88,11 +88,22 @@ def _bucket_case(field, buckets):
     """CASE labelling *field* into ``(label, lo, hi)`` buckets; NULL first.
 
     The ascending ``field <= hi`` ladder (rather than per-band BETWEENs)
-    means every non-NULL value lands in exactly one bucket: values below the
-    first band's ``lo`` are claimed by its ``<= hi`` arm, so nothing can
-    leak into the ``else_`` overflow from below the way
-    ``_build_range_case``'s band arithmetic allows. The ``lo`` values are
-    reporting metadata (and drill-down filter bounds), not SQL.
+    means every non-NULL value lands in exactly one bucket, with no gaps for
+    a value to fall through the way ``_build_range_case``'s band arithmetic
+    allows. The ``lo`` values are reporting metadata (and drill-down filter
+    bounds), not SQL.
+
+    That makes the ladder *total* but not automatically *faithful*, and the
+    bucket table owns the difference. Only ``hi`` is tested, so a value
+    below the first band's ``lo`` is still claimed by that band's arm, and a
+    value above the last band's ``hi`` falls to ``else_`` — in both cases
+    labelled with a band whose advertised ``lo``/``hi`` would exclude it,
+    breaking the histogram's bar↔``jobs_search`` round-trip (a bar counting
+    rows the replayed filters don't return). So every table must be
+    *closed*: the first band reaches the column's domain floor (``lo=0``, or
+    ``lo=None`` for a signed dimension like ``memory_wasted``) and the last
+    band is open-ended (``hi=None``). Pinned by
+    ``test_bucket_tables_are_closed_and_contiguous``.
     """
     whens = [(field.is_(None), _NULL_BUCKET)]
     whens += [(field <= hi, label) for label, _lo, hi in buckets if hi is not None]
@@ -295,13 +306,24 @@ class QueryConfig:
         (">18h",    64800, None),
     ]
 
-    NODE_HIST_BUCKETS = _ranges_to_buckets(NODE_RANGES, NODE_OVERFLOW, 2049)
+    # NODE_RANGES starts at 1, but a bucket table must reach the column's
+    # domain floor or _bucket_case's `<= hi` ladder folds sub-floor values
+    # into the first band while its advertised lo/hi excludes them (see the
+    # leading-band note there). Hence the explicit zero band, matching
+    # GPU_HIST_BUCKETS. No numnodes=0 rows exist today; numcpus=0 does.
+    NODE_HIST_BUCKETS = (
+        [("0", 0, 0)] + _ranges_to_buckets(NODE_RANGES, NODE_OVERFLOW, 2049)
+    )
 
     # Deliberately NOT derived from CORE_RANGES: its >128 overflow would
     # swallow every multi-node derecho job (128 cpus is one derecho node).
     # Within-node resolution matches CORE_RANGES, then ×4 steps keep the
     # tail wide enough for 2000+-node jobs without a dozen more bars.
+    # The zero band is load-bearing, not symmetry: 404 derecho / 21 casper
+    # production rows carry numcpus=0, and without it they were counted in
+    # the "1" bar while min_cpus=1/max_cpus=1 excluded them.
     CPU_HIST_BUCKETS = [
+        ("0", 0, 0),
         ("1", 1, 1), ("2", 2, 2), ("3-4", 3, 4), ("5-8", 5, 8),
         ("9-16", 9, 16), ("17-32", 17, 32), ("33-64", 33, 64),
         ("65-128", 65, 128), ("129-512", 129, 512),
@@ -1814,11 +1836,15 @@ class JobQueries:
               "total_count": 14,                # Σ job_count + null_count
             }
 
-        ``lo``/``hi`` are inclusive native-unit bounds (``hi`` is None on
-        the open-ended last band); replaying a band is
-        ``jobs_search(**{min_param: lo, max_param: hi}, ...)`` (omit the max
-        when ``hi`` is None), and ``total_count == jobs_count(**filters)``
-        by construction.
+        ``lo``/``hi`` are inclusive native-unit bounds. Either may be None
+        where the band is open-ended: always ``hi`` on the last band, and
+        ``lo`` on ``memory_wasted``'s leading ``over request`` band, the one
+        dimension unbounded below. Replaying a band is
+        ``jobs_search(**{min_param: lo, max_param: hi}, ...)``, dropping
+        whichever bound is None (passing it through as None is equivalent —
+        the filters treat None as unset). Every band replays to exactly its
+        own ``job_count``, and ``total_count == jobs_count(**filters)``;
+        both are pinned by tests.
 
         ``null_count`` is the "N jobs unmeasured" story: rows that match
         the filters but have a NULL *dimension* column land there, never in
