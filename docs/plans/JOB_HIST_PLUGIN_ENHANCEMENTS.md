@@ -44,6 +44,8 @@ Everything below is warm, machine-wide, on the localhost dev container.
 | facets, 5 dimensions as 5 separate queries | 714 ms |
 | facets, 5 dimensions via `GROUPING SETS` | 182 ms |
 | `GROUP BY queue_id` vs `GROUP BY <hybrid property>` | **122 ms vs 1,223 ms (10×)** |
+| `jobs_histogram`, 1 month, machine-wide (§8) | _tbd — measured after §8 lands_ |
+| `jobs_usage_by('user')`, 1 month, machine-wide (§8) | _tbd — measured after §8 lands_ |
 
 Two conclusions that drive the design:
 
@@ -122,6 +124,7 @@ uses).
 name, ignore_case,
 min_eligible_secs, max_eligible_secs,
 min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus
+min_elapsed, max_elapsed, min_reqmem, max_reqmem      # added in-flight, see §8
 ```
 
 and, per §7, **remove** `has_gpus` and **rename** `status` → `exit_status`
@@ -337,6 +340,140 @@ Because the `COLUMNS` key is also the **row-dict key** returned by `jobs_search`
 SAM's column tuples must change in the same deploy or its table renders a blank
 column. That is the one place the coordination actually matters.
 
+## 8. Aggregation surface (added in-flight)
+
+SAM's dashboard grew a concrete shape while this branch was in review: a
+5-tab card (Jobs table · By-User usage pie · Wait Times histogram · Job
+Sizes histogram · Durations histogram) in project / machine-wide / per-user
+modes. The table and filter chips are served by `jobs_search`/`jobs_count`/
+`jobs_facets` above; the pie and the three histogram tabs are not servable
+by anything in the class — `job_waits_by_resource` buckets by *size* and
+averages wait (a means table, not a distribution), and the `usage_by_*`
+reports are machine-wide with no account scoping. Two new methods close the
+gap, both sharing `_apply_jobs_search_filters` so a histogram bar can never
+disagree with the Jobs tab it sits next to.
+
+### 8a. Complete the range-filter set first: `min/max_elapsed`, `min/max_reqmem`
+
+The whole point of a histogram returning numeric bucket bounds is that SAM
+can turn a clicked bar into `jobs_search(min_X=lo, max_X=hi)` — the fs_scans
+band-drill-down pattern. Four of the six dashboard dimensions already
+round-trip into filters; without `elapsed` and `reqmem` bounds, the Duration
+and Memory bars would be the only dead ends on the card. Mechanically it is
+two more rows in the table-driven range loop (native units: seconds and
+**bytes**), four kwargs on each filter-shaped method (the no-defaults helper
+makes omission fail loudly), and four CLI flags per the "all filters get
+flags" convention: `--min/--max-elapsed-hours` (hours → seconds at the
+boundary, like the wait pair) and `--min/--max-reqmem-gb` (GB → bytes,
+×1024³). Same inclusive, NULL-strict, `is not None` semantics as the six
+existing bounds.
+
+### 8b. `jobs_histogram(dimension, *, <full filter set>)`
+
+Dimensions are SAM-facing names: `wait | nodes | cpus | gpus | memory |
+duration`, mapped by a module-level `_HISTOGRAM_SPECS` table to
+`(column, bucket table, unit, min_param, max_param)`. The response is
+self-describing — it carries `column`, `unit`, and the `min_param`/
+`max_param` kwarg names — so SAM never hardcodes the dimension→filter map.
+
+**One statement**: a CASE label + `COUNT` + `SUM(cpu_hours)` +
+`SUM(gpu_hours)` over a LEFT OUTER JOIN to `job_charges`, filtered by
+`_apply_jobs_search_filters`, grouped by the label. Decisions, in the order
+people will ask about them:
+
+- **Memory buckets `reqmem` (requested), raw bytes.** The dashboard ask is
+  "histograms of resource *needs*" — the requested allocation, known at
+  submit for every job. Used-memory physics belongs to
+  `job_memory_per_rank`. Bucketing raw bytes (no GiB division in SQL) means
+  returned bounds round-trip exactly into `min_reqmem`/`max_reqmem`.
+  (Observed, not changed here: the legacy `MEMORY_RANGES` CASE labels
+  `reqmem < 1GiB` — and NULL — as its `>1000` overflow. The new table gains
+  a real `<1GB` band; legacy reports keep their behaviour.)
+- **Hours always included, no opt-in flag.** The join is 1:1 on an indexed
+  PK; `job_sizes_by_resource` already sums hours inside the same aggregate.
+  A flag would create two statement shapes and force every caller to decide;
+  including them makes SAM's count↔hours toggle a re-render, not a refetch.
+  Raw `cpu_hours`/`gpu_hours`, not QoS-weighted charges (consistent with
+  `job_sizes_by_resource`; a weighted variant is one more SUM if ever asked).
+- **Full bucket vector, zeros included, spec order.** Stable x-axes for the
+  chart; free in the Python zero-fill; makes "buckets sum to total"
+  testable without knowing which buckets are populated.
+- **NULL accounting inside the same statement.** The CASE's first WHEN is
+  `field IS NULL → '__null__'`; the fold routes that label to a top-level
+  `null_count`, and `total_count = Σ job_count + null_count ==
+  jobs_count(**filters)` by construction (pinned by a test). This is the
+  "N jobs unmeasured" caption for derecho waits before 2025-01-07.
+- **The bucket CASE is an ascending `<= hi` ladder** (NULL first, `else_` =
+  last label), so every non-NULL value lands in exactly one bucket — no
+  below-range gap can leak into the overflow the way `_build_range_case`'s
+  band arithmetic allows.
+- **No `self_exclude`, no `limit`.** Filters mean exactly what they say; a
+  caller wanting the histogram unconstrained by its own dimension's bounds
+  simply omits those kwargs.
+
+Bucket tables live on `QueryConfig` as `(label, lo, hi)` triples (`hi=None`
+open-ended — the same triple shape as fs_scans' `SIZE_BUCKETS`, which SAM
+already band-drills against):
+
+- `WAIT_BUCKETS` — new, 12 log-scaled buckets `<1m … >2d`. `eligible_secs`
+  masses at ~0 with a days-long tail; log scaling gives resolution at both
+  ends.
+- `DURATION_HIST_BUCKETS` — the legacy 7 duration labels, byte-identical;
+  `get_duration_buckets()` is rewritten to *derive* from this table so the
+  labels have a single source of truth and `job_durations` output is
+  untouched.
+- `NODE_HIST_BUCKETS` — derived from `NODE_RANGES` + its overflow.
+- `CPU_HIST_BUCKETS` — deliberately *not* `CORE_RANGES`: its `>128` overflow
+  would swallow every multi-node derecho job (128 cpus is one node).
+  Within-node resolution matching `CORE_RANGES`, then ×4 steps to `>32768`.
+- `GPU_HIST_BUCKETS` — deliberately *not* `GPU_RANGES` (starts at 4,
+  derecho-shaped): explicit `"0"` and `"1"`/`"2"` buckets so casper's small
+  GPU jobs and the CPU/GPU split are visible; `min_gpus=1` composes to drop
+  the zero bucket.
+- `REQMEM_HIST_BUCKETS` — 7 GiB-boundary byte bands `<1GB … >1000GB`.
+
+### 8c. `jobs_usage_by(dimension, *, <full filter set>, limit=None)`
+
+Per-entity `job_count` + `cpu_hours` + `gpu_hours` for the usage pie,
+`dimension` ∈ the `_FACET_SPECS` keys (`user` is SAM's case). Why this is a
+method and **not** `jobs_facets(include_hours=True)`:
+
+1. Facet self-exclusion is *wrong* for usage: hours attributed under a
+   self-excluded dimension describe rows the current filters exclude, and
+   the composite fold would have to carry hours per sub-combination.
+2. `include_hours` would force the `job_charges` join (or a second statement
+   shape) onto every facet call that only wants dropdown counts.
+3. It would break the published facet row contract `{'value','count'}`.
+
+One statement: group the **integer FK** from `_FACET_SPECS` (never the
+hybrid), OUTER JOIN charges, resolve display names post-aggregation. **No
+self-exclusion of any kind** — every filter, `account` included, always
+applies; this is the same security property `_FACET_SCOPE_DIMS` protects,
+stated in the docstring. Rows sort `(cpu_hours + gpu_hours)` desc, then
+value asc, `None` last. `limit` truncates post-sort with no synthetic
+"other" row, but **`totals` are computed before truncation**, so SAM's
+"Other" pie slice is `totals − Σ rows` — an invariant, not a guess. NULL FK
+surfaces as `value: None`.
+
+### 8d. API-only, like facets
+
+`jobhist resource` already ships job-sizes/job-waits/durations reports for
+the terminal, and `ResourceCommand` expects flat row lists with fixed
+params — adapting it to a dict envelope plus the full filter set is real
+plumbing for no known consumer. Revisit trigger: an operator asking for
+*filtered* histograms at the terminal.
+
+### 8e. Verification additions
+
+The `test_jobs_search.py` additions that matter most: the
+**bounds-round-trip invariant** (for every dimension, every non-empty
+bucket: `jobs_count(**{min_param: lo, max_param: hi})` equals the bucket's
+`job_count` — this is what forces 8a), the `total_count == jobs_count`
+identity, the one-aggregate-scan guards (no hybrid scalar subqueries in the
+emitted SQL), signature-parity extensions for both methods, and offline
+dialect compiles of the bucket CASE. Measured costs go in the table above
+and both docstrings once the end-to-end pass runs against the local dev PG.
+
 ## Explicitly out of scope
 
 - **SAM-side feature work.** The §7 renames require mechanical SAM edits in the
@@ -353,12 +490,15 @@ column. That is the one place the coordination actually matters.
   `CREATE EXTENSION`, as in PR #78) — PG-only, no benefit to SQLite. **Revisit
   trigger:** if the dashboard ever exposes an *unbounded-window* name search.
   Date-bounded, the glob is free.
-- `GROUPING SETS`, an `include_hours` facet variant, a `daily_summary` facet
-  fast path, caching (SAM's layer — and job history has no content-addressed
-  freshness key like fs_scans' scan dates), and `ix_jobs_account_end` /
-  `ix_jobs_queue_end` composites (separate PR; `ix_jobs_account_submit` is on
-  `submit` while the date filter is on `end`, so an account+date query filters
-  one predicate per row).
+- `GROUPING SETS`, a `daily_summary` facet fast path, caching (SAM's layer —
+  and job history has no content-addressed freshness key like fs_scans' scan
+  dates), and `ix_jobs_account_end` / `ix_jobs_queue_end` composites (separate
+  PR; `ix_jobs_account_submit` is on `submit` while the date filter is on
+  `end`, so an account+date query filters one predicate per row).
+- ~~An `include_hours` facet variant~~ — **superseded in-flight**: SAM's
+  By-User usage pie needs hours per entity, and it landed as the separate
+  `jobs_usage_by` method instead of a facet flag (see §8 for why facet
+  self-exclusion semantics make `include_hours` the wrong vehicle).
 
 ## Verification
 
