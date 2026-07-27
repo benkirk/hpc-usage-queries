@@ -95,13 +95,13 @@ def search_db(in_memory_session):
     base = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
     jobs = [
         Job(
-            job_id="200.desched1", short_id=200, user="alice",
+            job_id="200.desched1", short_id=200, user="alice", name="alice_run",
             account="NCAR0001", queue="main", status="F",
             submit=base, start=base, end=base + timedelta(hours=1),
             elapsed=3600, numcpus=128, numgpus=0, numnodes=1,
         ),
         Job(
-            job_id="201.desched1", short_id=201, user="bob",
+            job_id="201.desched1", short_id=201, user="bob", name="bob_run",
             account="NCAR0002", queue="gpudev", status="F",
             submit=base, start=base, end=base + timedelta(hours=2),
             elapsed=7200, numcpus=64, numgpus=4, numnodes=1,
@@ -207,6 +207,56 @@ class TestSearchCommand:
         assert [r["job_id"] for r in parsed["rows"]] == ["200.desched1"]
         assert parsed["filters"]["job_id"] == "200"
 
+    def test_name_pattern_filters_and_appears_in_filters(self, search_ctx, capsys):
+        search_ctx.output_format = "json"
+        code = SearchCommand(search_ctx).execute(name=("alice_*",))
+        assert code == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [r["job_id"] for r in parsed["rows"]] == ["200.desched1"]
+        # Click's tuple is normalized to a JSON array.
+        assert parsed["filters"]["name"] == ["alice_*"]
+        assert parsed["filters"]["ignore_case"] is False
+
+    def test_name_glob_underscore_is_literal(self, search_ctx, capsys):
+        # 'alice_run' must not be reachable via a pattern that only matches
+        # if `_` were treated as a single-character LIKE wildcard.
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(
+            name=("aliceXrun",), ignore_case=True) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["rows"] == []
+
+    def test_unset_name_is_null_not_empty_list(self, search_ctx, capsys):
+        # Click's multiple=True default is (); the envelope contract is
+        # "null when unset", so () must normalize to None, not [].
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute() == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["filters"]["name"] is None
+        assert len(parsed["rows"]) == 2
+
+    def test_wait_hours_converted_to_seconds_in_filters(self, search_ctx, capsys):
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(min_wait_hours=1.5) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["filters"]["min_eligible_secs"] == 5400
+        assert parsed["filters"]["max_eligible_secs"] is None
+
+    def test_zero_wait_hours_is_not_treated_as_unset(self, search_ctx, capsys):
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(max_wait_hours=0.0) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["filters"]["max_eligible_secs"] == 0
+
+    def test_resource_range_flags_appear_in_filters(self, search_ctx, capsys):
+        search_ctx.output_format = "json"
+        assert SearchCommand(search_ctx).execute(min_gpus=1) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [r["job_id"] for r in parsed["rows"]] == ["201.desched1"]
+        assert parsed["filters"]["min_gpus"] == 1
+        for key in ("max_gpus", "min_nodes", "max_nodes", "min_cpus", "max_cpus"):
+            assert parsed["filters"][key] is None
+
 
 # ---------------------------------------------------------------------------
 # CliRunner — Click integration through the new entry point
@@ -229,6 +279,11 @@ class TestJobhistSearchCli:
         assert result.exit_code == 0
         for opt in ("--start-date", "--end-date", "-m, --machine",
                     "--user", "--project", "--queue", "--job-id",
+                    "--exit-status",
+                    "-N, --name-pattern", "-i, --ignore-case",
+                    "--min-wait-hours", "--max-wait-hours",
+                    "--min-nodes", "--max-nodes", "--min-cpus", "--max-cpus",
+                    "--min-gpus", "--max-gpus",
                     "-v, --verbose", "--display"):
             assert opt in result.output
 

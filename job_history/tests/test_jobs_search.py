@@ -10,7 +10,7 @@ import pytest
 
 from job_history.database import Job, JobCharge
 from job_history.queries import JobQueries
-from job_history.cli.search.columns import COLUMNS, DEFAULT_COLUMNS
+from job_history.columns import COLUMNS, DEFAULT_COLUMNS
 
 
 @pytest.fixture
@@ -144,10 +144,11 @@ class TestJobsSearchFilters:
         )
         assert rows == []
 
-    def test_status_filter(self, in_memory_session, search_jobs):
+    def test_exit_status_filter(self, in_memory_session, search_jobs):
         # All sample jobs are 'F'; assert filter is applied, then negative.
-        assert len(JobQueries(in_memory_session).jobs_search(status="F")) == 3
-        assert JobQueries(in_memory_session).jobs_search(status="Q") == []
+        q = JobQueries(in_memory_session)
+        assert len(q.jobs_search(exit_status="F")) == 3
+        assert q.jobs_search(exit_status="Q") == []
 
     def test_date_range_filter(self, in_memory_session, search_jobs):
         # Job ends span 2025-01-15 13:00 .. 2025-01-17 13:00 (naive UTC).
@@ -433,23 +434,28 @@ class TestJobsSearchPagination:
         assert rows[0]["job_id"] == "102.desched1"
 
 
-class TestJobsSearchHasGpus:
-    def test_has_gpus_true_returns_only_gpu_jobs(self, in_memory_session, search_jobs):
-        rows = JobQueries(in_memory_session).jobs_search(has_gpus=True)
+class TestJobsSearchResourceRanges:
+    """search_jobs: (nodes, cpus, gpus) = (1,128,0), (2,256,0), (1,64,4)."""
+
+    def test_min_gpus_selects_gpu_jobs(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(min_gpus=1)
         # Only bob-1 has numgpus=4; alice's jobs have numgpus=0.
         assert [r["job_id"] for r in rows] == ["102.desched1"]
 
-    def test_has_gpus_false_returns_cpu_only(self, in_memory_session, search_jobs):
-        rows = JobQueries(in_memory_session).jobs_search(has_gpus=False)
+    def test_max_gpus_zero_selects_cpu_only(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(max_gpus=0)
         # alice-1 and alice-2 have numgpus=0.
         assert {r["job_id"] for r in rows} == {"100.desched1", "101.desched1"}
 
-    def test_has_gpus_none_ignored(self, in_memory_session, search_jobs):
-        rows = JobQueries(in_memory_session).jobs_search(has_gpus=None)
+    def test_unset_bounds_ignored(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(min_gpus=None, max_gpus=None)
         assert len(rows) == 3
 
-    def test_has_gpus_false_includes_null_numgpus(self, in_memory_session, search_jobs):
-        # A job with numgpus=NULL should still be classified as CPU-only.
+    def test_range_filters_are_null_strict(self, in_memory_session, search_jobs):
+        # A NULL numgpus fails both comparisons, so it drops out of either
+        # bound. No row in production has a NULL here (verified across 34M
+        # rows on both machines), but the semantics are pinned deliberately:
+        # NULL means "unknown", not "zero".
         base = datetime(2025, 2, 1, 12, 0, 0)
         in_memory_session.add(Job(
             job_id="888.desched1", short_id=888, user="alice",
@@ -458,8 +464,34 @@ class TestJobsSearchHasGpus:
             elapsed=3600, numcpus=1, numnodes=1, numgpus=None,
         ))
         in_memory_session.commit()
-        rows = JobQueries(in_memory_session).jobs_search(has_gpus=False)
-        assert "888.desched1" in {r["job_id"] for r in rows}
+        q = JobQueries(in_memory_session)
+        assert "888.desched1" not in {r["job_id"] for r in q.jobs_search(max_gpus=0)}
+        assert "888.desched1" not in {r["job_id"] for r in q.jobs_search(min_gpus=0)}
+
+    def test_bounds_are_inclusive(self, in_memory_session, search_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(min_cpus=128, max_cpus=128) == 1
+
+    def test_min_and_max_nodes(self, in_memory_session, search_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(min_nodes=2) == 1
+        assert q.jobs_count(max_nodes=1) == 2
+        assert q.jobs_count(min_nodes=1, max_nodes=2) == 3
+
+    def test_inverted_range_returns_empty_not_error(self, in_memory_session, search_jobs):
+        assert JobQueries(in_memory_session).jobs_count(min_nodes=5, max_nodes=1) == 0
+
+    def test_all_six_compose(self, in_memory_session, search_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_nodes=1, max_nodes=1, min_cpus=64, max_cpus=64,
+            min_gpus=4, max_gpus=4, columns=("job_id",),
+        )
+        assert [r["job_id"] for r in rows] == ["102.desched1"]
+
+    def test_count_agrees_with_search(self, in_memory_session, search_jobs):
+        q = JobQueries(in_memory_session)
+        kw = {"min_nodes": 1, "max_cpus": 256}
+        assert q.jobs_count(**kw) == len(q.jobs_search(**kw))
 
 
 @pytest.fixture
@@ -639,8 +671,8 @@ class TestJobsCount:
         q = JobQueries(in_memory_session)
         assert q.jobs_count(user="alice") == 2
         assert q.jobs_count(account="NCAR0002") == 1
-        assert q.jobs_count(has_gpus=True) == 1
-        assert q.jobs_count(has_gpus=False) == 2
+        assert q.jobs_count(min_gpus=1) == 1
+        assert q.jobs_count(max_gpus=0) == 2
         assert q.jobs_count(qos="premium") == 1
         assert q.jobs_count(qos="economy") == 1
         assert q.jobs_count(qos="regular") == 1
@@ -663,3 +695,366 @@ class TestJobsCount:
             JobQueries(in_memory_session).jobs_count(limit=1)
         with pytest.raises(TypeError):
             JobQueries(in_memory_session).jobs_count(offset=5)
+
+
+@pytest.fixture
+def name_jobs(in_memory_session):
+    """Job names exercising case, underscores, and NULL.
+
+    `cesm_b1850` vs `cesmXb1850` is the regression pair for the LIKE `_` leak:
+    without escaping, an ignore-case search for 'cesm_b*' matches both.
+    """
+    base = datetime(2025, 3, 1, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    specs = [
+        ("300.desched1", "wrf_cycle_01"),
+        ("301.desched1", "wrf_cycle_02"),
+        ("302.desched1", "WRF_CYCLE_03"),   # case variant
+        ("303.desched1", "cesm_b1850"),
+        ("304.desched1", "cesmXb1850"),     # `_` leak decoy
+        ("305.desched1", "postproc.restart"),
+        ("306.desched1", None),             # NULL name
+    ]
+    jobs = [
+        Job(job_id=jid, short_id=300 + i, name=nm, user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=base, start=base, end=base + timedelta(hours=i + 1),
+            elapsed=3600, numcpus=128, numgpus=0, numnodes=1)
+        for i, (jid, nm) in enumerate(specs)
+    ]
+    for j in jobs:
+        in_memory_session.add(j)
+    in_memory_session.commit()
+    return jobs
+
+
+class TestJobsSearchNameFilter:
+    """Shell-glob filter on Job.name.
+
+    SQLite GLOB path only; the PostgreSQL regex path is covered by the
+    compiled-SQL assertions in test_query_builders.py.
+    """
+
+    def _names(self, session, **kw):
+        return {r["name"] for r in JobQueries(session).jobs_search(
+            columns=("job_id", "name"), **kw)}
+
+    def test_star_wildcard(self, in_memory_session, name_jobs):
+        assert self._names(in_memory_session, name="wrf_*") == {
+            "wrf_cycle_01", "wrf_cycle_02"}
+
+    def test_question_mark_matches_exactly_one(self, in_memory_session, name_jobs):
+        assert self._names(in_memory_session, name="wrf_cycle_0?") == {
+            "wrf_cycle_01", "wrf_cycle_02"}
+        assert self._names(in_memory_session, name="wrf_cycle_?") == set()
+
+    def test_case_sensitive_by_default(self, in_memory_session, name_jobs):
+        assert "WRF_CYCLE_03" not in self._names(in_memory_session, name="wrf_*")
+
+    def test_ignore_case_matches_both(self, in_memory_session, name_jobs):
+        assert self._names(in_memory_session, name="wrf_*", ignore_case=True) == {
+            "wrf_cycle_01", "wrf_cycle_02", "WRF_CYCLE_03"}
+
+    def test_ignore_case_underscore_is_literal(self, in_memory_session, name_jobs):
+        # THE regression guard for the fs_scans `_` leak: with LIKE and no
+        # escaping, 'cesm_b*' -> 'cesm_b%' would also match 'cesmXb1850'.
+        assert self._names(
+            in_memory_session, name="cesm_b*", ignore_case=True,
+        ) == {"cesm_b1850"}
+
+    def test_case_sensitive_underscore_is_literal(self, in_memory_session, name_jobs):
+        # GLOB has no `_` wildcard at all, so this holds on the other path too.
+        assert self._names(in_memory_session, name="cesm_b*") == {"cesm_b1850"}
+
+    def test_dot_is_literal(self, in_memory_session, name_jobs):
+        assert self._names(in_memory_session, name="*.restart") == {"postproc.restart"}
+
+    def test_multiple_patterns_are_ored(self, in_memory_session, name_jobs):
+        assert self._names(
+            in_memory_session, name=["wrf_cycle_01", "*.restart"],
+        ) == {"wrf_cycle_01", "postproc.restart"}
+
+    def test_null_name_never_matches(self, in_memory_session, name_jobs):
+        # NULL GLOB 'x' is NULL -> excluded, even for the match-everything glob.
+        matched = self._names(in_memory_session, name="*")
+        assert None not in matched
+        assert len(matched) == 6
+
+    def test_none_is_no_filter(self, in_memory_session, name_jobs):
+        assert len(JobQueries(in_memory_session).jobs_search(name=None)) == len(name_jobs)
+
+    def test_empty_string_is_no_filter(self, in_memory_session, name_jobs):
+        assert len(JobQueries(in_memory_session).jobs_search(name="")) == len(name_jobs)
+
+    def test_empty_sequence_is_no_filter_unlike_account(self, in_memory_session, name_jobs):
+        # Deliberate divergence from `account=[]`, which means "no rows".
+        # Click's multiple=True hands us () for an unsupplied -N, so the empty
+        # case MUST be the identity or the CLI default returns nothing.
+        q = JobQueries(in_memory_session)
+        assert len(q.jobs_search(name=[])) == len(name_jobs)
+        assert len(q.jobs_search(name=[""])) == len(name_jobs)
+        # Contrast, to pin the asymmetry:
+        assert q.jobs_search(account=[]) == []
+
+    def test_count_matches_search(self, in_memory_session, name_jobs):
+        q = JobQueries(in_memory_session)
+        assert q.jobs_count(name="wrf_*") == 2
+        assert q.jobs_count(name="wrf_*", ignore_case=True) == 3
+        assert q.jobs_count(name="*") == 6      # NULL row excluded
+        assert q.jobs_count(name=[]) == len(name_jobs)
+
+    def test_combines_with_other_filters(self, in_memory_session, name_jobs):
+        assert JobQueries(in_memory_session).jobs_search(user="bob", name="wrf_*") == []
+
+
+@pytest.fixture
+def wait_jobs(in_memory_session):
+    """Jobs with distinct eligible_secs, including the pre-2025 NULL case."""
+    base = datetime(2025, 4, 1, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    specs = [("400.desched1", 0), ("401.desched1", 1800),
+             ("402.desched1", 7200), ("403.desched1", None)]
+    jobs = [
+        Job(job_id=jid, short_id=400 + i, name=f"w{i}", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=base, start=base, end=base + timedelta(hours=i + 1),
+            elapsed=3600, eligible_secs=secs,
+            numcpus=128, numgpus=0, numnodes=1)
+        for i, (jid, secs) in enumerate(specs)
+    ]
+    for j in jobs:
+        in_memory_session.add(j)
+    in_memory_session.commit()
+    return jobs
+
+
+class TestJobsSearchWaitFilters:
+    def test_min_wait_excludes_shorter(self, in_memory_session, wait_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_eligible_secs=1800, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {"401.desched1", "402.desched1"}
+
+    def test_max_wait_excludes_longer(self, in_memory_session, wait_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            max_eligible_secs=1800, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {"400.desched1", "401.desched1"}
+
+    def test_null_eligible_secs_excluded_by_min(self, in_memory_session, wait_jobs):
+        # min=0 is not "everything": the NULL row (derecho before
+        # eligible_time_enable) has no wait measurement and drops out.
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_eligible_secs=0, columns=("job_id",))
+        assert "403.desched1" not in {r["job_id"] for r in rows}
+        assert len(rows) == 3
+
+    def test_null_eligible_secs_excluded_by_max(self, in_memory_session, wait_jobs):
+        # The dangerous direction: "jobs that waited at most 1h" must NOT
+        # silently include jobs whose wait is unknown.
+        rows = JobQueries(in_memory_session).jobs_search(
+            max_eligible_secs=3600, columns=("job_id",))
+        assert "403.desched1" not in {r["job_id"] for r in rows}
+
+    def test_zero_bound_is_not_none(self, in_memory_session, wait_jobs):
+        # 0 is falsy — guards against an `if min_eligible_secs:` regression.
+        assert JobQueries(in_memory_session).jobs_count(max_eligible_secs=0) == 1
+
+    def test_count_agrees_with_search(self, in_memory_session, wait_jobs):
+        q = JobQueries(in_memory_session)
+        for kw in ({"min_eligible_secs": 1800}, {"max_eligible_secs": 3600},
+                   {"min_eligible_secs": 0, "max_eligible_secs": 7200}):
+            assert q.jobs_count(**kw) == len(q.jobs_search(**kw))
+
+
+class TestFilterSignatureParity:
+    """jobs_search / jobs_count / jobs_facets / the helper must stay in sync.
+
+    Without this, adding a filter to jobs_search and forgetting jobs_count
+    yields a paginated UI whose 'N total' disagrees with its rows — the
+    quietest possible bug. The private helper takes no defaults, so the
+    call-site half of the mistake raises TypeError at runtime; this catches
+    the signature half at collection time.
+    """
+
+    SEARCH_ONLY = {"columns", "limit", "offset", "sort_by", "sort_dir"}
+    FACET_ONLY = {"facets", "self_exclude", "limit"}
+
+    @staticmethod
+    def _params(fn):
+        import inspect
+        return set(inspect.signature(fn).parameters) - {"self"}
+
+    def test_jobs_count_accepts_every_jobs_search_filter(self):
+        search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
+        assert search == self._params(JobQueries.jobs_count)
+
+    def test_jobs_facets_accepts_every_jobs_search_filter(self):
+        search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
+        assert search == self._params(JobQueries.jobs_facets) - self.FACET_ONLY
+
+    def test_helper_covers_exactly_the_filter_set(self):
+        search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
+        helper = self._params(JobQueries._apply_jobs_search_filters) - {"query"}
+        assert search == helper
+
+    def test_helper_params_have_no_defaults(self):
+        """Defaults would let a forgotten jobs_count arg fail *silently*."""
+        import inspect
+        sig = inspect.signature(JobQueries._apply_jobs_search_filters)
+        for name, param in sig.parameters.items():
+            if name in ("self", "query"):
+                continue
+            assert param.default is inspect.Parameter.empty, name
+
+
+@pytest.fixture
+def facet_jobs(in_memory_session):
+    """Jobs spanning two queues, two QoS, two users, and exit codes.
+
+    Includes one job with no queue so the NULL-FK facet bucket is exercised.
+    """
+    base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    specs = [
+        # (job_id, user, account, queue, qos, exit code)
+        ("500.desched1", "alice", "NCAR0001", "main",   "premium", "0"),
+        ("501.desched1", "alice", "NCAR0001", "main",   "regular", "0"),
+        ("502.desched1", "alice", "NCAR0001", "main",   "regular", "1"),
+        ("503.desched1", "bob",   "NCAR0002", "gpudev", "regular", "0"),
+        ("504.desched1", "bob",   "NCAR0002", "gpudev", "premium", "271"),
+        ("505.desched1", "carol", "NCAR0002", None,     "regular", "0"),
+    ]
+    jobs = [
+        Job(job_id=jid, short_id=500 + i, name=f"f{i}", user=u, account=a,
+            queue=q, qos=qs, status=st,
+            submit=base, start=base, end=base + timedelta(hours=i + 1),
+            elapsed=3600, numcpus=128, numgpus=0, numnodes=1)
+        for i, (jid, u, a, q, qs, st) in enumerate(specs)
+    ]
+    for j in jobs:
+        in_memory_session.add(j)
+    in_memory_session.commit()
+    return jobs
+
+
+class TestJobsFacets:
+    @staticmethod
+    def _as_map(rows):
+        return {r["value"]: r["count"] for r in rows}
+
+    def test_row_contract(self, in_memory_session, facet_jobs):
+        facets = JobQueries(in_memory_session).jobs_facets()
+        assert set(facets) == {"queue", "qos", "exit_status"}
+        for rows in facets.values():
+            for row in rows:
+                assert set(row) == {"value", "count"}
+
+    def test_counts_are_correct(self, in_memory_session, facet_jobs):
+        facets = JobQueries(in_memory_session).jobs_facets()
+        assert self._as_map(facets["qos"]) == {"regular": 4, "premium": 2}
+        assert self._as_map(facets["exit_status"]) == {"0": 4, "1": 1, "271": 1}
+
+    def test_null_fk_surfaces_as_none(self, in_memory_session, facet_jobs):
+        # Dropping the NULL bucket would make the facet rows silently
+        # under-sum against jobs_count.
+        queue_counts = self._as_map(
+            JobQueries(in_memory_session).jobs_facets()["queue"])
+        assert queue_counts == {"main": 3, "gpudev": 2, None: 1}
+
+    def test_rows_sum_to_jobs_count_without_self_exclusion(
+            self, in_memory_session, facet_jobs):
+        q = JobQueries(in_memory_session)
+        total = q.jobs_count()
+        facets = q.jobs_facets(self_exclude=False)
+        for dim, rows in facets.items():
+            assert sum(r["count"] for r in rows) == total, dim
+
+    def test_ordering_is_count_desc_then_value_asc(self, in_memory_session, facet_jobs):
+        facets = JobQueries(in_memory_session).jobs_facets()
+        counts = [r["count"] for r in facets["exit_status"]]
+        assert counts == sorted(counts, reverse=True)
+        # Ties break on value ascending, with None last.
+        queue_rows = facets["queue"]
+        assert queue_rows[-1]["value"] is None
+
+    def test_self_exclusion_keeps_own_dimension_open(self, in_memory_session, facet_jobs):
+        # With queue='main' selected, the queue facet must still list every
+        # queue (so the user can switch), while the other facets narrow.
+        facets = JobQueries(in_memory_session).jobs_facets(queue="main")
+        assert self._as_map(facets["queue"]) == {"main": 3, "gpudev": 2, None: 1}
+        assert self._as_map(facets["qos"]) == {"regular": 2, "premium": 1}
+
+    def test_self_exclude_false_collapses_own_dimension(
+            self, in_memory_session, facet_jobs):
+        facets = JobQueries(in_memory_session).jobs_facets(
+            queue="main", self_exclude=False)
+        assert self._as_map(facets["queue"]) == {"main": 3}
+
+    def test_other_excluded_dimensions_still_apply(self, in_memory_session, facet_jobs):
+        # Two faceted filters at once: the qos facet respects queue='main',
+        # and the queue facet respects qos='regular' — each drops only its own.
+        facets = JobQueries(in_memory_session).jobs_facets(
+            queue="main", qos="regular")
+        assert self._as_map(facets["qos"]) == {"regular": 2, "premium": 1}
+        assert self._as_map(facets["queue"]) == {"main": 2, "gpudev": 1, None: 1}
+
+    def test_account_is_never_self_excluded(self, in_memory_session, facet_jobs):
+        # Security invariant: account is the authorization scope in every
+        # real caller, so its counts must stay inside the requested scope.
+        facets = JobQueries(in_memory_session).jobs_facets(
+            account="NCAR0001", facets=("account", "queue"))
+        assert self._as_map(facets["account"]) == {"NCAR0001": 3}
+        assert self._as_map(facets["queue"]) == {"main": 3}
+
+    def test_opt_in_dimensions(self, in_memory_session, facet_jobs):
+        facets = JobQueries(in_memory_session).jobs_facets(facets=("user",))
+        assert self._as_map(facets["user"]) == {"alice": 3, "bob": 2, "carol": 1}
+
+    def test_limit_truncates_without_other_bucket(self, in_memory_session, facet_jobs):
+        rows = JobQueries(in_memory_session).jobs_facets(
+            facets=("user",), limit=2)["user"]
+        assert [r["value"] for r in rows] == ["alice", "bob"]
+        # The tail is dropped, not folded into a synthetic "other" row.
+        assert sum(r["count"] for r in rows) == 5
+
+    def test_respects_the_full_filter_set(self, in_memory_session, facet_jobs):
+        # Facets must reflect the same filters jobs_search would apply,
+        # including the new name glob.
+        facets = JobQueries(in_memory_session).jobs_facets(name="f0")
+        assert self._as_map(facets["qos"]) == {"premium": 1}
+
+    def test_unknown_facet_raises(self, in_memory_session, facet_jobs):
+        with pytest.raises(ValueError, match="Unknown facet"):
+            JobQueries(in_memory_session).jobs_facets(facets=("nope",))
+
+    def test_bad_limit_raises(self, in_memory_session, facet_jobs):
+        with pytest.raises(ValueError, match="positive integer"):
+            JobQueries(in_memory_session).jobs_facets(limit=0)
+
+    def test_empty_facets_returns_empty_dict(self, in_memory_session, facet_jobs):
+        assert JobQueries(in_memory_session).jobs_facets(facets=()) == {}
+
+    def test_all_facets_come_from_one_aggregate_scan(self, in_memory_session, facet_jobs):
+        """N facets must not mean N scans of the jobs table.
+
+        Also pins the grouping to the integer FKs: ``GROUP BY Job.queue``
+        would emit the LookupMixin hybrid's correlated scalar subquery, which
+        measured 10x slower on PostgreSQL.
+        """
+        from sqlalchemy import event
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_facets(
+                facets=("queue", "qos", "exit_status", "user"))
+        finally:
+            event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
+
+        aggregates = [s for s in statements
+                      if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+        assert len(aggregates) == 1, \
+            f"expected 1 aggregate scan, got {len(aggregates)}:\n{aggregates}"
+        for fk in ("jobs.queue_id", "jobs.qos_id", "jobs.user_id"):
+            assert fk in aggregates[0], f"{fk} missing — grouping on the hybrid?"
+        assert "SELECT queues.queue_name" not in aggregates[0]
+        assert "SELECT users.username" not in aggregates[0]

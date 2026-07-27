@@ -1,14 +1,20 @@
-"""Single source of truth for ``jobhist search`` column metadata.
+"""Single source of truth for job-row column metadata.
 
 Each entry maps a column key → display spec (header/width/format) plus the
 attribute path used to pull the value from either the ``Job`` row or its
 outer-joined ``JobCharge`` row. The same registry drives:
 
 * the row-projection inside :meth:`JobQueries.jobs_search`
-* envelope construction in :func:`builders.build_search`
+* envelope construction in :func:`job_history.cli.search.builders.build_search`
 * ``--display`` validation in :class:`SearchCommand`
 
 That way default/verbose/custom column lists all flow from one declaration.
+
+This lives at the package root, not under ``cli/``, because it is query-layer
+metadata: ``jobs_search`` projects rows through it and ``_sort_expression``
+resolves ORDER BY through it. It is also re-exported from ``job_history`` and
+consumed by downstream callers (SAM renders table headers from ``COLUMNS``),
+so treat the keys and ``header`` values as a public contract.
 """
 
 from typing import Any, Dict, Sequence
@@ -36,7 +42,10 @@ COLUMNS: Dict[str, Dict[str, Any]] = {
     "account":        {"header": "Project",   "width": 12, "format": "s",   "source": "job.account"},
     "queue":          {"header": "Queue",     "width": 10, "format": "s",   "source": "job.queue"},
     "qos":            {"header": "QoS",       "width":  9, "format": "s",   "source": "job.qos"},
-    "status":         {"header": "Status",    "width":  8, "format": "s",   "source": "job.status"},
+    # PBS ``Exit_status`` — a numeric exit code ('0' == success), NOT a job
+    # state letter. The ORM attribute stays ``Job.status`` to match the DB
+    # column; every user-facing surface says ``exit_status``.
+    "exit_status":    {"header": "Exit",      "width":  8, "format": "s",   "source": "job.status"},
     "numnodes":       {"header": "Nodes",     "width":  6, "format": "d",   "source": "job.numnodes"},
     "numcpus":        {"header": "CPUs",      "width":  6, "format": "d",   "source": "job.numcpus"},
     "numgpus":        {"header": "GPUs",      "width":  6, "format": "d",   "source": "job.numgpus"},

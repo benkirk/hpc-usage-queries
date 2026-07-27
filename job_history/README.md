@@ -194,6 +194,42 @@ project_samuel's `src/cli/` (the SAM CLI). The key conventions:
   resource subcommands share a single execution path through
   `ResourceCommand`. Adding a new resource report = appending one
   `ReportConfig` entry (no new class needed).
+- **Column metadata** lives at the package root in
+  `job_history/columns.py`, *not* under `cli/` — `jobs_search` projects
+  rows and `_sort_expression` resolves `ORDER BY` through the same
+  registry, so it is query-layer metadata. It is re-exported from
+  `job_history` and consumed downstream (SAM renders table headers from
+  `COLUMNS`), which makes the keys and headers a public contract.
+
+### Search filters
+
+`jobhist search` and its programmatic twin `JobQueries.jobs_search` share
+one filter set with `jobs_count` and `jobs_facets`, applied by
+`_apply_jobs_search_filters`. That helper deliberately declares **no
+defaults**: adding a filter to `jobs_search` and forgetting `jobs_count`
+then raises `TypeError` immediately, instead of silently producing a
+paginated UI whose total disagrees with its rows.
+
+Beyond the identity filters (user, project, queue, qos, `exit_status`,
+job id) there are:
+
+- `-N/--name-pattern` (repeatable, OR'd) + `-i/--ignore-case` — shell-glob
+  matching on the job name, dialect-aware via
+  `queries/builders.py:glob_match_clause`.
+- `--min-wait-hours` / `--max-wait-hours` — bounds on PBS `eligible_time`.
+  The CLI takes hours; the API takes `min_/max_eligible_secs`. Both
+  exclude jobs where PBS never recorded a wait (NULL is not zero).
+- `--min-nodes/--max-nodes`, `--min-cpus/--max-cpus`,
+  `--min-gpus/--max-gpus` — inclusive, NULL-strict. `--min-gpus 1`
+  selects GPU jobs, `--max-gpus 0` CPU-only ones.
+
+All of these hit unindexed columns, so they scan whatever slice the date
+window leaves behind — always pass `--start-date`/`--end-date`.
+
+`JobQueries.jobs_facets()` returns per-dimension value counts for the same
+filter set (for filter dropdowns with live counts). It costs one aggregate
+scan regardless of how many dimensions are requested, and it is API-only —
+there is no CLI surface.
 
 ### Adding a new history subcommand
 

@@ -70,8 +70,8 @@ Core job records with foreign keys to normalized tables.
 | `account_id` | INTEGER | FK, YES | → accounts.id |
 | `queue_id` | INTEGER | FK, YES | → queues.id |
 | `qos_id` | INTEGER | FK, YES | → job_qos.id (resolved at sync time from `priority` + `queue`) |
-| `name` | TEXT | NO | Job name |
-| `status` | TEXT | YES | Completion status |
+| `name` | TEXT | NO | Job name — filterable by shell glob via `jobs_search(name=…)` / `jobhist search -N` (see note below) |
+| `status` | TEXT | YES | PBS `Exit_status` — an exit **code**, not a state (see note below). Exposed as `exit_status` on every query/CLI surface |
 | `submit` | DATETIME | YES | PBS `ctime` — job creation (naive UTC — see note below) |
 | `queued` | DATETIME | NO | PBS `qtime` — entered *current* queue; reset by routing |
 | `eligible` | DATETIME | NO | PBS `etime` — reset by queue move **and** hold/release |
@@ -150,6 +150,42 @@ silently mixing two different wait definitions.
 > `PbsRecord.process_record()` rewrites the `eligible_time` attribute *divided by*
 > `self._divisor` (qhist's display time unit: 1 = s, 60 = min, 3600 = hr).  Sync
 > parses the raw `HH:MM:SS` string instead.
+
+#### `status` holds an exit code, not a job state
+
+`Job.status` is populated from the PBS `Exit_status` field (`sync/pbs.py`).  It is
+a numeric exit code stored as text — `'0'` is success, non-zero is a failure or a
+signal.  It is **not** a state letter: across all 34M rows on both production
+machines there are **zero** non-numeric values (192 distinct codes on derecho,
+135 on casper; the most common are `'0'`, `'1'`, `'-29'`, `'271'`, `'255'`,
+`'143'`).  A filter for `'F'` matches nothing, ever.
+
+The ORM attribute stays `Job.status` to match the DB column, but every query and
+CLI surface names it `exit_status` — `jobs_search(exit_status=…)`,
+`jobhist search --exit-status`, the `exit_status` column key, and the
+`exit_status` facet dimension.
+
+#### Job-name glob filtering
+
+`jobs_search` / `jobs_count` / `jobs_facets` accept `name=` — one shell-glob
+pattern or a sequence of them, OR'd (`jobhist search -N 'wrf_*' -N '*.restart'`).
+`*` matches any run of characters and `?` exactly one; `ignore_case=True`
+(`-i`) switches to case-insensitive matching.
+
+Dialect-aware, in `job_history/queries/builders.py`: SQLite compiles to `GLOB`,
+PostgreSQL to an anchored POSIX regex (`~`), and the case-insensitive path to
+portable `ILIKE`/`lower() LIKE` with literal `%` and `_` escaped.  One asymmetry
+to know: SQLite `GLOB` honours `[abc]` character classes while the PostgreSQL
+regex path treats `[` as a literal — stick to `*` and `?` for identical results
+on both backends.  Rows with a NULL `name` never match any pattern.
+
+`jobs.name` is **not indexed**, so a glob is evaluated across whatever slice
+`start`/`end` leave behind via `ix_jobs_end`.  Measured on 13M rows: a
+one-month window costs ~107 ms with the glob versus ~100 ms without (i.e. free),
+while an unbounded full-history glob costs 1.5-2.4 s.  Always bound the date
+window.  A B-tree would not help — under a non-`C` collation PostgreSQL cannot
+use one for `LIKE 'foo%'` at all without `text_pattern_ops`, and even then only
+for left-anchored patterns; the substring case would need a `pg_trgm` GIN index.
 
 ### users, accounts, queues
 

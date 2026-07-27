@@ -11,6 +11,26 @@ from typing import List, Dict, Any
 from datetime import date
 
 
+def _format_cell(value: Any, fmt: str) -> str:
+    """Render one cell, tolerating NULLs.
+
+    ``format(None, '<9d')`` raises TypeError, and several projected columns are
+    legitimately NULL — ``eligible_secs`` is NULL for every derecho job that
+    ended before PBS ``eligible_time_enable`` was switched on, and ``short_id``
+    is NULL on every array-job row. An empty string is the right rendering for
+    "no value"; the Rich exporter already does this, so this brings the
+    fixed-width and Markdown writers in line.
+    """
+    if value is None:
+        return ""
+    if fmt and fmt != "s":
+        try:
+            return format(value, fmt)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 class ReportExporter(ABC):
     """Abstract base class for report exporters."""
 
@@ -51,20 +71,13 @@ class DatExporter(ReportExporter):
             for row in data:
                 row_parts = []
                 for col in columns:
-                    value = row[col.key]
+                    # Format first, then pad — so a NULL renders as blanks
+                    # rather than raising inside the width specifier.
+                    cell = _format_cell(row[col.key], col.format)
                     if col.width > 0:
-                        if col.format == "s":
-                            row_parts.append(f"{value:<{col.width}}")
-                        elif col.format:
-                            row_parts.append(f"{value:<{col.width}{col.format}}")
-                        else:
-                            row_parts.append(f"{value:<{col.width}}")
+                        row_parts.append(f"{cell:<{col.width}}")
                     else:
-                        # Last column
-                        if col.format:
-                            row_parts.append(f"{value:{col.format}}")
-                        else:
-                            row_parts.append(str(value))
+                        row_parts.append(cell)  # last column, no padding
                 f.write("".join(row_parts) + "\n")
 
 
@@ -140,14 +153,7 @@ class MarkdownExporter(ReportExporter):
             for row in data:
                 values = []
                 for col in columns:
-                    value = row[col.key]
-                    # Format the value
-                    if col.format and col.format not in ["s", ""]:
-                        # Numeric format
-                        formatted = f"{value:{col.format}}"
-                    else:
-                        formatted = str(value)
-                    values.append(formatted)
+                    values.append(_format_cell(row[col.key], col.format))
                 f.write("| " + " | ".join(values) + " |\n")
 
 

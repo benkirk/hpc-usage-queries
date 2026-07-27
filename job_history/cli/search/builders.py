@@ -7,7 +7,7 @@ the JSON envelope consumed by every Exporter.
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from .columns import COLUMNS
+from job_history.columns import COLUMNS
 
 
 def build_search(
