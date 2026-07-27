@@ -10,7 +10,9 @@ import pytest
 
 from job_history.database import Job, JobCharge
 from job_history.queries import JobQueries
-from job_history.queries.jobs import QueryConfig, _HISTOGRAM_SPECS
+from job_history.queries.jobs import (
+    QueryConfig, _HISTOGRAM_SPECS, _SORT_LOOKUP_JOINS, _USAGE_SORT_KEYS,
+)
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS
 
 
@@ -418,26 +420,30 @@ class TestJobsSearchPagination:
             "102.desched1",  # 64
         ]
 
-    def test_sort_by_user_asc(self, in_memory_session, search_jobs):
+    @pytest.mark.parametrize("dim", sorted(_SORT_LOOKUP_JOINS))
+    def test_sort_by_lookup_column_asc(self, in_memory_session, search_jobs, dim):
         rows = JobQueries(in_memory_session).jobs_search(
-            sort_by="user", sort_dir="asc", columns=("job_id", "user"),
+            sort_by=dim, sort_dir="asc", columns=("job_id", dim),
         )
-        users = [r["user"] for r in rows]
-        assert users == sorted(users)
-        assert set(users) == {"alice", "bob"}
+        values = [r[dim] for r in rows]
+        assert values == sorted(values)
+        assert len(set(values)) > 1, "fixture must span >1 value to order by"
 
-    def test_sort_by_user_desc(self, in_memory_session, search_jobs):
-        rows = JobQueries(in_memory_session).jobs_search(
-            sort_by="user", sort_dir="desc", columns=("job_id", "user"),
-        )
-        assert rows[0]["user"] == "bob"
+    @pytest.mark.parametrize("dim", sorted(_SORT_LOOKUP_JOINS))
+    def test_sort_by_lookup_column_desc(self, in_memory_session, search_jobs, dim):
+        q = JobQueries(in_memory_session)
+        values = [r[dim] for r in q.jobs_search(
+            sort_by=dim, sort_dir="desc", columns=("job_id", dim))]
+        assert values == sorted(values, reverse=True)
 
-    def test_sort_by_user_joins_instead_of_correlated_subquery(
-            self, in_memory_session, search_jobs):
-        # The Job.user hybrid's SQL side is a correlated scalar subquery,
-        # re-evaluated per row (measured 10x slower). Sorting must join the
-        # lookup table instead — pin the emitted shape.
+    @pytest.mark.parametrize("dim", sorted(_SORT_LOOKUP_JOINS))
+    def test_sort_by_lookup_joins_instead_of_correlated_subquery(
+            self, in_memory_session, search_jobs, dim):
+        # The Job.user/account/queue/qos hybrids' SQL side is a correlated
+        # scalar subquery, re-evaluated per row (measured 10x slower).
+        # Sorting must join the lookup table instead — pin the emitted shape.
         from sqlalchemy import event
+        model, _fk_col, name_col = _SORT_LOOKUP_JOINS[dim]
         statements = []
 
         @event.listens_for(in_memory_session.bind, "before_cursor_execute")
@@ -445,19 +451,21 @@ class TestJobsSearchPagination:
             statements.append(statement)
 
         try:
-            JobQueries(in_memory_session).jobs_search(sort_by="user")
+            JobQueries(in_memory_session).jobs_search(sort_by=dim)
         finally:
             event.remove(in_memory_session.bind, "before_cursor_execute", _capture)
 
+        table = model.__tablename__
         stmt = next(s for s in statements if "ORDER BY" in s.upper())
-        assert "JOIN users" in stmt
-        assert "(SELECT users.username" not in stmt
+        assert f"JOIN {table}" in stmt
+        assert f"(SELECT {table}.{name_col.key}" not in stmt
 
-    def test_sort_by_user_keeps_count_agreement(
-            self, in_memory_session, search_jobs):
+    @pytest.mark.parametrize("dim", sorted(_SORT_LOOKUP_JOINS))
+    def test_sort_by_lookup_keeps_count_agreement(
+            self, in_memory_session, search_jobs, dim):
         # OUTER join: a lookup sort must never drop rows vs jobs_count.
         q = JobQueries(in_memory_session)
-        assert len(q.jobs_search(sort_by="user")) == q.jobs_count()
+        assert len(q.jobs_search(sort_by=dim)) == q.jobs_count()
 
     def test_sort_by_unknown_raises(self, in_memory_session, search_jobs):
         with pytest.raises(ValueError, match="Unknown sort_by"):
@@ -1117,7 +1125,7 @@ class TestFilterSignatureParity:
 
     SEARCH_ONLY = {"columns", "limit", "offset", "sort_by", "sort_dir"}
     FACET_ONLY = {"facets", "self_exclude", "limit"}
-    HIST_ONLY = {"dimension", "owners_limit"}
+    HIST_ONLY = {"dimension", "owners_limit", "owners_sort_by"}
     USAGE_ONLY = {"dimension", "limit", "sort_by"}
 
     @staticmethod
@@ -1664,20 +1672,30 @@ class TestJobsHistogramOwners:
 
     def test_envelope_identical_modulo_owners(
             self, in_memory_session, histogram_jobs):
-        # The owners variant must be the plain envelope plus one appended
-        # key per bucket — nothing else may move.
+        """The owners variant is the plain envelope plus one appended key per
+        bucket — nothing else may move.
+
+        Counts are compared exactly; hours only to a tolerance. The owners
+        path adds N per-user partial SUMs in Python instead of taking one
+        SQL SUM, and float addition isn't associative, so the two agree to
+        rounding and no further — on real derecho data they differ in the
+        last ULP on every dimension. This fixture is too small to expose
+        that, which is exactly why the tolerance belongs here rather than
+        being discovered downstream.
+        """
         q = JobQueries(in_memory_session)
         plain = q.jobs_histogram("wait")
         rich = q.jobs_histogram("wait", owners_limit=10)
-        stripped = {
-            **rich,
-            "buckets": [
-                {k: v for k, v in b.items() if k != "owners"}
-                for b in rich["buckets"]
-            ],
-        }
-        assert stripped == plain
+
         assert all(list(b)[-1] == "owners" for b in rich["buckets"])
+        assert {k: v for k, v in rich.items() if k != "buckets"} == \
+            {k: v for k, v in plain.items() if k != "buckets"}
+        for got, want in zip(rich["buckets"], plain["buckets"]):
+            assert set(got) - {"owners"} == set(want)
+            assert (got["label"], got["lo"], got["hi"], got["job_count"]) == \
+                (want["label"], want["lo"], want["hi"], want["job_count"])
+            assert got["cpu_hours"] == pytest.approx(want["cpu_hours"])
+            assert got["gpu_hours"] == pytest.approx(want["gpu_hours"])
 
     def test_owners_shape_and_rank(self, in_memory_session, histogram_jobs):
         out = JobQueries(in_memory_session).jobs_histogram(
@@ -1741,6 +1759,73 @@ class TestJobsHistogramOwners:
             f"expected 1 aggregate scan, got {len(aggregates)}:\n{aggregates}"
         assert "jobs.user_id" in aggregates[0]
         assert "SELECT users.username" not in aggregates[0]
+
+    def test_owners_round_trip_into_filters(
+            self, in_memory_session, histogram_jobs, floor_band_jobs):
+        """Level three of the drill-down: every listed owner replays.
+
+        A bar's owner slice must return exactly the jobs it claims when
+        clicked — ``jobs_count(user=name, **band bounds)``. This is the
+        owners-level analogue of ``_assert_bands_round_trip``, and the same
+        class of defect that made the ``cpus`` "1" bar over-count before the
+        bucket tables were closed at the domain floor.
+        """
+        q = JobQueries(in_memory_session)
+        checked = 0
+        for dim in _HISTOGRAM_SPECS:
+            out = q.jobs_histogram(dim, owners_limit=10)
+            for band in out["buckets"]:
+                kw = {out["min_param"]: band["lo"]}
+                if band["hi"] is not None:
+                    kw[out["max_param"]] = band["hi"]
+                for name, agg in band["owners"].items():
+                    assert q.jobs_count(user=name, **kw) == agg["job_count"], \
+                        (dim, band["label"], name)
+                    checked += 1
+                # …and the listed owners never over-claim the band.
+                assert sum(o["job_count"] for o in band["owners"].values()) \
+                    <= band["job_count"], (dim, band["label"])
+        assert checked, "fixtures produced no owners to round-trip"
+
+    def test_owners_sort_by_decides_which_top_n_survives(
+            self, in_memory_session, usage_sort_jobs):
+        """The bug jobs_usage_by(sort_by=) fixes, one level down.
+
+        All three usage_sort_jobs rows share a band on every dimension, so
+        the band's owner list is a pure ranking question: cpuking leads on
+        combined hours, gpuqueen on gpu_hours and on job_count. Ranked by
+        combined hours a GPU-stacked bar shows the wrong user — measured on
+        derecho, the top-5 combined-hours owners of a wait or duration band
+        cover ~0% of that band's GPU hours.
+        """
+        q = JobQueries(in_memory_session)
+
+        def top(**kw):
+            out = q.jobs_histogram("wait", owners_limit=1, **kw)
+            band = next(b for b in out["buckets"] if b["owners"])
+            return list(band["owners"])
+
+        assert top() == ["cpuking"]                        # default: hours
+        assert top(owners_sort_by="hours") == ["cpuking"]
+        assert top(owners_sort_by="cpu_hours") == ["cpuking"]
+        assert top(owners_sort_by="gpu_hours") == ["gpuqueen"]
+        assert top(owners_sort_by="job_count") == ["gpuqueen"]
+
+    @pytest.mark.parametrize("key", _USAGE_SORT_KEYS)
+    def test_owners_sort_by_never_changes_band_totals(
+            self, in_memory_session, usage_sort_jobs, key):
+        # Ranking picks *which* owners are listed, never what the band says.
+        q = JobQueries(in_memory_session)
+        plain = q.jobs_histogram("wait")
+        rich = q.jobs_histogram("wait", owners_limit=1, owners_sort_by=key)
+        assert [b["job_count"] for b in rich["buckets"]] == \
+            [b["job_count"] for b in plain["buckets"]]
+        assert rich["total_count"] == plain["total_count"]
+
+    def test_bad_owners_sort_by_raises(self, in_memory_session, histogram_jobs):
+        with pytest.raises(ValueError, match="Unknown owners_sort_by"):
+            JobQueries(in_memory_session).jobs_histogram(
+                "wait", owners_limit=5, owners_sort_by="memory_hours")
 
 
 @pytest.fixture
@@ -1882,7 +1967,7 @@ class TestJobsUsageBy:
         assert by_gpu["totals"]["gpu_hours"] == pytest.approx(500.0)
         assert by_gpu["totals"]["job_count"] == 3
 
-    def test_bad_sort_by_raises(self, in_memory_session, histogram_jobs):
+    def test_bad_sort_by_raises(self, in_memory_session, usage_sort_jobs):
         with pytest.raises(ValueError, match="Unknown sort_by"):
             JobQueries(in_memory_session).jobs_usage_by(
                 "user", sort_by="memory_hours")

@@ -110,9 +110,32 @@ def _bucket_case(field, buckets):
     return case(*whens, else_=buckets[-1][0]).label("bucket_label")
 
 
-#: Ranking metrics accepted by ``jobs_usage_by(sort_by=...)``. ``hours``
-#: is the historical default: combined ``cpu_hours + gpu_hours``.
+#: Ranking metrics accepted by ``jobs_usage_by(sort_by=...)`` and
+#: ``jobs_histogram(owners_sort_by=...)``. ``hours`` is the historical
+#: default: combined ``cpu_hours + gpu_hours``.
 _USAGE_SORT_KEYS = ("hours", "cpu_hours", "gpu_hours", "job_count")
+
+
+def _check_usage_sort_key(sort_by: str, param: str) -> None:
+    """Validate a ``_USAGE_SORT_KEYS`` selection, naming the offending kwarg."""
+    if sort_by not in _USAGE_SORT_KEYS:
+        valid = ", ".join(_USAGE_SORT_KEYS)
+        raise ValueError(f"Unknown {param}: {sort_by!r}. Valid keys: {valid}")
+
+
+def _usage_rank(sort_by: str, job_count, cpu_hours, gpu_hours) -> float:
+    """The ranking metric's value, so both call sites agree on ``hours``.
+
+    Shared by ``jobs_usage_by``'s row ranking and ``jobs_histogram``'s
+    per-bucket owner ranking — the same vocabulary must mean the same thing
+    in both, or a dashboard's pie and its stacked bars disagree about who
+    the top consumers are.
+    """
+    if sort_by == "hours":
+        return cpu_hours + gpu_hours
+    if sort_by == "job_count":
+        return job_count
+    return cpu_hours if sort_by == "cpu_hours" else gpu_hours
 
 
 def _sort_expression(sort_by: str):
@@ -1831,6 +1854,7 @@ class JobQueries:
         min_memory_wasted: Optional[int] = None,
         max_memory_wasted: Optional[int] = None,
         owners_limit: Optional[int] = None,
+        owners_sort_by: str = "hours",
     ) -> Dict[str, Any]:
         """Distribution histogram over one job dimension, for dashboards.
 
@@ -1854,7 +1878,16 @@ class JobQueries:
                 match the SAM dashboard vocabulary, not column names.
             owners_limit: When set, each bucket additionally carries an
                 ``owners`` mapping — its top-N users. ``None`` (the
-                default) leaves the envelope exactly as before.
+                default) leaves the envelope as before.
+            owners_sort_by: Which metric decides *which* N users survive:
+                ``'hours'`` (the default, ``cpu_hours + gpu_hours``),
+                ``'cpu_hours'``, ``'gpu_hours'``, or ``'job_count'`` — the
+                same vocabulary as :meth:`jobs_usage_by`. A consumer
+                stacking a bar by GPU hours must pass ``'gpu_hours'``, for
+                the reason spelled out there: ranked by combined hours, the
+                top-5 owners of a ``wait`` or ``duration`` band cover ~0% of
+                that band's GPU hours on derecho, so every bar renders as
+                "Other". Ignored when *owners_limit* is None.
 
         Returns::
 
@@ -1901,16 +1934,34 @@ class JobQueries:
                                  "cpu_hours": 120.0, "gpu_hours": 4.0},
                        ...}    # top-N, insertion-ordered by rank
 
-        Owners are ranked per bucket by combined ``cpu_hours + gpu_hours``
-        (descending; name asc tie-break, the facet convention). Bucket
-        totals stay authoritative: the long tail beyond N — and any rows
-        with a NULL ``user_id`` — is exactly ``bucket totals − Σ owners``,
-        derivable, never synthesized. Zero-count buckets carry
-        ``owners: {}``. The NULL *dimension* band still folds into
-        ``null_count`` and never carries owners. Cost is unchanged — the
-        aggregate grows a ``user_id`` GROUP BY key (the 1:1 charge join
-        keeps COUNT/SUM exact) plus the usual post-aggregation name
-        lookup.
+        Owners are ranked per bucket by *owners_sort_by* (descending; name
+        asc tie-break, the facet convention). Bucket totals stay
+        authoritative: the long tail beyond N — and any rows with a NULL
+        ``user_id`` — is exactly ``bucket totals − Σ owners``, derivable,
+        never synthesized. Zero-count buckets carry ``owners: {}``. The
+        NULL *dimension* band still folds into ``null_count`` and never
+        carries owners.
+
+        Every listed owner replays exactly: ``jobs_count(user=name,
+        **{min_param: lo, max_param: hi}, **filters)`` equals that owner's
+        ``job_count``, the third level of a bin → user → jobs drill-down.
+        Pinned by ``test_owners_round_trip_into_filters``.
+
+        Still one aggregate statement — the GROUP BY grows a ``user_id``
+        key (the 1:1 charge join keeps COUNT/SUM exact) plus the usual
+        post-aggregation name lookup — but not the same cost: the group
+        cardinality goes from one row per bucket to buckets × distinct
+        users, and the Python fold below grows with it. Measured ~1.4× on
+        derecho over a one-month window (``cpus`` 761 → 1085 ms, ``wait``
+        1202 → 1647 ms).
+
+        Every ``job_count`` — per bucket, ``null_count``, ``total_count`` —
+        is identical to the ``owners_limit=None`` envelope. The hour sums
+        are equal only to within float rounding: this path adds N per-user
+        partial ``SUM``s in Python instead of taking one SQL ``SUM``, and
+        float addition is not associative, so they can differ in the last
+        ULP (~1e-7 relative, observed on every dimension against real
+        data). Compare hours with a tolerance, never ``==``.
 
         Cost: one aggregate statement — a CASE label + COUNT + two SUMs over
         a LEFT OUTER JOIN to ``job_charges`` (1:1 on the PK), grouped by the
@@ -1924,8 +1975,8 @@ class JobQueries:
         QoS-weighted charges), matching :meth:`job_sizes_by_resource`.
 
         Raises:
-            ValueError: on an unknown *dimension* or non-positive
-                *owners_limit*.
+            ValueError: on an unknown *dimension* or *owners_sort_by*, or a
+                non-positive *owners_limit*.
         """
         spec = _HISTOGRAM_SPECS.get(dimension)
         if spec is None:
@@ -1939,6 +1990,7 @@ class JobQueries:
             raise ValueError(
                 f"owners_limit must be a positive integer, got {owners_limit!r}"
             )
+        _check_usage_sort_key(owners_sort_by, "owners_sort_by")
         column, buckets, unit, min_param, max_param = spec
 
         bucket_label = _bucket_case(column, buckets)
@@ -2027,21 +2079,26 @@ class JobQueries:
                 "gpu_hours": float(gpu or 0.0),
             }
             if owners_limit is not None:
-                # Rank by combined hours desc, then name asc (the facet
-                # tie-break, minus the None arm — NULL users never rank).
-                ranked = sorted(
-                    owners_by_label.get(label, {}).items(),
-                    key=lambda kv: (
-                        -(kv[1][1] + kv[1][2]), str(names.get(kv[0]))
-                    ),
-                )[:owners_limit]
+                # Rank by the caller's metric desc, then name asc (the facet
+                # tie-break, minus the None arm — NULL users never rank). The
+                # display name is resolved once and used for both the tie-break
+                # and the output key, so an id the lookup can't resolve sorts
+                # and renders under the same string.
+                named = [
+                    (str(names.get(uid, uid)), agg)
+                    for uid, agg in owners_by_label.get(label, {}).items()
+                ]
+                ranked = sorted(named, key=lambda na: (
+                    -_usage_rank(owners_sort_by, na[1][0], na[1][1], na[1][2]),
+                    na[0],
+                ))[:owners_limit]
                 bucket["owners"] = {
-                    str(names.get(uid, uid)): {
+                    name: {
                         "job_count": agg[0],
                         "cpu_hours": agg[1],
                         "gpu_hours": agg[2],
                     }
-                    for uid, agg in ranked
+                    for name, agg in ranked
                 }
             out_buckets.append(bucket)
 
@@ -2120,7 +2177,10 @@ class JobQueries:
                 ``cpu_hours + gpu_hours``), ``'cpu_hours'``,
                 ``'gpu_hours'``, or ``'job_count'``. A consumer showing a
                 GPU-hours view must rank by ``'gpu_hours'``, or a pure-GPU
-                user can vanish beneath ``limit`` CPU-heavy ones.
+                user can vanish beneath ``limit`` CPU-heavy ones. Same
+                vocabulary as :meth:`jobs_histogram`'s ``owners_sort_by``
+                — and *not* the same as :meth:`jobs_search`'s ``sort_by``,
+                which takes ``COLUMNS`` keys.
 
         Returns::
 
@@ -2162,11 +2222,7 @@ class JobQueries:
             )
         if limit is not None and (not isinstance(limit, int) or limit <= 0):
             raise ValueError(f"limit must be a positive integer, got {limit!r}")
-        if sort_by not in _USAGE_SORT_KEYS:
-            valid = ", ".join(_USAGE_SORT_KEYS)
-            raise ValueError(
-                f"Unknown sort_by: {sort_by!r}. Valid keys: {valid}"
-            )
+        _check_usage_sort_key(sort_by, "sort_by")
         group_col, model, name_col = spec
 
         query = (
@@ -2213,12 +2269,10 @@ class JobQueries:
             })
         # sort_by metric desc, then value asc with None last — the facet
         # tie-break convention, keyed on the caller's ranking metric.
-        if sort_by == "hours":
-            rank = lambda r: r["cpu_hours"] + r["gpu_hours"]  # noqa: E731
-        else:
-            rank = lambda r: r[sort_by]  # noqa: E731
         rows.sort(key=lambda r: (
-            -rank(r), r["value"] is None, str(r["value"])
+            -_usage_rank(sort_by, r["job_count"], r["cpu_hours"], r["gpu_hours"]),
+            r["value"] is None,
+            str(r["value"]),
         ))
 
         totals = {
