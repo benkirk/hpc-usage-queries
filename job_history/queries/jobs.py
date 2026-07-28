@@ -1862,6 +1862,7 @@ class JobQueries:
         max_memory_wasted: Optional[int] = None,
         owners_limit: Optional[int] = None,
         owners_sort_by: str = "hours",
+        owners_by: str = "user",
     ) -> Dict[str, Any]:
         """Distribution histogram over one job dimension, for dashboards.
 
@@ -1884,9 +1885,16 @@ class JobQueries:
                 a NULL in either column land in ``null_count``). Names
                 match the SAM dashboard vocabulary, not column names.
             owners_limit: When set, each bucket additionally carries an
-                ``owners`` mapping — its top-N users. ``None`` (the
-                default) leaves the envelope as before.
-            owners_sort_by: Which metric decides *which* N users survive:
+                ``owners`` mapping — its top-N owners (users by default;
+                see *owners_by*). ``None`` (the default) leaves the
+                envelope as before.
+            owners_by: Which entity "owns" a bucket's jobs for the
+                ``owners`` breakdown: ``'user'`` (the default — keys are
+                usernames) or ``'account'`` (keys are account/project
+                codes). Same aggregate shape either way — only the GROUP
+                BY key and the name lookup change. Ignored when
+                *owners_limit* is None.
+            owners_sort_by: Which metric decides *which* N owners survive:
                 ``'hours'`` (the default, ``cpu_hours + gpu_hours``),
                 ``'cpu_hours'``, ``'gpu_hours'``, or ``'job_count'`` — the
                 same vocabulary as :meth:`jobs_usage_by`. A consumer
@@ -1942,19 +1950,22 @@ class JobQueries:
                        ...}    # top-N, insertion-ordered by rank
 
         Owners are ranked per bucket by *owners_sort_by* (descending; name
-        asc tie-break, the facet convention). Bucket totals stay
+        asc tie-break, the facet convention). With ``owners_by='account'``
+        the keys are account codes instead of usernames; everything below
+        reads the same with "account" substituted. Bucket totals stay
         authoritative: the long tail beyond N — and any rows with a NULL
-        ``user_id`` — is exactly ``bucket totals − Σ owners``, derivable,
+        owner FK — is exactly ``bucket totals − Σ owners``, derivable,
         never synthesized. Zero-count buckets carry ``owners: {}``. The
         NULL *dimension* band still folds into ``null_count`` and never
         carries owners.
 
         Every listed owner replays exactly: ``jobs_count(user=name,
-        **{min_param: lo, max_param: hi}, **filters)`` equals that owner's
-        ``job_count``, the third level of a bin → user → jobs drill-down.
-        Pinned by ``test_owners_round_trip_into_filters``.
+        **{min_param: lo, max_param: hi}, **filters)`` — or
+        ``account=name`` under ``owners_by='account'`` — equals that
+        owner's ``job_count``, the third level of a bin → owner → jobs
+        drill-down. Pinned by ``test_owners_round_trip_into_filters``.
 
-        Still one aggregate statement — the GROUP BY grows a ``user_id``
+        Still one aggregate statement — the GROUP BY grows the owner FK
         key (the 1:1 charge join keeps COUNT/SUM exact) plus the usual
         post-aggregation name lookup — but not the same cost: the group
         cardinality goes from one row per bucket to buckets × distinct
@@ -1982,8 +1993,8 @@ class JobQueries:
         QoS-weighted charges), matching :meth:`job_sizes_by_resource`.
 
         Raises:
-            ValueError: on an unknown *dimension* or *owners_sort_by*, or a
-                non-positive *owners_limit*.
+            ValueError: on an unknown *dimension*, *owners_sort_by*, or
+                *owners_by*, or a non-positive *owners_limit*.
         """
         spec = _HISTOGRAM_SPECS.get(dimension)
         if spec is None:
@@ -1998,6 +2009,11 @@ class JobQueries:
                 f"owners_limit must be a positive integer, got {owners_limit!r}"
             )
         _check_usage_sort_key(owners_sort_by, "owners_sort_by")
+        if owners_by not in ("user", "account"):
+            raise ValueError(
+                f"owners_by must be 'user' or 'account', got {owners_by!r}"
+            )
+        owner_fk, owner_model, owner_name_col = _FACET_SPECS[owners_by]
         column, buckets, unit, min_param, max_param = spec
 
         bucket_label = _bucket_case(column, buckets)
@@ -2009,11 +2025,11 @@ class JobQueries:
         ]
         group_cols = [bucket_label]
         if owners_limit is not None:
-            # Group the integer FK, never the Job.user text hybrid — see
+            # Group the integer FK, never the text hybrid — see
             # _FACET_SPECS. The 1:1 charge join keeps every aggregate exact
             # under the extra key.
-            select_cols.insert(1, Job.user_id)
-            group_cols.append(Job.user_id)
+            select_cols.insert(1, owner_fk)
+            group_cols.append(owner_fk)
         query = (
             self.session.query(*select_cols)
             .outerjoin(JobCharge, Job.id == JobCharge.job_id)
@@ -2047,13 +2063,13 @@ class JobQueries:
             }
             null_count = int(by_label.pop(_NULL_BUCKET, (0, None, None))[0])
         else:
-            # Per-user rows: re-fold bucket totals (identical arithmetic to
-            # the ungrouped shape) and keep the per-user split on the side.
-            # NULL-user rows count toward totals but are never owner
+            # Per-owner rows: re-fold bucket totals (identical arithmetic to
+            # the ungrouped shape) and keep the per-owner split on the side.
+            # NULL-owner rows count toward totals but are never owner
             # candidates — they live in the derivable remainder.
             by_label = {}
             null_count = 0
-            for label, user_id, count, cpu, gpu in rows:
+            for label, owner_id, count, cpu, gpu in rows:
                 if label == _NULL_BUCKET:
                     null_count += int(count)
                     continue
@@ -2063,15 +2079,15 @@ class JobQueries:
                     t_cpu + float(cpu or 0.0),
                     t_gpu + float(gpu or 0.0),
                 )
-                if user_id is not None:
-                    per_user = owners_by_label.setdefault(label, {})
-                    agg = per_user.setdefault(user_id, [0, 0.0, 0.0])
+                if owner_id is not None:
+                    per_owner = owners_by_label.setdefault(label, {})
+                    agg = per_owner.setdefault(owner_id, [0, 0.0, 0.0])
                     agg[0] += int(count)
                     agg[1] += float(cpu or 0.0)
                     agg[2] += float(gpu or 0.0)
             names = self._resolve_lookup_names(
-                User, User.username,
-                {uid for per_user in owners_by_label.values() for uid in per_user},
+                owner_model, owner_name_col,
+                {oid for per_owner in owners_by_label.values() for oid in per_owner},
             )
 
         out_buckets = []
@@ -2087,13 +2103,13 @@ class JobQueries:
             }
             if owners_limit is not None:
                 # Rank by the caller's metric desc, then name asc (the facet
-                # tie-break, minus the None arm — NULL users never rank). The
+                # tie-break, minus the None arm — NULL owners never rank). The
                 # display name is resolved once and used for both the tie-break
                 # and the output key, so an id the lookup can't resolve sorts
                 # and renders under the same string.
                 named = [
-                    (str(names.get(uid, uid)), agg)
-                    for uid, agg in owners_by_label.get(label, {}).items()
+                    (str(names.get(oid, oid)), agg)
+                    for oid, agg in owners_by_label.get(label, {}).items()
                 ]
                 ranked = sorted(named, key=lambda na: (
                     -_usage_rank(owners_sort_by, na[1][0], na[1][1], na[1][2]),
