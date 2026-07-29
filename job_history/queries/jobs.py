@@ -113,6 +113,60 @@ def _bucket_case(field, buckets):
     return case(*whens, else_=buckets[-1][0]).label("bucket_label")
 
 
+def _validate_bucket_table(buckets, name):
+    """Raise ValueError unless *buckets* is a closed, contiguous ladder.
+
+    The runtime form of the invariant :func:`_bucket_case` documents, applied
+    to every table at import. Every failure here is *silent* at query time —
+    the ladder still labels every row, so ``total_count`` stays correct while
+    individual bars count rows their advertised ``lo``/``hi`` exclude, and the
+    bar↔``jobs_search`` round-trip breaks. That regression has shipped once
+    already (404 derecho / 21 casper rows with ``numcpus=0`` landed in the
+    "1" bar while ``min_cpus=1`` excluded them), which is why this is a hard
+    error and not a warning.
+
+    *name* is the table's identity in the message — a dimension, or
+    ``"<dimension>/<machine>"`` for a derived per-machine table.
+    """
+    if not buckets:
+        # _bucket_case reads buckets[-1][0] for its else_ arm, so an empty
+        # table dies with IndexError somewhere far from the cause.
+        raise ValueError(f"{name}: bucket table is empty")
+
+    first, last = buckets[0], buckets[-1]
+    # lo=None is the signed-dimension floor (memory_wasted); every other
+    # column is non-negative, so its floor is 0.
+    if first[1] not in (0, None):
+        raise ValueError(
+            f"{name}: first band {first[0]!r} misses the domain floor "
+            f"(lo={first[1]!r}, expected 0 or None)"
+        )
+    if last[2] is not None:
+        raise ValueError(
+            f"{name}: last band {last[0]!r} is not open-ended (hi={last[2]!r})"
+        )
+
+    labels = [label for label, _lo, _hi in buckets]
+    if len(set(labels)) != len(labels):
+        # The fold in jobs_histogram is keyed by label, so duplicates merge
+        # two bands into one accumulator and then emit it once per
+        # occurrence — double-counting into total_count.
+        dupes = sorted({lb for lb in labels if labels.count(lb) > 1})
+        raise ValueError(f"{name}: duplicate band labels {dupes}")
+
+    for (label, _lo, hi), (nxt, lo_next, _hi) in zip(buckets, buckets[1:]):
+        if hi is None:
+            raise ValueError(
+                f"{name}: band {label!r} is open-ended mid-table — the "
+                f"ladder emits no arm for it, so it can never be selected"
+            )
+        if lo_next != hi + 1:
+            raise ValueError(
+                f"{name}: bands {label!r} and {nxt!r} are not contiguous "
+                f"({hi} → {lo_next}, expected {hi + 1})"
+            )
+
+
 #: Period granularities accepted by :meth:`JobQueries.jobs_timeseries`.
 #: Deliberately NOT ``PeriodGrouper``'s vocabulary — see
 #: :func:`_period_bands` for why that helper cannot be reused here.
@@ -582,6 +636,42 @@ class QueryConfig:
         buckets.append((overflow_label, overflow_lo, None))
         return buckets
 
+    @staticmethod
+    def _truncate_bucket_table(buckets, cap):
+        """Right-size *buckets* for a machine whose values never exceed *cap*.
+
+        Keeps every band up to and including the one containing *cap*, then
+        re-opens that band (``hi=None``). Bands below it are returned
+        untouched, so a label means the same thing on every machine — only
+        the overflow label differs, and it keeps the existing ``>{lo-1}``
+        convention (``">2048"`` has ``lo=2049``).
+
+        Closure is preserved by construction: the floor band is never
+        dropped and the survivor is always re-opened, so a truncated table
+        cannot fail :func:`_validate_bucket_table`. That is the point of
+        deriving rather than hand-writing per-machine tables.
+
+        *cap* only has to be right to within a band — a ``nodes`` cap of 100
+        and one of 128 both land in ``65-128`` and yield the same table, so
+        the constant carries no false precision. A *cap* at or above the last
+        band's ``lo`` is an identity: a machine larger than the default table
+        simply keeps it.
+        """
+        kept = [b for b in buckets if b[1] <= cap]
+        if len(kept) < 2:
+            # Truncating into the floor band would leave a single open band
+            # covering the whole domain — a histogram with one bar, and a
+            # nonsense '>-1' label. Always a mis-specified cap.
+            raise ValueError(
+                f"cap={cap!r} truncates below the second band "
+                f"{buckets[1][0]!r}: nothing left to distribute"
+            )
+        if len(kept) == len(buckets):
+            return list(buckets)
+        _label, lo, _hi = kept[-1]
+        kept[-1] = (f">{lo - 1}", lo, None)
+        return kept
+
     # Queue-wait distribution buckets (seconds). eligible_secs masses near
     # zero with a tail out to days, so log-ish spacing gives resolution at
     # both ends. A NEW table: job_waits_by_resource buckets by *size* and
@@ -648,6 +738,26 @@ class QueryConfig:
         ("33-64", 33, 64), ("65-128", 65, 128), ("129-256", 129, 256),
         (">256", 257, None),
     ]
+
+    # Per-machine hardware ceilings for the three hardware-sized histogram
+    # dimensions, mirroring MACHINE_QUEUES above: a machine absent here keeps
+    # the default table, so adding one is additive and never silently re-bins
+    # an existing machine. Applied via _truncate_bucket_table, which only
+    # needs the cap to be right to within a band.
+    #
+    # Sized from production, rounded up to the containing band. Over 21.1M
+    # casper jobs the observed maxima are 100 nodes / 864 cpus / 32 gpus, and
+    # NO casper job has ever exceeded these caps. Untruncated, casper spends
+    # its top 5 node bands, 3 cpu bands and 4 gpu bands on values nothing can
+    # reach; every band that survives here is populated.
+    #
+    # Deliberately NOT extended to memory: casper's largemem nodes put 9,666
+    # jobs above 1000 GB, so both machines populate every REQMEM band and
+    # there is no dead axis to reclaim. wait/duration are policy-shaped, not
+    # hardware-shaped.
+    MACHINE_HIST_CAPS = {
+        'casper': {'nodes': 128, 'cpus': 1024, 'gpus': 32},
+    }
 
     # Requested-memory bands: raw bytes at GiB boundaries so returned
     # bounds round-trip exactly into min_reqmem/max_reqmem (no division in
@@ -794,6 +904,37 @@ _HISTOGRAM_SPECS: Dict[str, Tuple[Any, List[tuple], str, str, str]] = {
     'memory_wasted': (_MEMORY_WASTED, QueryConfig.MEMWASTED_HIST_BUCKETS,
                       'bytes', 'min_memory_wasted', 'max_memory_wasted'),
 }
+
+def _build_machine_bucket_tables():
+    """Validate the shipped tables and derive the per-machine ones.
+
+    Called once at import. Both halves are pure functions of constants, so
+    this is deterministic — it either always passes or always fails, and no
+    query ever pays for it. Validating here is what keeps :func:`_bucket_case`
+    free to assume a closed ladder.
+    """
+    for dim, spec in _HISTOGRAM_SPECS.items():
+        _validate_bucket_table(spec[1], dim)
+
+    tables: Dict[str, Dict[str, List[tuple]]] = {}
+    for machine, caps in QueryConfig.MACHINE_HIST_CAPS.items():
+        for dim, cap in caps.items():
+            table = QueryConfig._truncate_bucket_table(
+                _HISTOGRAM_SPECS[dim][1], cap)
+            # Belt and braces: truncation cannot break closure, but the
+            # per-machine tables never reach _HISTOGRAM_SPECS, so this is
+            # their only structural check.
+            _validate_bucket_table(table, f"{dim}/{machine}")
+            tables.setdefault(machine, {})[dim] = table
+    return tables
+
+
+#: machine -> dimension -> right-sized bucket table. Only machines and
+#: dimensions with a declared cap appear; :meth:`JobQueries.jobs_histogram`
+#: falls back to the :data:`_HISTOGRAM_SPECS` default for everything else, so
+#: an unlisted machine — and the CLI's ``machine="all"`` — is byte-identical
+#: to before.
+_MACHINE_HISTOGRAM_BUCKETS = _build_machine_bucket_tables()
 
 
 class JobQueries:
@@ -2277,6 +2418,12 @@ class JobQueries:
             )
         owner_fk, owner_model, owner_name_col = _FACET_SPECS[owners_by]
         column, buckets, unit, min_param, max_param = spec
+        # Right-size the axis to the machine when we know its ceiling. The
+        # double .get mirrors get_cpu_queues: an unlisted machine, a
+        # dimension with no declared cap, and the CLI's machine="all" all
+        # fall through to the default table unchanged.
+        buckets = _MACHINE_HISTOGRAM_BUCKETS.get(self.machine, {}).get(
+            dimension, buckets)
 
         bucket_label = _bucket_case(column, buckets)
         select_cols = [bucket_label, *_metric_agg_cols()]

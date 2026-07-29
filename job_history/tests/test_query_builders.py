@@ -518,7 +518,10 @@ class TestBucketCase:
     @pytest.mark.parametrize("dialect_cls", [sqlite_dialect, pg_dialect])
     def test_every_bucket_table_compiles(self, dialect_cls):
         from job_history.database import Job
-        from job_history.queries.jobs import _bucket_case, QueryConfig
+        from job_history.queries.jobs import (
+            _HISTOGRAM_SPECS, _MACHINE_HISTOGRAM_BUCKETS, _bucket_case,
+            QueryConfig,
+        )
 
         for column, table in (
             (Job.eligible_secs, QueryConfig.WAIT_BUCKETS),
@@ -527,6 +530,16 @@ class TestBucketCase:
             (Job.numgpus,       QueryConfig.GPU_HIST_BUCKETS),
             (Job.reqmem,        QueryConfig.REQMEM_HIST_BUCKETS),
             (Job.elapsed,       QueryConfig.DURATION_HIST_BUCKETS),
+            (Job.memory,        QueryConfig.MEMUSED_HIST_BUCKETS),
+            ((Job.reqmem - Job.memory), QueryConfig.MEMWASTED_HIST_BUCKETS),
         ):
             sql = self._literal_sql(_bucket_case(column, table), dialect_cls)
             assert f"ELSE '{table[-1][0]}'" in sql
+
+        # The per-machine tables never reach _HISTOGRAM_SPECS, so nothing
+        # above compiles them. Their overflow label is derived, not literal.
+        for machine, dims in _MACHINE_HISTOGRAM_BUCKETS.items():
+            for dim, table in dims.items():
+                column = _HISTOGRAM_SPECS[dim][0]
+                sql = self._literal_sql(_bucket_case(column, table), dialect_cls)
+                assert f"ELSE '{table[-1][0]}'" in sql, (machine, dim)

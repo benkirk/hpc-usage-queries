@@ -261,6 +261,16 @@ already serve the terminal case:
   `memory_wasted`), and self-describing `min_param`/`max_param` so a
   clicked bar replays as `jobs_search` bounds. One CASE-grouped aggregate
   scan.
+  - **The axis is right-sized per machine.** `nodes`/`cpus`/`gpus` are
+    truncated to the machine's hardware ceiling
+    (`QueryConfig.MACHINE_HIST_CAPS`), so Casper does not spend a third of
+    each axis on bands nothing can reach: `nodes` 14→9 bands, `cpus` 14→11,
+    `gpus` 11→7. Bands below the overflow are byte-identical across
+    machines, so a label means the same thing everywhere; only the top
+    band's label differs. A machine with no declared cap — including the
+    CLI's `machine="all"` — gets the shared table unchanged. Memory and
+    time dimensions are never truncated (both machines populate every
+    band).
   - `owners_limit=N` appends each bucket's top-N users as
     `{username: {job_count, cpu_hours, gpu_hours}}` — the second level of a
     bin → user → jobs drill-down. Still one aggregate statement (the GROUP
