@@ -127,26 +127,130 @@ Exactly the predicted two scans (rank + series). One statement when
 
 ### Band-count sensitivity
 
-Fixed 180-day window (4,278,829 jobs) at three granularities, so row count and
-filters are identical and **ladder width is the only variable**. The three
-periods are **interleaved** across 6 rounds — measuring them in sequence lets
-buffer-cache warming masquerade as a band-count effect (a first, sequential
-pass suggested only +27 %; interleaving shows the real figure):
+> **Corrected 2026-07-29.** This section previously reported **+54 % at 180
+> bands** and concluded band count was a large cost knob. That figure was a
+> measurement artifact: the three periods were timed **sequentially**, so
+> buffer-cache warming rode along with band count — the exact failure this
+> section warned about while committing it. Re-measured with the periods
+> **interleaved inside one loop**, 180 bands costs ~10 %, not 54 %. The
+> `date_trunc` follow-up it proposed was also measured, and is not a fast
+> path. Corrected tables below.
 
-| period | bands | min | vs month |
+Fixed window at three granularities, so row count and filters are identical
+and **ladder width is the only variable**. Periods interleaved across rounds;
+min of N.
+
+| window | period | bands | min | vs month |
+|---|---|---|---|---|
+| 180 d (4,306,697 jobs) | month | 7 | 6735 ms | 1.00× |
+| | week | 26 | 6848 ms | 1.02× |
+| | day | 180 | 7390 ms | **1.10×** |
+| 730 d (16,604,039 jobs) | month | 25 | 8909 ms | 1.00× |
+| | week | 105 | 9505 ms | 1.07× |
+| | day | 730 | 14699 ms | **1.65×** |
+
+The `CASE` ladder really is ~O(bands/2) comparisons per scanned row — the
+original instinct was right — but the cost does not become visible until the
+ladder is several hundred arms wide. ~10 % at 180, ~65 % at 730. So
+`_MAX_TIMESERIES_BANDS = 400` sits just below the knee, and SAM's
+auto-coarsening to ≤120 bars is comfortably inside it (and is really a
+legibility limit, not a cost one).
+
+#### `date_trunc` is not the escape hatch
+
+The previous text named a PostgreSQL `date_trunc` fast path (O(1) per row,
+ladder retained for SQLite) as the fix if this ever needed to go wider. It was
+built and A/B'd against the ladder, interleaved, with bit-identical labels:
+
+| case | bands | ladder | `date_trunc` | ratio |
+|---|---|---|---|---|
+| 30 d / day, unscoped | 30 | 1558.8 ms | 1516.0 ms | 0.97× |
+| 180 d / day, unscoped | 180 | 7948.5 ms | 7921.8 ms | 1.00× |
+| 180 d / week, unscoped | 26 | 7131.7 ms | 7790.1 ms | 1.09× |
+| 365 d / day, unscoped | 365 | 10383.6 ms | 9871.9 ms | 0.95× |
+| 30 d / day, account-scoped | 30 | 127.6 ms | 135.4 ms | 1.06× |
+| 180 d / day, account-scoped | 180 | 764.6 ms | 655.8 ms | 0.86× |
+
+Parity within noise everywhere. The ladder is not what these queries spend
+their time on — see below.
+
+### Where the time actually goes
+
+`EXPLAIN (ANALYZE, BUFFERS)` on the unscoped 180 d / day series: a full
+`Parallel Seq Scan` on `jobs` (1.18 M blocks read from disk, 4.8 s)
+hash-joined against a full `Parallel Seq Scan` of *all* of `job_charges`.
+Isolating it, interleaved:
+
+| shape | min |
+|---|---|
+| with the `job_charges` join + 4 SUMs | 7739.7 ms |
+| `COUNT` only, no join | 4253.8 ms |
+| **join's share of total** | **45 %** |
+
+So the outer join to `job_charges` — not the ladder — is the dominant cost of
+every wide aggregate in this module.
+
+### The `daily_summary` fast path
+
+`daily_summary` is keyed `(date, user_id, account_id, queue_id)`, bins
+site-local by the same convention `_period_bands` computes with, and already
+stores both hours and QoS-weighted charges. Where the filter set is expressible
+in that key it answers the same question without touching `jobs`:
+
+| query | scan `jobs` | `daily_summary` | speedup |
 |---|---|---|---|
-| month | 7 | 3221 ms | 1.00× |
-| week | 26 | 3059 ms | 0.95× |
-| day | 180 | 4971 ms | **1.54×** |
+| 180 d / day, unscoped | 7390 ms | 15.6 ms | **474×** |
+| 730 d / day, unscoped | 14699 ms | 28.0 ms | **525×** |
 
-7 → 26 bands is flat (within noise); 7 → 180 costs **+54 %**. The `CASE`
-ladder is ~O(bands/2) comparisons per scanned row, so band count is a real
-cost knob — a bigger one than a sequential measurement implies. Hence
-`_MAX_TIMESERIES_BANDS = 400` as a backstop and, on the SAM side,
-auto-coarsening day → week → month to hold a chart near ≤120 bars. If this
-ever needs to go wider, the fix is a dialect-specific `date_trunc` fast path
-on PostgreSQL (O(1) per row) with the ladder retained for SQLite, not a
-higher cap.
+Fast-path figures are **end to end** — routing predicate plus query, i.e. what
+a caller actually waits for. The aggregate alone is 9.1 ms / 21.3 ms; the
+routing coverage check (below) is the ~7 ms difference.
+
+Agreement, 180 d window: `job_count` 4,306,697 == 4,306,697 == `jobs_count()`;
+`cpu_hours` 9,175,159.7 both ways; `cpu_charges` 7,352,227.1 both ways.
+Verified across 11 filter shapes — counts, band labels, window echo and owner
+keys match exactly; the float metrics to ~1e-13 relative, since the rollup
+pre-sums each group and the series re-folds those subtotals while the scan
+sums every job in one pass.
+
+Implemented as `JobQueries._timeseries_uses_summary` (routing) plus
+`_timeseries_from_summary` (execution), the same fast/slow split `fs_scans`
+uses for its precomputed histograms. `qos`, `exit_status`, `job_id`, `name`
+and every `min_*`/`max_*` bound force the scan path. Because the fast path has
+no ladder at all, it gets the looser `_MAX_SUMMARY_BANDS = 1200` — three years
+of daily bands — while the scan path keeps 400.
+
+**Coverage, not a watermark.** The obvious freshness test is "is the window at
+or before `max(daily_summary.date)`", and it is not enough: the rollup lags
+`jobs` at the top *and* need not reach back to the beginning of history (a
+partial `--resummarize` leaves an earlier gap), and a single skipped day
+mid-window would come back as a zero band while the scan path finds jobs — a
+silent under-count, the worst failure mode available here. Because
+`generate_daily_summary` writes a NO_JOBS marker for a day with no jobs, every
+*processed* day has at least one row, so `COUNT(DISTINCT date)` against the
+window's width is an exact check. Measured ~20 ms on casper_jobs — one
+aggregate on an indexed column of a table three orders of magnitude smaller
+than `jobs`, against 7390 ms saved. Anything short of full coverage falls back
+for the whole window; there is deliberately no hybrid, because two code paths
+contributing to one band vector is where a double-count would live.
+
+### Indexes: measured, and declined
+
+`SCHEMA.md` flagged the absence of `(account_id, end)` as a gap an
+account-scoped series would benefit from. Measured, it is a weak win: PostgreSQL
+already resolves the scoped shape with `BitmapAnd(ix_jobs_account_id,
+ix_jobs_end)`.
+
+| query, 30 d window | min |
+|---|---|
+| account-scoped, no owners | 119.4 ms |
+| user-scoped, no owners | 202.2 ms |
+| account-scoped, `owners_limit=10` | 257.2 ms |
+
+In the account-scoped plan the BitmapAnd costs ~23 ms of 105 ms, while the
+nested loop into `job_charges` is 638 k of 684 k buffers. Not worth an index
+on a 21 M-row table; the join is the target, and the fast path avoids it
+entirely.
 
 **Reproduce:** `scripts/bench_jobs_aggregates.py` (see below).
 
@@ -175,26 +279,71 @@ higher cap.
   because `histogram_jobs` is uniformly 1.0, where charges and hours coincide
   and a swapped formula would pass unnoticed.
 
-`job_history/tests/`: **673 passed**. The 38 `fs_scans` failures on this
-branch are pre-existing — verified by stashing these changes and re-running.
+Added in the self-review round:
+
+- `TestTimeseriesSummaryRouting` — which path answers and why: every
+  serviceable filter routes to the rollup, every aggregated-away one falls
+  back, a window past the watermark falls back, and the fast path issues no
+  statement against `jobs` at all. `test_every_filter_is_classified` walks
+  the method's own signature, so a **new** filter defaults to the safe path
+  instead of being silently ignored by the summary.
+- `TestTimeseriesPathEquivalence` — the decisive contract, 33 parametrized
+  shapes (3 periods × 11 filter/owner combinations) plus a derived window.
+  Counts, band labels, window echo and owner rank order compared **exactly**;
+  float metrics approximately, for the summation-order reason above.
+- `TestTimeseriesBandCaps` — the two caps, and that the summary path serves a
+  window the scan path refuses.
+- `TestTimeseriesSummaryCoverageLimit` — pins the one legitimate divergence
+  (below) rather than leaving it latent.
+- Re-bounding guards: the series statement carries a bounded `job.end`
+  predicate; a slice whose rows are *all* NULL-`end` still reports
+  `total_count == jobs_count()`; a partial-bound empty window echoes the
+  bound the caller supplied.
+
+`job_history/tests/`: **739 passed**. The `fs_scans` failures on this branch
+are pre-existing — verified by stashing these changes and re-running.
+
+## A rollup bug the fast path exposed
+
+`sync/summary.py` **inner**-joined `job_charges`, so a job with no charge row
+was silently dropped from `daily_summary` — and therefore from
+`daily_summary_report`, a charging surface. `trg_ensure_job_charge` makes that
+impossible in production (0 of 21.0M rows on casper_jobs), but a rollup should
+not depend on a trigger for its arithmetic. Now a LEFT join with `COALESCE`ed
+sums, so such a job counts with zero hours exactly as every outer-joining
+query already reports it. The path-equivalence test is what caught it.
+
+Rows whose `user_id` / `account_id` / `queue_id` is NULL are still excluded,
+and that one is **not** incidental: a NULL FK triple is already the NO_JOBS
+marker, so an unattributable job cannot be stored without becoming
+indistinguishable from one. That is the fast path's one documented coverage
+limit, pinned by `TestTimeseriesSummaryCoverageLimit` — also 0 of 21.0M rows.
 
 ## Docs touched
 
 - `CLAUDE.md` key-files: `jobs_timeseries` in the shared-filter family, the
-  `_METRIC_KEYS` note, and a warning on `PeriodGrouper`'s UTC formatting.
-- `job_history/SCHEMA.md` § *Composite Indexes* — **corrected**. It claimed
-  `(queue_id, end)`, `(queue_id, user_id, end)`, `(queue_id, account_id, end)`
-  and a planner trace through `ix_jobs_queue_end`; none of those indexes
-  exist. Replaced with the real inventory plus the known `(account_id, end)`
-  gap.
+  `_METRIC_KEYS` note, a warning on `PeriodGrouper`'s UTC formatting, the
+  fast path, and `sync/summary.py`'s join.
+- `job_history/SCHEMA.md` § *Composite Indexes* — **corrected twice**. It
+  claimed `(queue_id, end)`, `(queue_id, user_id, end)`,
+  `(queue_id, account_id, end)` and a planner trace through
+  `ix_jobs_queue_end`; none of those indexes exist. The replacement then
+  called the missing `(account_id, end)` a gap worth closing, which
+  measurement did not support — now records the numbers and declines it.
 
 ## Not in scope
 
-- `(account_id, end)` / `(queue_id, end)` composites — already deferred in
-  `JOB_HIST_PLUGIN_ENHANCEMENTS.md`; an account-scoped series is the query
-  that would benefit most.
+- `(account_id, end)` / `(queue_id, end)` composites — measured and
+  **declined**, see § *Indexes*. The join, not the index, is the cost.
+- Denormalising `cpu_hours`/`gpu_hours`/`qos_factor` onto `jobs` to kill the
+  45 % join. Real, but a schema change against the `job_charges` 1:1 trigger
+  design, with a migration in `bin/update_jobs_db.py`. Its own PR.
+- A `daily_summary` fast path for `jobs_histogram` / `jobs_usage_by`.
+  `jobs_usage_by` is the natural next candidate — same serviceable filter
+  subset — but one new path per PR.
 - `quarter` / `year` periods — a chart that wide wants month bands, and
   keeping the vocabularies independent avoids implying `PeriodGrouper`
   compatibility.
 - `memory_hours` / `memory_charges` in the metric vector — omitted until a
   consumer needs them, consistent with the existing note in `jobs_usage_by`.
+  Note the rollup already stores them, so the fast path could serve them free.

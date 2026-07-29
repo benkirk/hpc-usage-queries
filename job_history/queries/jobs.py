@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Sequence, Union
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, and_, or_, false
+from sqlalchemy import func, and_, or_, false, distinct
 from sqlalchemy.orm import Session
 
 from ..database import Job, DailySummary, JobCharge, JobQoS
@@ -115,11 +115,44 @@ def _bucket_case(field, buckets):
 #: :func:`_period_bands` for why that helper cannot be reused here.
 _TIMESERIES_PERIODS = ("day", "week", "month")
 
-#: Hard cap on the period ladder's width. :func:`_period_case` emits one
-#: WHEN arm per band and PostgreSQL evaluates the ladder per scanned row, so
-#: band count is a real cost knob (measured ~O(bands/2) comparisons/row).
-#: Callers pick a coarser *period* for wide windows rather than raising this.
+#: Hard cap on the period ladder's width, for the ``jobs`` **scan** path.
+#: :func:`_period_case` emits one WHEN arm per band and PostgreSQL evaluates
+#: the ladder per scanned row, so band count is a real cost knob — but it does
+#: not bite where the first cut of this method assumed. Measured on PG 18 /
+#: casper_jobs (21.0M jobs), periods **interleaved** inside one loop and the
+#: window held fixed so ladder width is the only variable:
+#:
+#:   180d window (4.3M rows):    7 bands 6735ms | 26 bands 6848ms (1.02x)
+#:                             180 bands 7390ms (1.10x)
+#:   730d window (16.6M rows):  25 bands 8909ms | 105 bands 9505ms (1.07x)
+#:                             730 bands 14699ms (1.65x)
+#:
+#: So ~10 % at 180 bands and ~65 % at 730 — the O(bands/2) argument is sound,
+#: it just does not show until the ladder is several hundred arms wide. 400
+#: sits below that knee. Callers pick a coarser *period* rather than raising
+#: it. (An earlier "+54 % at 180 bands" figure was a measurement artifact:
+#: the periods were timed sequentially, so cache warming rode along with band
+#: count. A PostgreSQL ``date_trunc`` fast path was also tried and measured at
+#: parity with the ladder, 0.86-1.11x — it is not the escape hatch.)
 _MAX_TIMESERIES_BANDS = 400
+
+#: The same cap for the ``daily_summary`` fast path, which has no ladder at
+#: all — it groups the pre-binned ``date`` column, so band count costs nothing
+#: (730 daily bands: 21 ms, against 14699 ms for the scan path). This cap is
+#: purely a JSON-payload backstop; ~1200 is over three years of daily bands.
+_MAX_SUMMARY_BANDS = 1200
+
+#: Filters :class:`~job_history.database.models.DailySummary` can express.
+#: Its unique key is ``(date, user_id, account_id, queue_id)``, so those
+#: dimensions — and only those — survive the rollup. Anything else is a
+#: per-job attribute that was aggregated away and forces the ``jobs`` scan.
+#: ``qos`` is the subtle one: a qos *filter* cannot be served, but the
+#: qos-weighted *metrics* can, because ``sync.summary`` folds ``qos_factor``
+#: into the stored ``*_charges`` with the same ``hours x factor`` formula
+#: :func:`_charge_expr` uses.
+_SUMMARY_SERVICEABLE_FILTERS = frozenset({
+    "start", "end", "user", "account", "queue", "ignore_case",
+})
 
 
 def _site_midnight_utc(day: date) -> datetime:
@@ -275,8 +308,13 @@ def _zero_metrics() -> List[float]:
 
 def _accumulate(acc: List[float], count, cpu, gpu, cpu_chg, gpu_chg) -> None:
     """Fold one aggregate row into *acc*. SUM over an all-NULL charge group
-    is NULL, hence the ``or 0.0``."""
-    acc[0] += int(count)
+    is NULL, hence the ``or 0.0``.
+
+    ``count`` gets the same treatment: it is ``COUNT()`` on the ``jobs`` scan
+    path, which is never NULL, but ``SUM(job_count)`` on the ``daily_summary``
+    fast path, which can be.
+    """
+    acc[0] += int(count or 0)
     acc[1] += float(cpu or 0.0)
     acc[2] += float(gpu or 0.0)
     acc[3] += float(cpu_chg or 0.0)
@@ -2565,7 +2603,7 @@ class JobQueries:
                  "owners": {"alice": {...}}},   # top-N, global rank order
                 ...
               ],
-              "totals": {...},            # every band, pre-truncation
+              "totals": {...},            # Σ over every band
               "null_count": 0,            # filters matched, Job.end NULL
               "total_count": 24680,       # Σ band job_count + null_count
             }
@@ -2577,16 +2615,24 @@ class JobQueries:
         ``job_count``, and ``total_count == jobs_count(**filters)``; both
         are pinned by tests.
 
-        ``start``/``end`` echo the **resolved** window. When the caller
-        supplies neither (an explicit opt-in to full history), the domain is
-        derived from ``MIN``/``MAX`` of ``Job.end`` under the same filters —
-        one extra cheap aggregate — because a band vector needs a domain.
-        An empty result yields no bands.
+        ``start``/``end`` echo the **resolved** window, and both statements
+        are re-bound to it, so the band ladder's totality is a property of
+        the WHERE clause rather than of the probe's snapshot. When the caller
+        supplies neither bound (an explicit opt-in to full history), the
+        domain is derived from ``MIN``/``MAX`` of ``Job.end`` under the same
+        filters, because a band vector needs a domain. That probe is **not**
+        cheap under a real filter set — see
+        :meth:`_resolve_timeseries_window` — so pass explicit bounds when you
+        can. A window with no banded rows yields no bands but still echoes
+        whichever bound the caller supplied.
 
         ``null_count`` collects rows matching the filters whose ``Job.end``
-        is NULL; they never land in a band. In practice a bounded window
-        excludes them already (NULL fails both bounds), so this is non-zero
-        only for an unbounded query.
+        is NULL; they belong to no calendar band. It rides out on the same
+        probe, so it survives the re-bounding that would otherwise drop those
+        rows, and ``total_count == jobs_count(**filters)`` holds even for a
+        slice whose rows are *all* NULL-``end``. A caller-bounded window
+        excludes them by its own date filter, so this is non-zero only for an
+        unbounded query.
 
         The ``owners`` remainder is derivable, never synthesized: a band's
         "Others" is exactly ``band totals − Σ band owners``. Rows whose
@@ -2594,18 +2640,23 @@ class JobQueries:
         into that remainder by construction — SQL maps both to the same NULL
         group key.
 
-        Cost: **two aggregate statements** when *owners_limit* is set (one
-        to rank owners over the window, one for the series), **one**
-        otherwise; plus one MIN/MAX probe when the window is derived. Each
-        scans the filtered slice once. The band ladder costs ~O(bands/2)
-        comparisons per scanned row, so prefer a coarser *period* over a
-        wide day-granular window — band count is capped at
-        :data:`_MAX_TIMESERIES_BANDS`.
+        Cost: served off ``daily_summary`` when the filter set and the
+        window allow it (see :meth:`_timeseries_uses_summary`) — measured
+        **9 ms** against **7390 ms** for a 180d daily series on a 21.0M-job
+        PostgreSQL, agreeing to the last digit. Otherwise it scans ``jobs``:
+        **two aggregate statements** when *owners_limit* is set (one to rank
+        owners over the window, one for the series), **one** otherwise, plus
+        the MIN/MAX probe when the window is derived. Either way the envelope
+        is identical — consumers cannot tell which path ran. On the scan path
+        the band ladder costs ~O(bands/2) comparisons per scanned row, which
+        is ~10 % at 180 bands and ~65 % at 730, hence
+        :data:`_MAX_TIMESERIES_BANDS`; the fast path has no ladder and gets
+        the looser :data:`_MAX_SUMMARY_BANDS`.
 
         Raises:
             ValueError: unknown *period*, non-positive *owners_limit*,
                 unknown *owners_by* / *owners_sort_by*, or a window whose
-                band count exceeds the cap.
+                band count exceeds the cap for the path it routed to.
         """
         if period not in _TIMESERIES_PERIODS:
             valid = ", ".join(_TIMESERIES_PERIODS)
@@ -2638,28 +2689,62 @@ class JobQueries:
             max_memory_wasted=max_memory_wasted,
         )
 
-        win_start, win_end = self._resolve_timeseries_window(start, end, filters)
-        empty = {
-            "period": period, "owners_by": owners_by,
-            "start": None, "end": None, "bands": [],
-            "totals": _metrics_dict(_zero_metrics()),
-            "null_count": 0, "total_count": 0,
-        }
+        win_start, win_end, null_count = self._resolve_timeseries_window(
+            start, end, filters)
+
+        def _empty(win_lo, win_hi):
+            # NULL-``end`` rows match the filters but belong to no calendar
+            # band, so they still count toward total_count.
+            return {
+                "period": period, "owners_by": owners_by,
+                "start": win_lo.isoformat() if win_lo is not None else None,
+                "end": win_hi.isoformat() if win_hi is not None else None,
+                "bands": [],
+                "totals": _metrics_dict(_zero_metrics()),
+                "null_count": null_count, "total_count": null_count,
+            }
+
         if win_start is None:
-            # No rows at all, and no caller-supplied domain to zero-fill over.
-            return empty
+            # Nothing landed in a band, and no derivable domain to zero-fill
+            # over. Echo whichever bound the caller DID supply rather than
+            # discarding it — only a missing bound reaches the probe.
+            return _empty(start, end)
 
         bands = _period_bands(win_start, win_end, period)
         if not bands:
             # Inverted window (start > end). ``jobs_count``/``jobs_search``
             # answer 0 rather than raising, so this does too — and returning
             # early also keeps _period_case from indexing an empty ladder.
-            return empty
-        if len(bands) > _MAX_TIMESERIES_BANDS:
+            return _empty(win_start, win_end)
+
+        # Route BEFORE capping: the two paths cost ~700x differently, so they
+        # do not share a band budget. Routing needs only the filter set and
+        # the resolved window, both settled by now.
+        via_summary = self._timeseries_uses_summary(
+            filters, win_start, win_end, owners_by)
+        cap = _MAX_SUMMARY_BANDS if via_summary else _MAX_TIMESERIES_BANDS
+        if len(bands) > cap:
             raise ValueError(
                 f"{win_start}..{win_end} at period={period!r} needs "
-                f"{len(bands)} bands, over the {_MAX_TIMESERIES_BANDS} cap. "
+                f"{len(bands)} bands, over the {cap} cap "
+                f"({'daily_summary' if via_summary else 'jobs scan'} path). "
                 f"Use a coarser period or a narrower window.")
+
+        # Re-bind BOTH statements to the resolved window. Left unbounded (as
+        # they are whenever a bound was derived) two things go wrong:
+        # _period_case's totality would rest on the probe's snapshot rather
+        # than on the WHERE clause — a job synced between the probe and the
+        # series lands in the ``else_`` arm and silently breaks that band's
+        # ``jobs_search`` replay — and the rank statement and the series
+        # statement could disagree about a late-arriving row under READ
+        # COMMITTED. ``null_count`` already came off the probe, so bounding
+        # here costs no information.
+        filters["start"], filters["end"] = win_start, win_end
+
+        if via_summary:
+            return self._timeseries_from_summary(
+                bands, filters, period, owners_by, owners_limit,
+                owners_sort_by, win_start, win_end, null_count)
 
         # Statement 1 (owners only): rank owners ONCE over the whole window,
         # so the band vector shares one legend and one colour assignment.
@@ -2711,13 +2796,16 @@ class JobQueries:
 
         by_label: Dict[str, List[float]] = {}
         owners_by_label: Dict[str, Dict[Any, List[float]]] = {}
-        null_count = 0
         for row in rows:
             if with_owners:
                 label, owner_id, metric_cols = row[0], row[1], row[2:]
             else:
                 label, owner_id, metric_cols = row[0], None, row[1:]
             if label == _NULL_BUCKET:
+                # Unreachable now that the statement is bounded — a date
+                # filter drops NULL ``end``, and ``null_count`` comes off the
+                # probe instead. Kept because _period_case is total on its own
+                # terms and counting beats silently dropping if that changes.
                 null_count += int(metric_cols[0])
                 continue
             _accumulate(by_label.setdefault(label, _zero_metrics()), *metric_cols)
@@ -2762,25 +2850,254 @@ class JobQueries:
             "total_count": totals["job_count"] + null_count,
         }
 
+    def _timeseries_uses_summary(self, filters, win_start, win_end, owners_by):
+        """Can ``daily_summary`` answer this series, or must we scan ``jobs``?
+
+        The fast path is worth a lot — measured on PG 18 / casper_jobs
+        (21.0M jobs), a 180d daily series costs **9 ms** off the summary
+        against **7390 ms** scanning ``jobs``, agreeing to the last digit on
+        ``job_count``, ``cpu_hours`` and ``cpu_charges``; 730 daily bands are
+        21 ms against 14699 ms. It is the same fast/slow split ``fs_scans``
+        uses for its precomputed histograms.
+
+        Two independent conditions, both required:
+
+        **Expressible filters.** ``daily_summary``'s unique key is
+        ``(date, user_id, account_id, queue_id)``; every other filter is a
+        per-job attribute the rollup aggregated away. See
+        :data:`_SUMMARY_SERVICEABLE_FILTERS`.
+
+        **Complete coverage.** Every day in the window must actually be
+        summarized. A trailing-watermark test is not enough: the summary lags
+        ``jobs`` at the top *and* need not reach back to the beginning of
+        history (a partial ``--resummarize`` leaves an earlier gap), and a
+        single skipped day mid-window would come back as a zero band while
+        the scan path finds jobs. :func:`~job_history.sync.summary.generate_daily_summary`
+        writes a NO_JOBS marker row for a day with no jobs, so every
+        *processed* day has at least one row and ``COUNT(DISTINCT date)``
+        against the window's width is an exact check — one aggregate on an
+        indexed column of a table three orders of magnitude smaller than
+        ``jobs``.
+
+        Anything short of full coverage falls back for the **whole** window.
+        There is deliberately no hybrid (summary for the covered days, live
+        scan for the rest), because two code paths contributing to one band
+        vector is exactly where a silent double-count would live.
+
+        .. warning::
+
+           This inherits ``daily_summary``'s coverage, which is **not** a
+           faithful rollup of ``jobs``: :mod:`sync.summary` skips rows whose
+           ``user_id`` / ``account_id`` / ``queue_id`` is NULL (summary.py
+           ``AND j.* IS NOT NULL``) and inner-joins ``job_charges``, so a
+           chargeless job is dropped too. Where such rows exist the fast path
+           under-counts against the scan path. Both are currently impossible
+           in production — ``trg_ensure_job_charge`` guarantees the charge
+           row at DB level, and casper_jobs has 0 of either across all 21.0M
+           rows — and this is the same bar :meth:`daily_summary_report`
+           already ships at. If that ever stops holding, the fix belongs in
+           :mod:`sync.summary`, not here.
+        """
+        # `ignore_case` only modifies `name` matching and defaults to False;
+        # every other filter is None when unset. `0` is a meaningful bound,
+        # so test against None rather than truthiness.
+        active = {k for k, v in filters.items() if v is not None and v is not False}
+        if active - _SUMMARY_SERVICEABLE_FILTERS:
+            return False
+        if owners_by not in ("user", "account"):
+            return False
+        covered = self.session.query(
+            func.count(distinct(DailySummary.date))
+        ).filter(
+            DailySummary.date >= win_start, DailySummary.date <= win_end
+        ).scalar()
+        return covered == (win_end - win_start).days + 1
+
+    def _timeseries_from_summary(self, bands, filters, period, owners_by,
+                                 owners_limit, owners_sort_by,
+                                 win_start, win_end, null_count):
+        """:meth:`jobs_timeseries` served off ``daily_summary``.
+
+        Returns the same envelope as the ``jobs``-scan path — same band
+        vector, same :data:`_METRIC_KEYS`, same owner contract and rank
+        order — so a consumer cannot tell which path ran. Pinned by the
+        equivalence tests rather than by inspection.
+
+        Counts and structure are **exact**: measured across 11 shapes on
+        casper_jobs (21.0M jobs), every ``job_count``, band label, window
+        echo and owner key matched the scan path bit for bit. The float
+        metrics agree to ~1e-13 relative but not bit for bit, because
+        summation order differs — the rollup pre-sums each
+        ``(date, user, account, queue)`` group and this re-folds those
+        subtotals, where the scan sums every job in one pass, and float
+        addition is not associative. Fewer accumulation steps means the fast
+        path's sums are, if anything, marginally the more accurate of the
+        two. Equivalence tests must compare floats approximately.
+
+        There is no ``CASE`` ladder here: ``DailySummary.date`` is already
+        binned into site-local calendar days by :mod:`sync.summary`, using
+        the same convention :func:`_period_bands` computes with, so the
+        date -> band mapping is a Python dict lookup and band count costs
+        nothing.
+        """
+        owner_fk = {"user": DailySummary.user_id,
+                    "account": DailySummary.account_id}[owners_by]
+        owner_model, owner_name_col = {
+            "user": (User, User.username),
+            "account": (Account, Account.account_name),
+        }[owners_by]
+
+        label_of: Dict[date, str] = {}
+        for band in bands:
+            day = band["start"]
+            while day <= band["end"]:
+                label_of[day] = band["label"]
+                day += timedelta(days=1)
+
+        def _filtered(query):
+            query = query.filter(DailySummary.date >= win_start,
+                                 DailySummary.date <= win_end)
+            for dim, col in (("user", DailySummary.user_id),
+                             ("account", DailySummary.account_id),
+                             ("queue", DailySummary.queue_id)):
+                value = filters.get(dim)
+                if dim == "account" and isinstance(value, str) and not value:
+                    continue        # empty projcode string == no filter
+                if value:
+                    query = query.filter(
+                        self._lookup_fk_clause(dim, value, fk_col=col))
+            return query
+
+        metric_cols = [
+            func.sum(DailySummary.job_count),
+            func.sum(DailySummary.cpu_hours),
+            func.sum(DailySummary.gpu_hours),
+            func.sum(DailySummary.cpu_charges),
+            func.sum(DailySummary.gpu_charges),
+        ]
+
+        # Statement 1 (owners only): rank ONCE over the window, exactly as
+        # the scan path does, so both produce the same legend.
+        top_ids: List[Any] = []
+        top_names: Dict[Any, str] = {}
+        if owners_limit is not None:
+            rank_q = _filtered(self.session.query(owner_fk, *metric_cols))
+            candidates = {}
+            for owner_id, *cols in rank_q.group_by(owner_fk).all():
+                if owner_id is None:
+                    continue    # NO_JOBS markers and NULL FKs: the remainder
+                acc = _zero_metrics()
+                _accumulate(acc, *cols)
+                candidates[owner_id] = _metrics_dict(acc)
+            names = self._resolve_lookup_names(
+                owner_model, owner_name_col, set(candidates))
+            ranked = sorted(
+                ((str(names.get(oid, oid)), oid, m)
+                 for oid, m in candidates.items()),
+                key=lambda t: (-_usage_rank(owners_sort_by, t[2]), t[0]),
+            )[:owners_limit]
+            top_ids = [oid for _n, oid, _m in ranked]
+            top_names = {oid: nm for nm, oid, _m in ranked}
+
+        # Statement 2: the series. Same trick as the scan path — non-top-N
+        # owners collapse to a NULL group key, joining the derivable
+        # remainder without a second pass.
+        with_owners = owners_limit is not None and bool(top_ids)
+        select_cols: List[Any] = [DailySummary.date, *metric_cols]
+        group_cols: List[Any] = [DailySummary.date]
+        if with_owners:
+            owner_key = case((owner_fk.in_(top_ids), owner_fk)).label("owner_key")
+            select_cols.insert(1, owner_key)
+            group_cols.append(owner_key)
+        rows = _filtered(self.session.query(*select_cols)).group_by(
+            *group_cols).all()
+
+        by_label: Dict[str, List[float]] = {}
+        owners_by_label: Dict[str, Dict[Any, List[float]]] = {}
+        for row in rows:
+            if with_owners:
+                day, owner_id, cols = row[0], row[1], row[2:]
+            else:
+                day, owner_id, cols = row[0], None, row[1:]
+            label = label_of.get(day)
+            if label is None:
+                continue        # outside the window; the filter already bars it
+            _accumulate(by_label.setdefault(label, _zero_metrics()), *cols)
+            if owner_id is not None:
+                per_owner = owners_by_label.setdefault(label, {})
+                _accumulate(per_owner.setdefault(owner_id, _zero_metrics()), *cols)
+
+        out_bands = []
+        for band in bands:
+            out = {
+                "label": band["label"],
+                "start": band["start"].isoformat(),
+                "end": band["end"].isoformat(),
+                **_metrics_dict(by_label.get(band["label"], _zero_metrics())),
+            }
+            if owners_limit is not None:
+                per_owner = owners_by_label.get(band["label"], {})
+                out["owners"] = {
+                    top_names[oid]: _metrics_dict(
+                        per_owner.get(oid, _zero_metrics()))
+                    for oid in top_ids
+                }
+            out_bands.append(out)
+
+        totals = {key: sum(b[key] for b in out_bands) for key in _METRIC_KEYS}
+        return {
+            "period": period,
+            "owners_by": owners_by,
+            "start": win_start.isoformat(),
+            "end": win_end.isoformat(),
+            "bands": out_bands,
+            "totals": totals,
+            "null_count": null_count,
+            "total_count": totals["job_count"] + null_count,
+        }
+
     def _resolve_timeseries_window(self, start, end, filters):
-        """``(win_start, win_end)`` site-local dates for the band vector.
+        """``(win_start, win_end, null_count)`` for the band vector.
 
         Caller-supplied bounds win. A missing bound is derived from the
         observed ``MIN``/``MAX`` of ``Job.end`` under the same filters —
         converted back to site-local days, so the derived domain and the
-        bands share one timezone convention. Returns ``(None, None)`` when
-        nothing matches and no bound was supplied.
+        bands share one timezone convention. ``win_start`` is ``None`` when
+        nothing at all matched and no bound was supplied.
+
+        The probe also carries the NULL-``Job.end`` count, because
+        :meth:`jobs_timeseries` re-bounds its statements to the resolved
+        window and a bounded date filter drops those rows (NULL fails both
+        comparisons). Counting them here costs nothing — it is one more
+        aggregate on a scan already being made — and the coverage lines up
+        exactly: this probe runs **iff** a bound is missing, which is **iff**
+        ``null_count`` can be non-zero. When the caller supplies both bounds
+        their own filter has already excluded NULLs, so the count is 0
+        without asking.
+
+        Cost: **not** cheap. PostgreSQL can only shortcut ``MIN``/``MAX``
+        through ``ix_jobs_end`` when the predicate is index-compatible; under
+        a real filter set this is a full aggregate over the slice, on par
+        with the series statement itself. Callers who can supply explicit
+        bounds should — it skips this entirely.
         """
         if start is not None and end is not None:
-            return start, end
-        probe = self.session.query(func.min(Job.end), func.max(Job.end))
+            return start, end, 0
+        probe = self.session.query(
+            func.min(Job.end), func.max(Job.end),
+            func.count(Job.id).filter(Job.end.is_(None)),
+        )
         probe = self._apply_jobs_search_filters(probe, **filters)
-        lo, hi = probe.one()
+        lo, hi, nulls = probe.one()
+        nulls = int(nulls or 0)
         if lo is None or hi is None:
-            # Nothing matched, so there is no domain to zero-fill over. (Both
+            # No banded rows, so there is no domain to zero-fill over. (Both
             # bounds supplied already returned above, so there is no
-            # caller-supplied domain to fall back on here.)
-            return None, None
+            # caller-supplied domain to fall back on here.) The slice may
+            # still hold NULL-``end`` rows — they belong to no calendar band
+            # but they DO match the filters, so they ride out in null_count
+            # and keep ``total_count == jobs_count()`` honest.
+            return None, None, nulls
         site_tz = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
 
         def _to_site_day(naive_utc: datetime) -> date:
@@ -2788,7 +3105,8 @@ class JobQueries:
                     .astimezone(site_tz).date())
 
         return (start if start is not None else _to_site_day(lo),
-                end if end is not None else _to_site_day(hi))
+                end if end is not None else _to_site_day(hi),
+                nulls)
 
     def _resolve_lookup_names(self, model, name_col, ids) -> Dict[Any, Any]:
         """``{id: display_name}`` for a lookup table, post-aggregation.
@@ -2803,7 +3121,7 @@ class JobQueries:
             query = query.filter(model.id.in_(ids))
         return dict(query.all())
 
-    def _lookup_fk_clause(self, dim: str, value):
+    def _lookup_fk_clause(self, dim: str, value, *, fk_col=None):
         """Filter clause matching a lookup dimension by *name*, via its FK.
 
         The inverse of :meth:`_resolve_lookup_names`: one indexed probe of
@@ -2816,8 +3134,14 @@ class JobQueries:
         so an unresolvable name — or an empty sequence — yields ``false()``
         rather than silently dropping the filter. Rows with a NULL FK are
         excluded either way (``NULL = 'x'`` is not true).
+
+        *fk_col* overrides which table's FK the predicate lands on, so the
+        ``daily_summary`` fast path resolves names through this one code path
+        rather than a parallel copy. The lookup tables are shared, so only
+        the column changes.
         """
-        model, fk_col, name_col = _LOOKUP_DIMS[dim]
+        model, fk_col_default, name_col = _LOOKUP_DIMS[dim]
+        fk_col = fk_col_default if fk_col is None else fk_col
         names = (value,) if isinstance(value, str) else tuple(value)
         if not names:
             return false()
@@ -3111,8 +3435,15 @@ class JobQueries:
             end: End date (inclusive)
 
         Returns:
-            List of dicts with keys: date, user, account, queue,
-            job_count, cpu_hours, gpu_hours, memory_hours
+            List of dicts with keys: date, user, account, queue, job_count,
+            cpu_hours, gpu_hours, memory_hours, and their QoS-weighted
+            counterparts cpu_charges, gpu_charges, memory_charges
+            (``hours x qos_factor``, folded in by :mod:`sync.summary` with
+            the same formula :func:`_charge_expr` uses on the live tables).
+
+            **Charges are not proportional to hours** — ``qos_factor`` is a
+            genuine 0.0 for the ``uncharged`` QoS, so a row can report hours
+            > 0 with charges == 0.
         """
         if end is None:
             end = date.today()

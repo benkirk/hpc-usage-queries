@@ -36,6 +36,20 @@ def generate_daily_summary(
     Uses UTC timestamp ranges that match the Mountain Time day to ensure
     consistent attribution.
 
+    The join to ``job_charges`` is a LEFT join on purpose. It used to be an
+    inner join, which silently dropped any job without a charge row from the
+    rollup — and therefore from :meth:`~job_history.queries.JobQueries.daily_summary_report`,
+    a charging surface. ``trg_ensure_job_charge`` makes that impossible on the
+    production databases, but a rollup should not depend on a trigger for its
+    arithmetic: such a job now counts with zero hours, exactly as it does in
+    ``jobs_search`` / ``jobs_usage_by`` / ``jobs_timeseries``, which all outer
+    join. ``JobQueries._timeseries_uses_summary`` relies on that agreement.
+
+    Rows whose ``user_id`` / ``account_id`` / ``queue_id`` is NULL are still
+    excluded, and that one is NOT incidental: a NULL FK triple is already the
+    NO_JOBS marker (``DailySummary._null_sentinel``), so an unattributable job
+    cannot be stored without becoming indistinguishable from one.
+
     Args:
         session: SQLAlchemy session
         machine: Machine name (kept for API compatibility)
@@ -91,14 +105,14 @@ def generate_daily_summary(
             j.account_id,
             j.queue_id,
             COUNT(*) as job_count,
-            SUM(jc.cpu_hours   ) as cpu_hours,
-            SUM(jc.gpu_hours   ) as gpu_hours,
-            SUM(jc.memory_hours) as memory_hours,
-            SUM(jc.cpu_hours    * jc.qos_factor) as cpu_charges,
-            SUM(jc.gpu_hours    * jc.qos_factor) as gpu_charges,
-            SUM(jc.memory_hours * jc.qos_factor) as memory_charges
+            COALESCE(SUM(jc.cpu_hours   ), 0.0) as cpu_hours,
+            COALESCE(SUM(jc.gpu_hours   ), 0.0) as gpu_hours,
+            COALESCE(SUM(jc.memory_hours), 0.0) as memory_hours,
+            COALESCE(SUM(jc.cpu_hours    * jc.qos_factor), 0.0) as cpu_charges,
+            COALESCE(SUM(jc.gpu_hours    * jc.qos_factor), 0.0) as gpu_charges,
+            COALESCE(SUM(jc.memory_hours * jc.qos_factor), 0.0) as memory_charges
         FROM jobs j
-        JOIN job_charges jc ON j.id = jc.job_id
+        LEFT JOIN job_charges jc ON j.id = jc.job_id
         WHERE j.end >= :start_utc AND j.end < :end_utc
           AND j.user_id IS NOT NULL
           AND j.account_id IS NOT NULL

@@ -7,12 +7,15 @@ mirroring the dict-row shape of ``daily_summary_report``.
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import func
 
-from job_history.database import Job, JobCharge
+from job_history.database import DailySummary, Job, JobCharge
 from job_history.queries import JobQueries
 from job_history.queries.jobs import (
-    QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _USAGE_SORT_KEYS,
+    QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _MAX_SUMMARY_BANDS,
+    _MAX_TIMESERIES_BANDS, _SUMMARY_SERVICEABLE_FILTERS, _USAGE_SORT_KEYS,
 )
+from job_history.sync.summary import generate_daily_summary
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS
 
 
@@ -2336,7 +2339,12 @@ class TestJobsTimeseries:
     def test_null_end_jobs_land_in_null_count_not_a_band(
             self, in_memory_session, timeseries_jobs):
         """Job.end is nullable. Such rows match an unbounded query but belong
-        to no calendar band, so they keep total_count == jobs_count honest."""
+        to no calendar band, so they keep total_count == jobs_count honest.
+
+        They ride out on the MIN/MAX probe rather than the series statement,
+        which is what lets the series be re-bound to the resolved window
+        without losing them — a bounded date filter drops NULL ``end``.
+        """
         in_memory_session.add(Job(
             job_id="899.desched1", short_id=899, name="no-end", user="alice",
             account="NCAR0001", queue="main", status="0",
@@ -2352,6 +2360,60 @@ class TestJobsTimeseries:
         # A bounded window excludes it via the date filter instead.
         bounded = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
         assert bounded["null_count"] == 0 and bounded["total_count"] == 5
+
+    def test_all_null_end_slice_still_counts(self, in_memory_session):
+        """A slice whose rows ALL have NULL ``end`` has no domain to band
+        over — but the rows match the filters, so dropping them would break
+        ``total_count == jobs_count()``, the invariant this method advertises.
+        """
+        for i in range(3):
+            in_memory_session.add(Job(
+                job_id=f"9{i}0.desched1", short_id=900 + i, name="pending",
+                user="alice", account="NCAR0001", queue="main", status=None,
+                submit=datetime(2025, 7, 1, 12), start=None, end=None,
+                eligible_secs=60, numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day")
+        assert out["bands"] == []
+        assert out["null_count"] == 3
+        assert out["total_count"] == 3 == q.jobs_count()
+
+    def test_empty_partial_window_echoes_the_supplied_bound(
+            self, in_memory_session, timeseries_jobs):
+        """One bound supplied and nothing matched: echo it rather than
+        discarding it. Only a MISSING bound is ever derived."""
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=date(2030, 1, 1), user="nobody")
+        assert out["bands"] == []
+        assert out["start"] == "2030-01-01"
+
+    def test_series_statement_is_bounded_to_the_resolved_window(
+            self, in_memory_session, timeseries_jobs):
+        """The ladder's totality must rest on the WHERE clause, not on the
+        probe's snapshot: otherwise a row synced between the two lands in the
+        ``else_`` arm and silently breaks the last band's replay."""
+        from sqlalchemy import event
+
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_timeseries("day")  # unbounded
+        finally:
+            event.remove(
+                in_memory_session.bind, "before_cursor_execute", _capture)
+
+        series = [s for s in statements
+                  if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+        assert series, statements
+        for stmt in series:
+            assert "jobs.\"end\" >=" in stmt or "jobs.end >=" in stmt, stmt
+            assert "jobs.\"end\" <" in stmt or "jobs.end <" in stmt, stmt
 
     def test_filters_narrow_the_series(
             self, in_memory_session, timeseries_jobs):
@@ -2653,3 +2715,375 @@ class TestChargesAcrossAggregations:
             "user", sort_by="hours")["rows"][0]["value"] == "bob"
         assert q.jobs_usage_by(
             "user", sort_by="charges")["rows"][0]["value"] == "alice"
+
+
+# ---------------------------------------------------------------------------
+# jobs_timeseries — the daily_summary fast path
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def summarized_timeseries(in_memory_session, timeseries_jobs):
+    """``timeseries_jobs`` plus the real ``daily_summary`` rollup over it.
+
+    Deliberately runs :func:`generate_daily_summary` rather than hand-building
+    rows: the fast path's whole claim is that it agrees with the scan path,
+    and hand-built summaries would let a rollup bug hide behind a matching
+    fixture. Returns the watermark (last summarized day).
+    """
+    day = _TS_START
+    while day <= _TS_END:
+        generate_daily_summary(in_memory_session, "casper", day, replace=True)
+        day += timedelta(days=1)
+    in_memory_session.commit()
+    return _TS_END
+
+
+def _force_scan(monkeypatch):
+    """Disable the fast path for the duration of a test."""
+    monkeypatch.setattr(
+        JobQueries, "_timeseries_uses_summary", lambda *a, **k: False)
+
+
+class TestTimeseriesSummaryRouting:
+    """Which path answers, and why."""
+
+    def test_no_summary_rows_means_no_fast_path(
+            self, in_memory_session, timeseries_jobs):
+        """An unsummarized database must not silently return empty bands."""
+        q = JobQueries(in_memory_session)
+        assert q._timeseries_uses_summary(
+            {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
+            "user") is False
+
+    def test_serviceable_filters_route_to_the_summary(
+            self, in_memory_session, summarized_timeseries):
+        q = JobQueries(in_memory_session)
+        for extra in ({}, {"user": "alice"}, {"account": "NCAR0001"},
+                      {"queue": "main"}, {"ignore_case": True}):
+            filters = {"start": _TS_START, "end": _TS_END, **extra}
+            assert q._timeseries_uses_summary(
+                filters, _TS_START, _TS_END, "user") is True, extra
+
+    @pytest.mark.parametrize("unserviceable", [
+        {"qos": "regular"},          # not in daily_summary's key
+        {"exit_status": "0"},        # per-job attribute
+        {"job_id": "800"},
+        {"name": "t0"},
+        {"min_nodes": 0},            # 0 is a real bound, not "unset"
+        {"max_cpus": 8},
+        {"min_memory_wasted": 1},
+    ])
+    def test_unserviceable_filters_fall_back(
+            self, in_memory_session, summarized_timeseries, unserviceable):
+        """Every filter the rollup aggregated away must force the jobs scan —
+        serving it off the summary would silently ignore it."""
+        q = JobQueries(in_memory_session)
+        filters = {"start": _TS_START, "end": _TS_END, **unserviceable}
+        assert q._timeseries_uses_summary(
+            filters, _TS_START, _TS_END, "user") is False
+
+    def test_every_filter_is_classified(self):
+        """No filter may be accidentally serviceable: the whitelist plus the
+        aggregated-away set must together cover the shared filter signature,
+        so a NEW filter defaults to the safe path rather than being ignored."""
+        import inspect
+        params = {
+            name for name, p in
+            inspect.signature(JobQueries.jobs_timeseries).parameters.items()
+            if p.kind == p.KEYWORD_ONLY
+        } - {"owners_limit", "owners_sort_by", "owners_by"}
+        assert _SUMMARY_SERVICEABLE_FILTERS <= params
+        # Anything outside the whitelist must be rejected by the predicate.
+        q = JobQueries.__new__(JobQueries)
+        for extra in params - _SUMMARY_SERVICEABLE_FILTERS:
+            filters = {"start": _TS_START, "end": _TS_END, extra: 1}
+            assert q._timeseries_uses_summary(
+                filters, _TS_START, _TS_END, "user") is False, extra
+
+    def test_window_past_the_watermark_falls_back(
+            self, in_memory_session, summarized_timeseries):
+        """The summary lags jobs. A window touching an unsummarized day would
+        come back short, so the whole window falls back rather than hybridising.
+        """
+        q = JobQueries(in_memory_session)
+        assert q._timeseries_uses_summary(
+            {"start": _TS_START, "end": _TS_END + timedelta(days=1)},
+            _TS_START, _TS_END + timedelta(days=1), "user") is False
+        # Exactly at the watermark is still fine.
+        assert q._timeseries_uses_summary(
+            {"start": _TS_START, "end": _TS_END},
+            _TS_START, _TS_END, "user") is True
+
+    def test_window_reaching_back_before_coverage_falls_back(
+            self, in_memory_session, summarized_timeseries):
+        """A trailing watermark is not enough. The rollup need not reach back
+        to the start of history — a partial ``--resummarize`` leaves an
+        earlier gap — and those days would come back as zero bands while the
+        scan path finds jobs."""
+        q = JobQueries(in_memory_session)
+        earlier = _TS_START - timedelta(days=30)
+        assert q._timeseries_uses_summary(
+            {"start": earlier, "end": _TS_END}, earlier, _TS_END,
+            "user") is False
+
+    def test_a_single_missing_interior_day_falls_back(
+            self, in_memory_session, summarized_timeseries):
+        """The failure mode a watermark check misses entirely: one skipped
+        day mid-window silently becomes a zero band."""
+        q = JobQueries(in_memory_session)
+        assert q._timeseries_uses_summary(
+            {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
+            "user") is True
+        in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 3)).delete()
+        in_memory_session.commit()
+        assert q._timeseries_uses_summary(
+            {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
+            "user") is False
+
+    def test_no_jobs_marker_days_still_count_as_covered(
+            self, in_memory_session, timeseries_jobs):
+        """An idle day has only a NO_JOBS marker row. It IS summarized, so it
+        must not force a fallback — otherwise a quiet weekend would drop the
+        whole window onto the slow path."""
+        # 07-03 is idle in the fixture, so the rollup writes it as a marker.
+        day = _TS_START
+        while day <= _TS_END:
+            generate_daily_summary(in_memory_session, "casper", day,
+                                   replace=True)
+            day += timedelta(days=1)
+        in_memory_session.commit()
+        marker = in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 3)).one()
+        assert marker.user_id is None and marker.job_count == 0
+        assert JobQueries(in_memory_session)._timeseries_uses_summary(
+            {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
+            "user") is True
+
+    def test_fast_path_never_touches_the_jobs_table(
+            self, in_memory_session, summarized_timeseries):
+        """The point of the fast path: no scan of ``jobs`` at all."""
+        from sqlalchemy import event
+
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_timeseries(
+                "day", start=_TS_START, end=_TS_END, owners_limit=2)
+        finally:
+            event.remove(
+                in_memory_session.bind, "before_cursor_execute", _capture)
+
+        aggregates = [s for s in statements if "GROUP BY" in s.upper()]
+        assert aggregates
+        assert all("daily_summary" in s for s in aggregates), aggregates
+        assert not any("FROM jobs" in s for s in aggregates), aggregates
+
+
+class TestTimeseriesPathEquivalence:
+    """The decisive contract: a consumer cannot tell which path ran.
+
+    Counts, labels, window echo and owner keys must match **exactly**; the
+    float metrics only approximately, because the rollup pre-sums each
+    ``(date, user, account, queue)`` group and this re-folds those subtotals
+    while the scan sums every job in one pass — and float addition is not
+    associative.
+    """
+
+    _FLOAT_KEYS = ("cpu_hours", "gpu_hours", "cpu_charges", "gpu_charges")
+
+    @classmethod
+    def _assert_same(cls, fast, scan, ctx=""):
+        assert fast.keys() == scan.keys(), ctx
+        for key in ("period", "owners_by", "start", "end",
+                    "null_count", "total_count"):
+            assert fast[key] == scan[key], f"{ctx}: {key}"
+        assert [b["label"] for b in fast["bands"]] == \
+               [b["label"] for b in scan["bands"]], ctx
+        for fb, sb in zip(fast["bands"], scan["bands"]):
+            where = f"{ctx}: band {fb['label']}"
+            assert fb.keys() == sb.keys(), where
+            assert fb["job_count"] == sb["job_count"], where
+            assert (fb["start"], fb["end"]) == (sb["start"], sb["end"]), where
+            for key in cls._FLOAT_KEYS:
+                assert fb[key] == pytest.approx(sb[key]), f"{where}: {key}"
+            if "owners" in fb:
+                # Same legend, same rank ORDER — a stacked chart keys colour
+                # off position, so a reordered legend is a visible defect.
+                assert list(fb["owners"]) == list(sb["owners"]), where
+                for name, fm in fb["owners"].items():
+                    assert fm["job_count"] == sb["owners"][name]["job_count"], \
+                        f"{where}: {name}"
+                    for key in cls._FLOAT_KEYS:
+                        assert fm[key] == pytest.approx(
+                            sb["owners"][name][key]), f"{where}: {name}.{key}"
+        for key in ("job_count",):
+            assert fast["totals"][key] == scan["totals"][key], ctx
+        for key in cls._FLOAT_KEYS:
+            assert fast["totals"][key] == pytest.approx(
+                scan["totals"][key]), f"{ctx}: totals.{key}"
+
+    CASES = [
+        ("plain", {}),
+        ("owners", {"owners_limit": 2}),
+        ("owners by account", {"owners_limit": 2, "owners_by": "account"}),
+        ("owners by charges", {"owners_limit": 2, "owners_sort_by": "charges"}),
+        ("owners by job_count", {"owners_limit": 1,
+                                 "owners_sort_by": "job_count"}),
+        ("user filter", {"user": "alice"}),
+        ("account filter", {"account": "NCAR0002"}),
+        ("queue filter", {"queue": "main"}),
+        ("account seq", {"account": ["NCAR0001", "NCAR0002"]}),
+        ("scoped + owners", {"account": "NCAR0001", "owners_limit": 2}),
+        ("unresolvable user", {"user": "nobody"}),
+    ]
+
+    @pytest.mark.parametrize("period", ["day", "week", "month"])
+    @pytest.mark.parametrize("label,kwargs",
+                             CASES, ids=[c[0] for c in CASES])
+    def test_paths_agree(self, in_memory_session, summarized_timeseries,
+                         monkeypatch, period, label, kwargs):
+        q = JobQueries(in_memory_session)
+        fast = q.jobs_timeseries(
+            period, start=_TS_START, end=_TS_END, **kwargs)
+        _force_scan(monkeypatch)
+        scan = q.jobs_timeseries(
+            period, start=_TS_START, end=_TS_END, **kwargs)
+        self._assert_same(fast, scan, f"{period}/{label}")
+
+    def test_paths_agree_on_a_derived_window(
+            self, in_memory_session, summarized_timeseries, monkeypatch):
+        """The derived-domain path also has to route and agree."""
+        q = JobQueries(in_memory_session)
+        fast = q.jobs_timeseries("day", end=_TS_END)
+        _force_scan(monkeypatch)
+        scan = q.jobs_timeseries("day", end=_TS_END)
+        self._assert_same(fast, scan, "derived window")
+
+    def test_fast_path_totals_match_jobs_count(
+            self, in_memory_session, summarized_timeseries):
+        """The invariant survives the routing — a fast path that quietly
+        under-counted would still look self-consistent."""
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert out["total_count"] == q.jobs_count(
+            start=_TS_START, end=_TS_END) == 5
+
+    def test_fast_path_bands_replay_into_jobs_count(
+            self, in_memory_session, summarized_timeseries):
+        """A bar click still lands on exactly that bar's jobs."""
+        q = JobQueries(in_memory_session)
+        for period in ("day", "week", "month"):
+            out = q.jobs_timeseries(period, start=_TS_START, end=_TS_END)
+            for band in out["bands"]:
+                assert q.jobs_count(
+                    start=date.fromisoformat(band["start"]),
+                    end=date.fromisoformat(band["end"])
+                ) == band["job_count"], (period, band["label"])
+
+
+class TestTimeseriesBandCaps:
+    """The two caps differ because the two paths cost ~700x differently."""
+
+    def test_summary_cap_is_looser_than_the_scan_cap(self):
+        assert _MAX_SUMMARY_BANDS > _MAX_TIMESERIES_BANDS
+
+    def test_scan_path_refuses_a_ladder_past_its_cap(
+            self, in_memory_session, timeseries_jobs):
+        with pytest.raises(ValueError, match="jobs scan"):
+            JobQueries(in_memory_session).jobs_timeseries(
+                "day", start=date(2020, 1, 1), end=date(2025, 12, 31))
+
+    @staticmethod
+    def _mark_covered(session, start, end):
+        """Seed NO_JOBS markers, exactly as the rollup does for an empty day.
+
+        Cheaper than running the real rollup over 1200 days, and it is the
+        coverage predicate's actual input: one row per processed date.
+        """
+        day = start
+        while day <= end:
+            session.add(DailySummary(
+                date=day, user_id=None, account_id=None, queue_id=None,
+                job_count=0, cpu_hours=0.0, gpu_hours=0.0, memory_hours=0.0,
+                cpu_charges=0.0, gpu_charges=0.0, memory_charges=0.0))
+            day += timedelta(days=1)
+        session.commit()
+
+    def test_summary_path_allows_a_window_the_scan_path_refuses(
+            self, in_memory_session, summarized_timeseries):
+        """Two years of daily bands is a 15s query against ``jobs`` and a
+        21ms one against the rollup, so only one of them gets refused."""
+        q = JobQueries(in_memory_session)
+        wide_start = _TS_END - timedelta(days=_MAX_TIMESERIES_BANDS + 10)
+        self._mark_covered(in_memory_session, wide_start,
+                           _TS_START - timedelta(days=1))
+        out = q.jobs_timeseries("day", start=wide_start, end=_TS_END)
+        assert len(out["bands"]) == _MAX_TIMESERIES_BANDS + 11
+        assert out["total_count"] == 5      # zero-filled outside the data
+
+    def test_summary_path_still_has_a_payload_backstop(
+            self, in_memory_session, summarized_timeseries):
+        q = JobQueries(in_memory_session)
+        too_wide = _TS_END - timedelta(days=_MAX_SUMMARY_BANDS + 5)
+        self._mark_covered(in_memory_session, too_wide,
+                           _TS_START - timedelta(days=1))
+        with pytest.raises(ValueError, match="daily_summary"):
+            q.jobs_timeseries("day", start=too_wide, end=_TS_END)
+
+
+class TestTimeseriesSummaryCoverageLimit:
+    """The one place the two paths can legitimately disagree — pinned, not
+    hidden, so it fails loudly if the precondition ever stops holding.
+
+    :func:`generate_daily_summary` cannot store a job whose
+    ``user_id`` / ``account_id`` / ``queue_id`` is NULL, because a NULL FK
+    triple is already the NO_JOBS marker. The ``jobs`` scan path counts such
+    a job; the rollup has nowhere to put it. Measured 0 of 21.0M rows on
+    casper_jobs, so this is theory — but it is theory with a silent
+    under-count as its failure mode, which is why it gets a test.
+    """
+
+    def test_unattributable_job_is_absent_from_the_rollup(
+            self, in_memory_session, timeseries_jobs):
+        in_memory_session.add(Job(
+            job_id="880.desched1", short_id=880, name="orphan",
+            user=None, account=None, queue=None, status="0",
+            submit=datetime(2025, 7, 2, 12), start=datetime(2025, 7, 2, 12),
+            end=datetime(2025, 7, 2, 18), eligible_secs=60,
+            numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+        day = _TS_START
+        while day <= _TS_END:
+            generate_daily_summary(in_memory_session, "casper", day,
+                                   replace=True)
+            day += timedelta(days=1)
+        in_memory_session.commit()
+
+        q = JobQueries(in_memory_session)
+        # The scan path counts it...
+        assert q.jobs_count(start=_TS_START, end=_TS_END) == 6
+        # ...and the rollup does not, by construction.
+        rolled = in_memory_session.query(
+            func.sum(DailySummary.job_count)).filter(
+            DailySummary.date >= _TS_START,
+            DailySummary.date <= _TS_END).scalar()
+        assert rolled == 5, (
+            "daily_summary gained a NULL-FK row — if sync.summary changed, "
+            "the fast path's coverage caveat needs revisiting")
+
+    def test_chargeless_job_is_now_in_the_rollup(
+            self, in_memory_session, summarized_timeseries):
+        """Regression guard on the inner->LEFT join fix in sync.summary: job
+        804 has no JobCharge row and must still be counted, with zero hours,
+        exactly as every outer-joining query reports it."""
+        row = in_memory_session.query(
+            func.sum(DailySummary.job_count),
+            func.sum(DailySummary.cpu_hours),
+        ).filter(DailySummary.date == date(2025, 7, 5)).one()
+        assert row[0] == 1
+        assert (row[1] or 0.0) == pytest.approx(0.0)

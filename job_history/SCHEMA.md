@@ -61,11 +61,22 @@ plus single-column btrees on `job_id`, `short_id`, `status`, `submit`,
 `DailySummary` adds `ix_daily_summary_date` and
 `ix_daily_summary_user_account`.
 
-**Known gap:** there is no `(account_id, end)` or `(queue_id, end)`. Every
-date filter is on `Job.end` while the entity composites are on `submit`, so an
-account- or queue-scoped date query filters one predicate per row. Deferred to
-its own PR — see `docs/plans/JOB_HIST_PLUGIN_ENHANCEMENTS.md` § *Deferred*.
-An account-scoped `jobs_timeseries` is the query that would benefit most.
+**On the missing `(account_id, end)` / `(queue_id, end)`:** every date filter
+is on `Job.end` while the entity composites are on `submit`, so these look
+like an obvious gap. **Measured, they are not worth adding.** PostgreSQL
+already resolves the scoped shape with `BitmapAnd(ix_jobs_account_id,
+ix_jobs_end)` — on casper_jobs (21.0M rows) a 30-day account-scoped aggregate
+runs in 119 ms, user-scoped in 202 ms, and with `owners_limit=10` in 257 ms.
+In that plan the BitmapAnd costs ~23 ms of 105 ms while the nested loop into
+`job_charges` accounts for 638k of 684k buffers.
+
+The join, not the index, is where the time goes: on a wide unscoped aggregate
+it is **45 %** of total runtime (`EXPLAIN` shows a full seq scan of `jobs`
+hash-joined against a full seq scan of *all* of `job_charges`). The cheap win
+there is not an index but avoiding the scan altogether — see
+`JobQueries._timeseries_uses_summary`, which serves qualifying series off
+`daily_summary` ~800× faster. Full numbers in
+`docs/plans/JOBS_TIMESERIES.md` § *Where the time actually goes*.
 
 ## Table Schemas
 
