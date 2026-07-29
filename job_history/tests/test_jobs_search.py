@@ -6,13 +6,19 @@ mirroring the dict-row shape of ``daily_summary_report``.
 
 from datetime import date, datetime, timedelta, timezone
 
-import pytest
+import logging
 
-from job_history.database import Job, JobCharge
+import pytest
+from sqlalchemy import func
+
+from job_history.database import DailySummary, Job, JobCharge
 from job_history.queries import JobQueries
 from job_history.queries.jobs import (
-    QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _USAGE_SORT_KEYS,
+    QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _MAX_SUMMARY_BANDS,
+    _MAX_COVERAGE_PROBE_DAYS, _MAX_TIMESERIES_BANDS,
+    _SUMMARY_SERVICEABLE_FILTERS, _USAGE_SORT_KEYS,
 )
+from job_history.sync.summary import generate_daily_summary
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS
 
 
@@ -1178,6 +1184,7 @@ class TestFilterSignatureParity:
     FACET_ONLY = {"facets", "self_exclude", "limit"}
     HIST_ONLY = {"dimension", "owners_limit", "owners_sort_by", "owners_by"}
     USAGE_ONLY = {"dimension", "limit", "sort_by"}
+    TIMESERIES_ONLY = {"period", "owners_limit", "owners_sort_by", "owners_by"}
 
     @staticmethod
     def _params(fn):
@@ -1199,6 +1206,11 @@ class TestFilterSignatureParity:
     def test_jobs_usage_by_accepts_every_jobs_search_filter(self):
         search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
         assert search == self._params(JobQueries.jobs_usage_by) - self.USAGE_ONLY
+
+    def test_jobs_timeseries_accepts_every_jobs_search_filter(self):
+        search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
+        assert search == (
+            self._params(JobQueries.jobs_timeseries) - self.TIMESERIES_ONLY)
 
     def test_helper_covers_exactly_the_filter_set(self):
         search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
@@ -1754,9 +1766,11 @@ class TestJobsHistogramOwners:
         band = self._band(out, "<1m")
         assert list(band["owners"]) == ["alice", "carol"]  # 10 cpu-h > 0
         assert band["owners"]["alice"] == {
-            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0}
+            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0,
+            "cpu_charges": 10.0, "gpu_charges": 0.0}
         assert band["owners"]["carol"] == {
-            "job_count": 1, "cpu_hours": 0.0, "gpu_hours": 0.0}
+            "job_count": 1, "cpu_hours": 0.0, "gpu_hours": 0.0,
+            "cpu_charges": 0.0, "gpu_charges": 0.0}
 
     def test_owners_limit_truncates_but_totals_authoritative(
             self, in_memory_session, histogram_jobs):
@@ -1803,9 +1817,11 @@ class TestJobsHistogramOwners:
         band = self._band(out, "<1m")
         assert list(band["owners"]) == ["NCAR0001", "NCAR0002"]  # 10 cpu-h > 0
         assert band["owners"]["NCAR0001"] == {
-            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0}
+            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0,
+            "cpu_charges": 10.0, "gpu_charges": 0.0}
         assert band["owners"]["NCAR0002"] == {
-            "job_count": 1, "cpu_hours": 0.0, "gpu_hours": 0.0}
+            "job_count": 1, "cpu_hours": 0.0, "gpu_hours": 0.0,
+            "cpu_charges": 0.0, "gpu_charges": 0.0}
 
     def test_owners_by_account_merges_users_within_account(
             self, in_memory_session, histogram_jobs):
@@ -1817,9 +1833,11 @@ class TestJobsHistogramOwners:
         band = self._band(out, "1")
         assert list(band["owners"]) == ["NCAR0002", "NCAR0001"]
         assert band["owners"]["NCAR0002"] == {
-            "job_count": 3, "cpu_hours": 31.0, "gpu_hours": 60.0}
+            "job_count": 3, "cpu_hours": 31.0, "gpu_hours": 60.0,
+            "cpu_charges": 31.0, "gpu_charges": 60.0}
         assert band["owners"]["NCAR0001"] == {
-            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0}
+            "job_count": 1, "cpu_hours": 10.0, "gpu_hours": 0.0,
+            "cpu_charges": 10.0, "gpu_charges": 0.0}
 
     def test_owners_by_account_totals_unchanged(
             self, in_memory_session, histogram_jobs):
@@ -2010,7 +2028,8 @@ class TestJobsUsageBy:
         out = JobQueries(in_memory_session).jobs_usage_by("user")
         assert out["dimension"] == "user"
         for row in out["rows"]:
-            assert set(row) == {"value", "job_count", "cpu_hours", "gpu_hours"}
+            assert set(row) == {"value", "job_count", "cpu_hours", "gpu_hours",
+                                "cpu_charges", "gpu_charges"}
         assert [r["value"] for r in out["rows"]] == ["alice", "bob", "carol"]
 
     def test_totals_match_jobs_count_and_rows_sum(
@@ -2136,3 +2155,1106 @@ class TestJobsUsageBy:
         assert "jobs.user_id" in aggregates[0]
         assert "job_charges" in aggregates[0]
         assert "SELECT users.username" not in aggregates[0]
+
+
+# ---------------------------------------------------------------------------
+# jobs_timeseries — per-period activity series
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def timeseries_jobs(in_memory_session):
+    """Five jobs over a 5-day site-local window, with the edges that matter.
+
+    Deliberate rows:
+
+    - **801 ends 02:00 UTC on 07-02**, which is 20:00 MDT on 07-01. It must
+      bin into the **07-01** band. Bucketing the raw UTC column (what
+      ``PeriodGrouper`` would do) puts it in 07-02 — this row is the guard
+      against that regression.
+    - **07-03 is idle**, pinning an interior zero band.
+    - **803 carries ``qos_factor=0.0``** (the ``uncharged`` QoS): hours > 0
+      with charges == 0.
+    - **802 carries ``qos_factor=0.5``**, so charges != hours.
+    - **804 has NO JobCharge row** — counts, contributes 0.0 to every sum.
+    """
+    def _utc(y, m, d, hh):
+        return datetime(y, m, d, hh, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+
+    specs = [
+        # (jid, user, acct, end_utc, cpu_h, gpu_h, qos_factor)
+        ("800.desched1", "alice", "NCAR0001", _utc(2025, 7, 1, 18), 10.0, 0.0, 1.0),
+        # 20:00 MDT on 07-01 — the site-local binning guard.
+        ("801.desched1", "alice", "NCAR0001", _utc(2025, 7, 2, 2), 20.0, 0.0, 1.0),
+        ("802.desched1", "bob",   "NCAR0002", _utc(2025, 7, 2, 18), 40.0, 8.0, 0.5),
+        # 07-03 idle on purpose.
+        ("803.desched1", "alice", "NCAR0001", _utc(2025, 7, 4, 18),  5.0, 0.0, 0.0),
+        ("804.desched1", "carol", "NCAR0002", _utc(2025, 7, 5, 18), None, None, None),
+    ]
+    jobs = []
+    for i, (jid, user, acct, end, cpu, gpu, factor) in enumerate(specs):
+        job = Job(job_id=jid, short_id=800 + i, name=f"t{i}", user=user,
+                  account=acct, queue="main", status="0",
+                  submit=end - timedelta(hours=1), start=end - timedelta(hours=1),
+                  end=end, eligible_secs=60, numnodes=1, numcpus=8, numgpus=0,
+                  elapsed=3600, reqmem=_GIB, memory=_GIB // 2)
+        in_memory_session.add(job)
+        jobs.append((job, cpu, gpu, factor))
+    in_memory_session.flush()
+    for job, cpu, gpu, factor in jobs:
+        if factor is None:
+            continue  # 804 stays charge-less
+        in_memory_session.add(JobCharge(
+            job_id=job.id, cpu_hours=cpu, gpu_hours=gpu, memory_hours=0.0,
+            qos_factor=factor, charge_version=1))
+    in_memory_session.commit()
+    return [j for j, *_ in jobs]
+
+
+_TS_START = date(2025, 7, 1)
+_TS_END = date(2025, 7, 5)
+
+
+def _ts_filters(**overrides):
+    """A complete ``jobs_timeseries`` filter dict, for calling the routing
+    predicate directly.
+
+    ``_apply_jobs_search_filters`` requires every key with no defaults on
+    purpose (see its docstring), and ``_timeseries_uses_summary`` forwards to
+    it when probing an unsummarized gap. Production always passes the full
+    dict; only these tests need to build one.
+    """
+    filters = dict.fromkeys(['start', 'end', 'user', 'account', 'queue', 'qos', 'exit_status', 'job_id', 'name', 'ignore_case', 'min_eligible_secs', 'max_eligible_secs', 'min_nodes', 'max_nodes', 'min_cpus', 'max_cpus', 'min_gpus', 'max_gpus', 'min_elapsed', 'max_elapsed', 'min_reqmem', 'max_reqmem', 'min_memory_used', 'max_memory_used', 'min_memory_wasted', 'max_memory_wasted'])
+    filters["ignore_case"] = False
+    filters.update(overrides)
+    return filters
+
+
+
+class TestJobsTimeseries:
+    """Contract for the per-period series behind the stacked timeline."""
+
+    @staticmethod
+    def _band(out, label):
+        return next(b for b in out["bands"] if b["label"] == label)
+
+    def test_band_vector_is_zero_filled_and_chronological(
+            self, in_memory_session, timeseries_jobs):
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END)
+        assert [b["label"] for b in out["bands"]] == [
+            "2025-07-01", "2025-07-02", "2025-07-03", "2025-07-04", "2025-07-05"]
+        # The idle day is KEPT as an interior zero, never dropped.
+        assert self._band(out, "2025-07-03")["job_count"] == 0
+        assert out["period"] == "day"
+        assert (out["start"], out["end"]) == ("2025-07-01", "2025-07-05")
+
+    def test_site_local_day_binning_not_utc(
+            self, in_memory_session, timeseries_jobs):
+        """801 ends 02:00 UTC on 07-02 = 20:00 MDT on 07-01.
+
+        The whole reason this method does not reuse ``PeriodGrouper``: that
+        helper formats the raw naive-UTC column, which would file this job
+        under 07-02 while ``jobs_search(start=end=2025-07-01)`` returns it.
+        """
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert self._band(out, "2025-07-01")["job_count"] == 2
+        assert self._band(out, "2025-07-02")["job_count"] == 1
+        # And the band agrees with the table it will sit next to.
+        assert q.jobs_count(start=date(2025, 7, 1), end=date(2025, 7, 1)) == 2
+
+    def test_total_count_matches_jobs_count(
+            self, in_memory_session, timeseries_jobs):
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert out["total_count"] == q.jobs_count(
+            start=_TS_START, end=_TS_END) == 5
+        assert sum(b["job_count"] for b in out["bands"]) + out["null_count"] \
+            == out["total_count"]
+
+    def test_every_band_replays_into_jobs_count(
+            self, in_memory_session, timeseries_jobs):
+        """The band -> jobs_search round-trip, the calendar analogue of
+        ``_assert_bands_round_trip``. This is what a bar click promises."""
+        q = JobQueries(in_memory_session)
+        for period in ("day", "week", "month"):
+            out = q.jobs_timeseries(period, start=_TS_START, end=_TS_END)
+            for band in out["bands"]:
+                replay = q.jobs_count(
+                    start=date.fromisoformat(band["start"]),
+                    end=date.fromisoformat(band["end"]))
+                assert replay == band["job_count"], (period, band["label"])
+
+    def test_charges_are_qos_weighted(
+            self, in_memory_session, timeseries_jobs):
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END)
+        # 07-02: one job, 40 cpu-h at factor 0.5 -> 20 charges, 8 gpu-h -> 4.
+        band = self._band(out, "2025-07-02")
+        assert band["cpu_hours"] == pytest.approx(40.0)
+        assert band["cpu_charges"] == pytest.approx(20.0)
+        assert band["gpu_hours"] == pytest.approx(8.0)
+        assert band["gpu_charges"] == pytest.approx(4.0)
+
+    def test_uncharged_qos_yields_hours_with_zero_charges(
+            self, in_memory_session, timeseries_jobs):
+        """qos_factor 0.0 is a real value, not missing data: a charges view
+        legitimately shows an empty bar where an hours view shows work."""
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END)
+        band = self._band(out, "2025-07-04")
+        assert band["job_count"] == 1
+        assert band["cpu_hours"] == pytest.approx(5.0)
+        assert band["cpu_charges"] == 0.0
+
+    def test_chargeless_job_counts_but_adds_no_hours(
+            self, in_memory_session, timeseries_jobs):
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END)
+        band = self._band(out, "2025-07-05")
+        assert band["job_count"] == 1
+        assert band["cpu_hours"] == 0.0 and band["cpu_charges"] == 0.0
+
+    def test_totals_are_granularity_invariant(
+            self, in_memory_session, timeseries_jobs):
+        """day/week/month partition the same window, so every metric total
+        must agree — the strongest single check that the ladder tiles."""
+        q = JobQueries(in_memory_session)
+        outs = [q.jobs_timeseries(p, start=_TS_START, end=_TS_END)
+                for p in ("day", "week", "month")]
+        for key in ("job_count", "cpu_hours", "gpu_hours",
+                    "cpu_charges", "gpu_charges"):
+            values = [o["totals"][key] for o in outs]
+            assert values[0] == pytest.approx(values[1]) == pytest.approx(
+                values[2]), key
+
+    def test_derived_window_when_dates_omitted(
+            self, in_memory_session, timeseries_jobs):
+        """No dates is an opt-in to full history; the domain comes from the
+        observed MIN/MAX of Job.end, converted back to site-local days."""
+        out = JobQueries(in_memory_session).jobs_timeseries("day")
+        assert (out["start"], out["end"]) == ("2025-07-01", "2025-07-05")
+        assert out["total_count"] == 5
+
+    def test_empty_slice_yields_no_bands(
+            self, in_memory_session, timeseries_jobs):
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", user="nobody")
+        assert out["bands"] == [] and out["total_count"] == 0
+
+    @pytest.mark.parametrize("period", ["day", "week", "month"])
+    def test_inverted_window_is_empty_not_an_error(
+            self, in_memory_session, timeseries_jobs, period):
+        """start > end answers 0 rows, matching jobs_count/jobs_search rather
+        than raising. Reachable from the explorer's free-text date fields, and
+        an empty ladder would otherwise IndexError inside _period_case."""
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries(
+            period, start=date(2025, 7, 5), end=date(2025, 7, 1))
+        assert out["bands"] == []
+        assert out["total_count"] == 0 == q.jobs_count(
+            start=date(2025, 7, 5), end=date(2025, 7, 1))
+
+    def test_null_end_jobs_land_in_null_count_not_a_band(
+            self, in_memory_session, timeseries_jobs):
+        """Job.end is nullable. Such rows match an unbounded query but belong
+        to no calendar band, so they keep total_count == jobs_count honest.
+
+        They ride out on the MIN/MAX probe rather than the series statement,
+        which is what lets the series be re-bound to the resolved window
+        without losing them — a bounded date filter drops NULL ``end``.
+        """
+        in_memory_session.add(Job(
+            job_id="899.desched1", short_id=899, name="no-end", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=datetime(2025, 7, 1, 12), start=None, end=None,
+            eligible_secs=60, numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day")          # unbounded: no date filter
+        assert out["null_count"] == 1
+        assert sum(b["job_count"] for b in out["bands"]) == 5
+        assert out["total_count"] == 6 == q.jobs_count()
+        # A bounded window excludes it via the date filter instead.
+        bounded = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert bounded["null_count"] == 0 and bounded["total_count"] == 5
+
+    def test_all_null_end_slice_still_counts(self, in_memory_session):
+        """A slice whose rows ALL have NULL ``end`` has no domain to band
+        over — but the rows match the filters, so dropping them would break
+        ``total_count == jobs_count()``, the invariant this method advertises.
+        """
+        for i in range(3):
+            in_memory_session.add(Job(
+                job_id=f"9{i}0.desched1", short_id=900 + i, name="pending",
+                user="alice", account="NCAR0001", queue="main", status=None,
+                submit=datetime(2025, 7, 1, 12), start=None, end=None,
+                eligible_secs=60, numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day")
+        assert out["bands"] == []
+        assert out["null_count"] == 3
+        assert out["total_count"] == 3 == q.jobs_count()
+
+    def test_empty_partial_window_echoes_the_supplied_bound(
+            self, in_memory_session, timeseries_jobs):
+        """One bound supplied and nothing matched: echo it rather than
+        discarding it. Only a MISSING bound is ever derived."""
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=date(2030, 1, 1), user="nobody")
+        assert out["bands"] == []
+        assert out["start"] == "2030-01-01"
+
+    def test_probe_keeps_min_max_alone_for_the_index_initplan(
+            self, in_memory_session, timeseries_jobs):
+        """The MIN/MAX probe must stay a *pure* min/max select list.
+
+        PostgreSQL only rewrites MIN/MAX into index InitPlans when nothing
+        else is in the select list, so folding the NULL-end count in as
+        ``COUNT(*) FILTER (...)`` — the obvious tidier version — turns a
+        0.4ms index probe into a full seq scan: measured 4630ms against
+        0.4ms on casper_jobs (21.0M rows). Cheap to write, expensive to ship,
+        invisible on SQLite. Hence this guard.
+        """
+        from sqlalchemy import event
+
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_timeseries("day")   # unbounded
+        finally:
+            event.remove(
+                in_memory_session.bind, "before_cursor_execute", _capture)
+
+        probes = [s for s in statements
+                  if "min(" in s.lower() and "max(" in s.lower()]
+        assert probes, statements
+        for stmt in probes:
+            assert "count" not in stmt.lower(), (
+                "MIN/MAX probe gained another aggregate; this defeats the "
+                f"index InitPlan on PostgreSQL:\n{stmt}")
+
+    def test_series_statement_is_bounded_to_the_resolved_window(
+            self, in_memory_session, timeseries_jobs):
+        """The ladder's totality must rest on the WHERE clause, not on the
+        probe's snapshot: otherwise a row synced between the two lands in the
+        ``else_`` arm and silently breaks the last band's replay."""
+        from sqlalchemy import event
+
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_timeseries("day")  # unbounded
+        finally:
+            event.remove(
+                in_memory_session.bind, "before_cursor_execute", _capture)
+
+        series = [s for s in statements
+                  if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+        assert series, statements
+        for stmt in series:
+            assert "jobs.\"end\" >=" in stmt or "jobs.end >=" in stmt, stmt
+            assert "jobs.\"end\" <" in stmt or "jobs.end <" in stmt, stmt
+
+    def test_filters_narrow_the_series(
+            self, in_memory_session, timeseries_jobs):
+        """The point of the method: it honours the whole jobs_search filter
+        set, which no other per-period query here does."""
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day", start=_TS_START, end=_TS_END, user="alice")
+        assert out["total_count"] == 3 == q.jobs_count(
+            start=_TS_START, end=_TS_END, user="alice")
+        assert self._band(out, "2025-07-02")["job_count"] == 0  # bob's day
+
+    # -- owners ------------------------------------------------------------
+
+    def test_owners_legend_is_identical_in_every_band(
+            self, in_memory_session, timeseries_jobs):
+        """A stacked chart maps key -> colour once; a series that changed
+        position or vanished mid-axis would recolour the plot."""
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END, owners_limit=2)
+        keysets = {tuple(b["owners"]) for b in out["bands"]}
+        assert len(keysets) == 1
+        # Global rank by combined hours: bob 48 > alice 35 > carol 0.
+        assert keysets.pop() == ("bob", "alice")
+
+    def test_owners_are_zero_filled_in_idle_bands(
+            self, in_memory_session, timeseries_jobs):
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END, owners_limit=2)
+        idle = self._band(out, "2025-07-03")
+        assert idle["owners"]["bob"] == {
+            "job_count": 0, "cpu_hours": 0.0, "gpu_hours": 0.0,
+            "cpu_charges": 0.0, "gpu_charges": 0.0}
+
+    def test_owners_remainder_is_derivable(
+            self, in_memory_session, timeseries_jobs):
+        """"Others" is band totals - Sigma owners, never synthesized. carol
+        falls outside the top-2, so 07-05 is pure remainder."""
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END, owners_limit=2)
+        for band in out["bands"]:
+            others = band["job_count"] - sum(
+                o["job_count"] for o in band["owners"].values())
+            assert others >= 0
+        band = self._band(out, "2025-07-05")
+        assert band["job_count"] == 1
+        assert sum(o["job_count"] for o in band["owners"].values()) == 0
+
+    def test_owners_by_account_switches_the_axis(
+            self, in_memory_session, timeseries_jobs):
+        out = JobQueries(in_memory_session).jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END, owners_limit=2,
+            owners_by="account")
+        assert tuple(out["bands"][0]["owners"]) == ("NCAR0002", "NCAR0001")
+        assert out["owners_by"] == "account"
+
+    def test_owners_sort_by_decides_which_top_n_survives(
+            self, in_memory_session, timeseries_jobs):
+        """bob leads on hours; alice leads on job_count (3 vs 1)."""
+        q = JobQueries(in_memory_session)
+        by_hours = q.jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END, owners_limit=1)
+        by_jobs = q.jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END, owners_limit=1,
+            owners_sort_by="job_count")
+        assert tuple(by_hours["bands"][0]["owners"]) == ("bob",)
+        assert tuple(by_jobs["bands"][0]["owners"]) == ("alice",)
+
+    def test_owners_never_change_band_totals(
+            self, in_memory_session, timeseries_jobs):
+        q = JobQueries(in_memory_session)
+        plain = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        rich = q.jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END, owners_limit=2)
+        for a, b in zip(plain["bands"], rich["bands"]):
+            assert a["job_count"] == b["job_count"]
+            assert a["cpu_hours"] == pytest.approx(b["cpu_hours"])
+            assert list(b)[-1] == "owners", "owners must be appended last"
+
+    def test_owners_sort_by_charges_ranks_by_charges(
+            self, in_memory_session, timeseries_jobs):
+        """alice: 35 hours -> 30 charges (one job uncharged).
+        bob: 48 hours -> 24 charges (factor 0.5). Ranking flips."""
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries(
+            "day", start=_TS_START, end=_TS_END, owners_limit=2,
+            owners_sort_by="charges")
+        assert tuple(out["bands"][0]["owners"]) == ("alice", "bob")
+
+    # -- cost guard --------------------------------------------------------
+
+    def test_two_aggregate_scans_with_owners_one_without(
+            self, in_memory_session, timeseries_jobs):
+        from sqlalchemy import event
+
+        def _count_aggregates(**kwargs):
+            statements = []
+
+            @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+            def _capture(conn, cursor, statement, params, context, executemany):
+                statements.append(statement)
+
+            try:
+                JobQueries(in_memory_session).jobs_timeseries(
+                    "day", start=_TS_START, end=_TS_END, **kwargs)
+            finally:
+                event.remove(
+                    in_memory_session.bind, "before_cursor_execute", _capture)
+            return [s for s in statements
+                    if "GROUP BY" in s.upper() and " jobs" in s.lower()]
+
+        assert len(_count_aggregates()) == 1
+        with_owners = _count_aggregates(owners_limit=2)
+        assert len(with_owners) == 2, with_owners
+        # Grouped on the integer FK, names resolved separately.
+        assert all("jobs.user_id" in s for s in with_owners)
+        assert not any("SELECT users.username" in s for s in with_owners)
+
+    # -- validation --------------------------------------------------------
+
+    def test_bad_period_raises(self, in_memory_session, timeseries_jobs):
+        with pytest.raises(ValueError, match="Unknown period"):
+            JobQueries(in_memory_session).jobs_timeseries("fortnight")
+
+    def test_quarter_is_not_a_timeseries_period(
+            self, in_memory_session, timeseries_jobs):
+        """PeriodGrouper offers quarter/year; this method deliberately does
+        not — a chart that wide wants month bands, and the vocabularies are
+        independent on purpose."""
+        with pytest.raises(ValueError, match="Unknown period"):
+            JobQueries(in_memory_session).jobs_timeseries("quarter")
+
+    def test_bad_owners_limit_raises(self, in_memory_session, timeseries_jobs):
+        with pytest.raises(ValueError, match="owners_limit"):
+            JobQueries(in_memory_session).jobs_timeseries(
+                "day", start=_TS_START, end=_TS_END, owners_limit=0)
+
+    def test_bad_owners_by_raises(self, in_memory_session, timeseries_jobs):
+        with pytest.raises(ValueError, match="owners_by"):
+            JobQueries(in_memory_session).jobs_timeseries(
+                "day", start=_TS_START, end=_TS_END, owners_by="queue")
+
+    def test_bad_owners_sort_by_raises(self, in_memory_session, timeseries_jobs):
+        with pytest.raises(ValueError, match="owners_sort_by"):
+            JobQueries(in_memory_session).jobs_timeseries(
+                "day", start=_TS_START, end=_TS_END, owners_sort_by="bogus")
+
+    def test_band_cap_raises_rather_than_emitting_a_huge_ladder(
+            self, in_memory_session, timeseries_jobs):
+        """The CASE ladder costs ~O(bands/2) comparisons per scanned row, so
+        an unbounded day-granular window is refused, not silently served."""
+        with pytest.raises(ValueError, match="cap"):
+            JobQueries(in_memory_session).jobs_timeseries(
+                "day", start=date(2020, 1, 1), end=date(2025, 12, 31))
+
+
+class TestPeriodBands:
+    """Structural guards on the band table — no database needed.
+
+    The calendar analogue of ``test_bucket_tables_are_closed_and_contiguous``:
+    the ladder must tile the window exactly, or bands double-count or drop
+    jobs and the band -> jobs_search round-trip breaks.
+    """
+
+    @staticmethod
+    def _bands(start, end, period):
+        from job_history.queries.jobs import _period_bands
+        return _period_bands(start, end, period)
+
+    @pytest.mark.parametrize("period", ["day", "week", "month"])
+    @pytest.mark.parametrize("span", [1, 2, 7, 31, 90, 365])
+    def test_bands_tile_the_window_exactly(self, period, span):
+        start = date(2026, 1, 15)
+        end = start + timedelta(days=span - 1)
+        bands = self._bands(start, end, period)
+        assert bands, (period, span)
+        # Clipped to the window at both edges.
+        assert bands[0]["start"] == start
+        assert bands[-1]["end"] == end
+        # Contiguous with no gaps and no overlaps.
+        for prev, nxt in zip(bands, bands[1:]):
+            assert prev["end"] + timedelta(days=1) == nxt["start"]
+        # Every day of the window belongs to exactly one band.
+        covered = sum((b["end"] - b["start"]).days + 1 for b in bands)
+        assert covered == span
+
+    @pytest.mark.parametrize("period", ["day", "week", "month"])
+    def test_hi_utc_is_strictly_increasing(self, period):
+        bands = self._bands(date(2026, 1, 1), date(2026, 12, 31), period)
+        his = [b["hi_utc"] for b in bands]
+        assert his == sorted(his) and len(set(his)) == len(his)
+
+    def test_labels_are_unique_and_sort_chronologically(self):
+        for period in ("day", "week", "month"):
+            bands = self._bands(date(2025, 11, 1), date(2026, 3, 1), period)
+            labels = [b["label"] for b in bands]
+            assert len(set(labels)) == len(labels)
+            # Zero-padded, so lexicographic == chronological.
+            assert labels == sorted(labels)
+
+    def test_dst_days_are_23_and_25_hours_wide(self):
+        """The reason boundaries are computed with zoneinfo rather than a
+        fixed offset: a fixed shift silently misfiles an hour of jobs twice
+        a year, on exactly the days an operator is most likely to look."""
+        from job_history.queries.jobs import _site_midnight_utc
+        widths = {}
+        for day in (date(2026, 3, 7), date(2026, 3, 8),
+                    date(2026, 10, 31), date(2026, 11, 1)):
+            lo = _site_midnight_utc(day)
+            hi = _site_midnight_utc(day + timedelta(days=1))
+            widths[day] = (hi - lo).total_seconds() / 3600
+        assert widths[date(2026, 3, 7)] == 24     # ordinary day
+        assert widths[date(2026, 3, 8)] == 23     # spring forward
+        assert widths[date(2026, 10, 31)] == 24   # ordinary day
+        assert widths[date(2026, 11, 1)] == 25    # fall back
+
+    def test_week_bands_snap_to_monday_but_clip_to_the_window(self):
+        """Whole ISO weeks keep two overlapping windows comparable; the
+        clip keeps each band replaying to exactly its own job_count."""
+        bands = self._bands(date(2026, 3, 4), date(2026, 3, 20), "week")
+        assert [b["label"] for b in bands] == [
+            "2026-W10", "2026-W11", "2026-W12"]
+        # Wednesday start is reported as-is, not backdated to the Monday.
+        assert bands[0]["start"] == date(2026, 3, 4)
+        assert bands[1]["start"] == date(2026, 3, 9)   # a real Monday
+        assert bands[-1]["end"] == date(2026, 3, 20)
+
+
+class TestChargesAcrossAggregations:
+    """``charges = hours x qos_factor`` must mean the same thing in every
+    aggregate, or a metric pill shows different numbers per tab.
+
+    Uses ``timeseries_jobs`` because its factors are 1.0 / 0.5 / 0.0 —
+    ``histogram_jobs`` is uniformly 1.0, where charges and hours coincide
+    and a swapped formula would pass unnoticed.
+    """
+
+    #: alice 3 jobs: 10@1.0 + 20@1.0 + 5@0.0 = 35 cpu-h -> 30 charges.
+    #: bob   1 job:  40@0.5                             -> 20 charges,
+    #:                8 gpu-h @0.5                      ->  4 charges.
+    #: carol 1 job:  charge-less                        ->  0 / 0.
+    EXPECTED = {
+        "alice": (35.0, 30.0, 0.0, 0.0),
+        "bob":   (40.0, 20.0, 8.0, 4.0),
+        "carol": (0.0, 0.0, 0.0, 0.0),
+    }
+
+    def test_usage_by_rows_carry_qos_weighted_charges(
+            self, in_memory_session, timeseries_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by("user")
+        rows = {r["value"]: r for r in out["rows"]}
+        for user, (cpu_h, cpu_c, gpu_h, gpu_c) in self.EXPECTED.items():
+            assert rows[user]["cpu_hours"] == pytest.approx(cpu_h), user
+            assert rows[user]["cpu_charges"] == pytest.approx(cpu_c), user
+            assert rows[user]["gpu_hours"] == pytest.approx(gpu_h), user
+            assert rows[user]["gpu_charges"] == pytest.approx(gpu_c), user
+
+    def test_usage_by_totals_include_charges(
+            self, in_memory_session, timeseries_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by("user")
+        assert out["totals"]["cpu_hours"] == pytest.approx(75.0)
+        assert out["totals"]["cpu_charges"] == pytest.approx(50.0)
+        assert out["totals"]["gpu_charges"] == pytest.approx(4.0)
+
+    def test_histogram_bands_and_owners_carry_charges(
+            self, in_memory_session, timeseries_jobs):
+        """All five jobs share numcpus=8, so one band holds the lot — the
+        band and its owners must both report the weighted sums."""
+        out = JobQueries(in_memory_session).jobs_histogram(
+            "cpus", owners_limit=3)
+        band = next(b for b in out["buckets"] if b["job_count"] == 5)
+        assert band["cpu_hours"] == pytest.approx(75.0)
+        assert band["cpu_charges"] == pytest.approx(50.0)
+        assert band["owners"]["alice"]["cpu_charges"] == pytest.approx(30.0)
+        assert band["owners"]["bob"]["cpu_charges"] == pytest.approx(20.0)
+
+    def test_every_aggregate_agrees_on_total_charges(
+            self, in_memory_session, timeseries_jobs):
+        """The cross-method identity a metric pill depends on."""
+        q = JobQueries(in_memory_session)
+        usage = q.jobs_usage_by("user")["totals"]
+        hist = q.jobs_histogram("cpus")
+        series = q.jobs_timeseries("day")["totals"]
+        hist_totals = {
+            key: sum(b[key] for b in hist["buckets"])
+            for key in ("cpu_charges", "gpu_charges")
+        }
+        for key in ("cpu_charges", "gpu_charges"):
+            assert usage[key] == pytest.approx(hist_totals[key]), key
+            assert usage[key] == pytest.approx(series[key]), key
+
+    def test_sort_by_charges_is_accepted_everywhere(
+            self, in_memory_session, timeseries_jobs):
+        """``charges`` joins the shared _USAGE_SORT_KEYS vocabulary, so the
+        ranking metric can follow a charges metric pill on every surface."""
+        assert "charges" in _USAGE_SORT_KEYS
+        q = JobQueries(in_memory_session)
+        # bob leads on hours (48 > 35); alice leads on charges (30 > 24).
+        assert q.jobs_usage_by(
+            "user", sort_by="hours")["rows"][0]["value"] == "bob"
+        assert q.jobs_usage_by(
+            "user", sort_by="charges")["rows"][0]["value"] == "alice"
+
+
+# ---------------------------------------------------------------------------
+# jobs_timeseries — the daily_summary fast path
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def summarized_timeseries(in_memory_session, timeseries_jobs):
+    """``timeseries_jobs`` plus the real ``daily_summary`` rollup over it.
+
+    Deliberately runs :func:`generate_daily_summary` rather than hand-building
+    rows: the fast path's whole claim is that it agrees with the scan path,
+    and hand-built summaries would let a rollup bug hide behind a matching
+    fixture. Returns the watermark (last summarized day).
+    """
+    day = _TS_START
+    while day <= _TS_END:
+        generate_daily_summary(in_memory_session, "casper", day, replace=True)
+        day += timedelta(days=1)
+    in_memory_session.commit()
+    return _TS_END
+
+
+def _force_scan(monkeypatch):
+    """Disable the fast path for the duration of a test."""
+    monkeypatch.setattr(
+        JobQueries, "_timeseries_uses_summary", lambda *a, **k: False)
+
+
+class TestTimeseriesSummaryRouting:
+    """Which path answers, and why."""
+
+    def test_no_summary_rows_means_no_fast_path(
+            self, in_memory_session, timeseries_jobs):
+        """An unsummarized database must not silently return empty bands."""
+        q = JobQueries(in_memory_session)
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
+            "user") is False
+
+    def test_serviceable_filters_route_to_the_summary(
+            self, in_memory_session, summarized_timeseries):
+        q = JobQueries(in_memory_session)
+        for extra in ({}, {"user": "alice"}, {"account": "NCAR0001"},
+                      {"queue": "main"}, {"ignore_case": True}):
+            filters = _ts_filters(start=_TS_START, end=_TS_END, **extra)
+            assert q._timeseries_uses_summary(
+                filters, _TS_START, _TS_END, "user") is True, extra
+
+    @pytest.mark.parametrize("unserviceable", [
+        {"qos": "regular"},          # not in daily_summary's key
+        {"exit_status": "0"},        # per-job attribute
+        {"job_id": "800"},
+        {"name": "t0"},
+        {"min_nodes": 0},            # 0 is a real bound, not "unset"
+        {"max_cpus": 8},
+        {"min_memory_wasted": 1},
+    ])
+    def test_unserviceable_filters_fall_back(
+            self, in_memory_session, summarized_timeseries, unserviceable):
+        """Every filter the rollup aggregated away must force the jobs scan —
+        serving it off the summary would silently ignore it."""
+        q = JobQueries(in_memory_session)
+        filters = _ts_filters(start=_TS_START, end=_TS_END, **unserviceable)
+        assert q._timeseries_uses_summary(
+            filters, _TS_START, _TS_END, "user") is False
+
+    def test_every_filter_is_classified(self):
+        """No filter may be accidentally serviceable: the whitelist plus the
+        aggregated-away set must together cover the shared filter signature,
+        so a NEW filter defaults to the safe path rather than being ignored."""
+        import inspect
+        params = {
+            name for name, p in
+            inspect.signature(JobQueries.jobs_timeseries).parameters.items()
+            if p.kind == p.KEYWORD_ONLY
+        } - {"owners_limit", "owners_sort_by", "owners_by"}
+        assert _SUMMARY_SERVICEABLE_FILTERS <= params
+        # Anything outside the whitelist must be rejected by the predicate.
+        q = JobQueries.__new__(JobQueries)
+        for extra in params - _SUMMARY_SERVICEABLE_FILTERS:
+            filters = {"start": _TS_START, "end": _TS_END, extra: 1}
+            assert q._timeseries_uses_summary(
+                filters, _TS_START, _TS_END, "user") is False, extra
+
+    def test_window_past_the_watermark_is_fine_when_those_days_are_empty(
+            self, in_memory_session, summarized_timeseries):
+        """The summary lags jobs, so a window ending today routinely runs a
+        day or two past the last rollup row. That only matters if those days
+        have jobs — and if they did, the scan path would be the only one
+        able to see them."""
+        q = JobQueries(in_memory_session)
+        beyond = _TS_END + timedelta(days=1)
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=beyond), _TS_START, beyond,
+            "user") is True
+
+        # Give that day a job and it becomes a real shortfall.
+        in_memory_session.add(Job(
+            job_id="890.desched1", short_id=890, name="late", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=datetime(2025, 7, 6, 12), start=datetime(2025, 7, 6, 12),
+            end=datetime(2025, 7, 6, 18), eligible_secs=60,
+            numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=beyond), _TS_START, beyond,
+            "user") is False
+
+    def test_window_reaching_back_before_coverage(
+            self, in_memory_session, summarized_timeseries):
+        """The rollup need not reach back to the start of history — a partial
+        ``--resummarize`` leaves an earlier gap. Empty prehistory is fine;
+        prehistory with jobs in it is not, since those days would come back as
+        zero bands while the scan path finds them."""
+        q = JobQueries(in_memory_session)
+        earlier = _TS_START - timedelta(days=30)
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=earlier, end=_TS_END), earlier, _TS_END,
+            "user") is True
+
+        in_memory_session.add(Job(
+            job_id="870.desched1", short_id=870, name="old", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=datetime(2025, 6, 20, 12), start=datetime(2025, 6, 20, 12),
+            end=datetime(2025, 6, 20, 18), eligible_secs=60,
+            numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=earlier, end=_TS_END), earlier, _TS_END,
+            "user") is False
+
+    def test_a_missing_day_that_has_jobs_falls_back(
+            self, in_memory_session, summarized_timeseries):
+        """The failure mode a watermark check misses entirely: a skipped day
+        mid-window that DOES have jobs would silently become a zero band."""
+        q = JobQueries(in_memory_session)
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
+            "user") is True
+        # 07-02 has jobs in the fixture, so dropping its rollup row is a
+        # genuine shortfall.
+        in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 2)).delete()
+        in_memory_session.commit()
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
+            "user") is False
+
+    def test_a_missing_day_with_no_jobs_does_not_force_a_fallback(
+            self, in_memory_session, summarized_timeseries):
+        """A scheduler outage leaves no PBS log, so sync fails that day and
+        writes no marker — a permanent hole over days that genuinely have no
+        jobs. ``jobs`` is the source of truth for both paths, so an empty hole
+        costs the fast path nothing and must not disqualify it. (derecho has
+        had multi-day outages producing exactly this.)"""
+        q = JobQueries(in_memory_session)
+        # 07-03 is idle in the fixture: rollup row is a NO_JOBS marker.
+        in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 3)).delete()
+        in_memory_session.commit()
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
+            "user") is True
+        # ...and the answer is still right.
+        out = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert out["total_count"] == q.jobs_count(
+            start=_TS_START, end=_TS_END) == 5
+        assert next(b for b in out["bands"]
+                    if b["label"] == "2025-07-03")["job_count"] == 0
+
+    def test_empty_gap_check_respects_the_filter_set(
+            self, in_memory_session, summarized_timeseries):
+        """A day with jobs but none matching the filters is empty *for this
+        query*, so it must not force the whole window onto the scan."""
+        q = JobQueries(in_memory_session)
+        in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 2)).delete()
+        in_memory_session.commit()
+        # 07-02 is bob's day only, so under user=alice the gap is empty.
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END, **{"user": "alice"}),
+            _TS_START, _TS_END, "user") is True
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END, **{"user": "bob"}),
+            _TS_START, _TS_END, "user") is False
+
+    def test_too_many_gaps_falls_back_without_probing(
+            self, in_memory_session, summarized_timeseries):
+        """Past the probe budget something is systemically wrong with the
+        rollup, and a scan is the honest answer."""
+        q = JobQueries(in_memory_session)
+        wide_start = _TS_START - timedelta(days=_MAX_COVERAGE_PROBE_DAYS + 5)
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=wide_start, end=_TS_END), wide_start, _TS_END,
+            "user") is False
+
+    def test_contiguous_runs_collapses_outage_gaps(self):
+        """Outages span consecutive days, so a 6-day hole is one range probe
+        rather than six."""
+        from job_history.queries.jobs import _contiguous_runs
+        days = [date(2025, 6, 3), date(2025, 6, 4), date(2025, 6, 5),
+                date(2025, 9, 17)]
+        assert _contiguous_runs(days) == [
+            (date(2025, 6, 3), date(2025, 6, 5)),
+            (date(2025, 9, 17), date(2025, 9, 17)),
+        ]
+        assert _contiguous_runs([]) == []
+
+    def test_no_jobs_marker_days_still_count_as_covered(
+            self, in_memory_session, timeseries_jobs):
+        """An idle day has only a NO_JOBS marker row. It IS summarized, so it
+        must not force a fallback — otherwise a quiet weekend would drop the
+        whole window onto the slow path."""
+        # 07-03 is idle in the fixture, so the rollup writes it as a marker.
+        day = _TS_START
+        while day <= _TS_END:
+            generate_daily_summary(in_memory_session, "casper", day,
+                                   replace=True)
+            day += timedelta(days=1)
+        in_memory_session.commit()
+        marker = in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 3)).one()
+        assert marker.user_id is None and marker.job_count == 0
+        assert JobQueries(in_memory_session)._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
+            "user") is True
+
+    def test_routing_decision_is_logged(
+            self, in_memory_session, summarized_timeseries, caplog):
+        """The two paths are deliberately indistinguishable from the envelope,
+        so the log is the ONLY way to answer "is the fast path firing?" in
+        production — a 7.4s timeline must not look like a 15ms one."""
+        q = JobQueries(in_memory_session)
+        with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
+            q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert "daily_summary path (5/5 days covered)" in caplog.text
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
+            q.jobs_timeseries("day", start=_TS_START, end=_TS_END, qos="regular")
+        assert "jobs-scan path" in caplog.text and "qos" in caplog.text
+
+        # A tolerated gap says so, and says how many days it verified as
+        # empty — an operator should be able to tell "rollup is behind but it
+        # doesn't matter" from "rollup is complete".
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
+            q.jobs_timeseries("day", start=_TS_START,
+                              end=_TS_END + timedelta(days=2))
+        assert "daily_summary path (5/7 days summarized" in caplog.text
+        assert "the other 2 have no jobs" in caplog.text
+
+        # A gap that DOES have jobs names the range, so a real sync failure is
+        # actionable rather than just slow.
+        in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 2)).delete()
+        in_memory_session.commit()
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
+            q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert "jobs-scan path" in caplog.text
+        assert "2025-07-02..2025-07-02 unsummarized but has jobs" in caplog.text
+
+    def test_fast_path_never_touches_the_jobs_table(
+            self, in_memory_session, summarized_timeseries):
+        """The point of the fast path: no scan of ``jobs`` at all."""
+        from sqlalchemy import event
+
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_timeseries(
+                "day", start=_TS_START, end=_TS_END, owners_limit=2)
+        finally:
+            event.remove(
+                in_memory_session.bind, "before_cursor_execute", _capture)
+
+        aggregates = [s for s in statements if "GROUP BY" in s.upper()]
+        assert aggregates
+        assert all("daily_summary" in s for s in aggregates), aggregates
+        assert not any("FROM jobs" in s for s in aggregates), aggregates
+
+
+class TestTimeseriesPathEquivalence:
+    """The decisive contract: a consumer cannot tell which path ran.
+
+    Counts, labels, window echo and owner keys must match **exactly**; the
+    float metrics only approximately, because the rollup pre-sums each
+    ``(date, user, account, queue)`` group and this re-folds those subtotals
+    while the scan sums every job in one pass — and float addition is not
+    associative.
+    """
+
+    _FLOAT_KEYS = ("cpu_hours", "gpu_hours", "cpu_charges", "gpu_charges")
+
+    @classmethod
+    def _assert_same(cls, fast, scan, ctx=""):
+        assert fast.keys() == scan.keys(), ctx
+        for key in ("period", "owners_by", "start", "end",
+                    "null_count", "total_count"):
+            assert fast[key] == scan[key], f"{ctx}: {key}"
+        assert [b["label"] for b in fast["bands"]] == \
+               [b["label"] for b in scan["bands"]], ctx
+        for fb, sb in zip(fast["bands"], scan["bands"]):
+            where = f"{ctx}: band {fb['label']}"
+            assert fb.keys() == sb.keys(), where
+            assert fb["job_count"] == sb["job_count"], where
+            assert (fb["start"], fb["end"]) == (sb["start"], sb["end"]), where
+            for key in cls._FLOAT_KEYS:
+                assert fb[key] == pytest.approx(sb[key]), f"{where}: {key}"
+            if "owners" in fb:
+                # Same legend, same rank ORDER — a stacked chart keys colour
+                # off position, so a reordered legend is a visible defect.
+                assert list(fb["owners"]) == list(sb["owners"]), where
+                for name, fm in fb["owners"].items():
+                    assert fm["job_count"] == sb["owners"][name]["job_count"], \
+                        f"{where}: {name}"
+                    for key in cls._FLOAT_KEYS:
+                        assert fm[key] == pytest.approx(
+                            sb["owners"][name][key]), f"{where}: {name}.{key}"
+        for key in ("job_count",):
+            assert fast["totals"][key] == scan["totals"][key], ctx
+        for key in cls._FLOAT_KEYS:
+            assert fast["totals"][key] == pytest.approx(
+                scan["totals"][key]), f"{ctx}: totals.{key}"
+
+    CASES = [
+        ("plain", {}),
+        ("owners", {"owners_limit": 2}),
+        ("owners by account", {"owners_limit": 2, "owners_by": "account"}),
+        ("owners by charges", {"owners_limit": 2, "owners_sort_by": "charges"}),
+        ("owners by job_count", {"owners_limit": 1,
+                                 "owners_sort_by": "job_count"}),
+        ("user filter", {"user": "alice"}),
+        ("account filter", {"account": "NCAR0002"}),
+        ("queue filter", {"queue": "main"}),
+        ("account seq", {"account": ["NCAR0001", "NCAR0002"]}),
+        ("scoped + owners", {"account": "NCAR0001", "owners_limit": 2}),
+        ("unresolvable user", {"user": "nobody"}),
+    ]
+
+    @pytest.mark.parametrize("period", ["day", "week", "month"])
+    @pytest.mark.parametrize("label,kwargs",
+                             CASES, ids=[c[0] for c in CASES])
+    def test_paths_agree(self, in_memory_session, summarized_timeseries,
+                         monkeypatch, period, label, kwargs):
+        q = JobQueries(in_memory_session)
+        fast = q.jobs_timeseries(
+            period, start=_TS_START, end=_TS_END, **kwargs)
+        _force_scan(monkeypatch)
+        scan = q.jobs_timeseries(
+            period, start=_TS_START, end=_TS_END, **kwargs)
+        self._assert_same(fast, scan, f"{period}/{label}")
+
+    def test_paths_agree_on_a_derived_window(
+            self, in_memory_session, summarized_timeseries, monkeypatch):
+        """The derived-domain path also has to route and agree."""
+        q = JobQueries(in_memory_session)
+        fast = q.jobs_timeseries("day", end=_TS_END)
+        _force_scan(monkeypatch)
+        scan = q.jobs_timeseries("day", end=_TS_END)
+        self._assert_same(fast, scan, "derived window")
+
+    def test_fast_path_totals_match_jobs_count(
+            self, in_memory_session, summarized_timeseries):
+        """The invariant survives the routing — a fast path that quietly
+        under-counted would still look self-consistent."""
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert out["total_count"] == q.jobs_count(
+            start=_TS_START, end=_TS_END) == 5
+
+    def test_fast_path_bands_replay_into_jobs_count(
+            self, in_memory_session, summarized_timeseries):
+        """A bar click still lands on exactly that bar's jobs."""
+        q = JobQueries(in_memory_session)
+        for period in ("day", "week", "month"):
+            out = q.jobs_timeseries(period, start=_TS_START, end=_TS_END)
+            for band in out["bands"]:
+                assert q.jobs_count(
+                    start=date.fromisoformat(band["start"]),
+                    end=date.fromisoformat(band["end"])
+                ) == band["job_count"], (period, band["label"])
+
+
+class TestTimeseriesBandCaps:
+    """The two caps differ because the two paths cost ~700x differently."""
+
+    def test_summary_cap_is_looser_than_the_scan_cap(self):
+        assert _MAX_SUMMARY_BANDS > _MAX_TIMESERIES_BANDS
+
+    def test_scan_path_refuses_a_ladder_past_its_cap(
+            self, in_memory_session, timeseries_jobs):
+        with pytest.raises(ValueError, match="jobs scan"):
+            JobQueries(in_memory_session).jobs_timeseries(
+                "day", start=date(2020, 1, 1), end=date(2025, 12, 31))
+
+    @staticmethod
+    def _mark_covered(session, start, end):
+        """Seed NO_JOBS markers, exactly as the rollup does for an empty day.
+
+        Cheaper than running the real rollup over 1200 days, and it is the
+        coverage predicate's actual input: one row per processed date.
+        """
+        day = start
+        while day <= end:
+            session.add(DailySummary(
+                date=day, user_id=None, account_id=None, queue_id=None,
+                job_count=0, cpu_hours=0.0, gpu_hours=0.0, memory_hours=0.0,
+                cpu_charges=0.0, gpu_charges=0.0, memory_charges=0.0))
+            day += timedelta(days=1)
+        session.commit()
+
+    def test_summary_path_allows_a_window_the_scan_path_refuses(
+            self, in_memory_session, summarized_timeseries):
+        """Two years of daily bands is a 15s query against ``jobs`` and a
+        21ms one against the rollup, so only one of them gets refused."""
+        q = JobQueries(in_memory_session)
+        wide_start = _TS_END - timedelta(days=_MAX_TIMESERIES_BANDS + 10)
+        self._mark_covered(in_memory_session, wide_start,
+                           _TS_START - timedelta(days=1))
+        out = q.jobs_timeseries("day", start=wide_start, end=_TS_END)
+        assert len(out["bands"]) == _MAX_TIMESERIES_BANDS + 11
+        assert out["total_count"] == 5      # zero-filled outside the data
+
+    def test_summary_path_still_has_a_payload_backstop(
+            self, in_memory_session, summarized_timeseries):
+        q = JobQueries(in_memory_session)
+        too_wide = _TS_END - timedelta(days=_MAX_SUMMARY_BANDS + 5)
+        self._mark_covered(in_memory_session, too_wide,
+                           _TS_START - timedelta(days=1))
+        with pytest.raises(ValueError, match="daily_summary"):
+            q.jobs_timeseries("day", start=too_wide, end=_TS_END)
+
+
+class TestTimeseriesSummaryCoverageLimit:
+    """The one place the two paths can legitimately disagree — pinned, not
+    hidden, so it fails loudly if the precondition ever stops holding.
+
+    :func:`generate_daily_summary` cannot store a job whose
+    ``user_id`` / ``account_id`` / ``queue_id`` is NULL, because a NULL FK
+    triple is already the NO_JOBS marker. The ``jobs`` scan path counts such
+    a job; the rollup has nowhere to put it. Measured 0 of 21.0M rows on
+    casper_jobs, so this is theory — but it is theory with a silent
+    under-count as its failure mode, which is why it gets a test.
+    """
+
+    def test_unattributable_job_is_absent_from_the_rollup(
+            self, in_memory_session, timeseries_jobs):
+        in_memory_session.add(Job(
+            job_id="880.desched1", short_id=880, name="orphan",
+            user=None, account=None, queue=None, status="0",
+            submit=datetime(2025, 7, 2, 12), start=datetime(2025, 7, 2, 12),
+            end=datetime(2025, 7, 2, 18), eligible_secs=60,
+            numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+        day = _TS_START
+        while day <= _TS_END:
+            generate_daily_summary(in_memory_session, "casper", day,
+                                   replace=True)
+            day += timedelta(days=1)
+        in_memory_session.commit()
+
+        q = JobQueries(in_memory_session)
+        # The scan path counts it...
+        assert q.jobs_count(start=_TS_START, end=_TS_END) == 6
+        # ...and the rollup does not, by construction.
+        rolled = in_memory_session.query(
+            func.sum(DailySummary.job_count)).filter(
+            DailySummary.date >= _TS_START,
+            DailySummary.date <= _TS_END).scalar()
+        assert rolled == 5, (
+            "daily_summary gained a NULL-FK row — if sync.summary changed, "
+            "the fast path's coverage caveat needs revisiting")
+
+    def test_chargeless_job_is_now_in_the_rollup(
+            self, in_memory_session, summarized_timeseries):
+        """Regression guard on the inner->LEFT join fix in sync.summary: job
+        804 has no JobCharge row and must still be counted, with zero hours,
+        exactly as every outer-joining query reports it."""
+        row = in_memory_session.query(
+            func.sum(DailySummary.job_count),
+            func.sum(DailySummary.cpu_hours),
+        ).filter(DailySummary.date == date(2025, 7, 5)).one()
+        assert row[0] == 1
+        assert (row[1] or 0.0) == pytest.approx(0.0)

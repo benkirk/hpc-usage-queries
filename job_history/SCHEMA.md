@@ -42,13 +42,41 @@ The **job_charges** table stores pre-computed resource hours:
 
 ### Composite Indexes
 
-Six composite indexes optimize common query patterns:
-- `(queue_id, end)` - Primary: filter by queue + date range
-- `(queue_id, user_id, end)` - User usage within queue
-- `(queue_id, account_id, end)` - Account usage within queue
-- `(user_id, date)`, `(account_id, date)`, `(queue_id, date)` - Daily summary lookups
+> **Corrected 2026-07-28.** This section previously listed `(queue_id, end)`,
+> `(queue_id, user_id, end)` and `(queue_id, account_id, end)`, and claimed a
+> planner trace through `ix_jobs_queue_end`. **None of those indexes exist** —
+> `database/models.py` is the only inventory, and every entity composite there
+> is on `submit`, not `end`. The accurate list is below and in
+> § *Indexes* further down; do not plan against the old text.
 
-Query planner verified using these indexes: `SEARCH jobs USING INDEX ix_jobs_queue_end`
+`Job.__table_args__` defines five composites:
+
+- `(user_id, account_id)` — `ix_jobs_user_account`
+- `(submit, end)` — `ix_jobs_submit_end`
+- `(user_id, submit)` / `(account_id, submit)` / `(queue_id, submit)`
+
+plus single-column btrees on `job_id`, `short_id`, `status`, `submit`,
+`start`, **`end`** (`ix_jobs_end`), and the four lookup FKs.
+
+`DailySummary` adds `ix_daily_summary_date` and
+`ix_daily_summary_user_account`.
+
+**On the missing `(account_id, end)` / `(queue_id, end)`:** every date filter
+is on `Job.end` while the entity composites are on `submit`, so these look
+like an obvious gap. **Measured, they are not worth adding.** PostgreSQL
+already resolves the scoped shape with `BitmapAnd(ix_jobs_account_id,
+ix_jobs_end)` — on casper_jobs (21.0M rows) a 30-day account-scoped aggregate
+runs in 119 ms, user-scoped in 202 ms, and with `owners_limit=10` in 257 ms.
+In that plan the BitmapAnd costs ~23 ms of 105 ms while the nested loop into
+`job_charges` accounts for 638k of 684k buffers.
+
+The join, not the index, is where the time goes: on a wide unscoped aggregate
+it is **45 %** of total runtime (`EXPLAIN` shows a full seq scan of `jobs`
+hash-joined against a full seq scan of *all* of `job_charges`). The cheap win
+there is not an index but avoiding the scan altogether — see
+`JobQueries._timeseries_uses_summary`, which serves qualifying series off
+`daily_summary` ~800× faster. Full numbers in
+`docs/plans/JOBS_TIMESERIES.md` § *Where the time actually goes*.
 
 ## Table Schemas
 

@@ -112,14 +112,14 @@ any shims. See `_get_record_class()` in `sync/pbs.py`.
 |------|------|
 | `job_history/database/models.py` | ORM models: Job, JobCharge, DailySummary, JobRecord, lookup tables |
 | `job_history/database/session.py` | Engine/session factory, `db_available()`, PRAGMA tuning, `init_db` |
-| `job_history/queries/jobs.py` | `JobQueries` class — high-level query API; `jobs_search`/`jobs_count`/`jobs_facets`/`jobs_histogram`/`jobs_usage_by` all share `_apply_jobs_search_filters` (no defaults there, on purpose); histogram bucket tables live on `QueryConfig` as `(label, lo, hi)` triples |
-| `job_history/queries/builders.py` | Period grouping + `glob_match_clause()` (dialect-aware GLOB/regex/ILIKE for job-name patterns) |
+| `job_history/queries/jobs.py` | `JobQueries` class — high-level query API; `jobs_search`/`jobs_count`/`jobs_facets`/`jobs_histogram`/`jobs_usage_by`/`jobs_timeseries` all share `_apply_jobs_search_filters` (no defaults there, on purpose); histogram bucket tables live on `QueryConfig` as `(label, lo, hi)` triples; every aggregate carries `_METRIC_KEYS` (hours **and** QoS-weighted `*_charges`, see `_charge_expr`). `jobs_timeseries` has a **`daily_summary` fast path** (~800× — `_timeseries_uses_summary` routes, `_timeseries_from_summary` executes); it falls back to scanning `jobs` for any filter the rollup aggregated away, or a window past the summary watermark |
+| `job_history/queries/builders.py` | Period grouping + `glob_match_clause()` (dialect-aware GLOB/regex/ILIKE for job-name patterns). ⚠️ `PeriodGrouper` formats the **raw UTC** column and is NOT usable for filter-aware series — `jobs_timeseries` builds site-local bands in Python instead (see `_period_bands`) |
 | `job_history/columns.py` | Column registry (`COLUMNS`, `DEFAULT_COLUMNS`, `project_row`). **Public contract** — re-exported from `job_history` and consumed by SAM for table headers. Lives at the package root, not under `cli/`, because `jobs_search` projects and sorts through it |
 | `job_history/database/session.py` | Engine/session factory, `_ensure_db_triggers()`, `init_db()` |
 | `job_history/sync/base.py` | `SyncBase` ABC; full sync lifecycle; `_compute_charges_for_jobs()`, `_upsert_charges()`, `_fill_missing_charges()`, `_recalculate_charges()`; `UPDATABLE_JOB_FIELDS` |
 | `job_history/sync/pbs.py` | PBS field parsers, `SyncPBSLogs` driver; `parse_pbs_timestamp()` → naive UTC |
 | `job_history/sync/charging.py` | `SystemCharging` ABC + `DerechoCharging`, `CasperCharging` |
-| `job_history/sync/summary.py` | `generate_daily_summary()` — naive UTC bounds, QoS-weighted charges |
+| `job_history/sync/summary.py` | `generate_daily_summary()` — naive UTC bounds, QoS-weighted charges. **LEFT** joins `job_charges` (an inner join silently dropped chargeless jobs from the rollup); still excludes NULL-FK jobs, because a NULL FK triple is the NO_JOBS marker. `jobs_timeseries`'s fast path depends on both |
 | `job_history/sync/cli.py` | `jobhist sync` Click command (`--upsert`, `--incremental`, `--recalculate`, `--resummarize`) |
 | `job_history/cli/` | SAM-aligned CLI package (Context, BaseCommand hierarchy, builders, ExporterRegistry, declarative resource reports). See `job_history/README.md` § *CLI Architecture* for the full recipe; key entry: `cli/cmds/jobhist.py` |
 | `job_history/_vendor/pbs_parser_ncar/ncar.py` | Vendored `DerechoRecord` (extends `PbsRecord` with power metrics) |
