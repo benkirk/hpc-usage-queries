@@ -110,10 +110,191 @@ def _bucket_case(field, buckets):
     return case(*whens, else_=buckets[-1][0]).label("bucket_label")
 
 
-#: Ranking metrics accepted by ``jobs_usage_by(sort_by=...)`` and
-#: ``jobs_histogram(owners_sort_by=...)``. ``hours`` is the historical
-#: default: combined ``cpu_hours + gpu_hours``.
-_USAGE_SORT_KEYS = ("hours", "cpu_hours", "gpu_hours", "job_count")
+#: Period granularities accepted by :meth:`JobQueries.jobs_timeseries`.
+#: Deliberately NOT ``PeriodGrouper``'s vocabulary — see
+#: :func:`_period_bands` for why that helper cannot be reused here.
+_TIMESERIES_PERIODS = ("day", "week", "month")
+
+#: Hard cap on the period ladder's width. :func:`_period_case` emits one
+#: WHEN arm per band and PostgreSQL evaluates the ladder per scanned row, so
+#: band count is a real cost knob (measured ~O(bands/2) comparisons/row).
+#: Callers pick a coarser *period* for wide windows rather than raising this.
+_MAX_TIMESERIES_BANDS = 400
+
+
+def _site_midnight_utc(day: date) -> datetime:
+    """Naive-UTC instant at which site-local *day* begins.
+
+    The same conversion :meth:`JobQueries._apply_date_filter` applies to its
+    ``start``/``end`` bounds, factored out so the period bands and the window
+    filter cannot drift apart. DST-exact because ``zoneinfo`` does the
+    arithmetic — a spring-forward day is 23h wide and a fall-back day 25h,
+    which no fixed-offset shift can reproduce.
+    """
+    site_tz = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
+    return (
+        datetime.combine(day, time.min)
+        .replace(tzinfo=site_tz)
+        .astimezone(timezone.utc)
+        .replace(tzinfo=None)
+    )
+
+
+def _period_first_days(start: date, end: date, period: str) -> List[date]:
+    """Site-local first-day of every *period* band touching ``[start, end]``."""
+    if period == "day":
+        return [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    if period == "week":
+        # Snap back to Monday so bands are whole ISO weeks: two windows over
+        # overlapping spans then share band boundaries and stay comparable.
+        out, cur = [], start - timedelta(days=start.weekday())
+        while cur <= end:
+            out.append(cur)
+            cur += timedelta(days=7)
+        return out
+    out, cur = [], start.replace(day=1)
+    while cur <= end:
+        out.append(cur)
+        # Jump into the next month without calendar arithmetic edge cases.
+        cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return out
+
+
+def _period_bands(start: date, end: date, period: str) -> List[Dict[str, Any]]:
+    """Zero-filled band table for ``[start, end]`` at *period* granularity.
+
+    Returns ``[{label, start, end, hi_utc}, ...]`` in chronological order,
+    where ``start``/``end`` are **site-local** inclusive calendar dates (the
+    band's replay bounds — ``jobs_search(start=…, end=…)`` returns exactly
+    that band's jobs) and ``hi_utc`` is the naive-UTC **exclusive** upper
+    bound used to build the SQL ladder.
+
+    Bands are clipped to the window: a week band snapped back to Monday
+    reports the window's start, not the Monday, so replaying it cannot pull
+    in jobs from before the window and break the band↔``jobs_search``
+    round-trip.
+
+    **Why not** :class:`~job_history.queries.builders.PeriodGrouper`: it
+    formats the raw column (``to_char(job.end, 'YYYY-MM-DD')`` /
+    ``strftime``) with no timezone conversion, so it buckets by **UTC**
+    calendar day while :meth:`JobQueries._apply_date_filter` bounds the
+    window by **site-local** days. Mixing the two offsets every band from
+    its own window, makes the first and last bands partial, and disagrees
+    with ``DailySummary`` (which bins site-local). Generating the boundaries
+    in Python keeps one convention, works identically on SQLite and
+    PostgreSQL, and gets ``week`` for free — a granularity ``PeriodGrouper``
+    does not support at all.
+    """
+    bands = []
+    firsts = _period_first_days(start, end, period)
+    for i, first in enumerate(firsts):
+        nxt = firsts[i + 1] if i + 1 < len(firsts) else None
+        last = (nxt - timedelta(days=1)) if nxt is not None else end
+        if period == "day":
+            label = first.isoformat()
+        elif period == "week":
+            iso = first.isocalendar()
+            label = f"{iso[0]}-W{iso[1]:02d}"
+        else:
+            label = first.strftime("%Y-%m")
+        bands.append({
+            "label": label,
+            # Clipped to the window — see the round-trip note above.
+            "start": max(first, start),
+            "end": min(last, end),
+            "hi_utc": _site_midnight_utc(min(last, end) + timedelta(days=1)),
+        })
+    return bands
+
+
+def _period_case(field, bands: List[Dict[str, Any]]):
+    """CASE labelling *field* into contiguous half-open period *bands*.
+
+    Mirrors :func:`_bucket_case`'s totality argument with the half-open
+    ``<`` comparison :meth:`JobQueries._apply_date_filter` uses, rather than
+    ``<= hi``: timestamps carry sub-second precision, so an inclusive upper
+    bound would need an epsilon and would not tile the axis exactly.
+
+    Totality holds because the caller has already filtered the query to
+    ``[bands[0] window start, bands[-1].hi_utc)``: every non-NULL row is at
+    or past the first band's floor, and anything beyond the penultimate
+    band's bound belongs to the last band, which is the ``else_`` arm.
+    """
+    whens = [(field.is_(None), _NULL_BUCKET)]
+    whens += [(field < b["hi_utc"], b["label"]) for b in bands[:-1]]
+    return case(*whens, else_=bands[-1]["label"]).label("period_label")
+
+
+def _charge_expr(hours_col):
+    """SUM-able charge expression: raw hours x the job's QoS factor.
+
+    The one formula for "charges" in this package, mirroring
+    ``columns._compute_charge`` (the per-row path) and ``sync.summary``'s
+    daily rollup, so all three surfaces cannot drift.
+
+    ``qos_factor`` is ``NOT NULL`` on ``job_charges``, so the COALESCE is
+    defensive only — it covers the outer-join miss (a job with no charge
+    row), where ``hours_col`` is NULL too and the product drops out of the
+    SUM regardless.
+    """
+    return hours_col * func.coalesce(JobCharge.qos_factor, 1.0)
+
+
+#: The metric vector every aggregate carries, in fold order (count first).
+#: ``*_charges`` reuse the plugin's established key names (``columns.py``,
+#: ``daily_summary_report``, ``DailySummary``) so a consumer keeps one map.
+_METRIC_KEYS = ("job_count", "cpu_hours", "gpu_hours",
+                "cpu_charges", "gpu_charges")
+
+
+def _metric_agg_cols() -> List[Any]:
+    """The five aggregate select columns, in ``_METRIC_KEYS`` order.
+
+    Charges add no join and no scan: ``qos_factor`` rides the same
+    ``job_charges`` row already read for the hour sums.
+    """
+    return [
+        func.count(Job.id),
+        func.sum(JobCharge.cpu_hours),
+        func.sum(JobCharge.gpu_hours),
+        func.sum(_charge_expr(JobCharge.cpu_hours)),
+        func.sum(_charge_expr(JobCharge.gpu_hours)),
+    ]
+
+
+def _zero_metrics() -> List[float]:
+    """A fresh mutable accumulator matching ``_METRIC_KEYS``."""
+    return [0, 0.0, 0.0, 0.0, 0.0]
+
+
+def _accumulate(acc: List[float], count, cpu, gpu, cpu_chg, gpu_chg) -> None:
+    """Fold one aggregate row into *acc*. SUM over an all-NULL charge group
+    is NULL, hence the ``or 0.0``."""
+    acc[0] += int(count)
+    acc[1] += float(cpu or 0.0)
+    acc[2] += float(gpu or 0.0)
+    acc[3] += float(cpu_chg or 0.0)
+    acc[4] += float(gpu_chg or 0.0)
+
+
+def _metrics_dict(acc: Sequence) -> Dict[str, Any]:
+    """``_METRIC_KEYS`` -> value, with ``job_count`` as an int."""
+    return {
+        "job_count":   int(acc[0]),
+        "cpu_hours":   float(acc[1]),
+        "gpu_hours":   float(acc[2]),
+        "cpu_charges": float(acc[3]),
+        "gpu_charges": float(acc[4]),
+    }
+
+
+#: Ranking metrics accepted by ``jobs_usage_by(sort_by=...)``,
+#: ``jobs_histogram(owners_sort_by=...)`` and
+#: ``jobs_timeseries(owners_sort_by=...)``. ``hours`` is the historical
+#: default: combined ``cpu_hours + gpu_hours``; ``charges`` is its
+#: QoS-weighted counterpart, combined ``cpu_charges + gpu_charges``.
+_USAGE_SORT_KEYS = ("hours", "cpu_hours", "gpu_hours", "job_count",
+                    "charges", "cpu_charges", "gpu_charges")
 
 
 def _check_usage_sort_key(sort_by: str, param: str) -> None:
@@ -123,19 +304,23 @@ def _check_usage_sort_key(sort_by: str, param: str) -> None:
         raise ValueError(f"Unknown {param}: {sort_by!r}. Valid keys: {valid}")
 
 
-def _usage_rank(sort_by: str, job_count, cpu_hours, gpu_hours) -> float:
-    """The ranking metric's value, so both call sites agree on ``hours``.
+def _usage_rank(sort_by: str, metrics: Dict[str, Any]) -> float:
+    """The ranking metric's value, so every call site agrees on ``hours``.
 
-    Shared by ``jobs_usage_by``'s row ranking and ``jobs_histogram``'s
-    per-bucket owner ranking — the same vocabulary must mean the same thing
-    in both, or a dashboard's pie and its stacked bars disagree about who
-    the top consumers are.
+    Shared by ``jobs_usage_by``'s row ranking and the per-owner ranking in
+    ``jobs_histogram`` / ``jobs_timeseries`` — the same vocabulary must mean
+    the same thing everywhere, or a dashboard's pie and its stacked bars
+    disagree about who the top consumers are.
+
+    Args:
+        sort_by: a ``_USAGE_SORT_KEYS`` member.
+        metrics: a ``_METRIC_KEYS``-shaped mapping.
     """
     if sort_by == "hours":
-        return cpu_hours + gpu_hours
-    if sort_by == "job_count":
-        return job_count
-    return cpu_hours if sort_by == "cpu_hours" else gpu_hours
+        return metrics["cpu_hours"] + metrics["gpu_hours"]
+    if sort_by == "charges":
+        return metrics["cpu_charges"] + metrics["gpu_charges"]
+    return metrics[sort_by]
 
 
 def _sort_expression(sort_by: str):
@@ -1914,12 +2099,20 @@ class JobQueries:
               "max_param": "max_eligible_secs", #   replay one band as filters
               "buckets": [
                 {"label": "<1m", "lo": 0, "hi": 59,
-                 "job_count": 12, "cpu_hours": 190.0, "gpu_hours": 0.0},
+                 "job_count": 12, "cpu_hours": 190.0, "gpu_hours": 0.0,
+                 "cpu_charges": 199.5, "gpu_charges": 0.0},
                 ...                             # full vector, band order
               ],
               "null_count": 2,                  # filters matched, column NULL
               "total_count": 14,                # Σ job_count + null_count
             }
+
+        Every band (and every ``owners`` entry) carries the full
+        :data:`_METRIC_KEYS` vector: raw hours *and* their QoS-weighted
+        ``cpu_charges``/``gpu_charges`` (``hours x qos_factor``, see
+        :func:`_charge_expr`). **Charges are not proportional to hours** —
+        ``qos_factor`` is a real 0.0 for the ``uncharged`` QoS, so a band can
+        legitimately report hours > 0 with charges == 0.
 
         ``lo``/``hi`` are inclusive native-unit bounds. Either may be None
         where the band is open-ended: always ``hi`` on the last band, and
@@ -2017,12 +2210,7 @@ class JobQueries:
         column, buckets, unit, min_param, max_param = spec
 
         bucket_label = _bucket_case(column, buckets)
-        select_cols = [
-            bucket_label,
-            func.count(Job.id),
-            func.sum(JobCharge.cpu_hours),
-            func.sum(JobCharge.gpu_hours),
-        ]
+        select_cols = [bucket_label, *_metric_agg_cols()]
         group_cols = [bucket_label]
         if owners_limit is not None:
             # Group the integer FK, never the text hybrid — see
@@ -2056,35 +2244,29 @@ class JobQueries:
         # charge group is NULL, hence the `or 0.0`. The NULL band routes to
         # null_count — its hour sums are deliberately dropped (unmeasured
         # rows are excluded from the distribution, not smeared into it).
+        # One fold for both shapes: with owners the bucket totals are
+        # re-folded from the per-owner rows (identical arithmetic to the
+        # ungrouped shape) and the per-owner split is kept on the side.
+        # NULL-owner rows count toward totals but are never owner
+        # candidates — they live in the derivable remainder.
         owners_by_label: Dict[str, Dict[Any, List[float]]] = {}
-        if owners_limit is None:
-            by_label = {
-                label: (count, cpu, gpu) for label, count, cpu, gpu in rows
-            }
-            null_count = int(by_label.pop(_NULL_BUCKET, (0, None, None))[0])
-        else:
-            # Per-owner rows: re-fold bucket totals (identical arithmetic to
-            # the ungrouped shape) and keep the per-owner split on the side.
-            # NULL-owner rows count toward totals but are never owner
-            # candidates — they live in the derivable remainder.
-            by_label = {}
-            null_count = 0
-            for label, owner_id, count, cpu, gpu in rows:
-                if label == _NULL_BUCKET:
-                    null_count += int(count)
-                    continue
-                t_count, t_cpu, t_gpu = by_label.get(label, (0, 0.0, 0.0))
-                by_label[label] = (
-                    t_count + int(count),
-                    t_cpu + float(cpu or 0.0),
-                    t_gpu + float(gpu or 0.0),
-                )
-                if owner_id is not None:
-                    per_owner = owners_by_label.setdefault(label, {})
-                    agg = per_owner.setdefault(owner_id, [0, 0.0, 0.0])
-                    agg[0] += int(count)
-                    agg[1] += float(cpu or 0.0)
-                    agg[2] += float(gpu or 0.0)
+        by_label: Dict[str, List[float]] = {}
+        names: Dict[Any, Any] = {}
+        null_count = 0
+        for row in rows:
+            if owners_limit is None:
+                label, owner_id, metric_cols = row[0], None, row[1:]
+            else:
+                label, owner_id, metric_cols = row[0], row[1], row[2:]
+            if label == _NULL_BUCKET:
+                null_count += int(metric_cols[0])
+                continue
+            _accumulate(by_label.setdefault(label, _zero_metrics()), *metric_cols)
+            if owner_id is not None:
+                per_owner = owners_by_label.setdefault(label, {})
+                _accumulate(per_owner.setdefault(owner_id, _zero_metrics()),
+                            *metric_cols)
+        if owners_limit is not None:
             names = self._resolve_lookup_names(
                 owner_model, owner_name_col,
                 {oid for per_owner in owners_by_label.values() for oid in per_owner},
@@ -2092,14 +2274,11 @@ class JobQueries:
 
         out_buckets = []
         for label, lo, hi in buckets:
-            count, cpu, gpu = by_label.get(label, (0, None, None))
             bucket = {
                 "label": label,
                 "lo": lo,
                 "hi": hi,
-                "job_count": int(count),
-                "cpu_hours": float(cpu or 0.0),
-                "gpu_hours": float(gpu or 0.0),
+                **_metrics_dict(by_label.get(label, _zero_metrics())),
             }
             if owners_limit is not None:
                 # Rank by the caller's metric desc, then name asc (the facet
@@ -2108,21 +2287,14 @@ class JobQueries:
                 # and the output key, so an id the lookup can't resolve sorts
                 # and renders under the same string.
                 named = [
-                    (str(names.get(oid, oid)), agg)
+                    (str(names.get(oid, oid)), _metrics_dict(agg))
                     for oid, agg in owners_by_label.get(label, {}).items()
                 ]
                 ranked = sorted(named, key=lambda na: (
-                    -_usage_rank(owners_sort_by, na[1][0], na[1][1], na[1][2]),
+                    -_usage_rank(owners_sort_by, na[1]),
                     na[0],
                 ))[:owners_limit]
-                bucket["owners"] = {
-                    name: {
-                        "job_count": agg[0],
-                        "cpu_hours": agg[1],
-                        "gpu_hours": agg[2],
-                    }
-                    for name, agg in ranked
-                }
+                bucket["owners"] = dict(ranked)
             out_buckets.append(bucket)
 
         total = sum(b["job_count"] for b in out_buckets) + null_count
@@ -2211,22 +2383,30 @@ class JobQueries:
               "dimension": "user",
               "rows": [   # sort_by metric desc, value asc, None last
                 {"value": "alice", "job_count": 812,
-                 "cpu_hours": 91234.5, "gpu_hours": 120.0},
+                 "cpu_hours": 91234.5, "gpu_hours": 120.0,
+                 "cpu_charges": 96000.1, "gpu_charges": 180.0},
                 ...
               ],
               "totals": {"job_count": 40213,
-                         "cpu_hours": 5432100.0, "gpu_hours": 21000.0},
+                         "cpu_hours": 5432100.0, "gpu_hours": 21000.0,
+                         "cpu_charges": 5698000.0, "gpu_charges": 31500.0},
             }
 
         ``value`` is ``None`` for a NULL FK (kept, not dropped — dropping
-        would make rows under-sum against ``totals``). Hours are raw
-        ``cpu_hours``/``gpu_hours``, not QoS-weighted charges, matching
-        :meth:`job_sizes_by_resource`; ``memory_hours`` is omitted until a
-        consumer needs it. ``totals["job_count"]`` equals
+        would make rows under-sum against ``totals``). Every row carries the
+        full :data:`_METRIC_KEYS` vector: raw ``cpu_hours``/``gpu_hours``
+        *and* their QoS-weighted ``cpu_charges``/``gpu_charges``
+        (``hours x qos_factor``, see :func:`_charge_expr`). ``memory_hours``
+        is omitted until a consumer needs it. ``totals["job_count"]`` equals
         :meth:`jobs_count` under the same filters by construction.
 
+        **Charges are not proportional to hours.** ``qos_factor`` is a real
+        0.0 for the ``uncharged`` QoS, so a slice can legitimately report
+        hours > 0 with charges == 0. A consumer offering a charges metric
+        must not present an empty bar as "no activity".
+
         Cost: one aggregate statement — grouped on the integer FK (never
-        the text hybrid; see :data:`_FACET_SPECS`), COUNT + two SUMs over a
+        the text hybrid; see :data:`_FACET_SPECS`), COUNT + four SUMs over a
         LEFT OUTER JOIN to ``job_charges``, names resolved after
         aggregation. Scans every row in the date slice, so always pass a
         bounded ``start``/``end``. Measured on PostgreSQL over a 308k-row
@@ -2249,12 +2429,7 @@ class JobQueries:
         group_col, model, name_col = spec
 
         query = (
-            self.session.query(
-                group_col,
-                func.count(Job.id),
-                func.sum(JobCharge.cpu_hours),
-                func.sum(JobCharge.gpu_hours),
-            )
+            self.session.query(group_col, *_metric_agg_cols())
             .outerjoin(JobCharge, Job.id == JobCharge.job_id)
         )
         query = self._apply_jobs_search_filters(
@@ -2282,31 +2457,325 @@ class JobQueries:
             )
 
         rows = []
-        for key, count, cpu, gpu in raw:
+        for key, *metric_cols in raw:
             value = names.get(key) if model is not None else key
-            rows.append({
-                "value": value,
-                "job_count": int(count),
-                "cpu_hours": float(cpu or 0.0),
-                "gpu_hours": float(gpu or 0.0),
-            })
+            acc = _zero_metrics()
+            _accumulate(acc, *metric_cols)
+            rows.append({"value": value, **_metrics_dict(acc)})
         # sort_by metric desc, then value asc with None last — the facet
         # tie-break convention, keyed on the caller's ranking metric.
         rows.sort(key=lambda r: (
-            -_usage_rank(sort_by, r["job_count"], r["cpu_hours"], r["gpu_hours"]),
+            -_usage_rank(sort_by, r),
             r["value"] is None,
             str(r["value"]),
         ))
 
-        totals = {
-            "job_count": sum(r["job_count"] for r in rows),
-            "cpu_hours": sum(r["cpu_hours"] for r in rows),
-            "gpu_hours": sum(r["gpu_hours"] for r in rows),
-        }
+        totals = {key: sum(r[key] for r in rows) for key in _METRIC_KEYS}
         if limit is not None:
             rows = rows[:limit]
 
         return {"dimension": dimension, "rows": rows, "totals": totals}
+
+    def jobs_timeseries(
+        self,
+        period: str = "day",
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
+        queue: Optional[str] = None,
+        qos: Optional[str] = None,
+        exit_status: Optional[str] = None,
+        job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
+        owners_limit: Optional[int] = None,
+        owners_sort_by: str = "hours",
+        owners_by: str = "user",
+    ) -> Dict[str, Any]:
+        """Per-period activity series, for a stacked time-series chart.
+
+        Buckets every job matching the filter set into contiguous calendar
+        bands of *period* and returns the **full zero-filled band vector in
+        chronological order**. Filter shape mirrors :meth:`jobs_search` /
+        :meth:`jobs_count` exactly (same ``_apply_jobs_search_filters``
+        helper), so a timeline can never disagree with the job table it sits
+        next to.
+
+        This is the time axis :meth:`jobs_histogram` deliberately does not
+        offer — and the only per-period method here that honours the filter
+        set. :meth:`usage_history`, :meth:`jobs_by_entity_period` and
+        :meth:`daily_summary_report` all take **dates only**, so a chart
+        built on them would silently ignore queue / size / exit-status
+        filters.
+
+        Args:
+            period: ``'day'``, ``'week'`` (ISO, Monday-start) or
+                ``'month'``. Bands are **site-local** calendar periods (see
+                :func:`_period_bands`), matching ``_apply_date_filter`` and
+                the ``DailySummary`` binning.
+            owners_limit: When set, every band additionally carries an
+                ``owners`` mapping — the window's top-N owners. Unlike
+                :meth:`jobs_histogram`, whose top-N is computed *per band*,
+                the set here is ranked **once over the whole window** and
+                every band carries the same N keys in the same rank order,
+                zero-filled where an owner was idle. A stacked bar chart
+                needs exactly that: one legend, and a colour that means the
+                same owner in every bar.
+            owners_by: ``'user'`` (default) or ``'account'``.
+            owners_sort_by: Which metric decides *which* N owners survive —
+                a :data:`_USAGE_SORT_KEYS` member. Must follow the displayed
+                metric, for the reason spelled out in :meth:`jobs_usage_by`.
+
+        Returns::
+
+            {
+              "period": "day",
+              "owners_by": "user",
+              "start": "2026-05-01",      # resolved window (see below)
+              "end":   "2026-05-31",
+              "bands": [                  # full vector, chronological
+                {"label": "2026-05-01",
+                 "start": "2026-05-01", "end": "2026-05-01",
+                 "job_count": 812, "cpu_hours": 91234.5, "gpu_hours": 120.0,
+                 "cpu_charges": 96000.1, "gpu_charges": 180.0,
+                 "owners": {"alice": {...}}},   # top-N, global rank order
+                ...
+              ],
+              "totals": {...},            # every band, pre-truncation
+              "null_count": 0,            # filters matched, Job.end NULL
+              "total_count": 24680,       # Σ band job_count + null_count
+            }
+
+        **Replaying a band is ``jobs_search(start=band['start'],
+        end=band['end'], **filters)``** — the window filters *are* this
+        dimension, so there is no ``min_param``/``max_param`` to echo. Bands
+        are clipped to the window, so every band replays to exactly its own
+        ``job_count``, and ``total_count == jobs_count(**filters)``; both
+        are pinned by tests.
+
+        ``start``/``end`` echo the **resolved** window. When the caller
+        supplies neither (an explicit opt-in to full history), the domain is
+        derived from ``MIN``/``MAX`` of ``Job.end`` under the same filters —
+        one extra cheap aggregate — because a band vector needs a domain.
+        An empty result yields no bands.
+
+        ``null_count`` collects rows matching the filters whose ``Job.end``
+        is NULL; they never land in a band. In practice a bounded window
+        excludes them already (NULL fails both bounds), so this is non-zero
+        only for an unbounded query.
+
+        The ``owners`` remainder is derivable, never synthesized: a band's
+        "Others" is exactly ``band totals − Σ band owners``. Rows whose
+        owner FK is NULL, and every owner outside the global top-N, fold
+        into that remainder by construction — SQL maps both to the same NULL
+        group key.
+
+        Cost: **two aggregate statements** when *owners_limit* is set (one
+        to rank owners over the window, one for the series), **one**
+        otherwise; plus one MIN/MAX probe when the window is derived. Each
+        scans the filtered slice once. The band ladder costs ~O(bands/2)
+        comparisons per scanned row, so prefer a coarser *period* over a
+        wide day-granular window — band count is capped at
+        :data:`_MAX_TIMESERIES_BANDS`.
+
+        Raises:
+            ValueError: unknown *period*, non-positive *owners_limit*,
+                unknown *owners_by* / *owners_sort_by*, or a window whose
+                band count exceeds the cap.
+        """
+        if period not in _TIMESERIES_PERIODS:
+            valid = ", ".join(_TIMESERIES_PERIODS)
+            raise ValueError(
+                f"Unknown period: {period!r}. Valid periods: {valid}")
+        if owners_limit is not None and (
+                not isinstance(owners_limit, int) or owners_limit <= 0):
+            raise ValueError(
+                f"owners_limit must be a positive integer, got {owners_limit!r}")
+        _check_usage_sort_key(owners_sort_by, "owners_sort_by")
+        if owners_by not in ("user", "account"):
+            raise ValueError(
+                f"Unknown owners_by: {owners_by!r}. Valid values: user, account")
+        owner_fk, owner_model, owner_name_col = _FACET_SPECS[owners_by]
+
+        filters = dict(
+            start=start, end=end, user=user, account=account,
+            queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
+            name=name, ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used,
+            max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
+        )
+
+        win_start, win_end = self._resolve_timeseries_window(start, end, filters)
+        empty = {
+            "period": period, "owners_by": owners_by,
+            "start": None, "end": None, "bands": [],
+            "totals": _metrics_dict(_zero_metrics()),
+            "null_count": 0, "total_count": 0,
+        }
+        if win_start is None:
+            # No rows at all, and no caller-supplied domain to zero-fill over.
+            return empty
+
+        bands = _period_bands(win_start, win_end, period)
+        if len(bands) > _MAX_TIMESERIES_BANDS:
+            raise ValueError(
+                f"{win_start}..{win_end} at period={period!r} needs "
+                f"{len(bands)} bands, over the {_MAX_TIMESERIES_BANDS} cap. "
+                f"Use a coarser period or a narrower window.")
+
+        # Statement 1 (owners only): rank owners ONCE over the whole window,
+        # so the band vector shares one legend and one colour assignment.
+        top_ids: List[Any] = []
+        top_names: Dict[Any, str] = {}
+        if owners_limit is not None:
+            rank_q = (
+                self.session.query(owner_fk, *_metric_agg_cols())
+                .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+            )
+            rank_q = self._apply_jobs_search_filters(rank_q, **filters)
+            candidates = {}
+            for owner_id, *metric_cols in rank_q.group_by(owner_fk).all():
+                if owner_id is None:
+                    continue  # NULL owners live in the derivable remainder
+                acc = _zero_metrics()
+                _accumulate(acc, *metric_cols)
+                candidates[owner_id] = _metrics_dict(acc)
+            names = self._resolve_lookup_names(
+                owner_model, owner_name_col, set(candidates))
+            ranked = sorted(
+                ((str(names.get(oid, oid)), oid, m)
+                 for oid, m in candidates.items()),
+                key=lambda t: (-_usage_rank(owners_sort_by, t[2]), t[0]),
+            )[:owners_limit]
+            top_ids = [oid for _n, oid, _m in ranked]
+            top_names = {oid: nm for nm, oid, _m in ranked}
+
+        # Statement 2: the series. Non-top-N owners collapse to a NULL group
+        # key in SQL — same bucket as a genuinely NULL owner FK, and both
+        # belong in "Others" — so band totals stay exact with no extra pass.
+        # No surviving candidates (an empty slice) means no owner axis to
+        # group by — an empty IN-list is both a SQLAlchemy warning and a
+        # pointless extra group key.
+        with_owners = owners_limit is not None and bool(top_ids)
+        period_label = _period_case(Job.end, bands)
+        select_cols: List[Any] = [period_label, *_metric_agg_cols()]
+        group_cols: List[Any] = [period_label]
+        if with_owners:
+            owner_key = case((owner_fk.in_(top_ids), owner_fk)).label("owner_key")
+            select_cols.insert(1, owner_key)
+            group_cols.append(owner_key)
+        query = (
+            self.session.query(*select_cols)
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+        )
+        query = self._apply_jobs_search_filters(query, **filters)
+        rows = query.group_by(*group_cols).all()
+
+        by_label: Dict[str, List[float]] = {}
+        owners_by_label: Dict[str, Dict[Any, List[float]]] = {}
+        null_count = 0
+        for row in rows:
+            if with_owners:
+                label, owner_id, metric_cols = row[0], row[1], row[2:]
+            else:
+                label, owner_id, metric_cols = row[0], None, row[1:]
+            if label == _NULL_BUCKET:
+                null_count += int(metric_cols[0])
+                continue
+            _accumulate(by_label.setdefault(label, _zero_metrics()), *metric_cols)
+            if owner_id is not None:
+                per_owner = owners_by_label.setdefault(label, {})
+                _accumulate(per_owner.setdefault(owner_id, _zero_metrics()),
+                            *metric_cols)
+
+        out_bands = []
+        for band in bands:
+            out = {
+                "label": band["label"],
+                "start": band["start"].isoformat(),
+                "end": band["end"].isoformat(),
+                **_metrics_dict(by_label.get(band["label"], _zero_metrics())),
+            }
+            if owners_limit is not None:
+                # EVERY band carries the SAME top-N keys, in global rank
+                # order, zero-filled where an owner was idle — the band
+                # vector's zero-fill contract applied to the owner axis. A
+                # stacked chart can map key -> colour once and trust that a
+                # series never changes position or disappears mid-axis.
+                # (jobs_histogram differs on purpose: its top-N is per-band,
+                # so absent owners have no meaning there.)
+                per_owner = owners_by_label.get(band["label"], {})
+                out["owners"] = {
+                    top_names[oid]: _metrics_dict(
+                        per_owner.get(oid, _zero_metrics()))
+                    for oid in top_ids
+                }
+            out_bands.append(out)
+
+        totals = {key: sum(b[key] for b in out_bands) for key in _METRIC_KEYS}
+        return {
+            "period": period,
+            "owners_by": owners_by,
+            "start": win_start.isoformat(),
+            "end": win_end.isoformat(),
+            "bands": out_bands,
+            "totals": totals,
+            "null_count": null_count,
+            "total_count": totals["job_count"] + null_count,
+        }
+
+    def _resolve_timeseries_window(self, start, end, filters):
+        """``(win_start, win_end)`` site-local dates for the band vector.
+
+        Caller-supplied bounds win. A missing bound is derived from the
+        observed ``MIN``/``MAX`` of ``Job.end`` under the same filters —
+        converted back to site-local days, so the derived domain and the
+        bands share one timezone convention. Returns ``(None, None)`` when
+        nothing matches and no bound was supplied.
+        """
+        if start is not None and end is not None:
+            return start, end
+        probe = self.session.query(func.min(Job.end), func.max(Job.end))
+        probe = self._apply_jobs_search_filters(probe, **filters)
+        lo, hi = probe.one()
+        if lo is None or hi is None:
+            return (start, end) if start is not None and end is not None \
+                else (None, None)
+        site_tz = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
+
+        def _to_site_day(naive_utc: datetime) -> date:
+            return (naive_utc.replace(tzinfo=timezone.utc)
+                    .astimezone(site_tz).date())
+
+        return (start if start is not None else _to_site_day(lo),
+                end if end is not None else _to_site_day(hi))
 
     def _resolve_lookup_names(self, model, name_col, ids) -> Dict[Any, Any]:
         """``{id: display_name}`` for a lookup table, post-aggregation.

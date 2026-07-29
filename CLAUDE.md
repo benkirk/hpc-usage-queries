@@ -112,8 +112,8 @@ any shims. See `_get_record_class()` in `sync/pbs.py`.
 |------|------|
 | `job_history/database/models.py` | ORM models: Job, JobCharge, DailySummary, JobRecord, lookup tables |
 | `job_history/database/session.py` | Engine/session factory, `db_available()`, PRAGMA tuning, `init_db` |
-| `job_history/queries/jobs.py` | `JobQueries` class — high-level query API; `jobs_search`/`jobs_count`/`jobs_facets`/`jobs_histogram`/`jobs_usage_by` all share `_apply_jobs_search_filters` (no defaults there, on purpose); histogram bucket tables live on `QueryConfig` as `(label, lo, hi)` triples |
-| `job_history/queries/builders.py` | Period grouping + `glob_match_clause()` (dialect-aware GLOB/regex/ILIKE for job-name patterns) |
+| `job_history/queries/jobs.py` | `JobQueries` class — high-level query API; `jobs_search`/`jobs_count`/`jobs_facets`/`jobs_histogram`/`jobs_usage_by`/`jobs_timeseries` all share `_apply_jobs_search_filters` (no defaults there, on purpose); histogram bucket tables live on `QueryConfig` as `(label, lo, hi)` triples; every aggregate carries `_METRIC_KEYS` (hours **and** QoS-weighted `*_charges`, see `_charge_expr`) |
+| `job_history/queries/builders.py` | Period grouping + `glob_match_clause()` (dialect-aware GLOB/regex/ILIKE for job-name patterns). ⚠️ `PeriodGrouper` formats the **raw UTC** column and is NOT usable for filter-aware series — `jobs_timeseries` builds site-local bands in Python instead (see `_period_bands`) |
 | `job_history/columns.py` | Column registry (`COLUMNS`, `DEFAULT_COLUMNS`, `project_row`). **Public contract** — re-exported from `job_history` and consumed by SAM for table headers. Lives at the package root, not under `cli/`, because `jobs_search` projects and sorts through it |
 | `job_history/database/session.py` | Engine/session factory, `_ensure_db_triggers()`, `init_db()` |
 | `job_history/sync/base.py` | `SyncBase` ABC; full sync lifecycle; `_compute_charges_for_jobs()`, `_upsert_charges()`, `_fill_missing_charges()`, `_recalculate_charges()`; `UPDATABLE_JOB_FIELDS` |

@@ -42,13 +42,30 @@ The **job_charges** table stores pre-computed resource hours:
 
 ### Composite Indexes
 
-Six composite indexes optimize common query patterns:
-- `(queue_id, end)` - Primary: filter by queue + date range
-- `(queue_id, user_id, end)` - User usage within queue
-- `(queue_id, account_id, end)` - Account usage within queue
-- `(user_id, date)`, `(account_id, date)`, `(queue_id, date)` - Daily summary lookups
+> **Corrected 2026-07-28.** This section previously listed `(queue_id, end)`,
+> `(queue_id, user_id, end)` and `(queue_id, account_id, end)`, and claimed a
+> planner trace through `ix_jobs_queue_end`. **None of those indexes exist** —
+> `database/models.py` is the only inventory, and every entity composite there
+> is on `submit`, not `end`. The accurate list is below and in
+> § *Indexes* further down; do not plan against the old text.
 
-Query planner verified using these indexes: `SEARCH jobs USING INDEX ix_jobs_queue_end`
+`Job.__table_args__` defines five composites:
+
+- `(user_id, account_id)` — `ix_jobs_user_account`
+- `(submit, end)` — `ix_jobs_submit_end`
+- `(user_id, submit)` / `(account_id, submit)` / `(queue_id, submit)`
+
+plus single-column btrees on `job_id`, `short_id`, `status`, `submit`,
+`start`, **`end`** (`ix_jobs_end`), and the four lookup FKs.
+
+`DailySummary` adds `ix_daily_summary_date` and
+`ix_daily_summary_user_account`.
+
+**Known gap:** there is no `(account_id, end)` or `(queue_id, end)`. Every
+date filter is on `Job.end` while the entity composites are on `submit`, so an
+account- or queue-scoped date query filters one predicate per row. Deferred to
+its own PR — see `docs/plans/JOB_HIST_PLUGIN_ENHANCEMENTS.md` § *Deferred*.
+An account-scoped `jobs_timeseries` is the query that would benefit most.
 
 ## Table Schemas
 
