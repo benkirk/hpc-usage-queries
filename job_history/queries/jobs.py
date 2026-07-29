@@ -185,6 +185,12 @@ def _period_bands(start: date, end: date, period: str) -> List[Dict[str, Any]]:
     PostgreSQL, and gets ``week`` for free — a granularity ``PeriodGrouper``
     does not support at all.
     """
+    if start > end:
+        # Inverted window covers nothing. Guarded here rather than in the
+        # caller because only ``day`` falls out empty on its own: ``week``
+        # and ``month`` snap their first day BACKWARDS, which can land at or
+        # before *end* and emit a single band whose clipped start > end.
+        return []
     bands = []
     firsts = _period_first_days(start, end, period)
     for i, first in enumerate(firsts):
@@ -2644,6 +2650,11 @@ class JobQueries:
             return empty
 
         bands = _period_bands(win_start, win_end, period)
+        if not bands:
+            # Inverted window (start > end). ``jobs_count``/``jobs_search``
+            # answer 0 rather than raising, so this does too — and returning
+            # early also keeps _period_case from indexing an empty ladder.
+            return empty
         if len(bands) > _MAX_TIMESERIES_BANDS:
             raise ValueError(
                 f"{win_start}..{win_end} at period={period!r} needs "
@@ -2766,8 +2777,10 @@ class JobQueries:
         probe = self._apply_jobs_search_filters(probe, **filters)
         lo, hi = probe.one()
         if lo is None or hi is None:
-            return (start, end) if start is not None and end is not None \
-                else (None, None)
+            # Nothing matched, so there is no domain to zero-fill over. (Both
+            # bounds supplied already returned above, so there is no
+            # caller-supplied domain to fall back on here.)
+            return None, None
         site_tz = ZoneInfo(JobHistoryConfig.SITE_TIMEZONE)
 
         def _to_site_day(naive_utc: datetime) -> date:

@@ -2320,6 +2320,39 @@ class TestJobsTimeseries:
             "day", user="nobody")
         assert out["bands"] == [] and out["total_count"] == 0
 
+    @pytest.mark.parametrize("period", ["day", "week", "month"])
+    def test_inverted_window_is_empty_not_an_error(
+            self, in_memory_session, timeseries_jobs, period):
+        """start > end answers 0 rows, matching jobs_count/jobs_search rather
+        than raising. Reachable from the explorer's free-text date fields, and
+        an empty ladder would otherwise IndexError inside _period_case."""
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries(
+            period, start=date(2025, 7, 5), end=date(2025, 7, 1))
+        assert out["bands"] == []
+        assert out["total_count"] == 0 == q.jobs_count(
+            start=date(2025, 7, 5), end=date(2025, 7, 1))
+
+    def test_null_end_jobs_land_in_null_count_not_a_band(
+            self, in_memory_session, timeseries_jobs):
+        """Job.end is nullable. Such rows match an unbounded query but belong
+        to no calendar band, so they keep total_count == jobs_count honest."""
+        in_memory_session.add(Job(
+            job_id="899.desched1", short_id=899, name="no-end", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=datetime(2025, 7, 1, 12), start=None, end=None,
+            eligible_secs=60, numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+
+        q = JobQueries(in_memory_session)
+        out = q.jobs_timeseries("day")          # unbounded: no date filter
+        assert out["null_count"] == 1
+        assert sum(b["job_count"] for b in out["bands"]) == 5
+        assert out["total_count"] == 6 == q.jobs_count()
+        # A bounded window excludes it via the date filter instead.
+        bounded = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert bounded["null_count"] == 0 and bounded["total_count"] == 5
+
     def test_filters_narrow_the_series(
             self, in_memory_session, timeseries_jobs):
         """The point of the method: it honours the whole jobs_search filter
