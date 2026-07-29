@@ -14,9 +14,9 @@ from sqlalchemy import func
 from job_history.database import DailySummary, Job, JobCharge
 from job_history.queries import JobQueries
 from job_history.queries.jobs import (
-    QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _MAX_SUMMARY_BANDS,
-    _MAX_COVERAGE_PROBE_DAYS, _MAX_TIMESERIES_BANDS,
-    _SUMMARY_SERVICEABLE_FILTERS, _USAGE_SORT_KEYS,
+    QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _MACHINE_HISTOGRAM_BUCKETS,
+    _MAX_SUMMARY_BANDS, _MAX_COVERAGE_PROBE_DAYS, _MAX_TIMESERIES_BANDS,
+    _SUMMARY_SERVICEABLE_FILTERS, _USAGE_SORT_KEYS, _validate_bucket_table,
 )
 from job_history.sync.summary import generate_daily_summary
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS
@@ -1471,6 +1471,95 @@ def floor_band_jobs(in_memory_session):
     in_memory_session.commit()
 
 
+class TestBucketTableInvariants:
+    """The closure validator and the per-machine truncation that feeds it.
+
+    Both are pure functions over constants, so nothing here needs a session.
+    """
+
+    # A minimal well-formed table: floor at 0, open-ended top, contiguous.
+    GOOD = [("0", 0, 0), ("1-4", 1, 4), (">4", 5, None)]
+
+    def test_accepts_a_well_formed_table(self):
+        _validate_bucket_table(self.GOOD, "good")       # must not raise
+
+    def test_accepts_the_signed_floor(self):
+        # memory_wasted's leading band is unbounded below.
+        _validate_bucket_table(
+            [("over request", None, -1), ("0-4", 0, 4), (">4", 5, None)],
+            "signed")
+
+    @pytest.mark.parametrize("table, snippet", [
+        ([],                                            "empty"),
+        ([("1", 1, 1), (">1", 2, None)],                "domain floor"),
+        ([("0", 0, 0), ("1-4", 1, 4)],                  "not open-ended"),
+        ([("0", 0, 0), ("x", 1, None), (">4", 5, None)], "open-ended mid-table"),
+        ([("0", 0, 0), ("2-4", 2, 4), (">4", 5, None)], "not contiguous"),
+        ([("0", 0, 0), ("0", 1, 4), (">4", 5, None)],   "duplicate band labels"),
+    ], ids=["empty", "no-floor", "closed-top", "mid-open", "gap", "dupe-labels"])
+    def test_rejects_each_way_a_table_can_break(self, table, snippet):
+        with pytest.raises(ValueError, match=snippet):
+            _validate_bucket_table(table, "bad")
+
+    def test_truncation_reopens_the_band_holding_the_cap(self):
+        out = QueryConfig._truncate_bucket_table(self.GOOD, 2)
+        assert out == [("0", 0, 0), (">0", 1, None)]
+
+    def test_truncation_at_a_band_edge_keeps_that_band(self):
+        # cap == the band's hi still lands *in* that band, not past it.
+        assert QueryConfig._truncate_bucket_table(self.GOOD, 4) == \
+            [("0", 0, 0), (">0", 1, None)]
+
+    def test_cap_only_matters_to_within_a_band(self):
+        # The property that lets MACHINE_HIST_CAPS carry round numbers
+        # instead of measured maxima: casper's nodes cap of 128 and its real
+        # max of 100 sit in the same band and must yield the same table.
+        nodes = QueryConfig.NODE_HIST_BUCKETS
+        assert QueryConfig._truncate_bucket_table(nodes, 100) == \
+            QueryConfig._truncate_bucket_table(nodes, 128)
+
+    def test_cap_above_the_table_is_an_identity(self):
+        # A machine larger than the default table just keeps it.
+        cpus = QueryConfig.CPU_HIST_BUCKETS
+        assert QueryConfig._truncate_bucket_table(cpus, 10 ** 9) == list(cpus)
+
+    def test_cap_inside_the_floor_band_is_rejected(self):
+        # Would leave one open band covering the domain, labelled '>-1'.
+        with pytest.raises(ValueError, match="nothing left to distribute"):
+            QueryConfig._truncate_bucket_table(self.GOOD, 0)
+
+    @pytest.mark.parametrize("cap", [2, 4, 8, 64, 128, 512, 2048])
+    def test_truncation_always_yields_a_valid_table(self, cap):
+        # The load-bearing property: truncation cannot produce a table that
+        # _bucket_case would mislabel, whatever the cap.
+        for dim in ("nodes", "cpus", "gpus"):
+            table = QueryConfig._truncate_bucket_table(
+                _HISTOGRAM_SPECS[dim][1], cap)
+            _validate_bucket_table(table, f"{dim}@{cap}")
+
+    def test_truncation_preserves_the_bands_below_the_cap(self):
+        # Shared vocabulary across machines is the reason to derive rather
+        # than hand-write: every surviving closed band is untouched.
+        full = QueryConfig.CPU_HIST_BUCKETS
+        out = QueryConfig._truncate_bucket_table(full, 1024)
+        assert out[:-1] == full[:len(out) - 1]
+
+    def test_overflow_label_follows_the_existing_convention(self):
+        # '>N' where N is lo-1, matching NODE_OVERFLOW ('>2048' has lo=2049).
+        out = QueryConfig._truncate_bucket_table(QueryConfig.GPU_HIST_BUCKETS, 32)
+        label, lo, hi = out[-1]
+        assert (label, hi) == (">16", None)
+        assert label == f">{lo - 1}"
+
+    def test_every_capped_dimension_actually_shrinks(self):
+        # A cap that changed nothing would be dead config — and would mean
+        # the machine was never the constraint we thought it was.
+        for machine, caps in QueryConfig.MACHINE_HIST_CAPS.items():
+            for dim in caps:
+                assert len(_MACHINE_HISTOGRAM_BUCKETS[machine][dim]) < \
+                    len(_HISTOGRAM_SPECS[dim][1]), (machine, dim)
+
+
 class TestJobsHistogram:
     """(wait, nodes, cpus, gpus, elapsed, reqmem) per the histogram_jobs docstring."""
 
@@ -1545,18 +1634,25 @@ class TestJobsHistogram:
         assert out["null_count"] == 1
         assert out["total_count"] == q.jobs_count()
 
-    def test_bounds_round_trip_into_filters(self, in_memory_session, histogram_jobs):
+    @pytest.mark.parametrize("machine", ["derecho", "casper"])
+    def test_bounds_round_trip_into_filters(
+            self, in_memory_session, histogram_jobs, machine):
         # THE contract test: every non-empty band replays as jobs_search
         # bounds and reproduces its own count, across all six dimensions.
         # This is what forces min/max_elapsed + min/max_reqmem to exist.
-        self._assert_bands_round_trip(JobQueries(in_memory_session))
+        # Run per machine so a truncated table has to satisfy it too — a
+        # mis-derived band would count rows its own bounds exclude.
+        self._assert_bands_round_trip(
+            JobQueries(in_memory_session, machine=machine))
 
+    @pytest.mark.parametrize("machine", ["derecho", "casper"])
     def test_bounds_round_trip_at_the_domain_floor(
-            self, in_memory_session, floor_band_jobs):
+            self, in_memory_session, floor_band_jobs, machine):
         # The same contract where histogram_jobs cannot reach it: a value at
         # the floor of each column. Regression for numcpus=0 being counted
         # in the "1" bar while min_cpus=1/max_cpus=1 excluded it.
-        self._assert_bands_round_trip(JobQueries(in_memory_session))
+        self._assert_bands_round_trip(
+            JobQueries(in_memory_session, machine=machine))
 
     def test_domain_floor_gets_its_own_band(
             self, in_memory_session, floor_band_jobs):
@@ -1575,15 +1671,82 @@ class TestJobsHistogram:
         # mislabels sub-floor rows, and one that fails to end open-ended
         # mislabels over-range rows into else_ — both breaking the bar↔
         # jobs_search round-trip while leaving total_count intact.
+        # The rules themselves live in _validate_bucket_table so the derived
+        # per-machine tables are held to the same bar; this keeps the pin on
+        # the shipped tables explicit and independent of the import-time run.
         for dim, (_col, buckets, _unit, _mn, _mx) in _HISTOGRAM_SPECS.items():
-            first, last = buckets[0], buckets[-1]
-            # lo=None is the signed-dimension floor (memory_wasted); every
-            # other column is non-negative, so its floor is 0.
-            assert first[1] in (0, None), (dim, "first band misses the floor")
-            assert last[2] is None, (dim, "last band is not open-ended")
-            for (label, _lo, hi), (nxt, lo_next, _hi) in zip(buckets, buckets[1:]):
-                assert hi is not None, (dim, label, "gap: closed mid-table band")
-                assert lo_next == hi + 1, (dim, label, nxt, "bands not contiguous")
+            _validate_bucket_table(buckets, dim)
+
+    def test_derived_machine_tables_are_closed_and_contiguous(self):
+        # The derived tables never appear in _HISTOGRAM_SPECS, so the test
+        # above cannot see them. They are built by truncation and so should
+        # be closed by construction — this pins that they actually are.
+        for machine, dims in _MACHINE_HISTOGRAM_BUCKETS.items():
+            for dim, buckets in dims.items():
+                _validate_bucket_table(buckets, f"{dim}/{machine}")
+
+    @pytest.mark.parametrize("dim, labels", [
+        ("nodes", ["0", "1", "2", "3-4", "5-8", "9-16", "17-32", "33-64",
+                   ">64"]),
+        ("cpus",  ["0", "1", "2", "3-4", "5-8", "9-16", "17-32", "33-64",
+                   "65-128", "129-512", ">512"]),
+        ("gpus",  ["0", "1", "2", "3-4", "5-8", "9-16", ">16"]),
+    ])
+    def test_casper_axis_is_right_sized(self, in_memory_session, dim, labels):
+        # Casper's real maxima are 100 nodes / 864 cpus / 32 gpus, so the
+        # default tables (topping out at >2048, >32768, >256) spend a third
+        # of each axis on bands nothing can reach. Every band listed here is
+        # populated in production; the bands below the overflow are
+        # byte-identical to derecho's, so a label means the same thing on
+        # both machines.
+        q = JobQueries(in_memory_session, machine="casper")
+        out = q.jobs_histogram(dim)
+        assert [b["label"] for b in out["buckets"]] == labels
+        # Truncation must not disturb the self-describing envelope.
+        assert out["min_param"] == _HISTOGRAM_SPECS[dim][3]
+        assert out["max_param"] == _HISTOGRAM_SPECS[dim][4]
+
+    @pytest.mark.parametrize("dim", ["nodes", "cpus", "gpus"])
+    def test_casper_total_count_survives_truncation(
+            self, in_memory_session, histogram_jobs, dim):
+        # total_count is summed from the emitted vector, so a table that
+        # dropped or merged a band would lose rows here while every
+        # individual bar still looked plausible.
+        q = JobQueries(in_memory_session, machine="casper")
+        assert q.jobs_histogram(dim)["total_count"] == q.jobs_count()
+
+    @pytest.mark.parametrize("machine", ["derecho", "all", "gust"])
+    def test_machine_without_caps_is_byte_identical(
+            self, in_memory_session, histogram_jobs, machine):
+        # Exact equality, not approx: an unlisted machine takes the same code
+        # path with the same table, so any difference is a bug. 'all' is the
+        # CLI's cross-machine value (cli/core/context.py) and must not pick a
+        # per-machine axis.
+        baseline = JobQueries(in_memory_session, machine="derecho")
+        q = JobQueries(in_memory_session, machine=machine)
+        for dim in _HISTOGRAM_SPECS:
+            assert q.jobs_histogram(dim) == baseline.jobs_histogram(dim), \
+                (machine, dim)
+
+    def test_casper_lookup_is_case_insensitive(
+            self, in_memory_session, histogram_jobs):
+        # __init__ lowercases, so the caps dict can stay all-lowercase like
+        # MACHINE_QUEUES. Without that, 'CASPER' would silently get derecho's
+        # axis — a wrong-but-plausible chart, not an error.
+        upper = JobQueries(in_memory_session, machine="CASPER")
+        lower = JobQueries(in_memory_session, machine="casper")
+        assert upper.jobs_histogram("gpus") == lower.jobs_histogram("gpus")
+
+    def test_memory_and_time_dimensions_are_not_truncated(
+            self, in_memory_session, histogram_jobs):
+        # Casper populates every REQMEM band (largemem), and wait/duration
+        # are policy-shaped rather than hardware-shaped — all four must stay
+        # on the shared table so the axes remain comparable across machines.
+        casper = JobQueries(in_memory_session, machine="casper")
+        derecho = JobQueries(in_memory_session, machine="derecho")
+        for dim in ("memory", "memory_used", "memory_wasted", "wait",
+                    "duration"):
+            assert casper.jobs_histogram(dim) == derecho.jobs_histogram(dim), dim
 
     def test_memory_buckets_reqmem_not_memory(self, in_memory_session, histogram_jobs):
         # 703 REQUESTED < 1 GiB but USED 600 GiB — it must land in "<1GB".

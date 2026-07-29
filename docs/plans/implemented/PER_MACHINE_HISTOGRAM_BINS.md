@@ -1,12 +1,19 @@
 # Per-machine histogram bins
 
-> **Status: RESEARCHED, NOT STARTED.** Scoped 2026-07-29 as a follow-up to
-> the `jobs_timeseries` work (PR #102). Nothing is implemented. This document
-> is written to be executable from a cold start — no prior conversation
-> needed.
+> **Status: IMPLEMENTED** 2026-07-29, on branch `per_machine_histogram`.
+> Scoped as a follow-up to the `jobs_timeseries` work (PR #102).
 >
-> **Recommendation: worth doing, reasonable to defer.** See § *Is this worth
-> it?* before starting.
+> **What shipped differs from § *Plan* below in one important way:** the
+> per-machine tables are **derived by truncation** from the shared tables
+> (`QueryConfig.MACHINE_HIST_CAPS` + `_truncate_bucket_table`), not
+> hand-written `CASPER_*_HIST_BUCKETS` constants. Closure and contiguity then
+> hold *by construction*, a cap only has to be right to within a band, and
+> adding a machine costs three integers. See § *What shipped* at the end;
+> § *Plan* is kept as the original reasoning.
+>
+> Memory was **dropped from scope on evidence**: Casper's largemem nodes put
+> 9,666 jobs above 1000 GB, so both machines populate every `REQMEM` band and
+> there is no dead axis there. Only `nodes`/`cpus`/`gpus` are capped.
 
 ## Context
 
@@ -216,11 +223,69 @@ trimming helper.
 Do it if you want the axis honest at the source; defer it freely otherwise.
 The validator extraction (§2) has standalone value and could ship alone.
 
+## What shipped
+
+All in `job_history/queries/jobs.py` unless noted. Note every line reference
+in § *Plan* above had drifted ~60 lines by the time this was executed; the
+claims held, the numbers did not.
+
+1. **`_validate_bucket_table(buckets, name)`**, beside `_bucket_case`. The six
+   rules — non-empty, floor reached, top open-ended, no mid-table `hi is
+   None`, strict contiguity, unique labels. Run **at import** over every
+   `_HISTOGRAM_SPECS` table and every derived one: the tables are constants,
+   so it either always passes or always fails, and a query never pays for it.
+   `test_bucket_tables_are_closed_and_contiguous` now calls it, keeping the
+   pin explicit.
+
+2. **`QueryConfig._truncate_bucket_table(buckets, cap)`** — keeps every band
+   with `lo <= cap`, then re-opens the last survivor as `(f">{lo-1}", lo,
+   None)`, matching the existing overflow convention. Bands below are
+   untouched, so a label means the same thing on every machine. `cap` at or
+   above the last band's `lo` is an identity; a `cap` landing in the floor
+   band raises.
+
+3. **`QueryConfig.MACHINE_HIST_CAPS = {'casper': {'nodes': 128, 'cpus': 1024,
+   'gpus': 32}}`**, beside `MACHINE_QUEUES`. Sized from production: over
+   21.1M casper jobs the observed maxima are 100 / 864 / 32, and no casper job
+   has ever exceeded a cap.
+
+4. **`_MACHINE_HISTOGRAM_BUCKETS`** — `{machine: {dimension: table}}`, derived
+   and validated once at import.
+
+5. **The selection**, at the `jobs_histogram` spec unpack:
+   `buckets = _MACHINE_HISTOGRAM_BUCKETS.get(self.machine, {}).get(dimension,
+   buckets)`. The double `.get` mirrors `get_cpu_queues`, so an unlisted
+   machine, an uncapped dimension, and the CLI's `machine="all"` all fall
+   through unchanged.
+
+6. **`scripts/bench_jobs_aggregates.py`** — its gate A read
+   `CPU_HIST_BUCKETS` directly while gate B called `jobs_histogram`, so under
+   `--machine casper` the two gates would have timed different ladders. Routed
+   through the same selector. (§ *Plan* missed this third reader.)
+
+Resulting Casper axes, and the live counts that justify them:
+
+| dim | bands | table | top band holds |
+|---|---|---|---|
+| `nodes` | 14 → **9** | `0 1 2 3-4 5-8 9-16 17-32 33-64 >64` | 5 jobs |
+| `cpus` | 14 → **11** | `… 65-128 129-512 >512` | 28 jobs |
+| `gpus` | 11 → **7** | `0 1 2 3-4 5-8 9-16 >16` | 52 jobs |
+
+No band is traded for another dead one. Verified against live `casper_jobs`:
+`total_count` exact and **every** band round-trips to its own `job_count`,
+both over a 1.2M-job month and over full history.
+
+37 new tests (`TestBucketTableInvariants`, plus per-machine cases in
+`TestJobsHistogram`); `_assert_bands_round_trip` is parameterized over
+machines, and `test_every_bucket_table_compiles` now covers the derived
+tables (and the `MEMUSED_`/`MEMWASTED_` ones it had been missing). Suite
+748 → **785** job_history, **1004** total.
+
 ## Verification
 
 ```bash
 cd ~/codes/hpc-usage-queries/devel
-PYTHONPATH=$PWD python -m pytest job_history/tests/ -q     # 682 baseline
+PYTHONPATH=$PWD python -m pytest job_history/tests/ -q     # 785
 
 # size the tables from the data
 PYTHONPATH=$PWD python -c "

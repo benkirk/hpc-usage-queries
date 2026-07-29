@@ -45,7 +45,9 @@ from sqlalchemy import func
 
 from job_history import Job, JobCharge, JobQueries, get_session
 from job_history.queries import jobs as jobs_mod
-from job_history.queries.jobs import QueryConfig, _bucket_case, _charge_expr
+from job_history.queries.jobs import (
+    QueryConfig, _MACHINE_HISTOGRAM_BUCKETS, _bucket_case, _charge_expr,
+)
 
 
 def best(fn, repeat):
@@ -60,7 +62,11 @@ def best(fn, repeat):
 
 def gate_a(q, session, start, end, repeat):
     """Same grouped aggregate, 2 SUMs vs 4 SUMs, interleaved."""
-    bucket = _bucket_case(Job.numcpus, QueryConfig.CPU_HIST_BUCKETS)
+    # Select the same table jobs_histogram('cpus') would for this machine —
+    # gate B calls it directly, and a hardcoded CPU_HIST_BUCKETS would time a
+    # 14-arm ladder here against casper's 11-arm one there.
+    bucket = _bucket_case(Job.numcpus, _MACHINE_HISTOGRAM_BUCKETS.get(
+        q.machine, {}).get('cpus', QueryConfig.CPU_HIST_BUCKETS))
 
     def run(with_charges):
         cols = [bucket, func.count(Job.id),
