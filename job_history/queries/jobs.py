@@ -7,6 +7,7 @@ database. It wraps SQLAlchemy queries with a convenient interface for:
 - Filtering by date ranges and status
 """
 
+import logging
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Sequence, Union
 from zoneinfo import ZoneInfo
@@ -19,6 +20,8 @@ from ..database.models import User, Account, Queue
 from ..database.config import JobHistoryConfig
 from ..columns import COLUMNS, DEFAULT_COLUMNS, project_row
 from .builders import glob_match_clause
+
+logger = logging.getLogger(__name__)
 
 
 from sqlalchemy import case
@@ -2889,29 +2892,55 @@ class JobQueries:
            This inherits ``daily_summary``'s coverage, which is **not** a
            faithful rollup of ``jobs``: :mod:`sync.summary` skips rows whose
            ``user_id`` / ``account_id`` / ``queue_id`` is NULL (summary.py
-           ``AND j.* IS NOT NULL``) and inner-joins ``job_charges``, so a
-           chargeless job is dropped too. Where such rows exist the fast path
-           under-counts against the scan path. Both are currently impossible
-           in production — ``trg_ensure_job_charge`` guarantees the charge
-           row at DB level, and casper_jobs has 0 of either across all 21.0M
-           rows — and this is the same bar :meth:`daily_summary_report`
-           already ships at. If that ever stops holding, the fix belongs in
-           :mod:`sync.summary`, not here.
+           ``AND j.* IS NOT NULL``), so where such rows exist the fast path
+           under-counts against the scan path. The coverage check above
+           cannot detect it — those days are summarized, just incompletely.
+           It is currently impossible in production (0 of 21.0M rows on
+           casper_jobs) and it is the same bar :meth:`daily_summary_report`
+           already ships at, but the exclusion is deliberate rather than
+           incidental: a NULL FK triple is already the NO_JOBS marker, so
+           such a job cannot be stored without becoming indistinguishable
+           from one. Pinned by ``TestTimeseriesSummaryCoverageLimit``. If it
+           ever stops holding, the fix belongs in :mod:`sync.summary`.
+
+           Chargeless jobs used to be a second divergence — the rollup
+           inner-joined ``job_charges`` — but that is fixed: summary.py now
+           LEFT joins, so such a job counts with zero hours on both paths.
+
+        Logs the routing decision at DEBUG on every call, since the two paths
+        are deliberately indistinguishable from the envelope and a 7.4 s
+        timeline should not look identical to a 15 ms one from the outside.
         """
         # `ignore_case` only modifies `name` matching and defaults to False;
         # every other filter is None when unset. `0` is a meaningful bound,
         # so test against None rather than truthiness.
         active = {k for k, v in filters.items() if v is not None and v is not False}
-        if active - _SUMMARY_SERVICEABLE_FILTERS:
+        unserviceable = active - _SUMMARY_SERVICEABLE_FILTERS
+        if unserviceable or owners_by not in ("user", "account"):
+            logger.debug(
+                "jobs_timeseries %s..%s: jobs-scan path (not expressible in "
+                "the rollup: %s)", win_start, win_end,
+                ", ".join(sorted(unserviceable)) or f"owners_by={owners_by!r}")
             return False
-        if owners_by not in ("user", "account"):
-            return False
+        needed = (win_end - win_start).days + 1
         covered = self.session.query(
             func.count(distinct(DailySummary.date))
         ).filter(
             DailySummary.date >= win_start, DailySummary.date <= win_end
-        ).scalar()
-        return covered == (win_end - win_start).days + 1
+        ).scalar() or 0
+        if covered == needed:
+            logger.debug(
+                "jobs_timeseries %s..%s: daily_summary path (%d/%d days "
+                "covered)", win_start, win_end, covered, needed)
+            return True
+        # Most often the window simply ends today and sync has not written
+        # today's row yet: `SyncBase` only summarizes a day it actually
+        # inserted jobs for (`should_summarize`), so between site-local
+        # midnight and the first job ending that day there is no row for it.
+        logger.debug(
+            "jobs_timeseries %s..%s: jobs-scan path (coverage %d/%d days)",
+            win_start, win_end, covered, needed)
+        return False
 
     def _timeseries_from_summary(self, bands, filters, period, owners_by,
                                  owners_limit, owners_sort_by,

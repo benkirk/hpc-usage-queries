@@ -6,6 +6,8 @@ mirroring the dict-row shape of ``daily_summary_report``.
 
 from datetime import date, datetime, timedelta, timezone
 
+import logging
+
 import pytest
 from sqlalchemy import func
 
@@ -2859,6 +2861,29 @@ class TestTimeseriesSummaryRouting:
         assert JobQueries(in_memory_session)._timeseries_uses_summary(
             {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
             "user") is True
+
+    def test_routing_decision_is_logged(
+            self, in_memory_session, summarized_timeseries, caplog):
+        """The two paths are deliberately indistinguishable from the envelope,
+        so the log is the ONLY way to answer "is the fast path firing?" in
+        production — a 7.4s timeline must not look like a 15ms one."""
+        q = JobQueries(in_memory_session)
+        with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
+            q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert "daily_summary path (5/5 days covered)" in caplog.text
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
+            q.jobs_timeseries("day", start=_TS_START, end=_TS_END, qos="regular")
+        assert "jobs-scan path" in caplog.text and "qos" in caplog.text
+
+        # A coverage shortfall reports the numbers, so a genuine sync gap is
+        # distinguishable from the ordinary "today isn't summarized yet" case.
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
+            q.jobs_timeseries("day", start=_TS_START,
+                              end=_TS_END + timedelta(days=2))
+        assert "jobs-scan path (coverage 5/7 days)" in caplog.text
 
     def test_fast_path_never_touches_the_jobs_table(
             self, in_memory_session, summarized_timeseries):
