@@ -220,6 +220,35 @@ and every `min_*`/`max_*` bound force the scan path. Because the fast path has
 no ladder at all, it gets the looser `_MAX_SUMMARY_BANDS = 1200` — three years
 of daily bands — while the scan path keeps 400.
 
+**The MIN/MAX probe must stay pure.** A caller that pins only `start` — which
+is the timeline's shape, since "up to now" has no natural `end` — derives
+`win_end` from `MAX(Job.end)`. The first cut folded the NULL-`end` count into
+that probe as `COUNT(*) FILTER (WHERE end IS NULL)`, which reads tidier and is
+a disaster: PostgreSQL only rewrites MIN/MAX into index InitPlans when the
+select list is *purely* min/max aggregates, so the extra aggregate turned a
+0.4 ms index probe into a full parallel seq scan.
+
+| probe shape | min | plan |
+|---|---|---|
+| `min/max` alone | **0.4 ms** | InitPlan (index) |
+| `min/max` + `count FILTER` | **4630 ms** | Parallel Seq Scan, 21.0M rows |
+| `count WHERE end IS NULL` alone | **0.4 ms** | Index Scan on `ix_jobs_end` |
+
+Split into two statements (both served by `ix_jobs_end` — PostgreSQL btrees
+index NULLs and `IS NULL` is index-scannable), and the count skipped entirely
+unless *both* bounds are missing, since any date bound already excludes NULLs
+by construction. End to end on the timeline's own call shape:
+
+| machine | window | before | after |
+|---|---|---|---|
+| derecho | 30 d / day | 414 ms | **3.8 ms** |
+| derecho | 180 d / day | 2170 ms | **14.3 ms** |
+| casper | 30 d / day | 456 ms | **4.8 ms** |
+| casper | 180 d / day | 17179 ms | **14.1 ms** |
+
+Invisible on SQLite, so `test_probe_keeps_min_max_alone_for_the_index_initplan`
+asserts the probe's select list stays pure.
+
 **Coverage, not a watermark.** The obvious freshness test is "is the window at
 or before `max(daily_summary.date)`", and it is not enough: the rollup lags
 `jobs` at the top *and* need not reach back to the beginning of history (a

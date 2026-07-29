@@ -2391,6 +2391,39 @@ class TestJobsTimeseries:
         assert out["bands"] == []
         assert out["start"] == "2030-01-01"
 
+    def test_probe_keeps_min_max_alone_for_the_index_initplan(
+            self, in_memory_session, timeseries_jobs):
+        """The MIN/MAX probe must stay a *pure* min/max select list.
+
+        PostgreSQL only rewrites MIN/MAX into index InitPlans when nothing
+        else is in the select list, so folding the NULL-end count in as
+        ``COUNT(*) FILTER (...)`` — the obvious tidier version — turns a
+        0.4ms index probe into a full seq scan: measured 4630ms against
+        0.4ms on casper_jobs (21.0M rows). Cheap to write, expensive to ship,
+        invisible on SQLite. Hence this guard.
+        """
+        from sqlalchemy import event
+
+        statements = []
+
+        @event.listens_for(in_memory_session.bind, "before_cursor_execute")
+        def _capture(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        try:
+            JobQueries(in_memory_session).jobs_timeseries("day")   # unbounded
+        finally:
+            event.remove(
+                in_memory_session.bind, "before_cursor_execute", _capture)
+
+        probes = [s for s in statements
+                  if "min(" in s.lower() and "max(" in s.lower()]
+        assert probes, statements
+        for stmt in probes:
+            assert "count" not in stmt.lower(), (
+                "MIN/MAX probe gained another aggregate; this defeats the "
+                f"index InitPlan on PostgreSQL:\n{stmt}")
+
     def test_series_statement_is_bounded_to_the_resolved_window(
             self, in_memory_session, timeseries_jobs):
         """The ladder's totality must rest on the WHERE clause, not on the

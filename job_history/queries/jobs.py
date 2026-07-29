@@ -3094,31 +3094,41 @@ class JobQueries:
         bands share one timezone convention. ``win_start`` is ``None`` when
         nothing at all matched and no bound was supplied.
 
-        The probe also carries the NULL-``Job.end`` count, because
+        The NULL-``Job.end`` count rides along, because
         :meth:`jobs_timeseries` re-bounds its statements to the resolved
         window and a bounded date filter drops those rows (NULL fails both
-        comparisons). Counting them here costs nothing — it is one more
-        aggregate on a scan already being made — and the coverage lines up
-        exactly: this probe runs **iff** a bound is missing, which is **iff**
-        ``null_count`` can be non-zero. When the caller supplies both bounds
-        their own filter has already excluded NULLs, so the count is 0
-        without asking.
+        comparisons). Coverage lines up exactly: this runs **iff** a bound is
+        missing, which is **iff** ``null_count`` can be non-zero.
 
-        Cost: **not** cheap. PostgreSQL can only shortcut ``MIN``/``MAX``
-        through ``ix_jobs_end`` when the predicate is index-compatible; under
-        a real filter set this is a full aggregate over the slice, on par
-        with the series statement itself. Callers who can supply explicit
-        bounds should — it skips this entirely.
+        It is a **separate statement**, and that is load-bearing. Folding it
+        into the probe as ``COUNT(*) FILTER (WHERE end IS NULL)`` is the
+        obvious move and it is a disaster: PostgreSQL only rewrites
+        ``MIN``/``MAX`` into index InitPlans when the select list is *purely*
+        min/max aggregates, so the extra aggregate turns a 0.4 ms index probe
+        into a full parallel seq scan — measured **4630 ms** on casper_jobs
+        (21.0M rows) against **0.4 ms** for the two statements run apart.
+        ``ix_jobs_end`` serves both, since PostgreSQL btrees index NULLs and
+        ``IS NULL`` is an index-scannable predicate.
+
+        The count is skipped outright unless *both* bounds are missing: any
+        date bound is already ``end >= x`` or ``end < y``, which no NULL can
+        satisfy, so the answer is 0 by construction rather than by query.
+
+        Cost is therefore ~1 ms unfiltered. Under a selective filter set
+        PostgreSQL may not be able to stop at the index extremes, so a caller
+        that can supply explicit bounds still should — it skips this entirely.
         """
         if start is not None and end is not None:
             return start, end, 0
-        probe = self.session.query(
-            func.min(Job.end), func.max(Job.end),
-            func.count(Job.id).filter(Job.end.is_(None)),
-        )
+        probe = self.session.query(func.min(Job.end), func.max(Job.end))
         probe = self._apply_jobs_search_filters(probe, **filters)
-        lo, hi, nulls = probe.one()
-        nulls = int(nulls or 0)
+        lo, hi = probe.one()
+        nulls = 0
+        if start is None and end is None:
+            nulls_q = self.session.query(func.count(Job.id)).filter(
+                Job.end.is_(None))
+            nulls_q = self._apply_jobs_search_filters(nulls_q, **filters)
+            nulls = int(nulls_q.scalar() or 0)
         if lo is None or hi is None:
             # No banded rows, so there is no domain to zero-fill over. (Both
             # bounds supplied already returned above, so there is no
