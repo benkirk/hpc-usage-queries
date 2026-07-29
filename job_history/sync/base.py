@@ -226,7 +226,25 @@ class SyncBase(ABC):
                         f"{day_stats['inserted']:,} new{updated_str}",
                         flush=True,
                     )
-                should_summarize = day_stats["inserted"] > 0 if incremental else day_stats["fetched"] > 0
+                # A day we READ successfully gets summarized even when it
+                # yielded nothing, so `generate_daily_summary` writes its
+                # NO_JOBS marker and the day is recorded as processed. Without
+                # this an idle day leaves a permanent hole in `daily_summary`,
+                # which `JobQueries._timeseries_uses_summary` then has to
+                # verify against `jobs` on every call.
+                #
+                # This is deliberately in the `else` of `day_stats["failed"]`.
+                # A day whose PBS log is MISSING raises (sync/pbs.py), lands in
+                # `failed_days`, and must NOT get a marker: "log absent" is not
+                # "no jobs ran", and a marker would permanently assert the day
+                # was empty. If the log went missing while the machine was up,
+                # that would bake a wrong zero into every charging rollup. A
+                # hole is recoverable by `--resummarize`; a false marker is not
+                # distinguishable from a true one.
+                should_summarize = (
+                    day_stats["inserted"] > 0 if incremental
+                    else True  # read succeeded: record the day either way
+                )
                 if generate_summary and not dry_run and should_summarize:
                     generate_daily_summary(self.session, self.machine, day_date, replace=True)
                     stats["days_summarized"] += 1

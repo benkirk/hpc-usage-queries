@@ -220,6 +220,37 @@ and every `min_*`/`max_*` bound force the scan path. Because the fast path has
 no ladder at all, it gets the looser `_MAX_SUMMARY_BANDS = 1200` — three years
 of daily bands — while the scan path keeps 400.
 
+**Outage holes are tolerated, not required to be backfilled.** A scheduler
+outage leaves no PBS log for the day; `fetch_records` raises (`sync/pbs.py`),
+`_sync_single_day` marks the day `failed`, and the summarize call sits in the
+`else` branch — so no NO_JOBS marker is written and the rollup keeps a
+permanent hole. Real example: derecho's PBS log tree is missing
+`2023-03-22..03-27`, `2024-09-17` and `2025-06-03..06-08`, and the last two
+match its `daily_summary` holes exactly.
+
+Two-sided fix, and the sides are deliberately asymmetric:
+
+*Read side* — a day absent from the rollup only disqualifies the fast path if
+`jobs` actually has rows for it. `jobs` is the source of truth for **both**
+paths, so an empty hole costs nothing: the rollup is not missing anything and
+the fast path reports the same zeros the scan would. Missing days are collapsed
+into contiguous runs (outages are contiguous) and checked with one indexed
+`LIMIT 1` probe each (~12 ms), capped at `_MAX_COVERAGE_PROBE_DAYS`. Verified
+against the real June-2025 hole: with the 6 markers removed the fast path still
+fires in 5.2 ms and returns a byte-identical band vector.
+
+*Write side* — a day that was **read successfully** now gets summarized even
+when it yielded nothing, so `generate_daily_summary` writes its marker. A day
+that **failed** deliberately does not. "Log absent" is not "no jobs ran": if a
+log went missing while the machine was up, a marker would permanently assert
+the day was empty and bake a wrong zero into every charging rollup. A hole is
+recoverable with `--resummarize`; a false marker is indistinguishable from a
+true one. Validated on the real log tree — empty-but-readable `20230321` gets a
+marker, missing `20230322` does not.
+
+Net effect: existing holes stop being a silent perf cliff without a backfill,
+and idle days stop creating new ones.
+
 **The MIN/MAX probe must stay pure.** A caller that pins only `start` — which
 is the timeline's shape, since "up to now" has no natural `end` — derives
 `win_end` from `MAX(Job.end)`. The first cut folded the NULL-`end` count into

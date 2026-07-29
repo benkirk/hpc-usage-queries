@@ -157,6 +157,28 @@ _SUMMARY_SERVICEABLE_FILTERS = frozenset({
     "start", "end", "user", "account", "queue", "ignore_case",
 })
 
+#: How many unsummarized days :meth:`JobQueries._timeseries_uses_summary` will
+#: verify as genuinely empty before giving up and scanning. Each contiguous
+#: run costs one indexed ``LIMIT 1`` probe (~12 ms), and outage gaps are
+#: contiguous, so real windows check one or two. A window with more holes than
+#: this has something systemically wrong with its rollup and deserves the scan.
+_MAX_COVERAGE_PROBE_DAYS = 62
+
+
+def _contiguous_runs(days: List[date]) -> List[Tuple[date, date]]:
+    """Collapse a sorted date list into ``[(first, last), ...]`` runs.
+
+    Scheduler outages span consecutive days, so a gap that looks like 6 holes
+    is one range probe rather than six.
+    """
+    runs: List[List[date]] = []
+    for day in sorted(days):
+        if runs and day == runs[-1][1] + timedelta(days=1):
+            runs[-1][1] = day
+        else:
+            runs.append([day, day])
+    return [(lo, hi) for lo, hi in runs]
+
 
 def _site_midnight_utc(day: date) -> datetime:
     """Naive-UTC instant at which site-local *day* begins.
@@ -2923,24 +2945,47 @@ class JobQueries:
                 ", ".join(sorted(unserviceable)) or f"owners_by={owners_by!r}")
             return False
         needed = (win_end - win_start).days + 1
-        covered = self.session.query(
-            func.count(distinct(DailySummary.date))
+        have = {d for (d,) in self.session.query(
+            distinct(DailySummary.date)
         ).filter(
             DailySummary.date >= win_start, DailySummary.date <= win_end
-        ).scalar() or 0
-        if covered == needed:
+        )}
+        missing = [win_start + timedelta(days=i) for i in range(needed)
+                   if win_start + timedelta(days=i) not in have]
+        if not missing:
             logger.debug(
                 "jobs_timeseries %s..%s: daily_summary path (%d/%d days "
-                "covered)", win_start, win_end, covered, needed)
+                "covered)", win_start, win_end, needed, needed)
             return True
-        # Most often the window simply ends today and sync has not written
-        # today's row yet: `SyncBase` only summarizes a day it actually
-        # inserted jobs for (`should_summarize`), so between site-local
-        # midnight and the first job ending that day there is no row for it.
+
+        # A day absent from the rollup is only a problem if `jobs` actually
+        # has rows for it. Scheduler outages produce exactly this: no PBS log
+        # for the day, so `_sync_single_day` fails, so the summarize call is
+        # skipped and no marker is written -- a permanent hole over days that
+        # genuinely have no jobs. `jobs` is the source of truth for BOTH
+        # paths, so if it is empty for those days the rollup is not missing
+        # anything and the fast path reports the same zeros the scan would.
+        if len(missing) > _MAX_COVERAGE_PROBE_DAYS:
+            logger.debug(
+                "jobs_timeseries %s..%s: jobs-scan path (%d/%d days covered, "
+                "too many gaps to verify)", win_start, win_end,
+                needed - len(missing), needed)
+            return False
+        for lo, hi in _contiguous_runs(missing):
+            probe = self.session.query(Job.id)
+            probe = self._apply_jobs_search_filters(
+                probe, **{**filters, "start": lo, "end": hi})
+            if probe.limit(1).first() is not None:
+                logger.debug(
+                    "jobs_timeseries %s..%s: jobs-scan path (%d/%d days "
+                    "covered; %s..%s unsummarized but has jobs)",
+                    win_start, win_end, needed - len(missing), needed, lo, hi)
+                return False
         logger.debug(
-            "jobs_timeseries %s..%s: jobs-scan path (coverage %d/%d days)",
-            win_start, win_end, covered, needed)
-        return False
+            "jobs_timeseries %s..%s: daily_summary path (%d/%d days "
+            "summarized; the other %d have no jobs)", win_start, win_end,
+            needed - len(missing), needed, len(missing))
+        return True
 
     def _timeseries_from_summary(self, bands, filters, period, owners_by,
                                  owners_limit, owners_sort_by,

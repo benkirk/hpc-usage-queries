@@ -15,7 +15,8 @@ from job_history.database import DailySummary, Job, JobCharge
 from job_history.queries import JobQueries
 from job_history.queries.jobs import (
     QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _MAX_SUMMARY_BANDS,
-    _MAX_TIMESERIES_BANDS, _SUMMARY_SERVICEABLE_FILTERS, _USAGE_SORT_KEYS,
+    _MAX_COVERAGE_PROBE_DAYS, _MAX_TIMESERIES_BANDS,
+    _SUMMARY_SERVICEABLE_FILTERS, _USAGE_SORT_KEYS,
 )
 from job_history.sync.summary import generate_daily_summary
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS
@@ -2213,6 +2214,22 @@ _TS_START = date(2025, 7, 1)
 _TS_END = date(2025, 7, 5)
 
 
+def _ts_filters(**overrides):
+    """A complete ``jobs_timeseries`` filter dict, for calling the routing
+    predicate directly.
+
+    ``_apply_jobs_search_filters`` requires every key with no defaults on
+    purpose (see its docstring), and ``_timeseries_uses_summary`` forwards to
+    it when probing an unsummarized gap. Production always passes the full
+    dict; only these tests need to build one.
+    """
+    filters = dict.fromkeys(['start', 'end', 'user', 'account', 'queue', 'qos', 'exit_status', 'job_id', 'name', 'ignore_case', 'min_eligible_secs', 'max_eligible_secs', 'min_nodes', 'max_nodes', 'min_cpus', 'max_cpus', 'min_gpus', 'max_gpus', 'min_elapsed', 'max_elapsed', 'min_reqmem', 'max_reqmem', 'min_memory_used', 'max_memory_used', 'min_memory_wasted', 'max_memory_wasted'])
+    filters["ignore_case"] = False
+    filters.update(overrides)
+    return filters
+
+
+
 class TestJobsTimeseries:
     """Contract for the per-period series behind the stacked timeline."""
 
@@ -2787,7 +2804,7 @@ class TestTimeseriesSummaryRouting:
         """An unsummarized database must not silently return empty bands."""
         q = JobQueries(in_memory_session)
         assert q._timeseries_uses_summary(
-            {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
             "user") is False
 
     def test_serviceable_filters_route_to_the_summary(
@@ -2795,7 +2812,7 @@ class TestTimeseriesSummaryRouting:
         q = JobQueries(in_memory_session)
         for extra in ({}, {"user": "alice"}, {"account": "NCAR0001"},
                       {"queue": "main"}, {"ignore_case": True}):
-            filters = {"start": _TS_START, "end": _TS_END, **extra}
+            filters = _ts_filters(start=_TS_START, end=_TS_END, **extra)
             assert q._timeseries_uses_summary(
                 filters, _TS_START, _TS_END, "user") is True, extra
 
@@ -2813,7 +2830,7 @@ class TestTimeseriesSummaryRouting:
         """Every filter the rollup aggregated away must force the jobs scan —
         serving it off the summary would silently ignore it."""
         q = JobQueries(in_memory_session)
-        filters = {"start": _TS_START, "end": _TS_END, **unserviceable}
+        filters = _ts_filters(start=_TS_START, end=_TS_END, **unserviceable)
         assert q._timeseries_uses_summary(
             filters, _TS_START, _TS_END, "user") is False
 
@@ -2835,46 +2852,129 @@ class TestTimeseriesSummaryRouting:
             assert q._timeseries_uses_summary(
                 filters, _TS_START, _TS_END, "user") is False, extra
 
-    def test_window_past_the_watermark_falls_back(
+    def test_window_past_the_watermark_is_fine_when_those_days_are_empty(
             self, in_memory_session, summarized_timeseries):
-        """The summary lags jobs. A window touching an unsummarized day would
-        come back short, so the whole window falls back rather than hybridising.
-        """
+        """The summary lags jobs, so a window ending today routinely runs a
+        day or two past the last rollup row. That only matters if those days
+        have jobs — and if they did, the scan path would be the only one
+        able to see them."""
         q = JobQueries(in_memory_session)
+        beyond = _TS_END + timedelta(days=1)
         assert q._timeseries_uses_summary(
-            {"start": _TS_START, "end": _TS_END + timedelta(days=1)},
-            _TS_START, _TS_END + timedelta(days=1), "user") is False
-        # Exactly at the watermark is still fine.
-        assert q._timeseries_uses_summary(
-            {"start": _TS_START, "end": _TS_END},
-            _TS_START, _TS_END, "user") is True
+            _ts_filters(start=_TS_START, end=beyond), _TS_START, beyond,
+            "user") is True
 
-    def test_window_reaching_back_before_coverage_falls_back(
+        # Give that day a job and it becomes a real shortfall.
+        in_memory_session.add(Job(
+            job_id="890.desched1", short_id=890, name="late", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=datetime(2025, 7, 6, 12), start=datetime(2025, 7, 6, 12),
+            end=datetime(2025, 7, 6, 18), eligible_secs=60,
+            numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=beyond), _TS_START, beyond,
+            "user") is False
+
+    def test_window_reaching_back_before_coverage(
             self, in_memory_session, summarized_timeseries):
-        """A trailing watermark is not enough. The rollup need not reach back
-        to the start of history — a partial ``--resummarize`` leaves an
-        earlier gap — and those days would come back as zero bands while the
-        scan path finds jobs."""
+        """The rollup need not reach back to the start of history — a partial
+        ``--resummarize`` leaves an earlier gap. Empty prehistory is fine;
+        prehistory with jobs in it is not, since those days would come back as
+        zero bands while the scan path finds them."""
         q = JobQueries(in_memory_session)
         earlier = _TS_START - timedelta(days=30)
         assert q._timeseries_uses_summary(
-            {"start": earlier, "end": _TS_END}, earlier, _TS_END,
+            _ts_filters(start=earlier, end=_TS_END), earlier, _TS_END,
+            "user") is True
+
+        in_memory_session.add(Job(
+            job_id="870.desched1", short_id=870, name="old", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=datetime(2025, 6, 20, 12), start=datetime(2025, 6, 20, 12),
+            end=datetime(2025, 6, 20, 18), eligible_secs=60,
+            numnodes=1, numcpus=8, numgpus=0))
+        in_memory_session.commit()
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=earlier, end=_TS_END), earlier, _TS_END,
             "user") is False
 
-    def test_a_single_missing_interior_day_falls_back(
+    def test_a_missing_day_that_has_jobs_falls_back(
             self, in_memory_session, summarized_timeseries):
-        """The failure mode a watermark check misses entirely: one skipped
-        day mid-window silently becomes a zero band."""
+        """The failure mode a watermark check misses entirely: a skipped day
+        mid-window that DOES have jobs would silently become a zero band."""
         q = JobQueries(in_memory_session)
         assert q._timeseries_uses_summary(
-            {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
             "user") is True
+        # 07-02 has jobs in the fixture, so dropping its rollup row is a
+        # genuine shortfall.
+        in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 2)).delete()
+        in_memory_session.commit()
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
+            "user") is False
+
+    def test_a_missing_day_with_no_jobs_does_not_force_a_fallback(
+            self, in_memory_session, summarized_timeseries):
+        """A scheduler outage leaves no PBS log, so sync fails that day and
+        writes no marker — a permanent hole over days that genuinely have no
+        jobs. ``jobs`` is the source of truth for both paths, so an empty hole
+        costs the fast path nothing and must not disqualify it. (derecho has
+        had multi-day outages producing exactly this.)"""
+        q = JobQueries(in_memory_session)
+        # 07-03 is idle in the fixture: rollup row is a NO_JOBS marker.
         in_memory_session.query(DailySummary).filter(
             DailySummary.date == date(2025, 7, 3)).delete()
         in_memory_session.commit()
         assert q._timeseries_uses_summary(
-            {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
+            "user") is True
+        # ...and the answer is still right.
+        out = q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert out["total_count"] == q.jobs_count(
+            start=_TS_START, end=_TS_END) == 5
+        assert next(b for b in out["bands"]
+                    if b["label"] == "2025-07-03")["job_count"] == 0
+
+    def test_empty_gap_check_respects_the_filter_set(
+            self, in_memory_session, summarized_timeseries):
+        """A day with jobs but none matching the filters is empty *for this
+        query*, so it must not force the whole window onto the scan."""
+        q = JobQueries(in_memory_session)
+        in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 2)).delete()
+        in_memory_session.commit()
+        # 07-02 is bob's day only, so under user=alice the gap is empty.
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END, **{"user": "alice"}),
+            _TS_START, _TS_END, "user") is True
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=_TS_START, end=_TS_END, **{"user": "bob"}),
+            _TS_START, _TS_END, "user") is False
+
+    def test_too_many_gaps_falls_back_without_probing(
+            self, in_memory_session, summarized_timeseries):
+        """Past the probe budget something is systemically wrong with the
+        rollup, and a scan is the honest answer."""
+        q = JobQueries(in_memory_session)
+        wide_start = _TS_START - timedelta(days=_MAX_COVERAGE_PROBE_DAYS + 5)
+        assert q._timeseries_uses_summary(
+            _ts_filters(start=wide_start, end=_TS_END), wide_start, _TS_END,
             "user") is False
+
+    def test_contiguous_runs_collapses_outage_gaps(self):
+        """Outages span consecutive days, so a 6-day hole is one range probe
+        rather than six."""
+        from job_history.queries.jobs import _contiguous_runs
+        days = [date(2025, 6, 3), date(2025, 6, 4), date(2025, 6, 5),
+                date(2025, 9, 17)]
+        assert _contiguous_runs(days) == [
+            (date(2025, 6, 3), date(2025, 6, 5)),
+            (date(2025, 9, 17), date(2025, 9, 17)),
+        ]
+        assert _contiguous_runs([]) == []
 
     def test_no_jobs_marker_days_still_count_as_covered(
             self, in_memory_session, timeseries_jobs):
@@ -2892,7 +2992,7 @@ class TestTimeseriesSummaryRouting:
             DailySummary.date == date(2025, 7, 3)).one()
         assert marker.user_id is None and marker.job_count == 0
         assert JobQueries(in_memory_session)._timeseries_uses_summary(
-            {"start": _TS_START, "end": _TS_END}, _TS_START, _TS_END,
+            _ts_filters(start=_TS_START, end=_TS_END), _TS_START, _TS_END,
             "user") is True
 
     def test_routing_decision_is_logged(
@@ -2910,13 +3010,26 @@ class TestTimeseriesSummaryRouting:
             q.jobs_timeseries("day", start=_TS_START, end=_TS_END, qos="regular")
         assert "jobs-scan path" in caplog.text and "qos" in caplog.text
 
-        # A coverage shortfall reports the numbers, so a genuine sync gap is
-        # distinguishable from the ordinary "today isn't summarized yet" case.
+        # A tolerated gap says so, and says how many days it verified as
+        # empty — an operator should be able to tell "rollup is behind but it
+        # doesn't matter" from "rollup is complete".
         caplog.clear()
         with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
             q.jobs_timeseries("day", start=_TS_START,
                               end=_TS_END + timedelta(days=2))
-        assert "jobs-scan path (coverage 5/7 days)" in caplog.text
+        assert "daily_summary path (5/7 days summarized" in caplog.text
+        assert "the other 2 have no jobs" in caplog.text
+
+        # A gap that DOES have jobs names the range, so a real sync failure is
+        # actionable rather than just slow.
+        in_memory_session.query(DailySummary).filter(
+            DailySummary.date == date(2025, 7, 2)).delete()
+        in_memory_session.commit()
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="job_history.queries.jobs"):
+            q.jobs_timeseries("day", start=_TS_START, end=_TS_END)
+        assert "jobs-scan path" in caplog.text
+        assert "2025-07-02..2025-07-02 unsummarized but has jobs" in caplog.text
 
     def test_fast_path_never_touches_the_jobs_table(
             self, in_memory_session, summarized_timeseries):
