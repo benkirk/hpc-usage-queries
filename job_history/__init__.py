@@ -6,7 +6,7 @@ from .database import (
     get_db_path, get_db_url, get_engine, get_session, init_db, VALID_MACHINES,
     Job, DailySummary, JobCharge, JobRecord,
 )
-from .queries import JobQueries
+from .queries import JobQueries, histogram_buckets
 from .columns import COLUMNS, DEFAULT_COLUMNS, VERBOSE_COLUMNS, project_row
 
 __all__ = [
@@ -26,5 +26,6 @@ __all__ = [
     "JobRecord",
     "JobHistoryConfig",
     "JobQueries",
+    "histogram_buckets",
     "VALID_MACHINES",
 ]

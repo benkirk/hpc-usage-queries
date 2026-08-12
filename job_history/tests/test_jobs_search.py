@@ -17,6 +17,7 @@ from job_history.queries.jobs import (
     QueryConfig, _HISTOGRAM_SPECS, _LOOKUP_DIMS, _MACHINE_HISTOGRAM_BUCKETS,
     _MAX_SUMMARY_BANDS, _MAX_COVERAGE_PROBE_DAYS, _MAX_TIMESERIES_BANDS,
     _SUMMARY_SERVICEABLE_FILTERS, _USAGE_SORT_KEYS, _validate_bucket_table,
+    histogram_buckets,
 )
 from job_history.sync.summary import generate_daily_summary
 from job_history.columns import COLUMNS, DEFAULT_COLUMNS
@@ -1558,6 +1559,77 @@ class TestBucketTableInvariants:
             for dim in caps:
                 assert len(_MACHINE_HISTOGRAM_BUCKETS[machine][dim]) < \
                     len(_HISTOGRAM_SPECS[dim][1]), (machine, dim)
+
+    # Measured over 11,243,376 derecho jobs (data/derecho.db):
+    #   SELECT MAX(numnodes), MAX(numcpus), MAX(numgpus) FROM jobs;
+    DERECHO_MAXIMA = {'nodes': 2487, 'cpus': 318336, 'gpus': 328}
+
+    @pytest.mark.parametrize("dim, observed", sorted(DERECHO_MAXIMA.items()))
+    def test_derecho_maxima_need_no_truncation(self, dim, observed):
+        # The converse of the test above, and the reason derecho is absent
+        # from MACHINE_HIST_CAPS: its real maxima land in each table's
+        # existing overflow band, so truncating there is an identity. This is
+        # what "the default tables are sized for the largest machine" means —
+        # asserted rather than assumed, so a future table that shrinks its
+        # tail below derecho's reach fails here instead of silently binning
+        # 2000-node jobs into a band that claims to stop lower.
+        table = _HISTOGRAM_SPECS[dim][1]
+        assert QueryConfig._truncate_bucket_table(table, observed) == list(table)
+
+
+class TestHistogramBucketsAccessor:
+    """``histogram_buckets`` — the public form of the per-machine selection.
+
+    Exists so a consumer can build a *control* on the same axis the chart
+    draws (SAM's jobs-explorer range sliders) without running the query.
+    Pure over constants, so only the agreement test needs a session.
+    """
+
+    def test_no_machine_is_the_shared_default(self):
+        assert histogram_buckets("nodes") == list(QueryConfig.NODE_HIST_BUCKETS)
+
+    def test_casper_is_right_sized(self):
+        casper = histogram_buckets("nodes", "casper")
+        assert casper == _MACHINE_HISTOGRAM_BUCKETS["casper"]["nodes"]
+        assert len(casper) < len(QueryConfig.NODE_HIST_BUCKETS)
+
+    @pytest.mark.parametrize("machine", ["derecho", "all", "gust", "DERECHO"])
+    def test_uncapped_machines_fall_through(self, machine):
+        # An unlisted machine, the CLI's cross-machine 'all', and derecho
+        # (capped nowhere) must all keep the shared table — the same
+        # fall-through jobs_histogram relies on.
+        assert histogram_buckets("cpus", machine) == \
+            list(QueryConfig.CPU_HIST_BUCKETS)
+
+    def test_machine_lookup_is_case_insensitive(self):
+        # __init__ lowercases before it reaches jobs_histogram; a caller
+        # holding a machine name from config has no such guarantee.
+        assert histogram_buckets("gpus", "CASPER") == \
+            histogram_buckets("gpus", "casper")
+
+    @pytest.mark.parametrize("dim", sorted(_HISTOGRAM_SPECS))
+    def test_returns_a_copy_not_the_shipped_table(self, dim):
+        # A public accessor handing out the live module constant would let
+        # one consumer's mutation re-bin every histogram in the process.
+        out = histogram_buckets(dim)
+        out.append(("junk", 10 ** 9, None))
+        assert histogram_buckets(dim) != out
+
+    def test_unknown_dimension_raises_like_jobs_histogram(self):
+        with pytest.raises(ValueError, match="Unknown dimension"):
+            histogram_buckets("cores")
+
+    @pytest.mark.parametrize("machine", ["casper", "derecho"])
+    @pytest.mark.parametrize("dim", ["nodes", "cpus", "gpus"])
+    def test_accessor_agrees_with_the_query_it_describes(
+            self, in_memory_session, histogram_jobs, machine, dim):
+        # The load-bearing property, and the whole point of the accessor: a
+        # band offered by a control built from histogram_buckets must be a
+        # band the query actually bins on. If these two ever diverge, a
+        # filter picked in the UI selects rows no bar represents.
+        envelope = JobQueries(in_memory_session, machine=machine).jobs_histogram(dim)
+        assert [(b["label"], b["lo"], b["hi"]) for b in envelope["buckets"]] == \
+            histogram_buckets(dim, machine)
 
 
 class TestJobsHistogram:

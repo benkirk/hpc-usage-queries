@@ -755,6 +755,14 @@ class QueryConfig:
     # jobs above 1000 GB, so both machines populate every REQMEM band and
     # there is no dead axis to reclaim. wait/duration are policy-shaped, not
     # hardware-shaped.
+    #
+    # Derecho is absent on purpose, and by measurement rather than by
+    # omission: over 11.2M derecho jobs the maxima are 2487 nodes / 318,336
+    # cpus / 328 gpus, and each lands in its table's existing overflow band
+    # (lo = 2049 / 32769 / 257). Truncating there is an identity, so an entry
+    # would be dead config — which is what the default tables being sized for
+    # the largest machine means. TestBucketTableInvariants pins both halves:
+    # every declared cap must shrink, and derecho's maxima must not.
     MACHINE_HIST_CAPS = {
         'casper': {'nodes': 128, 'cpus': 1024, 'gpus': 32},
     }
@@ -935,6 +943,50 @@ def _build_machine_bucket_tables():
 #: an unlisted machine — and the CLI's ``machine="all"`` — is byte-identical
 #: to before.
 _MACHINE_HISTOGRAM_BUCKETS = _build_machine_bucket_tables()
+
+
+def histogram_buckets(dimension: str,
+                      machine: Optional[str] = None) -> List[tuple]:
+    """The ``(label, lo, hi)`` bucket table a histogram of *dimension* bins on.
+
+    The public form of the selection :meth:`JobQueries.jobs_histogram` makes
+    internally, for consumers that need the *axis* without running the query.
+    The motivating case is a filter control offering the same bands the chart
+    draws: because both sides resolve the table here, a band picked in the
+    control and the equivalent bar clicked on the chart select the same rows by
+    construction, rather than by two vocabularies being kept in step by hand.
+
+    Reads module constants only — no session, no I/O, no query.
+
+    Args:
+        dimension: a key of the histogram vocabulary — ``nodes``, ``cpus``,
+            ``gpus``, ``wait``, ``duration``, ``memory``, ``memory_used`` or
+            ``memory_wasted``.
+        machine: right-size the axis to this machine's hardware ceiling.
+            ``None`` returns the shared default table, as does any machine
+            without a declared cap and the CLI's ``machine="all"`` — the same
+            fall-through :data:`_MACHINE_HISTOGRAM_BUCKETS` documents.
+
+    Returns:
+        A fresh list, so a caller cannot mutate the shipped tables.
+
+    Raises:
+        ValueError: on an unknown *dimension*, with the message
+            :meth:`JobQueries.jobs_histogram` raises for the same mistake.
+    """
+    spec = _HISTOGRAM_SPECS.get(dimension)
+    if spec is None:
+        valid = ", ".join(sorted(_HISTOGRAM_SPECS))
+        raise ValueError(
+            f"Unknown dimension: {dimension!r}. Valid dimensions: {valid}"
+        )
+    default = spec[1]
+    if machine is None:
+        return list(default)
+    return list(
+        _MACHINE_HISTOGRAM_BUCKETS.get(machine.lower(), {})
+        .get(dimension, default)
+    )
 
 
 class JobQueries:
@@ -2417,13 +2469,12 @@ class JobQueries:
                 f"owners_by must be 'user' or 'account', got {owners_by!r}"
             )
         owner_fk, owner_model, owner_name_col = _FACET_SPECS[owners_by]
-        column, buckets, unit, min_param, max_param = spec
-        # Right-size the axis to the machine when we know its ceiling. The
-        # double .get mirrors get_cpu_queues: an unlisted machine, a
-        # dimension with no declared cap, and the CLI's machine="all" all
-        # fall through to the default table unchanged.
-        buckets = _MACHINE_HISTOGRAM_BUCKETS.get(self.machine, {}).get(
-            dimension, buckets)
+        column, _default_buckets, unit, min_param, max_param = spec
+        # Right-size the axis to the machine when we know its ceiling. Shared
+        # with the public histogram_buckets() rather than inlined, so a
+        # consumer building a control from that accessor is guaranteed the
+        # same axis this query bins on — the two cannot drift.
+        buckets = histogram_buckets(dimension, self.machine)
 
         bucket_label = _bucket_case(column, buckets)
         select_cols = [bucket_label, *_metric_agg_cols()]
