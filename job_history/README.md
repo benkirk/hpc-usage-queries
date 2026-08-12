@@ -270,7 +270,18 @@ already serve the terminal case:
     band's label differs. A machine with no declared cap — including the
     CLI's `machine="all"` — gets the shared table unchanged. Memory and
     time dimensions are never truncated (both machines populate every
-    band).
+    band). Derecho is absent from the caps *by measurement*: over 11.2M
+    jobs its maxima are 2487 nodes / 318,336 cpus / 328 gpus, each inside
+    its table's existing overflow band, so a cap there would be an
+    identity.
+  - `histogram_buckets(dimension, machine=None)` — the same table, without
+    running the query. Exported from `job_history`, reads constants only
+    (no session, no I/O), returns a fresh list. It is what
+    `jobs_histogram` itself uses to pick the axis, so a **filter control**
+    built on it offers exactly the bands the chart draws — a band picked
+    in the control and the equivalent bar clicked on the chart select the
+    same rows by construction rather than by two vocabularies being kept
+    in step by hand. SAM's jobs-explorer range sliders are the consumer.
   - `owners_limit=N` appends each bucket's top-N users as
     `{username: {job_count, cpu_hours, gpu_hours}}` — the second level of a
     bin → user → jobs drill-down. Still one aggregate statement (the GROUP
