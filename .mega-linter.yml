@@ -25,10 +25,15 @@ DISABLE_LINTERS:
 
 SHOW_ELAPSED_TIME: true
 
+# v9 introduced an "LLM Advisor" that calls an external LLM to explain linter
+# errors. Pin it off rather than leave a network-calling default unmanaged.
+LLM_ADVISOR_ENABLED: false
+
 # Uncomment if you want MegaLinter to detect errors but not block CI to pass
 DISABLE_ERRORS: true
 
 # linter-specific customizations
+ACTION_ZIZMOR_ARGUMENTS: --offline
 BASH_FILTER_REGEX_EXCLUDE: "(Dockerfile)"
 BASH_SHFMT_ARGUMENTS: "--binary-next-line --case-indent --func-next-line --space-redirects --indent 4"
 JSON_PRETTIER_FILTER_REGEX_EXCLUDE: '(\.cspell\.json)'

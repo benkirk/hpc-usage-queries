@@ -1,0 +1,30 @@
+# Dependabot configuration
+#
+# Added because the GitHub Actions pins in .github/workflows/ silently drifted
+# 1-3 majors behind, which is how this repo ended up still on the deprecated
+# Node 20 Actions runtime. A weekly check keeps that from recurring.
+#
+# Scoped to GitHub Actions on purpose. Python dependencies are resolved through
+# conda-env.yaml + pyproject.toml and are exercised by the full test suite;
+# opening Dependabot PRs against them is a separate decision.
+---
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # No target-branch: PRs go to the default branch, `main`.
+    labels:
+      - dependencies
+      - ci
+    # One PR for the whole ecosystem rather than one per action.
+    groups:
+      github-actions:
+        patterns:
+          - '*'
+    commit-message:
+      prefix: 'ci'
+    open-pull-requests-limit: 3
