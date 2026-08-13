@@ -42,14 +42,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: List Source Tree
         run: |
           pwd
           find * ! -type d
 
-      - uses: conda-incubator/setup-miniconda@v3
+      - uses: conda-incubator/setup-miniconda@v4
         with:
           auto-activate-base: false
           activate-environment: ./conda-env/

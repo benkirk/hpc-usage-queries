@@ -25,6 +25,10 @@ DISABLE_LINTERS:
 
 SHOW_ELAPSED_TIME: true
 
+# v9 introduced an "LLM Advisor" that calls an external LLM to explain linter
+# errors. Pin it off rather than leave a network-calling default unmanaged.
+LLM_ADVISOR_ENABLED: false
+
 # Uncomment if you want MegaLinter to detect errors but not block CI to pass
 DISABLE_ERRORS: true
 

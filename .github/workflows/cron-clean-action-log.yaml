@@ -9,11 +9,9 @@ on:
 
 jobs:
   delete-old-actions:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: yanovation/delete-old-actions@v1
-        with:
-          token: ${{ secrets.BENKIRK_GITHUB_TOKEN }}
-          days-ago: 60
-          dry-run: false
+    permissions:
+      actions: write
+    uses: ./.github/workflows/_prune-workflow-runs.yaml
+    with:
+      days-ago: '60'
+      dry-run: false

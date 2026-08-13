@@ -1,0 +1,129 @@
+name: Prune old workflow runs (reusable)
+
+# Shared implementation behind `cron-clean-action-log.yaml` (monthly) and
+# `manually-clean-action-log.yaml` (on demand). Both callers do nothing but
+# supply `days-ago` and `dry-run`.
+#
+# This replaces the third-party `yanovation/delete-old-actions` action, which
+# was archived by its author and never moved off the deprecated Node 20 Actions
+# runtime. The work it did is four `gh api` calls, so we do them here and carry
+# no dependency at all.
+#
+# A reusable workflow — rather than a local composite action — because composite
+# actions must be checked out before they can run, and neither caller otherwise
+# needs the repository on disk.
+
+on:
+  workflow_call:
+    inputs:
+      days-ago:
+        # Deliberately a string: a workflow_dispatch input arrives as a string
+        # in the expression context, and feeding that to a `number`-typed
+        # workflow_call input trips GitHub's type validation.
+        description: Delete completed workflow runs older than this many days.
+        type: string
+        required: true
+      dry-run:
+        description: Log what would be deleted without deleting it.
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  prune:
+    name: Prune runs older than ${{ inputs.days-ago }} days
+    runs-on: ubuntu-latest
+
+    # The built-in GITHUB_TOKEN is sufficient — deleting a run in this same
+    # repository needs `actions: write` and nothing else, so no PAT is
+    # involved. A job-level block is exhaustive: every scope not listed here
+    # is set to `none`. Callers declare the same, since a called workflow can
+    # only downgrade what the caller granted.
+    permissions:
+      actions: write
+
+    steps:
+      - name: Delete old workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAYS_AGO: ${{ inputs.days-ago }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+
+          # Values reach the script through `env:` above, never by expression
+          # interpolation into the shell source, so they cannot inject. Still
+          # reject a non-integer here so the failure names the cause.
+          case "${DAYS_AGO}" in
+            ''|*[!0-9]*)
+              echo "::error::days-ago must be a positive integer, got '${DAYS_AGO}'"
+              exit 1
+              ;;
+          esac
+
+          CUTOFF="$(date -u -d "${DAYS_AGO} days ago" +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Cutoff: ${CUTOFF} (runs created before this are eligible)"
+
+          # Collect every eligible id BEFORE deleting any of them. Deleting
+          # mid-pagination shifts the remaining runs backwards across page
+          # boundaries, which silently skips roughly one run per page.
+          #
+          # Filtering happens in jq rather than via the API's `created` query
+          # param deliberately: a filter that fails to match yields nothing,
+          # whereas a query param that is ignored would yield everything.
+          #
+          # `completed` only — an in-flight run cannot be deleted, and a run
+          # still going after ${DAYS_AGO} days is stuck, not garbage.
+          mapfile -t IDS < <(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+              --paginate \
+              --jq ".workflow_runs[]
+                    | select(.status == \"completed\")
+                    | select(.created_at < \"${CUTOFF}\")
+                    | .id"
+          )
+
+          echo "Eligible runs: ${#IDS[@]}"
+
+          if [ "${#IDS[@]}" -eq 0 ]; then
+            echo "Nothing to do."
+            {
+              echo "## Prune workflow runs"
+              echo ""
+              echo "No completed runs older than ${DAYS_AGO} days."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "DRY RUN — would delete ${#IDS[@]} run(s):"
+            printf '  %s\n' "${IDS[@]}"
+            {
+              echo "## Prune workflow runs (dry run)"
+              echo ""
+              echo "Would delete **${#IDS[@]}** completed run(s) older than ${DAYS_AGO} days."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # One failure (a run deleted concurrently, a transient 5xx) should not
+          # abandon the rest of the batch.
+          DELETED=0
+          FAILED=0
+          for id in "${IDS[@]}"; do
+            if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" --silent 2>/dev/null; then
+              DELETED=$((DELETED + 1))
+            else
+              echo "::warning::Failed to delete run ${id}"
+              FAILED=$((FAILED + 1))
+            fi
+          done
+
+          echo "Deleted ${DELETED}, failed ${FAILED}."
+          {
+            echo "## Prune workflow runs"
+            echo ""
+            echo "- Cutoff: completed runs created before \`${CUTOFF}\` (${DAYS_AGO} days)"
+            echo "- Deleted: **${DELETED}**"
+            echo "- Failed: **${FAILED}**"
+          } >> "$GITHUB_STEP_SUMMARY"

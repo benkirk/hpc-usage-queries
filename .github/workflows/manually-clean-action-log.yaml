@@ -5,17 +5,21 @@ on:
     inputs:
       days-ago:
         description: Timeframe to Purge
-        type: int
+        # was `int`, which is not a valid workflow_dispatch input type
+        type: number
         required: true
         default: 1
+      dry-run:
+        description: List what would be deleted, without deleting it
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   delete-old-actions:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: yanovation/delete-old-actions@v1
-        with:
-          token: ${{ secrets.BENKIRK_GITHUB_TOKEN }}
-          days-ago: ${{ inputs.days-ago }}
-          dry-run: false
+    permissions:
+      actions: write
+    uses: ./.github/workflows/_prune-workflow-runs.yaml
+    with:
+      days-ago: ${{ inputs.days-ago }}
+      dry-run: ${{ inputs.dry-run }}
