@@ -22,9 +22,9 @@ before merging.
 ## Tests
 
 ```bash
-pytest                        # both suites (~360 tests)
-pytest job_history/tests/     # job_history only (~289 tests)
-pytest fs_scans/tests/        # fs_scans only
+pytest                        # both suites (~1030 tests)
+pytest job_history/tests/     # job_history only (~810 tests)
+pytest fs_scans/tests/        # fs_scans only (~220 tests)
 ```
 
 Tests live **inside** each module: `job_history/tests/` and `fs_scans/tests/`.
@@ -32,6 +32,30 @@ Shared fixtures (in-memory SQLite DB, job data) are in `job_history/tests/confte
 `fs_scans/tests/` has no shared fixtures.
 
 **Always run tests before committing.**
+
+## CI
+
+Workflows live in `.github/workflows/`. Two conventions there look like defects and
+are not — "fixing" either one breaks something:
+
+- **Actions are pinned to major tags, not SHAs, deliberately.** That is what lets
+  Dependabot bump them (`.github/dependabot.yml` — weekly, grouped into one PR,
+  targets `main`). MegaLinter's bundled `zizmor` reports `unpinned-uses` errors
+  against every one of them; that is a declined policy, not a finding. Do not
+  SHA-pin to silence it.
+- **Dependabot PRs receive Dependabot secrets, not Actions secrets.** Every
+  `secrets.X` resolves to empty on those runs, so any workflow input that is
+  *required* needs a fallback — see `token: … || github.token` in `mega-linter.yaml`.
+  Without it the job dies at its first step, before any linter or test runs.
+
+`_prune-workflow-runs.yaml` is a local reusable workflow, called by both
+clean-action-log workflows, rather than a third-party action. It uses the built-in
+`GITHUB_TOKEN` with `actions: write` — no PAT. It collects run ids *before* deleting
+any, because deleting mid-`--paginate` shifts later pages and silently skips roughly
+one run per page.
+
+MegaLinter is configured by `.mega-linter.yaml` (not `.yml`) with
+`DISABLE_ERRORS: true`: linters report but can never fail CI.
 
 ## CLI Entry Points
 
