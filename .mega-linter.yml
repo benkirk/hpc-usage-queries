@@ -33,6 +33,7 @@ LLM_ADVISOR_ENABLED: false
 DISABLE_ERRORS: true
 
 # linter-specific customizations
+ACTION_ZIZMOR_ARGUMENTS: --offline
 BASH_FILTER_REGEX_EXCLUDE: "(Dockerfile)"
 BASH_SHFMT_ARGUMENTS: "--binary-next-line --case-indent --func-next-line --space-redirects --indent 4"
 JSON_PRETTIER_FILTER_REGEX_EXCLUDE: '(\.cspell\.json)'
