@@ -10,6 +10,20 @@ ancestor-at-level (`anc_d{k}`) approach — see
 limitation the shipped design has not been shown to hit in practice. Revisit only under
 the triggers listed below.
 
+> **Update 2026-09-10 — production evidence corroborates the HOLD.** A "campaign
+> spilled ~700 GB to temp" alert on the deployed CNPG cluster prompted a check of
+> whether nested-set was the fix. Live `pg_stat_statements` / `pg_stat_database`
+> attribution on `campaign` showed it is **not** the recursive fallback:
+> - The `-ro` **replica** (the fs_scans read side) had **0 bytes** of temp spill.
+> - On the **primary**, `WITH RECURSIVE … descendants` (the query-time subtree
+>   walk that nested-set / `anc_d{k}` target) was **~0.5 %** of temp (~5 GB, 42
+>   calls); **~92 %** was weekly-consolidation `CREATE INDEX` builds (the `anc_d{k}`
+>   covering indexes sorting past `maintenance_work_mem`).
+>
+> So the recursive fallback is not a practical cost in production — exactly as §3
+> predicted — and none of the §4 revisit triggers is met. Nested-set would **not**
+> reduce that spill (it also builds covering indexes at consolidation). HOLD stands.
+
 ## 1. What it is / what it would buy us
 
 A modified-preorder-traversal ("nested set") encoding stores two integers per row,
