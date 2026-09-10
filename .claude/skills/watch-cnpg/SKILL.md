@@ -98,6 +98,17 @@ state (see step 6).
   every `≥2s` statement is logged — those 4-digit-ms durations are the *expected*
   fs_scans slow-path tail and are **not** surfaced here. Flag a NEW slow shape or
   a sustained rise in the ≥10s count, not the ambient noise.
+- **benign idle-timeout** (`sql_state_code 57P05`, "terminating connection due to
+  idle-session timeout") is the error-path analogue of that ≥2s noise: the server
+  healthily reaping idle pooled connections (chiefly SAM's `system_status`
+  writers), high-volume and permanent — hundreds since the last tick is normal.
+  The script filters these *out* of the error/fatal FAIL count (see `BENIGN_LOG_RE`)
+  and reports them as a `[+N benign idle-timeout]` tail on the `logs:` line, so
+  they never drive the exit code but a genuine surge (pool churn, a mass restart)
+  is still visible as a trend. Without this every tick would FAIL and bury real
+  errors. A *different* sqlstate confirmed benign can be added to the alternation;
+  never whitelist a real failed-transaction class (e.g. `23505` duplicate-key is
+  an app defect worth surfacing, not noise).
 
 ## 5. Capacity & expiry
 

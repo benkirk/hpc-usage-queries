@@ -53,6 +53,16 @@ FS_PCT_WARN=40            # fs_scans family share of max_connections
 REPL_LAG_WARN=$((16*1024*1024))   # replication lag bytes
 LOG_WINDOW_FALLBACK="35m" # first-tick log window before a marker exists
 
+# Benign, expected server log noise — the error-path analogue of the ≥2s slow
+# tail that the ≥10s (5-digit-ms) duration threshold already filters out. These
+# lines carry a scary severity but are the server working as configured, not a
+# cluster fault; they are counted on the logs: line but never drive the FAIL
+# exit. 57P05 = idle_session_timeout: the server reaping idle pooled connections
+# (chiefly SAM's system_status writers), high-volume and permanent, so without
+# this exclusion every single tick exits FAIL and buries real ERROR/FATAL.
+# Extend the alternation (…|…) to whitelist another confirmed-benign sqlstate.
+BENIGN_LOG_RE='"sql_state_code":"57P05"'
+
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
@@ -345,16 +355,20 @@ fi
 # ============================================================================
 last_log=$(get_state LAST_LOG_TIME)
 if [[ -n "$last_log" ]]; then LOG_SINCE=(--since-time="$last_log"); else LOG_SINCE=(--since="$LOG_WINDOW_FALLBACK"); fi
-logmatches=$("${KCTL_NS[@]}" logs "$PRIMARY_POD" -c postgres "${LOG_SINCE[@]}" --tail=-1 2>/dev/null \
-    | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"|duration: [0-9]{5,}' || true)
+rawlog=$("${KCTL_NS[@]}" logs "$PRIMARY_POD" -c postgres "${LOG_SINCE[@]}" --tail=-1 2>/dev/null || true)
 put_state LAST_LOG_TIME "$NOW_ISO"
+# Drop benign noise (see BENIGN_LOG_RE) before classifying, then match the rest.
+benign=$(echo "$rawlog" | grep -cE "$BENIGN_LOG_RE" || true)
+logmatches=$(echo "$rawlog" | grep -vE "$BENIGN_LOG_RE" \
+    | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"|duration: [0-9]{5,}' || true)
+benign_note=""; [[ "${benign:-0}" -gt 0 ]] && benign_note=" [+${benign} benign idle-timeout]"
 if [[ -z "$logmatches" ]]; then
-    line "logs: $(tag_ok 'no new ERROR/FATAL/≥10s')"; pass
+    line "logs: $(tag_ok 'no new ERROR/FATAL/≥10s')${benign_note}"; pass
 else
     n=$(echo "$logmatches" | grep -c . || true)
     sev=$(echo "$logmatches" | grep -cE '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"' || true)
-    if [[ "${sev:-0}" -gt 0 ]]; then line "logs: $(tag_fail "${sev} error/fatal") + $((n-sev)) slow(≥10s) since last tick"; fail
-    else line "logs: $(tag_warn "${n} slow(≥10s)") since last tick (≥2s is expected)"; warn; fi
+    if [[ "${sev:-0}" -gt 0 ]]; then line "logs: $(tag_fail "${sev} error/fatal") + $((n-sev)) slow(≥10s) since last tick${benign_note}"; fail
+    else line "logs: $(tag_warn "${n} slow(≥10s)") since last tick (≥2s is expected)${benign_note}"; warn; fi
     echo "$logmatches" | tail -"${VERBOSE:+8}" | tail -3 | sed 's/^/    /'
 fi
 
