@@ -90,25 +90,41 @@ state (see step 6).
 ## 4. The log line
 
 `logs: no new ERROR/FATAL/≥10s` is the normal case. The script reads only lines
-*since the last tick* (`--since-time`) and classifies:
+*since the last tick* (`--since-time`), drops benign noise, and sorts the rest
+into three buckets — the line reads `logs: N cluster-err + N app-err + N slow(≥10s)`
+with only the non-zero buckets shown:
 
-- **error/fatal** (`error_severity` ERROR/FATAL/PANIC, or `level` error/fatal) →
-  FAIL. Read the message; a `FATAL` is usually a connection/auth issue or an OOM.
-- **slow (≥10s)** durations → WARN. Note: `log_min_duration_statement=2000`, so
-  every `≥2s` statement is logged — those 4-digit-ms durations are the *expected*
-  fs_scans slow-path tail and are **not** surfaced here. Flag a NEW slow shape or
-  a sustained rise in the ≥10s count, not the ambient noise.
+- **cluster-err → FAIL** (drives exit 2). Any ERROR/FATAL/PANIC whose sqlstate is
+  *not* in the app-caused set below — connection/auth (`28…`), insufficient
+  resources (`53…`), operator action (`57…`), system/internal (`58…`/`XX…`), and
+  crucially **any unknown sqlstate**. This is the bucket that means the cluster (or
+  its infra) needs you. Read the message; a `FATAL` here is usually a
+  connection/auth issue or an OOM.
+- **app-err → WARN** (exit 1, not 2). Client-caused SQL errors the server
+  *correctly* rejected — sqlstate classes `22…` (data), `23…` (integrity, e.g.
+  `23505` duplicate-key), `42…` (syntax/access), via `APP_ERR_RE`. Surfaced and
+  worth chasing on the *app* side, but a healthy cluster serving a buggy client
+  must not page a scheduler watching the exit code. (This is why the ~hourly SAM
+  `xras_notices 23505` held the tick at WARN, never FAIL, during that incident.)
+  Widen `APP_ERR_RE` only for a class that is *always* client-caused; when unsure,
+  leave it in the FAIL bucket.
+- **slow (≥10s) → WARN**. Note: `log_min_duration_statement=2000`, so every `≥2s`
+  statement is logged — those 4-digit-ms durations are the *expected* fs_scans
+  slow-path tail and are **not** surfaced here. Flag a NEW slow shape or a
+  sustained rise in the ≥10s count, not the ambient noise.
 - **benign idle-timeout** (`sql_state_code 57P05`, "terminating connection due to
   idle-session timeout") is the error-path analogue of that ≥2s noise: the server
   healthily reaping idle pooled connections (chiefly SAM's `system_status`
   writers), high-volume and permanent — hundreds since the last tick is normal.
-  The script filters these *out* of the error/fatal FAIL count (see `BENIGN_LOG_RE`)
-  and reports them as a `[+N benign idle-timeout]` tail on the `logs:` line, so
-  they never drive the exit code but a genuine surge (pool churn, a mass restart)
-  is still visible as a trend. Without this every tick would FAIL and bury real
-  errors. A *different* sqlstate confirmed benign can be added to the alternation;
-  never whitelist a real failed-transaction class (e.g. `23505` duplicate-key is
-  an app defect worth surfacing, not noise).
+  The script filters these *out* of all three buckets (see `BENIGN_LOG_RE`) and
+  reports them as a `[+N benign idle-timeout]` tail, so they never drive the exit
+  code but a genuine surge (pool churn, a mass restart) is still visible as a
+  trend. A *different* sqlstate confirmed benign can be added to the alternation.
+
+The sample lines under the `logs:` line show **one representative per distinct
+error shape** (sqlstate + message head), cluster-err first, capped at 3 (8 under
+`-v`) — so a mixed batch never buries a distinct shape behind repeats of a noisier
+one.
 
 ## 5. Capacity & expiry
 

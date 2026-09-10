@@ -63,6 +63,16 @@ LOG_WINDOW_FALLBACK="35m" # first-tick log window before a marker exists
 # Extend the alternation (…|…) to whitelist another confirmed-benign sqlstate.
 BENIGN_LOG_RE='"sql_state_code":"57P05"'
 
+# App-caused SQL errors: the client sent something the server correctly rejected,
+# never a cluster/infra fault. SQLSTATE classes 22 (data exception), 23 (integrity
+# constraint violation, e.g. 23505 duplicate-key), 42 (syntax error / access-rule
+# violation). These are surfaced but downgraded to WARN, not FAIL, so the exit
+# code (which a scheduler may alert on) stays a true *cluster-health* signal — a
+# healthy cluster serving a buggy client should not page. Everything NOT matched
+# here — connection/auth (28), insufficient resources (53), operator action (57),
+# system/internal (58/XX), and any UNKNOWN sqlstate — stays FAIL by default.
+APP_ERR_RE='"sql_state_code":"(22|23|42)[0-9A-Za-z]{3}"'
+
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
@@ -357,19 +367,42 @@ last_log=$(get_state LAST_LOG_TIME)
 if [[ -n "$last_log" ]]; then LOG_SINCE=(--since-time="$last_log"); else LOG_SINCE=(--since="$LOG_WINDOW_FALLBACK"); fi
 rawlog=$("${KCTL_NS[@]}" logs "$PRIMARY_POD" -c postgres "${LOG_SINCE[@]}" --tail=-1 2>/dev/null || true)
 put_state LAST_LOG_TIME "$NOW_ISO"
-# Drop benign noise (see BENIGN_LOG_RE) before classifying, then match the rest.
+# Drop benign noise (see BENIGN_LOG_RE) first, then classify what remains into
+# three buckets: cluster/infra errors (FAIL), app-caused SQL errors (WARN, see
+# APP_ERR_RE), and slow ≥10s statements (WARN). The ≥2s slow tail is excluded by
+# the 5-digit-ms threshold, as before.
 benign=$(echo "$rawlog" | grep -cE "$BENIGN_LOG_RE" || true)
-logmatches=$(echo "$rawlog" | grep -vE "$BENIGN_LOG_RE" \
-    | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"|duration: [0-9]{5,}' || true)
+denoised=$(echo "$rawlog" | grep -vE "$BENIGN_LOG_RE" || true)
+sev_lines=$(echo "$denoised" | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"' || true)
+slow_lines=$(echo "$denoised" | grep -E 'duration: [0-9]{5,}' || true)
+app_lines=$(echo "$sev_lines" | grep -E "$APP_ERR_RE" || true)
+cluster_lines=$(echo "$sev_lines" | grep -vE "$APP_ERR_RE" || true)
+nclu=$(echo -n "$cluster_lines" | grep -c . || true)
+napp=$(echo -n "$app_lines"     | grep -c . || true)
+nslow=$(echo -n "$slow_lines"   | grep -c . || true)
 benign_note=""; [[ "${benign:-0}" -gt 0 ]] && benign_note=" [+${benign} benign idle-timeout]"
-if [[ -z "$logmatches" ]]; then
+msg=""
+[[ "$nclu"  -gt 0 ]] && msg="${msg:+$msg + }$(tag_fail "${nclu} cluster-err")"
+[[ "$napp"  -gt 0 ]] && msg="${msg:+$msg + }$(tag_warn "${napp} app-err")"
+[[ "$nslow" -gt 0 ]] && msg="${msg:+$msg + }$(tag_warn "${nslow} slow(≥10s)")"
+if [[ -z "$msg" ]]; then
     line "logs: $(tag_ok 'no new ERROR/FATAL/≥10s')${benign_note}"; pass
 else
-    n=$(echo "$logmatches" | grep -c . || true)
-    sev=$(echo "$logmatches" | grep -cE '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"' || true)
-    if [[ "${sev:-0}" -gt 0 ]]; then line "logs: $(tag_fail "${sev} error/fatal") + $((n-sev)) slow(≥10s) since last tick${benign_note}"; fail
-    else line "logs: $(tag_warn "${n} slow(≥10s)") since last tick (≥2s is expected)${benign_note}"; warn; fi
-    echo "$logmatches" | tail -"${VERBOSE:+8}" | tail -3 | sed 's/^/    /'
+    line "logs: ${msg} since last tick${benign_note}"
+    if [[ "$nclu" -gt 0 ]]; then fail; else warn; fi
+    # Sample one representative per DISTINCT error shape (sqlstate + message head),
+    # cluster-errs first, so a mixed batch never hides a shape behind repeats of
+    # another. Cap 3 (8 under -v).
+    cap=3; [[ "${VERBOSE:-0}" -eq 1 ]] && cap=8
+    printf '%s\n' "$cluster_lines" "$app_lines" "$slow_lines" | grep -E '.' \
+        | awk -v cap="$cap" '
+            { code=""; m="";
+              if (match($0,/"sql_state_code":"[^"]*"/)) code=substr($0,RSTART+18,RLENGTH-19);
+              if (match($0,/"message":"[^"]*"/))        m=substr($0,RSTART+11,40);
+              key=code "|" m;
+              if (code=="" && match($0,/duration: [0-9]+/)) key="slow";
+              if (!(key in seen)) { seen[key]=1; print; if (++c>=cap) exit } }' \
+        | sed 's/^/    /'
 fi
 
 # ============================================================================
