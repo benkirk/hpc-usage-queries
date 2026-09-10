@@ -73,6 +73,14 @@ BENIGN_LOG_RE='"sql_state_code":"57P05"'
 # system/internal (58/XX), and any UNKNOWN sqlstate — stays FAIL by default.
 APP_ERR_RE='"sql_state_code":"(22|23|42)[0-9A-Za-z]{3}"'
 
+# Slow-bucket self-noise: admin/diagnostic psql sessions (application_name=psql),
+# chiefly cirrus_healthcheck.sh's own section-9 history-span / pg_stat_statements
+# probes, which are ≥10s by nature. Running the deep sweep would otherwise make
+# the NEXT tick WARN on the sweep's own queries. Excluded from the slow bucket
+# ONLY — a real client slow query (any other application_name) is still surfaced,
+# and error/fatal classification is untouched.
+SLOW_SELF_RE='"application_name":"psql"'
+
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
@@ -374,7 +382,7 @@ put_state LAST_LOG_TIME "$NOW_ISO"
 benign=$(echo "$rawlog" | grep -cE "$BENIGN_LOG_RE" || true)
 denoised=$(echo "$rawlog" | grep -vE "$BENIGN_LOG_RE" || true)
 sev_lines=$(echo "$denoised" | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"' || true)
-slow_lines=$(echo "$denoised" | grep -E 'duration: [0-9]{5,}' || true)
+slow_lines=$(echo "$denoised" | grep -vE "$SLOW_SELF_RE" | grep -E 'duration: [0-9]{5,}' || true)
 app_lines=$(echo "$sev_lines" | grep -E "$APP_ERR_RE" || true)
 cluster_lines=$(echo "$sev_lines" | grep -vE "$APP_ERR_RE" || true)
 nclu=$(echo -n "$cluster_lines" | grep -c . || true)

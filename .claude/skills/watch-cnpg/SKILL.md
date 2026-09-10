@@ -111,7 +111,11 @@ with only the non-zero buckets shown:
 - **slow (≥10s) → WARN**. Note: `log_min_duration_statement=2000`, so every `≥2s`
   statement is logged — those 4-digit-ms durations are the *expected* fs_scans
   slow-path tail and are **not** surfaced here. Flag a NEW slow shape or a
-  sustained rise in the ≥10s count, not the ambient noise.
+  sustained rise in the ≥10s count, not the ambient noise. Admin/diagnostic
+  `application_name=psql` sessions — chiefly `cirrus_healthcheck.sh`'s own
+  history-span / `pg_stat_statements` probes — are excluded from this bucket
+  (`SLOW_SELF_RE`), so running the deep sweep doesn't make the next tick WARN on
+  the sweep's own ≥10s queries.
 - **benign idle-timeout** (`sql_state_code 57P05`, "terminating connection due to
   idle-session timeout") is the error-path analogue of that ≥2s noise: the server
   healthily reaping idle pooled connections (chiefly SAM's `system_status`
