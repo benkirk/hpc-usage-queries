@@ -617,10 +617,17 @@ BEGIN
           AND t.table_type='BASE TABLE'
     LOOP
         BEGIN
+            -- Exclude the fs_scans epoch-0 sentinel: consolidation maps the
+            -- SQLite integer-0 in max_atime_* to PG timestamp 1970-01-01 00:00:00.
+            -- Counting it as a real value made oldest=1970 and reported a bogus
+            -- ~56y span (and a false "archive old rows" hint). No genuine file
+            -- atime/mtime or job timestamp predates 1970-01-02, so the guard is
+            -- safe across every column; a column that is all-sentinel now yields
+            -- MIN=NULL and drops out of the report entirely.
             EXECUTE format(
-                'SELECT MIN(%I)::timestamp, MAX(%I)::timestamp, COUNT(*) FROM %I.%I WHERE %I IS NOT NULL',
+                'SELECT MIN(%I)::timestamp, MAX(%I)::timestamp, COUNT(*) FROM %I.%I WHERE %I IS NOT NULL AND %I > timestamp ''1970-01-02''',
                 rec.column_name, rec.column_name,
-                rec.table_schema, rec.table_name, rec.column_name)
+                rec.table_schema, rec.table_name, rec.column_name, rec.column_name)
               INTO min_ts, max_ts, n;
             IF min_ts IS NOT NULL THEN
                 INSERT INTO _hist VALUES (rec.table_schema, rec.table_name, rec.column_name, min_ts, max_ts, n);
@@ -753,7 +760,17 @@ if "${KCTL_NS[@]}" logs "${CLUSTER}-1" -c postgres --tail=200 >/dev/null 2>&1; t
     # now 2000ms, so the logs carry every ≥2s statement; we surface only the
     # ≥10s ones here to keep "notable" meaningful (4-digit durations are the
     # expected fs_scans slow-path noise).
+    #
+    # Exclude two self-inflicted / benign shapes before counting (mirrors the
+    # cnpg_watch.sh BENIGN_LOG_RE rationale): 57P05 idle-session-timeout is the
+    # server healthily reaping idle pooled connections, high-volume and permanent;
+    # and application_name=psql lines are THIS healthcheck's own section-9 history
+    # /pg_stat_statements probes, which are themselves ≥10s and would otherwise
+    # inflate the "notable" count on every run. Real client slow queries and
+    # errors (any other application_name) are kept.
+    SELF_NOISE_RE='"sql_state_code":"57P05"|"application_name":"psql"'
     matches=$("${KCTL_NS[@]}" logs "${CLUSTER}-1" -c postgres --tail=500 2>/dev/null \
+              | grep -vE "$SELF_NOISE_RE" \
               | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"|duration: [0-9]{5,}' || true)
     if [[ -z "$matches" ]]; then
         pass "no ERROR/FATAL/long-duration lines in last 500 log lines"
