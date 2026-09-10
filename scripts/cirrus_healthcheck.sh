@@ -559,13 +559,21 @@ else
         fi
     done <<< "$INSTANCES"
 
-    # --- Per-instance: temp-file spill (work_mem pressure proxy) ---
-    # Cumulative since each instance's stats reset. fs_scans slow-path scans over
-    # directory_stats (millions of rows) spill sorts/hashes to disk on whichever
-    # instance runs them — now the replica. Fast-path histogram reads never spill.
+    # --- Per-instance: temp-file spill (work_mem / maintenance_work_mem proxy) ---
+    # Cumulative since each instance's stats reset. The dominant source differs by
+    # role, so the hint below is instance-aware (verified 2026-09-10 via
+    # pg_stat_statements on campaign):
+    #   • PRIMARY  — almost all spill is weekly-consolidation CREATE INDEX builds
+    #     (the anc_d{k} covering indexes on 50M-row directory_stats) sorting past
+    #     maintenance_work_mem. Transient, freed after each build. Lever:
+    #     FS_SCAN_PG_MAINTENANCE_WORK_MEM (consolidator.py), not work_mem.
+    #   • REPLICA (-ro) — the fs_scans read side; spill here is the query-time
+    #     recursive directory_stats walk exceeding work_mem (64MB). On campaign the
+    #     replica measured 0 temp; this is the path that WOULD spill under load.
+    # Fast-path histogram reads never spill.
     echo
-    echo "  temp-file spill per instance (cumulative since stats reset — work_mem pressure proxy):"
-    explain "Growth here points at slow-path / resource-mode aggregation exceeding work_mem (64MB). The recursive directory_stats walk is the usual culprit; it lands on the -ro replica."
+    echo "  temp-file spill per instance (cumulative since stats reset — work_mem / maintenance_work_mem proxy):"
+    explain "On the PRIMARY this is dominated by consolidation index builds (lever: maintenance_work_mem); on the -ro REPLICA it is the query-time recursive directory_stats walk (lever: work_mem / query-side rollups)."
     while IFS='=' read -r pod role; do
         [[ -z "$pod" ]] && continue
         spill=$(pg_query_pod "$pod" "$DATABASE" "SELECT datname || E'\t' || temp_files || E'\t' || pg_size_pretty(temp_bytes) || E'\t' || temp_bytes FROM pg_stat_database WHERE temp_files > 0 ORDER BY temp_bytes DESC;")
@@ -577,7 +585,11 @@ else
                 [[ -z "$db" ]] && continue
                 printf "      %-16s %s files, %s spilled\n" "$db" "$files" "$pretty"
                 if awk -v b="${raw:-0}" 'BEGIN{exit !(b>10*1024*1024*1024)}'; then
-                    hint "$db on $pod has spilled $pretty to temp files — heavy fs_scans recursive scans; the durable fix is query-side (pre-aggregated rollups), not a higher work_mem"
+                    if [[ "$role" == *replica* ]]; then
+                        hint "$db on $pod (replica) has spilled $pretty to temp — query-time recursive directory_stats walk exceeding work_mem; the durable fix is query-side (pre-aggregated rollups / a wider anc_d band), not a higher work_mem"
+                    else
+                        hint "$db on $pod (primary) has spilled $pretty to temp — expected weekly-consolidation CREATE INDEX sort spill (transient, freed per build); if reduction is wanted, raise FS_SCAN_PG_MAINTENANCE_WORK_MEM or prune unused directory_stats indexes — NOT a query-model change"
+                    fi
                 fi
             done <<< "$spill"
         fi
@@ -617,10 +629,17 @@ BEGIN
           AND t.table_type='BASE TABLE'
     LOOP
         BEGIN
+            -- Exclude the fs_scans epoch-0 sentinel: consolidation maps the
+            -- SQLite integer-0 in max_atime_* to PG timestamp 1970-01-01 00:00:00.
+            -- Counting it as a real value made oldest=1970 and reported a bogus
+            -- ~56y span (and a false "archive old rows" hint). No genuine file
+            -- atime/mtime or job timestamp predates 1970-01-02, so the guard is
+            -- safe across every column; a column that is all-sentinel now yields
+            -- MIN=NULL and drops out of the report entirely.
             EXECUTE format(
-                'SELECT MIN(%I)::timestamp, MAX(%I)::timestamp, COUNT(*) FROM %I.%I WHERE %I IS NOT NULL',
+                'SELECT MIN(%I)::timestamp, MAX(%I)::timestamp, COUNT(*) FROM %I.%I WHERE %I IS NOT NULL AND %I > timestamp ''1970-01-02''',
                 rec.column_name, rec.column_name,
-                rec.table_schema, rec.table_name, rec.column_name)
+                rec.table_schema, rec.table_name, rec.column_name, rec.column_name)
               INTO min_ts, max_ts, n;
             IF min_ts IS NOT NULL THEN
                 INSERT INTO _hist VALUES (rec.table_schema, rec.table_name, rec.column_name, min_ts, max_ts, n);
@@ -753,7 +772,17 @@ if "${KCTL_NS[@]}" logs "${CLUSTER}-1" -c postgres --tail=200 >/dev/null 2>&1; t
     # now 2000ms, so the logs carry every ≥2s statement; we surface only the
     # ≥10s ones here to keep "notable" meaningful (4-digit durations are the
     # expected fs_scans slow-path noise).
+    #
+    # Exclude two self-inflicted / benign shapes before counting (mirrors the
+    # cnpg_watch.sh BENIGN_LOG_RE rationale): 57P05 idle-session-timeout is the
+    # server healthily reaping idle pooled connections, high-volume and permanent;
+    # and application_name=psql lines are THIS healthcheck's own section-9 history
+    # /pg_stat_statements probes, which are themselves ≥10s and would otherwise
+    # inflate the "notable" count on every run. Real client slow queries and
+    # errors (any other application_name) are kept.
+    SELF_NOISE_RE='"sql_state_code":"57P05"|"application_name":"psql"'
     matches=$("${KCTL_NS[@]}" logs "${CLUSTER}-1" -c postgres --tail=500 2>/dev/null \
+              | grep -vE "$SELF_NOISE_RE" \
               | grep -E '"error_severity":"(ERROR|FATAL|PANIC)"|"level":"(error|fatal)"|duration: [0-9]{5,}' || true)
     if [[ -z "$matches" ]]; then
         pass "no ERROR/FATAL/long-duration lines in last 500 log lines"
