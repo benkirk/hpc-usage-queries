@@ -38,6 +38,14 @@ class JobHistoryConfig:
     PG_PASSWORD = os.getenv("JOB_HISTORY_PG_PASSWORD", "")
     PG_REQUIRE_SSL = os.getenv("JOB_HISTORY_PG_REQUIRE_SSL", "false").lower() in ("true", "1", "yes")
 
+    # Per-query work_mem ceiling for the spill-prone raw analytic aggregates
+    # (jobs_histogram and the jobs-scan fallbacks of jobs_usage_by /
+    # jobs_timeseries), applied as a transaction-scoped SET LOCAL on PostgreSQL
+    # only.  work_mem is USERSET, so this needs no elevated privilege.  Blank
+    # disables the override and keeps the server default.  Must match the
+    # size grammar `\d+(kB|MB|GB)`.  See JobQueries._apply_query_work_mem.
+    PG_WORK_MEM = os.getenv("JOB_HISTORY_PG_WORK_MEM", "1GB")
+
     # ------------------------------------------------- Per-machine DB names
     @classmethod
     def pg_db_name(cls, machine: str) -> str:

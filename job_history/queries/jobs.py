@@ -8,11 +8,12 @@ database. It wraps SQLAlchemy queries with a convenient interface for:
 """
 
 import logging
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Sequence, Union
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, and_, or_, false, distinct
+from sqlalchemy import func, and_, or_, false, distinct, text
 from sqlalchemy.orm import Session
 
 from ..database import Job, DailySummary, JobCharge, JobQoS
@@ -2277,6 +2278,35 @@ class JobQueries:
 
         return {d: _facet_rows(buckets[d], limit) for d in dims}
 
+    def _apply_query_work_mem(self) -> None:
+        """Raise ``work_mem`` for the current transaction on PostgreSQL.
+
+        The spill-prone raw aggregates — :meth:`jobs_histogram` and the
+        ``jobs``-scan fallbacks of :meth:`jobs_usage_by` /
+        :meth:`jobs_timeseries` — hash-join ``jobs`` to ``job_charges`` over
+        the whole window; at the cluster-default ``work_mem`` those hashes
+        spill ~1.5 GB to temp per call (measured on the ``-ro`` replica). A
+        ``daily_summary`` fast path removes the spill where it applies; this
+        covers what is left. ``work_mem`` is a USERSET GUC, so a
+        transaction-scoped ``SET LOCAL`` lifts it for exactly this statement
+        with no elevated privilege and no leak onto the pooled connection —
+        the same lever ``fs_scans`` uses for ``maintenance_work_mem`` in its
+        consolidator. No-op off PostgreSQL (the SQLite CLI path) and when
+        ``JOB_HISTORY_PG_WORK_MEM`` is blank.
+
+        The value is validated against a strict size grammar and inlined: a
+        GUC value cannot be a bind parameter, so the regex is what keeps this
+        one literal injection-safe.
+        """
+        value = (JobHistoryConfig.PG_WORK_MEM or "").strip()
+        if not value or self.session.bind.dialect.name != "postgresql":
+            return
+        if not re.fullmatch(r"\d+\s*(kB|MB|GB)", value):
+            raise ValueError(
+                "JOB_HISTORY_PG_WORK_MEM must look like '1GB' / '512MB' / "
+                f"'65536kB', got {value!r}")
+        self.session.execute(text(f"SET LOCAL work_mem = '{value}'"))
+
     def jobs_histogram(
         self,
         dimension: str,
@@ -2505,6 +2535,10 @@ class JobQueries:
             min_memory_wasted=min_memory_wasted,
             max_memory_wasted=max_memory_wasted,
         )
+        # Histograms can never use the daily_summary rollup (no per-job
+        # node/cpu/gpu distribution is stored), so this scan+hash is where the
+        # ~1.5 GB temp spill lives — lift work_mem for just this statement.
+        self._apply_query_work_mem()
         rows = query.group_by(*group_cols).all()
 
         # Zero-fill from the spec table, in order; SUM over an all-NULL
@@ -2695,14 +2729,10 @@ class JobQueries:
         _check_usage_sort_key(sort_by, "sort_by")
         group_col, model, name_col = spec
 
-        query = (
-            self.session.query(group_col, *_metric_agg_cols())
-            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
-        )
-        query = self._apply_jobs_search_filters(
-            query, start=start, end=end, user=user, account=account,
-            queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
-            name=name, ignore_case=ignore_case,
+        filters = dict(
+            start=start, end=end, user=user, account=account, queue=queue,
+            qos=qos, exit_status=exit_status, job_id=job_id, name=name,
+            ignore_case=ignore_case,
             min_eligible_secs=min_eligible_secs,
             max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
@@ -2710,11 +2740,30 @@ class JobQueries:
             min_gpus=min_gpus, max_gpus=max_gpus,
             min_elapsed=min_elapsed, max_elapsed=max_elapsed,
             min_reqmem=min_reqmem, max_reqmem=max_reqmem,
-            min_memory_used=min_memory_used,
-            max_memory_used=max_memory_used,
+            min_memory_used=min_memory_used, max_memory_used=max_memory_used,
             min_memory_wasted=min_memory_wasted,
             max_memory_wasted=max_memory_wasted,
         )
+
+        # daily_summary fast path — the rollup :meth:`jobs_timeseries` uses.
+        # Only for an FK-keyed dimension under FK-keyed filters over an
+        # explicitly bounded, fully summarized window: explicit bounds make the
+        # scan's date filter exclude NULL-``end`` jobs, exactly as the rollup
+        # does, so both paths see the same population. Everything else (an
+        # unbounded window, a qos/exit_status dimension, any per-job filter)
+        # falls through to the scan, whose spill is bounded by the work_mem
+        # guard below.
+        if start is not None and end is not None and \
+                self._usage_by_uses_summary(dimension, filters, start, end):
+            return self._usage_by_from_summary(
+                dimension, filters, start, end, sort_by, limit)
+
+        query = (
+            self.session.query(group_col, *_metric_agg_cols())
+            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+        )
+        query = self._apply_jobs_search_filters(query, **filters)
+        self._apply_query_work_mem()
         raw = query.group_by(group_col).all()
 
         names = {}
@@ -2969,6 +3018,11 @@ class JobQueries:
                 bands, filters, period, owners_by, owners_limit,
                 owners_sort_by, win_start, win_end, null_count)
 
+        # Scan fallback (a filter the rollup can't express, or a window past
+        # its watermark): both statements below hash jobs⋈job_charges over the
+        # window, so lift work_mem for this transaction to keep the spill down.
+        self._apply_query_work_mem()
+
         # Statement 1 (owners only): rank owners ONCE over the whole window,
         # so the band vector shares one legend and one colour assignment.
         top_ids: List[Any] = []
@@ -3142,6 +3196,35 @@ class JobQueries:
                 "the rollup: %s)", win_start, win_end,
                 ", ".join(sorted(unserviceable)) or f"owners_by={owners_by!r}")
             return False
+        return self._summary_window_fully_covered(
+            win_start, win_end, filters, log_label="jobs_timeseries")
+
+    def _summary_window_fully_covered(self, win_start, win_end, filters, *,
+                                      log_label):
+        """Is every day in ``[win_start, win_end]`` summarized?
+
+        The coverage half of the fast-path decision, shared by
+        :meth:`_timeseries_uses_summary` and :meth:`_usage_by_uses_summary` so
+        the two can never diverge on what "covered" means.
+
+        :func:`~job_history.sync.summary.generate_daily_summary` writes a
+        NO_JOBS marker for a *processed* but empty day, so
+        ``COUNT(DISTINCT date)`` against the window width is an exact coverage
+        test on a table three orders of magnitude smaller than ``jobs``.
+
+        A day absent from the rollup is only a problem if ``jobs`` actually has
+        rows for it. Scheduler outages produce exactly this: no PBS log for the
+        day, so ``_sync_single_day`` fails, the summarize call is skipped and
+        no marker is written -- a permanent hole over days that genuinely have
+        no jobs. ``jobs`` is the source of truth for BOTH paths, so if it is
+        empty for those days the rollup is not missing anything and the fast
+        path reports the same zeros the scan would.
+
+        Anything short of full coverage returns ``False`` for the whole window:
+        there is deliberately no hybrid (summary for the covered days, scan for
+        the rest), because two code paths contributing to one result is exactly
+        where a silent double-count would live.
+        """
         needed = (win_end - win_start).days + 1
         have = {d for (d,) in self.session.query(
             distinct(DailySummary.date)
@@ -3152,21 +3235,13 @@ class JobQueries:
                    if win_start + timedelta(days=i) not in have]
         if not missing:
             logger.debug(
-                "jobs_timeseries %s..%s: daily_summary path (%d/%d days "
-                "covered)", win_start, win_end, needed, needed)
+                "%s %s..%s: daily_summary path (%d/%d days covered)",
+                log_label, win_start, win_end, needed, needed)
             return True
-
-        # A day absent from the rollup is only a problem if `jobs` actually
-        # has rows for it. Scheduler outages produce exactly this: no PBS log
-        # for the day, so `_sync_single_day` fails, so the summarize call is
-        # skipped and no marker is written -- a permanent hole over days that
-        # genuinely have no jobs. `jobs` is the source of truth for BOTH
-        # paths, so if it is empty for those days the rollup is not missing
-        # anything and the fast path reports the same zeros the scan would.
         if len(missing) > _MAX_COVERAGE_PROBE_DAYS:
             logger.debug(
-                "jobs_timeseries %s..%s: jobs-scan path (%d/%d days covered, "
-                "too many gaps to verify)", win_start, win_end,
+                "%s %s..%s: jobs-scan path (%d/%d days covered, too many gaps "
+                "to verify)", log_label, win_start, win_end,
                 needed - len(missing), needed)
             return False
         for lo, hi in _contiguous_runs(missing):
@@ -3175,13 +3250,13 @@ class JobQueries:
                 probe, **{**filters, "start": lo, "end": hi})
             if probe.limit(1).first() is not None:
                 logger.debug(
-                    "jobs_timeseries %s..%s: jobs-scan path (%d/%d days "
-                    "covered; %s..%s unsummarized but has jobs)",
-                    win_start, win_end, needed - len(missing), needed, lo, hi)
+                    "%s %s..%s: jobs-scan path (%d/%d days covered; %s..%s "
+                    "unsummarized but has jobs)", log_label, win_start,
+                    win_end, needed - len(missing), needed, lo, hi)
                 return False
         logger.debug(
-            "jobs_timeseries %s..%s: daily_summary path (%d/%d days "
-            "summarized; the other %d have no jobs)", win_start, win_end,
+            "%s %s..%s: daily_summary path (%d/%d days summarized; the other "
+            "%d have no jobs)", log_label, win_start, win_end,
             needed - len(missing), needed, len(missing))
         return True
 
@@ -3327,6 +3402,107 @@ class JobQueries:
             "null_count": null_count,
             "total_count": totals["job_count"] + null_count,
         }
+
+    def _usage_by_uses_summary(self, dimension, filters, win_start, win_end):
+        """Can ``daily_summary`` answer this ``jobs_usage_by``, or scan ``jobs``?
+
+        The usage_by analogue of :meth:`_timeseries_uses_summary`. The rollup
+        is keyed on ``(date, user_id, account_id, queue_id)``, so it can group
+        only those three dimensions, and only when every active filter is
+        itself expressible (:data:`_SUMMARY_SERVICEABLE_FILTERS`) and the whole
+        window is covered. ``qos``/``exit_status`` dimensions and any per-job
+        filter fall back to the scan. The window is always explicitly bounded
+        here — the caller routes in only when both bounds are given — so unlike
+        the timeseries path there is no domain to derive.
+        """
+        if dimension not in ("user", "account", "queue"):
+            logger.debug(
+                "jobs_usage_by %s..%s: jobs-scan path (dimension=%r is not a "
+                "rollup key)", win_start, win_end, dimension)
+            return False
+        active = {k for k, v in filters.items()
+                  if v is not None and v is not False}
+        unserviceable = active - _SUMMARY_SERVICEABLE_FILTERS
+        if unserviceable:
+            logger.debug(
+                "jobs_usage_by %s..%s: jobs-scan path (not expressible in the "
+                "rollup: %s)", win_start, win_end,
+                ", ".join(sorted(unserviceable)))
+            return False
+        return self._summary_window_fully_covered(
+            win_start, win_end, filters, log_label="jobs_usage_by")
+
+    def _usage_by_from_summary(self, dimension, filters, win_start, win_end,
+                               sort_by, limit):
+        """:meth:`jobs_usage_by` served off ``daily_summary``.
+
+        Returns the exact envelope the scan path builds — same row dicts, same
+        ``sort_by`` tie-break, ``totals`` summed over all rows *before*
+        ``limit`` — pinned by the equivalence tests. Grouping is the
+        dimension's FK on ``daily_summary``; the five metrics come straight off
+        the pre-summed ``*_hours`` / ``*_charges`` columns (qos-weighting
+        already folded in, so a qos *filter* is unserviceable but the weighted
+        metrics are exact).
+
+        NO_JOBS marker rows (all FKs NULL, zero metrics) drop out of the
+        grouped result as a NULL key. Real summary rows never carry a NULL
+        grouping FK (``sync.summary`` excludes NULL-FK jobs), so unlike the
+        scan path this path emits no ``value=None`` row — the same coverage
+        limitation :meth:`_timeseries_uses_summary` documents, and a no-op in
+        practice (0 of 21.0M rows on casper_jobs).
+        """
+        group_fk = {"user": DailySummary.user_id,
+                    "account": DailySummary.account_id,
+                    "queue": DailySummary.queue_id}[dimension]
+        model, name_col = {"user": (User, User.username),
+                           "account": (Account, Account.account_name),
+                           "queue": (Queue, Queue.queue_name)}[dimension]
+
+        query = self.session.query(
+            group_fk,
+            func.sum(DailySummary.job_count),
+            func.sum(DailySummary.cpu_hours),
+            func.sum(DailySummary.gpu_hours),
+            func.sum(DailySummary.cpu_charges),
+            func.sum(DailySummary.gpu_charges),
+        ).filter(DailySummary.date >= win_start, DailySummary.date <= win_end)
+        # Serviceable filters, matching _apply_jobs_search_filters exactly: an
+        # empty projcode STRING is "no filter", but an empty account SEQUENCE
+        # is "no rows" (an empty project tree), so it must reach false() rather
+        # than being skipped.
+        if filters.get("user"):
+            query = query.filter(self._lookup_fk_clause(
+                "user", filters["user"], fk_col=DailySummary.user_id))
+        account = filters.get("account")
+        if account is not None and not (isinstance(account, str) and not account):
+            query = query.filter(self._lookup_fk_clause(
+                "account", account, fk_col=DailySummary.account_id))
+        if filters.get("queue"):
+            query = query.filter(self._lookup_fk_clause(
+                "queue", filters["queue"], fk_col=DailySummary.queue_id))
+        raw = query.group_by(group_fk).all()
+
+        names = self._resolve_lookup_names(
+            model, name_col, {r[0] for r in raw if r[0] is not None})
+
+        rows = []
+        for key, *metric_cols in raw:
+            if key is None:
+                continue        # NO_JOBS markers / NULL FK — never a real group
+            acc = _zero_metrics()
+            _accumulate(acc, *metric_cols)
+            rows.append({"value": names.get(key), **_metrics_dict(acc)})
+        rows.sort(key=lambda r: (
+            -_usage_rank(sort_by, r),
+            r["value"] is None,
+            str(r["value"]),
+        ))
+
+        totals = {key: sum(r[key] for r in rows) for key in _METRIC_KEYS}
+        if limit is not None:
+            rows = rows[:limit]
+
+        return {"dimension": dimension, "rows": rows, "totals": totals}
 
     def _resolve_timeseries_window(self, start, end, filters):
         """``(win_start, win_end, null_count)`` for the band vector.
