@@ -3493,3 +3493,228 @@ class TestTimeseriesSummaryCoverageLimit:
         ).filter(DailySummary.date == date(2025, 7, 5)).one()
         assert row[0] == 1
         assert (row[1] or 0.0) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# jobs_usage_by — the daily_summary fast path
+# ---------------------------------------------------------------------------
+
+def _force_usage_scan(monkeypatch):
+    """Disable the usage_by fast path for the duration of a test."""
+    monkeypatch.setattr(
+        JobQueries, "_usage_by_uses_summary", lambda *a, **k: False)
+
+
+class TestUsageBySummaryRouting:
+    """Which path answers jobs_usage_by, and why."""
+
+    def test_no_summary_rows_means_no_fast_path(
+            self, in_memory_session, timeseries_jobs):
+        """An unsummarized database must not silently serve from an empty
+        rollup."""
+        q = JobQueries(in_memory_session)
+        assert q._usage_by_uses_summary(
+            "user", _ts_filters(start=_TS_START, end=_TS_END),
+            _TS_START, _TS_END) is False
+
+    def test_serviceable_dimensions_and_filters_route_to_summary(
+            self, in_memory_session, summarized_timeseries):
+        q = JobQueries(in_memory_session)
+        for dimension in ("user", "account", "queue"):
+            for extra in ({}, {"user": "alice"}, {"account": "NCAR0001"},
+                          {"queue": "main"}, {"ignore_case": True}):
+                filters = _ts_filters(start=_TS_START, end=_TS_END, **extra)
+                assert q._usage_by_uses_summary(
+                    dimension, filters, _TS_START, _TS_END) is True, \
+                    (dimension, extra)
+
+    @pytest.mark.parametrize("dimension", ["qos", "exit_status"])
+    def test_unkeyed_dimensions_fall_back(
+            self, in_memory_session, summarized_timeseries, dimension):
+        """Only user/account/queue survive the rollup — qos and exit_status
+        were aggregated away and must force the jobs scan."""
+        q = JobQueries(in_memory_session)
+        assert q._usage_by_uses_summary(
+            dimension, _ts_filters(start=_TS_START, end=_TS_END),
+            _TS_START, _TS_END) is False
+
+    @pytest.mark.parametrize("unserviceable", [
+        {"qos": "regular"},          # not in daily_summary's key
+        {"exit_status": "0"},        # per-job attribute
+        {"job_id": "800"},
+        {"name": "t0"},
+        {"min_nodes": 0},            # 0 is a real bound, not "unset"
+        {"max_cpus": 8},
+        {"min_memory_wasted": 1},
+    ])
+    def test_unserviceable_filters_fall_back(
+            self, in_memory_session, summarized_timeseries, unserviceable):
+        q = JobQueries(in_memory_session)
+        filters = _ts_filters(start=_TS_START, end=_TS_END, **unserviceable)
+        assert q._usage_by_uses_summary(
+            "user", filters, _TS_START, _TS_END) is False
+
+    def test_window_past_the_watermark_is_fine_when_those_days_are_empty(
+            self, in_memory_session, summarized_timeseries):
+        q = JobQueries(in_memory_session)
+        beyond = _TS_END + timedelta(days=1)
+        assert q._usage_by_uses_summary(
+            "user", _ts_filters(start=_TS_START, end=beyond),
+            _TS_START, beyond) is True
+
+    def test_unbounded_window_skips_the_fast_path(
+            self, in_memory_session, summarized_timeseries, monkeypatch):
+        """A missing bound must short-circuit before the fast path: the scan's
+        date filter includes NULL-``end`` jobs the rollup omits, so only an
+        explicitly bounded window is safe to serve from the summary."""
+        q = JobQueries(in_memory_session)
+        monkeypatch.setattr(
+            JobQueries, "_usage_by_from_summary",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("fast path taken")))
+        # Missing end => fall through to the scan without consulting it.
+        out = q.jobs_usage_by("user", start=_TS_START)
+        assert out["dimension"] == "user"
+        # Both bounds present => the fast path IS taken (the stub fires).
+        with pytest.raises(AssertionError, match="fast path taken"):
+            q.jobs_usage_by("user", start=_TS_START, end=_TS_END)
+
+    def test_every_filter_is_classified(self):
+        """No filter may be accidentally serviceable: the whitelist plus the
+        aggregated-away set must together cover the shared filter signature, so
+        a NEW filter defaults to the scan path rather than being ignored."""
+        import inspect
+        params = {
+            name for name, p in
+            inspect.signature(JobQueries.jobs_usage_by).parameters.items()
+            if p.kind == p.KEYWORD_ONLY
+        } - {"limit", "sort_by"}
+        assert _SUMMARY_SERVICEABLE_FILTERS <= params
+        q = JobQueries.__new__(JobQueries)
+        for extra in params - _SUMMARY_SERVICEABLE_FILTERS:
+            filters = {"start": _TS_START, "end": _TS_END, extra: 1}
+            assert q._usage_by_uses_summary(
+                "user", filters, _TS_START, _TS_END) is False, extra
+
+
+class TestUsageByPathEquivalence:
+    """A consumer cannot tell which path answered jobs_usage_by.
+
+    Row values, ordering and every ``job_count`` match exactly; the float
+    metrics only approximately, because the rollup pre-sums each
+    ``(date, user, account, queue)`` group and this re-folds those subtotals
+    while the scan sums every job in one pass.
+    """
+
+    _FLOAT_KEYS = ("cpu_hours", "gpu_hours", "cpu_charges", "gpu_charges")
+
+    @classmethod
+    def _assert_same(cls, fast, scan, ctx=""):
+        assert fast.keys() == scan.keys(), ctx
+        assert fast["dimension"] == scan["dimension"], ctx
+        assert fast["totals"]["job_count"] == scan["totals"]["job_count"], ctx
+        for key in cls._FLOAT_KEYS:
+            assert fast["totals"][key] == pytest.approx(
+                scan["totals"][key]), f"{ctx}: totals.{key}"
+        assert [r["value"] for r in fast["rows"]] == \
+               [r["value"] for r in scan["rows"]], ctx
+        for fr, sr in zip(fast["rows"], scan["rows"]):
+            where = f"{ctx}: row {fr['value']}"
+            assert fr.keys() == sr.keys(), where
+            assert fr["job_count"] == sr["job_count"], where
+            for key in cls._FLOAT_KEYS:
+                assert fr[key] == pytest.approx(sr[key]), f"{where}: {key}"
+
+    CASES = [
+        ("user plain", "user", {}),
+        ("account plain", "account", {}),
+        ("queue plain", "queue", {}),
+        ("user filter", "user", {"user": "alice"}),
+        ("account filter", "account", {"account": "NCAR0002"}),
+        ("queue scoped by account", "queue", {"account": "NCAR0001"}),
+        ("account seq", "account", {"account": ["NCAR0001", "NCAR0002"]}),
+        ("empty account seq", "user", {"account": []}),  # no rows, not all
+        ("sort_by gpu_hours", "user", {"sort_by": "gpu_hours"}),
+        ("sort_by charges", "account", {"sort_by": "charges"}),
+        ("sort_by job_count", "user", {"sort_by": "job_count"}),
+        ("limit truncates rows", "user", {"limit": 1}),
+        ("unresolvable user", "user", {"user": "nobody"}),
+    ]
+
+    @pytest.mark.parametrize("label,dimension,kwargs", CASES,
+                             ids=[c[0] for c in CASES])
+    def test_paths_agree(self, in_memory_session, summarized_timeseries,
+                         monkeypatch, label, dimension, kwargs):
+        q = JobQueries(in_memory_session)
+        # Fast path first (the predicate routes it), then force the scan.
+        fast = q.jobs_usage_by(
+            dimension, start=_TS_START, end=_TS_END, **kwargs)
+        _force_usage_scan(monkeypatch)
+        scan = q.jobs_usage_by(
+            dimension, start=_TS_START, end=_TS_END, **kwargs)
+        self._assert_same(fast, scan, f"{dimension}/{label}")
+
+
+class TestQueryWorkMem:
+    """The per-query ``SET LOCAL work_mem`` guard (_apply_query_work_mem)."""
+
+    @staticmethod
+    def _pg_session(execute):
+        class _Dialect:
+            name = "postgresql"
+
+        class _Bind:
+            dialect = _Dialect()
+
+        class _Session:
+            bind = _Bind()
+
+            def execute(self, stmt, *a, **k):
+                return execute(stmt, *a, **k)
+
+        return _Session()
+
+    def _query_with(self, session):
+        q = JobQueries.__new__(JobQueries)
+        q.session = session
+        return q
+
+    def test_noop_on_sqlite(self, in_memory_session, monkeypatch):
+        """The SQLite CLI path issues no SET and does not error."""
+        issued = []
+        monkeypatch.setattr(in_memory_session, "execute",
+                            lambda stmt, *a, **k: issued.append(str(stmt)))
+        JobQueries(in_memory_session)._apply_query_work_mem()
+        assert issued == []
+
+    def test_issues_set_local_on_postgres(self, monkeypatch):
+        from job_history.database.config import JobHistoryConfig
+        monkeypatch.setattr(JobHistoryConfig, "PG_WORK_MEM", "1GB")
+        issued = []
+        q = self._query_with(
+            self._pg_session(lambda stmt, *a, **k: issued.append(str(stmt))))
+        q._apply_query_work_mem()
+        assert issued == ["SET LOCAL work_mem = '1GB'"]
+
+    def test_blank_value_is_noop_on_postgres(self, monkeypatch):
+        from job_history.database.config import JobHistoryConfig
+        monkeypatch.setattr(JobHistoryConfig, "PG_WORK_MEM", "")
+        issued = []
+        q = self._query_with(
+            self._pg_session(lambda stmt, *a, **k: issued.append(str(stmt))))
+        q._apply_query_work_mem()
+        assert issued == []
+
+    @pytest.mark.parametrize("bad", [
+        "1GB; DROP TABLE jobs", "lots", "1 gigabyte", "-1MB", "64",
+    ])
+    def test_rejects_malformed_value(self, monkeypatch, bad):
+        from job_history.database.config import JobHistoryConfig
+        monkeypatch.setattr(JobHistoryConfig, "PG_WORK_MEM", bad)
+
+        def _boom(stmt, *a, **k):
+            raise AssertionError("must not execute a rejected value")
+
+        q = self._query_with(self._pg_session(_boom))
+        with pytest.raises(ValueError, match="JOB_HISTORY_PG_WORK_MEM"):
+            q._apply_query_work_mem()

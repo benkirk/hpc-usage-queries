@@ -128,6 +128,15 @@ spec:
       # leaves comfortable headroom. Revisit if active concurrency climbs.
       work_mem: "64MB"
       maintenance_work_mem: "128MB"
+      # effective_cache_size: the planner's estimate of RAM available for
+      # caching (shared_buffers + OS page cache) — NOT an allocation. Was
+      # unset, so the cluster ran on Postgres's 4GB default, which made the
+      # planner assume data is not cached and over-cost index scans, biasing it
+      # toward the seq-scan + hash-join/aggregate plans that spill job_history
+      # analytics (usage_by / histogram) to temp on the -ro replica. Set to
+      # ~75% of the 64Gi node (shared_buffers already 32GB) so index/merge
+      # plans are costed realistically. Reload-only — no restart/failover.
+      effective_cache_size: "48GB"
       dynamic_shared_memory_type: "posix"
 
       # Resource limits
