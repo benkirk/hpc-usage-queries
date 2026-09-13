@@ -76,7 +76,11 @@ state (see step 6).
   alternates between `-1` and `-2` after each roll — a `FAILOVER: primary X → Y`
   line during a known roll is the switchover, not an incident. Before this was
   set (2026-09-13) the default in-place primary restart left the primary LB
-  endpoint-less for 3.5 min.
+  endpoint-less for 3.5 min. Measured on the first switchover roll (#115,
+  2026-09-13 14:26Z, 65Gi): replica recreated → Ready in ~15 s, promotion with
+  <1 s of primary gap, old primary back as replica ~25 s later, whole roll
+  59 s. A failover (primary pod deleted, same day) was ~16 s of primary gap
+  and 65 s total. Anything materially slower than that is worth a look.
 
 ## 3. The performance line
 
