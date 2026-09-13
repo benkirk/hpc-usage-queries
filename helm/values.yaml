@@ -9,7 +9,9 @@ db:
                                           # primary; consumers opt in by pointing their host at the -ro name.
   resource:
     limits:
-      cpu: '8'
+      # Sized from an observed worst-case load (full fs_scans consolidation
+      # incl. cgd); measured primary peak ~2.9 cores. See PR for the data.
+      cpu: '4'
       memory: 64Gi
   superUser:
     enabled: true                         # Enable superuser access to the database
