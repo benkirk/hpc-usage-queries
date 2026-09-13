@@ -12,7 +12,7 @@ db:
       # Sized from an observed worst-case load (full fs_scans consolidation
       # incl. cgd); measured primary peak ~2.9 cores. See PR for the data.
       cpu: '4'
-      memory: 64Gi
+      memory: 65Gi
   superUser:
     enabled: true                         # Enable superuser access to the database
     usernameKey: username                 # Key in OpenBao for superuser username
