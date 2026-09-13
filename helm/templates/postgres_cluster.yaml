@@ -9,6 +9,19 @@ metadata:
 spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:18.3
   instances: {{ .Values.db.instances }}
+  # Rolling updates (any pod-spec change: image, resources, parameters that
+  # need a restart): replicas first, then PROMOTE the updated replica and
+  # rejoin the old primary as a replica. The operator default, `restart`,
+  # restarts the primary in place: on 2026-09-13 a CPU-limit change left the
+  # primary LoadBalancer with no endpoint for 3.5 min (pod recreate + PVC
+  # reattach + recovery). A switchover costs the seconds a promotion takes;
+  # clients see one dropped connection and reconnect (SAM: pool_pre_ping).
+  # With 2 instances the -ro LB is still empty while the lone replica
+  # rebuilds; its consumers (fs_scans, job_history) fail soft by design.
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+  switchoverDelay: 60          # s the old primary gets to shut down cleanly before fast shutdown
+  smartShutdownTimeout: 30     # s of smart (wait for clients) shutdown inside the stopDelay budget
   storage:
     size: {{ .Values.db.size }}
   resources:
@@ -77,9 +90,10 @@ spec:
     # Preload pg_stat_statements for cumulative per-query-shape cost stats —
     # the fs_scans slow-path recursive directory/owner scans are the target,
     # and without this we have no way to rank query shapes by total time.
-    # Adding a library to shared_preload_libraries requires a restart; CNPG
-    # performs a controlled rolling restart (replicas first, then switchover),
-    # so downtime is near-zero. The extension must additionally be created once
+    # Adding a library to shared_preload_libraries requires a restart; with
+    # primaryUpdateMethod: switchover (above) that is replicas first, then a
+    # promotion, so the primary is unavailable for seconds rather than the
+    # minutes an in-place restart takes. The extension must additionally be created once
     # per database (not auto-created on an existing cluster):
     #   CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
     shared_preload_libraries:

@@ -66,6 +66,17 @@ state (see step 6).
   WARN. A single old restart won't re-flag — the script compares counts tick to
   tick. Correlate an image change with an intended deploy; an *unexpected* one
   is worth surfacing to Ben (deploy mechanics are his).
+- **What a roll looks like** (any pod-spec change — image, `resources`,
+  restart-class parameters — recreates both pods; `primaryUpdateMethod:
+  switchover` in `helm/templates/postgres_cluster.yaml`): the replica is
+  recreated first (the `-ro` LB has **no endpoint** while it rebuilds; fs_scans
+  and job_history readers degrade), then the updated replica is **promoted**
+  (the `-rw`/primary LB flips with the `instanceRole` label, seconds), then the
+  old primary rebuilds as the replica (`-ro` empty again). The primary
+  alternates between `-1` and `-2` after each roll — a `FAILOVER: primary X → Y`
+  line during a known roll is the switchover, not an incident. Before this was
+  set (2026-09-13) the default in-place primary restart left the primary LB
+  endpoint-less for 3.5 min.
 
 ## 3. The performance line
 
