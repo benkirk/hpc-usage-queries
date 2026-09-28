@@ -1,11 +1,13 @@
 """CLI command for syncing scheduler accounting logs into the job history database."""
 
+import sys
+
 import click
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Callable
 
-from ..database import get_session, init_db, get_db_url
+from ..database import SchemaNotReady, check_db, get_session, init_db, get_db_url
 from .base import MACHINE_SCHEDULERS
 from .pbs import SyncPBSLogs
 from .slurm import SyncSLURMLogs
@@ -229,9 +231,14 @@ def print_sync_stats(stats: dict, machine: str, verbose: bool = False) -> None:
     type=click.Path(exists=False, file_okay=False, dir_okay=True, path_type=Path),
     help="Path to scheduler log directory (e.g. directory of YYYYMMDD files for PBS)"
 )
+@click.option(
+    "--init-db", "init_db_flag", is_flag=True,
+    help="Create or upgrade the schema (tables, trigger, QoS seed). Needs the DB owner role; "
+         "without dates or --log-path it initializes and exits.",
+)
 @date_options()
 @sync_options()
-def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch_size, dry_run, verbose, upsert, incremental, resummarize, recalculate, no_summary):
+def sync(machine, scheduler, log_path, init_db_flag, date, start, end, today_flag, last, batch_size, dry_run, verbose, upsert, incremental, resummarize, recalculate, no_summary):
     """Sync jobs from local scheduler accounting logs.
 
     Parses accounting log files from the given directory and imports them
@@ -261,9 +268,15 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
       jobhist sync -m casper -d 2026-03-21 --recalculate                               # recalculate charges from DB
       jobhist sync -m casper --start 2021-01-01 --end 2026-03-21 --recalculate         # full historical backfill
       jobhist sync -m derecho --scheduler pbs -l ./logs -d 2026-01-29                  # explicit scheduler
+      jobhist sync -m derecho --init-db                                                 # schema only, as DB owner
+
+    \b
+    A routine sync only checks the schema; it never runs DDL, so it works under a
+    DML-only role. Schema changes need one --init-db run by the database owner.
     """
     # Validate user-supplied flags before any resolution
     validate_dates(date, start, end, today_flag, last)
+    init_only = init_db_flag and not (log_path or date or start or end or today_flag or last)
 
     if sum([bool(upsert), bool(incremental), bool(resummarize), bool(recalculate)]) > 1:
         click.echo("Error: --upsert, --incremental, --resummarize, and --recalculate are mutually exclusive", err=True)
@@ -287,10 +300,22 @@ def sync(machine, scheduler, log_path, date, start, end, today_flag, last, batch
         raise click.Abort()
 
     if verbose:
-        click.echo(f"Initializing database: {get_db_url(machine)}")
+        click.echo(f"Database: {get_db_url(machine)}")
         click.echo(f"Scheduler: {syncer_cls.SCHEDULER_NAME}")
 
-    engine = init_db(machine)
+    from ..cli.core.utils import EXIT_ERROR  # lazy: job_history.cli imports this module
+
+    try:
+        engine = init_db(machine) if init_db_flag else check_db(machine)
+    except SchemaNotReady as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(EXIT_ERROR)
+    except Exception as e:
+        click.echo(f"Error: cannot open {get_db_url(machine)}: {e}", err=True)
+        sys.exit(EXIT_ERROR)
+    if init_only:
+        click.echo(f"Initialized {get_db_url(machine)}")
+        return
     session = get_session(machine, engine)
 
     try:

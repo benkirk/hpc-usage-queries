@@ -152,9 +152,19 @@ class TestEngineCaching:
         finally:
             clear_engine_cache()
 
-        assert captured["url"].startswith("postgresql+psycopg2://")
+        assert captured["url"].drivername == "postgresql+psycopg2"
         assert captured["kwargs"].get("pool_pre_ping") is True
         assert captured["kwargs"].get("pool_recycle") == 1800
+
+    def test_pg_url_quotes_password(self, monkeypatch):
+        """A password with URL metacharacters survives, and display masks it."""
+        from sqlalchemy.engine import make_url
+        from fs_scans.core.config import FsScanConfig
+
+        monkeypatch.setattr(FsScanConfig, "PG_PASSWORD", "p@ss:w/rd%#?")
+        url = FsScanConfig.pg_url("campaign")
+        assert make_url(url.render_as_string(hide_password=False)).password == "p@ss:w/rd%#?"
+        assert "p@ss" not in url.render_as_string(hide_password=True)
 
 
 # ============================================================================

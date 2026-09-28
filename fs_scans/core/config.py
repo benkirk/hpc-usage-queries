@@ -19,6 +19,7 @@ Quickstart:
 import os
 
 from dotenv import find_dotenv, load_dotenv
+from sqlalchemy.engine import URL
 
 # Load .env on import.  Calling this multiple times is harmless.
 load_dotenv(find_dotenv())
@@ -52,6 +53,22 @@ class FsScanConfig:
         collection = collection.lower()
         env_var = f"FS_SCAN_PG_{collection.upper()}_SCHEMA"
         return os.getenv(env_var, collection)
+
+    @classmethod
+    def pg_url(cls, database: str) -> URL:
+        """PostgreSQL URL for *database*; URL.create quotes any password character."""
+        return URL.create(
+            "postgresql+psycopg2",
+            username=cls.PG_USER,
+            password=cls.PG_PASSWORD,
+            host=cls.PG_HOST,
+            port=cls.PG_PORT,
+            database=database,
+        )
+
+    @classmethod
+    def pg_connect_args(cls) -> dict:
+        return {"sslmode": "require"} if cls.PG_REQUIRE_SSL else {}
 
     # ------------------------------------------------------------ Validate
     @classmethod

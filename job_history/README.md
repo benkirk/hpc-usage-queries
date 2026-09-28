@@ -41,12 +41,43 @@ docker compose up -d          # starts postgres:18 on localhost:5432
 export JOB_HISTORY_DB_BACKEND=postgres
 export JOB_HISTORY_PG_PASSWORD=...
 
-# Initialize (auto-creates derecho_jobs and casper_jobs databases)
-python -c "from job_history import init_db; init_db()"
+# Initialize, as the database owner (creates derecho_jobs / casper_jobs if missing)
+jobhist-sync -m derecho --init-db
+jobhist-sync -m casper --init-db
 
 # Everything else is identical
 jobhist sync -m derecho -l ./data/pbs_logs/derecho --start 2025-08-01 --end 2025-11-23
 ```
+
+### Roles (PostgreSQL)
+
+A routine sync never runs DDL. It checks the schema (`check_db`: every table plus the
+`trg_ensure_job_charge` trigger) and exits 2 with "run `jobhist-sync --init-db`" when
+something is missing. So it runs as a DML-only role, and only a schema change needs the owner:
+
+| role | runs | needs |
+|---|---|---|
+| owner (`postgres` on csg-postgres) | `jobhist-sync --init-db`, once per schema change | owns the tables and `fn_ensure_job_charge`; CREATEDB for a new database |
+| `jobhist_writer` | every `jobhist-sync` | the grants below |
+| `pguser` | readers (SAM accounting, the webapp jobs plugin) | SELECT |
+
+Apply in each of `casper_jobs` and `derecho_jobs`, as the owner:
+
+```sql
+CREATE ROLE jobhist_writer LOGIN PASSWORD '...';   -- once per cluster
+GRANT CONNECT ON DATABASE derecho_jobs TO jobhist_writer;
+GRANT USAGE ON SCHEMA public TO jobhist_writer;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO jobhist_writer;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO jobhist_writer;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO jobhist_writer;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO jobhist_writer;
+```
+
+`fn_ensure_job_charge` is not `SECURITY DEFINER`, so it runs as the inserting role, and the
+`job_charges` table grant covers it. SQLite has no roles: a missing `.db` file is still
+initialized on first sync.
 
 ## Configuration
 
@@ -466,7 +497,7 @@ PBS log sync populates `cpu_type` and `gpu_type` from PBS select strings — the
 from job_history import get_session, init_db
 from job_history.sync import SyncPBSLogs
 
-engine = init_db("derecho")
+engine = init_db("derecho")      # or check_db("derecho") under a DML-only role
 session = get_session("derecho", engine)
 syncer = SyncPBSLogs(session, "derecho")
 
@@ -630,7 +661,7 @@ JSON envelope conventions (matches project_samuel's CLI):
 |------|---------|
 | `0`   | Success |
 | `1`   | Not found (e.g. empty result window where expected) |
-| `2`   | Caught exception or validation failure (full traceback with `-v`) |
+| `2`   | Caught exception or validation failure (full traceback with `-v`); `sync` also uses it for an unreachable database or a schema that needs `--init-db` |
 | `130` | Keyboard interrupt (Ctrl-C) |
 
 ## Convenience Wrappers
