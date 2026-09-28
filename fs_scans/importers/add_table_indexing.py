@@ -50,6 +50,16 @@ def add_directory_stats_indexing(session):
         session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_owner_files    ON directory_stats(owner_uid, file_count_r);"))
         session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_group_size     ON directory_stats(owner_gid, total_size_r);"))
         session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_group_files    ON directory_stats(owner_gid, file_count_r);"))
+        # Non-recursive twins of the four composite owner/group indexes above.
+        # A recursive=0 drill-down (owner/group filter + atime window) sorts on
+        # total_size_nr / file_count_nr; without these the planner walks the
+        # size-only ix_stats_total_size_nr backward and filters, reading most of
+        # a 60M-row index to find a LIMIT 25 (see issue #120). These keep the
+        # walk inside the owner's entries in size/count order.
+        session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_owner_size_nr  ON directory_stats(owner_uid, total_size_nr);"))
+        session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_owner_files_nr ON directory_stats(owner_uid, file_count_nr);"))
+        session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_group_size_nr  ON directory_stats(owner_gid, total_size_nr);"))
+        session.execute(text("CREATE INDEX IF NOT EXISTS ix_stats_group_files_nr ON directory_stats(owner_gid, file_count_nr);"))
 
         # Scoped-query (ancestor-at-level) indexes over the selective band of
         # root-relative levels (SCOPE_INDEX_MIN_DEPTH..SCOPE_INDEX_MAX_DEPTH in
