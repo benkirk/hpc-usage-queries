@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
+from sqlalchemy.engine import URL
 
 # Load .env on import.  Calling this multiple times is harmless.
 load_dotenv(find_dotenv())
@@ -56,6 +57,22 @@ class JobHistoryConfig:
         """
         env_var = f"JOB_HISTORY_PG_{machine.upper()}_DB"
         return os.getenv(env_var, f"{machine}_jobs")
+
+    @classmethod
+    def pg_url(cls, database: str) -> URL:
+        """PostgreSQL URL for *database*; URL.create quotes any password character."""
+        return URL.create(
+            "postgresql+psycopg2",
+            username=cls.PG_USER,
+            password=cls.PG_PASSWORD,
+            host=cls.PG_HOST,
+            port=cls.PG_PORT,
+            database=database,
+        )
+
+    @classmethod
+    def pg_connect_args(cls) -> dict:
+        return {"sslmode": "require"} if cls.PG_REQUIRE_SSL else {}
 
     # --------------------------------------------------- Site timezone
     # Used to determine day boundaries for daily_summary generation and

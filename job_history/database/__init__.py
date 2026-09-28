@@ -18,6 +18,7 @@ from .models import (
     LookupMixin,
 )
 from .session import (
+    check_db,
     clear_engine_cache,
     db_available,
     get_db_path,
@@ -25,6 +26,7 @@ from .session import (
     get_engine,
     get_session,
     init_db,
+    SchemaNotReady,
     VALID_MACHINES,
 )
 
@@ -41,6 +43,7 @@ __all__ = [
     "Queue",
     "LookupCache",
     "LookupMixin",
+    "check_db",
     "clear_engine_cache",
     "db_available",
     "get_db_path",
@@ -48,5 +51,6 @@ __all__ = [
     "get_engine",
     "get_session",
     "init_db",
+    "SchemaNotReady",
     "VALID_MACHINES",
 ]

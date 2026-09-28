@@ -12,7 +12,7 @@ See ``job_history/config.py`` and ``.env.example`` for full configuration detail
 import threading
 from typing import Any, Mapping, Optional
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
@@ -118,8 +118,7 @@ def get_db_url(machine: str) -> str:
 
     config = JobHistoryConfig
     if config.DB_BACKEND == "postgres":
-        db_name = config.pg_db_name(machine)
-        return f"postgresql+psycopg2://{config.PG_USER}:***@{config.PG_HOST}:{config.PG_PORT}/{db_name}"
+        return config.pg_url(config.pg_db_name(machine)).render_as_string(hide_password=True)
     else:
         return str(get_db_path(machine))
 
@@ -217,15 +216,10 @@ def get_engine(
 
         if config.DB_BACKEND == "postgres":
             config.validate_postgres()
-            db_name = config.pg_db_name(machine)
-            connect_args = {}
-            if config.PG_REQUIRE_SSL:
-                connect_args["sslmode"] = "require"
-            url = (
-                f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
-                f"@{config.PG_HOST}:{config.PG_PORT}/{db_name}"
+            engine = create_engine(
+                config.pg_url(config.pg_db_name(machine)),
+                echo=echo, connect_args=config.pg_connect_args(), **extra,
             )
-            engine = create_engine(url, echo=echo, connect_args=connect_args, **extra)
         else:
             db_path = get_db_path(machine)
             db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -284,11 +278,11 @@ def _ensure_pg_database(machine: str, config: type) -> None:
     ``CREATE DATABASE`` can run outside a transaction.
     """
     db_name = config.pg_db_name(machine)
-    admin_url = (
-        f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
-        f"@{config.PG_HOST}:{config.PG_PORT}/postgres"
+    admin_engine = create_engine(
+        config.pg_url("postgres"),
+        isolation_level="AUTOCOMMIT",
+        connect_args=config.pg_connect_args(),
     )
-    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
         with admin_engine.connect() as conn:
             result = conn.execute(
@@ -456,3 +450,41 @@ def init_db(machine: str | None = None, echo: bool = False):
         _rename_jhublogin_to_uncharged(engines[m])
         _ensure_qos_seed_rows(engines[m])
     return engines
+
+
+class SchemaNotReady(RuntimeError):
+    """The database is missing tables or triggers that only ``init_db`` creates."""
+
+
+_CHARGE_TRIGGER = "trg_ensure_job_charge"
+
+
+def check_db(machine: str) -> Engine:
+    """Return *machine*'s engine after confirming its schema, without writing.
+
+    The routine sync runs as a DML-only role that cannot run ``init_db``.
+    A missing SQLite file is still initialized, so local and test flows are unchanged.
+
+    Raises:
+        SchemaNotReady: a table or the job_charges trigger is missing.
+    """
+    config = JobHistoryConfig
+    if config.DB_BACKEND != "postgres" and not get_db_path(machine).exists():
+        return init_db(machine)
+
+    engine = get_engine(machine)
+    missing = sorted(set(Base.metadata.tables) - set(inspect(engine).get_table_names()))
+    with engine.connect() as conn:
+        if engine.dialect.name == "postgresql":
+            trigger_sql = ("SELECT 1 FROM pg_trigger WHERE tgname = :name "
+                           "AND tgrelid = to_regclass('jobs')")
+        else:
+            trigger_sql = "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = :name"
+        if conn.execute(text(trigger_sql), {"name": _CHARGE_TRIGGER}).first() is None:
+            missing.append(f"trigger {_CHARGE_TRIGGER}")
+    if missing:
+        raise SchemaNotReady(
+            f"{machine}: schema not ready (missing {', '.join(missing)}); "
+            "run `jobhist-sync --init-db` as the database owner"
+        )
+    return engine

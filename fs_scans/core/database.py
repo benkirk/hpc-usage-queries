@@ -194,10 +194,8 @@ def get_db_url(filesystem: str, schema: str | None = None) -> str:
     config = FsScanConfig
     if config.DB_BACKEND == "postgres":
         schema = schema or config.pg_schema_name(filesystem)
-        return (
-            f"postgresql+psycopg2://{config.PG_USER}:***@"
-            f"{config.PG_HOST}:{config.PG_PORT}/{config.PG_DB_NAME}#schema={schema}"
-        )
+        url = config.pg_url(config.PG_DB_NAME).render_as_string(hide_password=True)
+        return f"{url}#schema={schema}"
     return str(get_db_path(filesystem))
 
 
@@ -244,13 +242,8 @@ def get_engine(
             if cache_key not in _engine_cache:
                 # Pin search_path so the existing bare-table-name SQL resolves
                 # to this collection's schema without any rewrite.
-                connect_args = {"options": f"-csearch_path={schema},public"}
-                if config.PG_REQUIRE_SSL:
-                    connect_args["sslmode"] = "require"
-                url = (
-                    f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
-                    f"@{config.PG_HOST}:{config.PG_PORT}/{db_name}"
-                )
+                connect_args = {"options": f"-csearch_path={schema},public",
+                                **config.pg_connect_args()}
                 # pool_pre_ping validates each pooled connection with a cheap
                 # liveness check at checkout and transparently reconnects a
                 # dropped one — without it, an engine cached for the life of
@@ -261,7 +254,7 @@ def get_engine(
                 # age so a very stale one is never reused (checkout-only, so
                 # pre_ping does the heavy lifting; this is belt-and-suspenders).
                 _engine_cache[cache_key] = create_engine(
-                    url, echo=echo, connect_args=connect_args,
+                    config.pg_url(db_name), echo=echo, connect_args=connect_args,
                     pool_pre_ping=True, pool_recycle=1800,
                 )
             return _engine_cache[cache_key]
@@ -398,11 +391,11 @@ def _ensure_pg_database() -> None:
     """
     config = FsScanConfig
     db_name = config.PG_DB_NAME
-    admin_url = (
-        f"postgresql+psycopg2://{config.PG_USER}:{config.PG_PASSWORD}"
-        f"@{config.PG_HOST}:{config.PG_PORT}/postgres"
+    admin_engine = create_engine(
+        config.pg_url("postgres"),
+        isolation_level="AUTOCOMMIT",
+        connect_args=config.pg_connect_args(),
     )
-    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
         with admin_engine.connect() as conn:
             result = conn.execute(
