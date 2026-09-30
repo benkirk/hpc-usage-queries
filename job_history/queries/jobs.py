@@ -13,7 +13,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Sequence, Union
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, and_, or_, false, distinct, text
+from sqlalchemy import func, and_, or_, false, distinct, select, text, union_all
 from sqlalchemy.orm import Session
 
 from ..database import Job, DailySummary, JobCharge, JobQoS
@@ -2004,12 +2004,8 @@ class JobQueries:
                 f"sort_dir must be 'asc' or 'desc', got {sort_dir!r}"
             )
 
-        query = (
-            self.session.query(Job, JobCharge)
-            .outerjoin(JobCharge, Job.id == JobCharge.job_id)
-        )
-        query = self._apply_jobs_search_filters(
-            query, start=start, end=end, user=user, account=account,
+        filters = dict(
+            start=start, end=end, user=user,
             queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
             name=name, ignore_case=ignore_case,
             min_eligible_secs=min_eligible_secs,
@@ -2024,21 +2020,45 @@ class JobQueries:
             min_memory_wasted=min_memory_wasted,
             max_memory_wasted=max_memory_wasted,
         )
-
-        if sort_by is None:
-            query = query.order_by(Job.end.desc())
+        fanout_ids = self._account_fanout_ids(account, sort_by=sort_by, limit=limit)
+        query = self.session.query(Job, JobCharge)
+        if fanout_ids:
+            # Top-N by end over several accounts: one ix_jobs_account_end walk
+            # per account, merged. A single `account_id IN (...)` query makes
+            # the planner walk ix_jobs_end backward instead, filtering millions
+            # of rows when those accounts ran early in the window (SCHEMA.md).
+            asc = sort_by is not None and sort_dir == 'asc'
+            order = Job.end.asc() if asc else Job.end.desc()
+            branches = [
+                self._apply_jobs_search_filters(
+                    self.session.query(Job.id).filter(Job.account_id == account_id),
+                    account=None, **filters,
+                ).order_by(order).limit(limit + offset).subquery()
+                for account_id in fanout_ids
+            ]
+            top = union_all(*(select(b.c.id) for b in branches)).subquery()
+            query = (
+                query.join(top, Job.id == top.c.id)
+                .outerjoin(JobCharge, Job.id == JobCharge.job_id)
+                .order_by(order)
+            )
         else:
-            lookup = _LOOKUP_DIMS.get(sort_by)
-            if lookup is not None:
-                # OUTER join (the FKs are nullable — an inner join would
-                # drop rows and break jobs_search ↔ jobs_count agreement)
-                # and no added select entity: the (Job, JobCharge) tuple
-                # unpacked below must keep its arity.
-                model, fk_col, expr = lookup
-                query = query.outerjoin(model, fk_col == model.id)
+            query = query.outerjoin(JobCharge, Job.id == JobCharge.job_id)
+            query = self._apply_jobs_search_filters(query, account=account, **filters)
+            if sort_by is None:
+                query = query.order_by(Job.end.desc())
             else:
-                expr = _sort_expression(sort_by)
-            query = query.order_by(expr.desc() if sort_dir == 'desc' else expr.asc())
+                lookup = _LOOKUP_DIMS.get(sort_by)
+                if lookup is not None:
+                    # OUTER join (the FKs are nullable — an inner join would
+                    # drop rows and break jobs_search ↔ jobs_count agreement)
+                    # and no added select entity: the (Job, JobCharge) tuple
+                    # unpacked below must keep its arity.
+                    model, fk_col, expr = lookup
+                    query = query.outerjoin(model, fk_col == model.id)
+                else:
+                    expr = _sort_expression(sort_by)
+                query = query.order_by(expr.desc() if sort_dir == 'desc' else expr.asc())
 
         if limit is not None:
             query = query.limit(limit)
@@ -3598,16 +3618,28 @@ class JobQueries:
         rather than a parallel copy. The lookup tables are shared, so only
         the column changes.
         """
-        model, fk_col_default, name_col = _LOOKUP_DIMS[dim]
-        fk_col = fk_col_default if fk_col is None else fk_col
-        names = (value,) if isinstance(value, str) else tuple(value)
-        if not names:
-            return false()
-        ids = [i for (i,) in
-               self.session.query(model.id).filter(name_col.in_(names))]
+        fk_col = _LOOKUP_DIMS[dim][1] if fk_col is None else fk_col
+        ids = self._lookup_ids(dim, value)
         if not ids:
             return false()
         return fk_col == ids[0] if len(ids) == 1 else fk_col.in_(ids)
+
+    def _lookup_ids(self, dim: str, value) -> List[int]:
+        """Lookup-table ids for a name or sequence of names; unknown names drop out."""
+        model, _fk_col, name_col = _LOOKUP_DIMS[dim]
+        names = (value,) if isinstance(value, str) else tuple(value)
+        if not names:
+            return []
+        return [i for (i,) in
+                self.session.query(model.id).filter(name_col.in_(names))]
+
+    def _account_fanout_ids(self, account, *, sort_by, limit) -> List[int]:
+        """Account ids to split a top-N-by-end search across, or [] to run it as one query."""
+        if (limit is None or sort_by not in (None, "end")
+                or account is None or isinstance(account, str) or len(account) < 2):
+            return []
+        ids = self._lookup_ids("account", account)
+        return ids if len(ids) > 1 else []
 
     def list_qos_names(self, *, active_only: bool = True) -> List[str]:
         """Return JobQoS names from the lookup table, alphabetically ordered.

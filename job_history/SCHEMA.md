@@ -49,11 +49,12 @@ The **job_charges** table stores pre-computed resource hours:
 > is on `submit`, not `end`. The accurate list is below and in
 > § *Indexes* further down; do not plan against the old text.
 
-`Job.__table_args__` defines five composites:
+`Job.__table_args__` defines seven composites:
 
 - `(user_id, account_id)` — `ix_jobs_user_account`
 - `(submit, end)` — `ix_jobs_submit_end`
 - `(user_id, submit)` / `(account_id, submit)` / `(queue_id, submit)`
+- `(account_id, end)` — `ix_jobs_account_end`; `(user_id, end)` — `ix_jobs_user_end`
 
 plus single-column btrees on `job_id`, `short_id`, `status`, `submit`,
 `start`, **`end`** (`ix_jobs_end`), and the four lookup FKs.
@@ -61,12 +62,9 @@ plus single-column btrees on `job_id`, `short_id`, `status`, `submit`,
 `DailySummary` adds `ix_daily_summary_date` and
 `ix_daily_summary_user_account`.
 
-**On the missing `(account_id, end)` / `(queue_id, end)`:** every date filter
-is on `Job.end` while the entity composites are on `submit`, so these look
-like an obvious gap. **Measured, they are not worth adding.** PostgreSQL
-already resolves the scoped shape with `BitmapAnd(ix_jobs_account_id,
-ix_jobs_end)` — on casper_jobs (21.0M rows) a 30-day account-scoped aggregate
-runs in 119 ms, user-scoped in 202 ms, and with `owners_limit=10` in 257 ms.
+**Aggregates do not need the `end` composites.** PostgreSQL resolves a scoped
+aggregate with `BitmapAnd(ix_jobs_account_id, ix_jobs_end)` — on casper_jobs
+(21.0M rows) a 30-day account-scoped aggregate runs in 119 ms, user-scoped in 202 ms, and with `owners_limit=10` in 257 ms.
 In that plan the BitmapAnd costs ~23 ms of 105 ms while the nested loop into
 `job_charges` accounts for 638k of 684k buffers.
 
@@ -77,6 +75,64 @@ there is not an index but avoiding the scan altogether — see
 `JobQueries._timeseries_uses_summary`, which serves qualifying series off
 `daily_summary` ~800× faster. Full numbers in
 `docs/plans/JOBS_TIMESERIES.md` § *Where the time actually goes*.
+
+**Top-N does.** `jobs_search(account=…, start=…, end=…, limit=50)` (SAM's jobs
+table) is `ORDER BY end DESC LIMIT 50`, and without `(account_id, end)` the
+planner walks `ix_jobs_end` backward filtering on `account_id`. That is fast for
+an account that ran recently and pathological for one whose jobs sit early in a
+wide window: it reads every other account's newer rows first. Measured in
+production 2026-09-30 (derecho 16.3M rows, casper 27.5M; window
+2025-10-01..2026-09-30, top 50). "Before" ran on the primary, first touch; the
+long cases were cold and setting hint bits (`dirtied` buffers):
+
+| scope | before | rows filtered | after |
+|---|---|---|---|
+| derecho P86850054 (active) | 6,014 ms | 384,878 | 1.2 ms |
+| derecho WYOM0224 (stalled) | 58,123 ms | 3,997,555 | 0.5 ms |
+| derecho UCUB0056 (stalled, warm) | 1,200 ms | 3,398,566 | 0.3 ms |
+| derecho user, stopped early (warm) | 1,049 ms | 2,472,537 | 0.3 ms |
+| casper NMMM0073 (stalled) | 108,897 ms | 7,287,219 | 4.1 ms |
+| casper user, stopped early (warm) | 2,093 ms | 5,769,647 | 8.8 ms |
+| casper 2-account tree (`IN`), replica, indexes built | 81,934 ms | 6,790,889 | 1.2 ms (split) |
+
+The local PG 18 mirror reproduces the shape (0.8-1.5 s warm for a stalled
+account). 30-day scoped aggregates did not regress there (42 → 20 ms, 8 → 7 ms,
+21 → 3 ms; the planner switches to the new composites). In production each
+index built in 9.5-19 s: 368 MB each on derecho, 508 MB each on casper.
+
+**A multi-account tree still needs the query split.** With several leading
+`account_id` values the composite cannot return rows in `end` order, so an
+`account_id IN (...)` top-N keeps walking `ix_jobs_end` (the 81,934 ms row).
+`jobs_search` therefore runs a multi-account search ordered by `end` as one
+`ORDER BY end LIMIT offset+limit` branch per account, `UNION ALL`-ed and
+re-sorted (`_account_fanout_ids`); each branch is a short walk of
+`ix_jobs_account_end`.
+
+`ix_jobs_user_end` covers the same shape for a user-scoped table. There is no
+`(queue_id, end)`: no top-N surface scopes by queue alone.
+
+**Adding them to an existing database** — `create_all` only builds indexes for
+new tables, so run on the primary, per machine DB (applied to production
+`derecho_jobs` and `casper_jobs` 2026-09-30):
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_account_end ON jobs (account_id, "end");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_user_end    ON jobs (user_id, "end");
+SELECT indexrelid::regclass, indisvalid FROM pg_index
+ WHERE indexrelid::regclass::text IN ('ix_jobs_account_end', 'ix_jobs_user_end');
+```
+
+An interrupted concurrent build leaves `indisvalid = f`, and `IF NOT EXISTS`
+then skips it silently — drop and rebuild.
+
+**Follow-up: drop the unused `submit` composites.** Candidates are
+`ix_jobs_account_submit` and `ix_jobs_submit_end` (1.4 GB derecho, 2.0 GB casper together) — no query
+filters on `submit` except the `uq_jobs_job_id_submit` dedup, and both showed 0
+scans on both production DBs on 2026-09-30. `ix_jobs_user_submit` showed 2
+(derecho), so it stays. Those counters only span back to the 2026-09-29
+failover, and `submit` is a sort key in SAM's jobs table, so re-check
+`pg_stat_user_indexes.idx_scan` after a real period before dropping
+(`DROP INDEX CONCURRENTLY`).
 
 ## Table Schemas
 
@@ -374,6 +430,8 @@ Optimized for common query patterns:
 | `ix_jobs_user_submit` | `(user_id, submit)` | User activity over time |
 | `ix_jobs_account_submit` | `(account_id, submit)` | Account activity over time |
 | `ix_jobs_queue_submit` | `(queue_id, submit)` | Queue activity over time |
+| `ix_jobs_account_end` | `(account_id, end)` | Account-scoped top-N by end time |
+| `ix_jobs_user_end` | `(user_id, end)` | User-scoped top-N by end time |
 | `ix_daily_summary_user_account` | `(user_id, account_id)` | Summary lookups |
 
 Single-column indexes also on: `job_id`, `short_id`, `user_id`, `account_id`, `queue_id`, `status`, `submit`, `start`, `end`
