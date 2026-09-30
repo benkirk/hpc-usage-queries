@@ -80,37 +80,40 @@ there is not an index but avoiding the scan altogether — see
 table) is `ORDER BY end DESC LIMIT 50`, and without `(account_id, end)` the
 planner walks `ix_jobs_end` backward filtering on `account_id`. That is fast for
 an account that ran recently and pathological for one whose jobs sit early in a
-wide window: it reads every other account's newer rows first. Measured
-2026-09-30 on the local PG 18 mirror (derecho 13.3M rows, casper 22.2M; window
-2025-10-01..2026-09-29, warm, top 50):
+wide window: it reads every other account's newer rows first. Measured in
+production 2026-09-30 (derecho 16.3M rows, casper 27.5M; window
+2025-10-01..2026-09-30, top 50). "Before" ran on the primary, first touch; the
+long cases were cold and setting hint bits (`dirtied` buffers):
 
 | scope | before | rows filtered | after |
 |---|---|---|---|
-| derecho account, active to the end of the data | 0.4 ms | 1,859 | 0.3 ms |
-| derecho account, last job Nov 2025 | 800 ms | 3,440,161 | 0.28 ms |
-| derecho user, stopped early | 451 ms | 1,937,516 | 0.13 ms |
-| casper account, last job Oct 2025 | 1,480 ms | 7,023,860 | 0.12 ms |
-| casper user, last job Jan 2026 | 1,114 ms | 5,529,184 | 0.15 ms |
-| casper 2-account tree, both stalled (`IN`) | 2,335 ms | 6,527,451 | 2.0 ms (fan-out) |
+| derecho P86850054 (active) | 6,014 ms | 384,878 | 1.2 ms |
+| derecho WYOM0224 (stalled) | 58,123 ms | 3,997,555 | 0.5 ms |
+| derecho UCUB0056 (stalled, warm) | 1,200 ms | 3,398,566 | 0.3 ms |
+| derecho user, stopped early (warm) | 1,049 ms | 2,472,537 | 0.3 ms |
+| casper NMMM0073 (stalled) | 108,897 ms | 7,287,219 | 4.1 ms |
+| casper user, stopped early (warm) | 2,093 ms | 5,769,647 | 8.8 ms |
+| casper 2-account tree (`IN`), replica, indexes built | 81,934 ms | 6,790,889 | 1.2 ms (split) |
 
-30-day scoped aggregates did not regress (42 → 20 ms, 8 → 7 ms, 21 → 3 ms;
-the planner switches to the new composites). Each index built in 11-19 s
-locally, at 300 MB (derecho) / 382 MB (casper) — about 370 / 470 MB at
-production row counts, ~1.7 GB per instance for the pair.
+The local PG 18 mirror reproduces the shape (0.8-1.5 s warm for a stalled
+account). 30-day scoped aggregates did not regress there (42 → 20 ms, 8 → 7 ms,
+21 → 3 ms; the planner switches to the new composites). In production each
+index built in 9.5-19 s: 368 MB each on derecho, 508 MB each on casper.
 
 **A multi-account tree still needs the query split.** With several leading
 `account_id` values the composite cannot return rows in `end` order, so an
-`account_id IN (...)` top-N keeps walking `ix_jobs_end` (the 2,335 ms row, with
-the indexes in place). `jobs_search` therefore runs a multi-account search
-ordered by `end` as one `ORDER BY end LIMIT offset+limit` branch per account,
-`UNION ALL`-ed and re-sorted (`_account_fanout_ids`); each branch is a short
-walk of `ix_jobs_account_end`.
+`account_id IN (...)` top-N keeps walking `ix_jobs_end` (the 81,934 ms row).
+`jobs_search` therefore runs a multi-account search ordered by `end` as one
+`ORDER BY end LIMIT offset+limit` branch per account, `UNION ALL`-ed and
+re-sorted (`_account_fanout_ids`); each branch is a short walk of
+`ix_jobs_account_end`.
 
 `ix_jobs_user_end` covers the same shape for a user-scoped table. There is no
 `(queue_id, end)`: no top-N surface scopes by queue alone.
 
 **Adding them to an existing database** — `create_all` only builds indexes for
-new tables, so run on the primary, per machine DB:
+new tables, so run on the primary, per machine DB (applied to production
+`derecho_jobs` and `casper_jobs` 2026-09-30):
 
 ```sql
 CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_account_end ON jobs (account_id, "end");
@@ -122,13 +125,14 @@ SELECT indexrelid::regclass, indisvalid FROM pg_index
 An interrupted concurrent build leaves `indisvalid = f`, and `IF NOT EXISTS`
 then skips it silently — drop and rebuild.
 
-**Drop candidates (not yet dropped):** `ix_jobs_account_submit`,
-`ix_jobs_user_submit` and `ix_jobs_submit_end` — no query filters on
-`submit` except the `uq_jobs_job_id_submit` dedup, and the first and last showed
-0 scans in production on 2026-09-30. Those counters only span back to the 2026-09-29
+**Follow-up: drop the unused `submit` composites.** Candidates are
+`ix_jobs_account_submit` and `ix_jobs_submit_end` (1.4 GB derecho, 2.0 GB casper together) — no query
+filters on `submit` except the `uq_jobs_job_id_submit` dedup, and both showed 0
+scans on both production DBs on 2026-09-30. `ix_jobs_user_submit` showed 2
+(derecho), so it stays. Those counters only span back to the 2026-09-29
 failover, and `submit` is a sort key in SAM's jobs table, so re-check
-`pg_stat_user_indexes.idx_scan` on both instances after a real period before
-dropping (`DROP INDEX CONCURRENTLY`).
+`pg_stat_user_indexes.idx_scan` after a real period before dropping
+(`DROP INDEX CONCURRENTLY`).
 
 ## Table Schemas
 
