@@ -378,6 +378,11 @@ class Job(LookupMixin, Base):
         Index("ix_jobs_user_submit", "user_id", "submit"),
         Index("ix_jobs_account_submit", "account_id", "submit"),
         Index("ix_jobs_queue_submit", "queue_id", "submit"),
+        # Scoped top-N (ORDER BY end DESC LIMIT n): without these the planner
+        # walks ix_jobs_end backward and filters, millions of rows for an
+        # account or user whose jobs sit early in the window (SCHEMA.md).
+        Index("ix_jobs_account_end", "account_id", "end"),
+        Index("ix_jobs_user_end", "user_id", "end"),
     )
 
     def __repr__(self):

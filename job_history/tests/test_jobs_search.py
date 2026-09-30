@@ -542,6 +542,89 @@ class TestJobsSearchPagination:
         assert rows[0]["job_id"] == "102.desched1"
 
 
+@pytest.fixture
+def fanout_jobs(in_memory_session):
+    """30 jobs over three accounts with distinct end times: one account early
+    in the window, one late, one interleaved -- the shapes where a per-account
+    split could disagree with a single ordered query."""
+    base = datetime(2025, 3, 1, 12, 0, 0)
+    layout = (
+        [("FAN0001", h) for h in range(0, 10)]            # early block
+        + [("FAN0002", h) for h in range(100, 110)]       # late block
+        + [("FAN0003", h) for h in range(5, 105, 10)]     # interleaved
+    )
+    jobs = []
+    for n, (acct, hours) in enumerate(layout):
+        end = base + timedelta(hours=hours, minutes=n)
+        jobs.append(Job(
+            job_id=f"{500 + n}.desched1", short_id=500 + n, name=f"fan-{n}",
+            user=("alice", "bob")[n % 2], account=acct, queue="main",
+            qos="regular", status="F", submit=end - timedelta(hours=1),
+            start=end - timedelta(hours=1), end=end, elapsed=3600,
+            numcpus=128, numgpus=0, numnodes=1, walltime=7200,
+        ))
+    in_memory_session.add_all(jobs)
+    in_memory_session.flush()
+    in_memory_session.add_all(
+        JobCharge(job_id=j.id, cpu_hours=float(i), gpu_hours=0.0,
+                  memory_hours=1.0, qos_factor=1.0, charge_version=1)
+        for i, j in enumerate(jobs) if i % 3)  # some jobs lack a charge row
+    in_memory_session.commit()
+    return jobs
+
+
+def _statements(session, fn):
+    from sqlalchemy import event
+    seen = []
+
+    def _capture(conn, cursor, statement, params, context, executemany):
+        seen.append(statement)
+
+    event.listen(session.bind, "before_cursor_execute", _capture)
+    try:
+        fn()
+    finally:
+        event.remove(session.bind, "before_cursor_execute", _capture)
+    return seen
+
+
+class TestJobsSearchAccountFanout:
+    """A multi-account top-N by end runs one ordered branch per account
+    (SCHEMA.md § Composite Indexes); the page must equal the single query's."""
+
+    TREE = ["FAN0001", "FAN0002", "FAN0003"]
+
+    @pytest.mark.parametrize("limit,offset", [(1, 0), (5, 0), (5, 5), (7, 20), (50, 0), (5, 40)])
+    @pytest.mark.parametrize("sort_by,sort_dir", [(None, "desc"), ("end", "desc"), ("end", "asc")])
+    @pytest.mark.parametrize("extra", [{}, {"user": "alice"},
+                                       {"start": date(2025, 3, 2), "end": date(2025, 3, 5)}])
+    def test_page_matches_single_query(self, in_memory_session, fanout_jobs,
+                                       limit, offset, sort_by, sort_dir, extra):
+        q = JobQueries(in_memory_session)
+        kw = dict(account=self.TREE, sort_by=sort_by, sort_dir=sort_dir,
+                  columns=("job_id", "account", "cpu_charges"), **extra)
+        expected = q.jobs_search(**kw)[offset:offset + limit]  # limit=None: no fan-out
+        assert q.jobs_search(limit=limit, offset=offset, **kw) == expected
+
+    def test_sort_dir_ignored_when_sort_by_is_none(self, in_memory_session, fanout_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            account=self.TREE, limit=3, sort_dir="asc")
+        assert [r["account"] for r in rows] == ["FAN0002"] * 3
+
+    @pytest.mark.parametrize("kw,fans_out", [
+        ({"account": TREE, "limit": 5}, True),
+        ({"account": TREE, "limit": 5, "sort_by": "end", "sort_dir": "asc"}, True),
+        ({"account": TREE}, False),                                    # no limit
+        ({"account": TREE, "limit": 5, "sort_by": "elapsed"}, False),  # not by end
+        ({"account": "FAN0001", "limit": 5}, False),
+        ({"account": ["FAN0001", "NO-SUCH-PROJ"], "limit": 5}, False),  # one real id
+    ])
+    def test_which_searches_fan_out(self, in_memory_session, fanout_jobs, kw, fans_out):
+        q = JobQueries(in_memory_session)
+        stmts = _statements(in_memory_session, lambda: q.jobs_search(**kw))
+        assert any("UNION ALL" in st for st in stmts) is fans_out
+
+
 class TestJobsSearchResourceRanges:
     """search_jobs: (nodes, cpus, gpus) = (1,128,0), (2,256,0), (1,64,4)."""
 

@@ -35,7 +35,7 @@ Everything below is warm, machine-wide, on the localhost dev container.
 
 | operation | cost |
 |---|---|
-| `jobs_search(limit=50)` | walks `ix_jobs_end`, stops at 50 — does **not** scan |
+| `jobs_search(limit=50)` | walks `ix_jobs_end`, stops at 50 — does **not** scan (unscoped only; an account/user filter can walk millions, see `SCHEMA.md` § *Composite Indexes*) |
 | `jobs_count()` | index-only scan of the slice |
 | name glob added to a scan | ~free (107 ms vs ~100 ms without) |
 | facets, 1 dimension | 154 ms |
@@ -504,9 +504,9 @@ and both docstrings once the end-to-end pass runs against the local dev PG.
   Date-bounded, the glob is free.
 - `GROUPING SETS`, a `daily_summary` facet fast path, caching (SAM's layer —
   and job history has no content-addressed freshness key like fs_scans' scan
-  dates), and `ix_jobs_account_end` / `ix_jobs_queue_end` composites (separate
-  PR; `ix_jobs_account_submit` is on `submit` while the date filter is on
-  `end`, so an account+date query filters one predicate per row).
+  dates), and an `ix_jobs_queue_end` composite. (`ix_jobs_account_end` and
+  `ix_jobs_user_end` landed for the scoped top-N LIMIT trap — see
+  `job_history/SCHEMA.md` § *Composite Indexes*.)
 - ~~An `include_hours` facet variant~~ — **superseded in-flight**: SAM's
   By-User usage pie needs hours per entity, and it landed as the separate
   `jobs_usage_by` method instead of a facet flag (see §8 for why facet
