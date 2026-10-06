@@ -2747,7 +2747,6 @@ class JobQueries:
         if limit is not None and (not isinstance(limit, int) or limit <= 0):
             raise ValueError(f"limit must be a positive integer, got {limit!r}")
         _check_usage_sort_key(sort_by, "sort_by")
-        group_col, model, name_col = spec
 
         filters = dict(
             start=start, end=end, user=user, account=account, queue=queue,
@@ -2775,42 +2774,160 @@ class JobQueries:
         # guard below.
         if start is not None and end is not None and \
                 self._usage_by_uses_summary(dimension, filters, start, end):
-            return self._usage_by_from_summary(
-                dimension, filters, start, end, sort_by, limit)
+            rows, totals = self._usage_by_from_summary(
+                (dimension,), filters, start, end, sort_by, limit, ("value",))
+        else:
+            rows, totals = self._usage_by_scan(
+                (dimension,), filters, sort_by, limit, ("value",))
+        return {"dimension": dimension, "rows": rows, "totals": totals}
 
+    def jobs_usage_by_pair(
+        self,
+        dimensions: Tuple[str, str],
+        *,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        user: Optional[str] = None,
+        account: Optional[Union[str, Sequence[str]]] = None,
+        queue: Optional[str] = None,
+        qos: Optional[str] = None,
+        exit_status: Optional[str] = None,
+        job_id: Optional[str] = None,
+        name: Optional[Union[str, Sequence[str]]] = None,
+        ignore_case: bool = False,
+        min_eligible_secs: Optional[int] = None,
+        max_eligible_secs: Optional[int] = None,
+        min_nodes: Optional[int] = None,
+        max_nodes: Optional[int] = None,
+        min_cpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        min_gpus: Optional[int] = None,
+        max_gpus: Optional[int] = None,
+        min_elapsed: Optional[int] = None,
+        max_elapsed: Optional[int] = None,
+        min_reqmem: Optional[int] = None,
+        max_reqmem: Optional[int] = None,
+        min_memory_used: Optional[int] = None,
+        max_memory_used: Optional[int] = None,
+        min_memory_wasted: Optional[int] = None,
+        max_memory_wasted: Optional[int] = None,
+        sort_by: str = "hours",
+    ) -> Dict[str, Any]:
+        """:meth:`jobs_usage_by` grouped on two dimensions at once.
+
+        The data behind a usage chart that places one entity under another:
+        ``('user', 'account')`` is every user's usage split by the project it
+        was charged to, so a consumer can group users by whatever the project
+        belongs to (a facility, a panel). Same filters, the same rule that
+        every filter always applies (``account`` is the security scope), the
+        same path choice (``daily_summary`` when both dimensions and all
+        filters are rollup keys over a bounded, covered window; the ``jobs``
+        scan otherwise) and the same ``sort_by`` vocabulary. No ``limit``:
+        a pair row is not a whole entity, so the consumer folds.
+
+        Returns::
+
+            {
+              "dimensions": ("user", "account"),
+              "rows": [   # sort_by metric desc, then user asc, account asc, None last
+                {"user": "alice", "account": "NCAR0001", "job_count": 812,
+                 "cpu_hours": 91234.5, "gpu_hours": 120.0,
+                 "cpu_charges": 96000.1, "gpu_charges": 180.0},
+                ...
+              ],
+              "totals": {the five metrics over every row},
+            }
+
+        Cost, Derecho machine-wide (``user`` x ``account``, read replica):
+        the summary path answers 30 days (1,284 pairs) in ~330 ms and 365
+        days (3,710 pairs, 2,565 users) in ~390 ms; the scan path over a
+        411k-job month takes ~1.4 s warm against ~1.3 s for one dimension.
+
+        Raises:
+            ValueError: unless *dimensions* is two distinct :data:`_FACET_SPECS`
+                keys, or on an unknown *sort_by*.
+        """
+        dimensions = tuple(dimensions)
+        if len(dimensions) != 2 or len(set(dimensions)) != 2 \
+                or any(d not in _FACET_SPECS for d in dimensions):
+            valid = ", ".join(sorted(_FACET_SPECS))
+            raise ValueError(
+                f"dimensions must be two distinct of: {valid}; got {dimensions!r}")
+        _check_usage_sort_key(sort_by, "sort_by")
+
+        filters = dict(
+            start=start, end=end, user=user, account=account, queue=queue,
+            qos=qos, exit_status=exit_status, job_id=job_id, name=name,
+            ignore_case=ignore_case,
+            min_eligible_secs=min_eligible_secs,
+            max_eligible_secs=max_eligible_secs,
+            min_nodes=min_nodes, max_nodes=max_nodes,
+            min_cpus=min_cpus, max_cpus=max_cpus,
+            min_gpus=min_gpus, max_gpus=max_gpus,
+            min_elapsed=min_elapsed, max_elapsed=max_elapsed,
+            min_reqmem=min_reqmem, max_reqmem=max_reqmem,
+            min_memory_used=min_memory_used, max_memory_used=max_memory_used,
+            min_memory_wasted=min_memory_wasted,
+            max_memory_wasted=max_memory_wasted,
+        )
+        if start is not None and end is not None and \
+                self._usage_by_uses_summary(dimensions, filters, start, end):
+            rows, totals = self._usage_by_from_summary(
+                dimensions, filters, start, end, sort_by, None, dimensions)
+        else:
+            rows, totals = self._usage_by_scan(
+                dimensions, filters, sort_by, None, dimensions)
+        return {"dimensions": dimensions, "rows": rows, "totals": totals}
+
+    def _usage_by_scan(self, dimensions, filters, sort_by, limit, key_names):
+        """The ``jobs`` scan behind :meth:`jobs_usage_by`: one aggregate grouped
+        on each dimension's FK, names resolved after aggregation."""
+        specs = [_FACET_SPECS[d] for d in dimensions]
+        group_cols = [spec[0] for spec in specs]
         query = (
-            self.session.query(group_col, *_metric_agg_cols())
+            self.session.query(*group_cols, *_metric_agg_cols())
             .outerjoin(JobCharge, Job.id == JobCharge.job_id)
         )
         query = self._apply_jobs_search_filters(query, **filters)
         self._apply_query_work_mem()
-        raw = query.group_by(group_col).all()
+        raw = query.group_by(*group_cols).all()
+        return self._usage_rows(raw, [spec[1:] for spec in specs], key_names,
+                                sort_by, limit)
 
-        names = {}
-        if model is not None:
-            names = self._resolve_lookup_names(
-                model, name_col, {r[0] for r in raw if r[0] is not None}
-            )
+    def _usage_rows(self, raw, lookups, key_names, sort_by, limit, skip_null=False):
+        """Rows and totals from grouped ``(key, ..., *metrics)`` tuples.
+
+        ``lookups`` is one ``(model, name_col)`` per key (``None`` keeps the raw
+        key); ``key_names`` names each key in the row dict. Rows sort by the
+        ranking metric desc, then each key asc with None last; ``totals`` is
+        summed over every row before ``limit``.
+        """
+        n = len(lookups)
+        names = []
+        for i, (model, name_col) in enumerate(lookups):
+            ids = {r[i] for r in raw if r[i] is not None}
+            names.append(self._resolve_lookup_names(model, name_col, ids)
+                         if model is not None else None)
 
         rows = []
-        for key, *metric_cols in raw:
-            value = names.get(key) if model is not None else key
+        for r in raw:
+            keys, metric_cols = r[:n], r[n:]
+            if skip_null and any(k is None for k in keys):
+                continue        # NO_JOBS markers / NULL FK — never a real group
             acc = _zero_metrics()
             _accumulate(acc, *metric_cols)
-            rows.append({"value": value, **_metrics_dict(acc)})
-        # sort_by metric desc, then value asc with None last — the facet
-        # tie-break convention, keyed on the caller's ranking metric.
+            row = {name: (lookup.get(key) if lookup is not None else key)
+                   for name, lookup, key in zip(key_names, names, keys)}
+            rows.append({**row, **_metrics_dict(acc)})
         rows.sort(key=lambda r: (
             -_usage_rank(sort_by, r),
-            r["value"] is None,
-            str(r["value"]),
+            *((r[k] is None, str(r[k])) for k in key_names),
         ))
 
         totals = {key: sum(r[key] for r in rows) for key in _METRIC_KEYS}
         if limit is not None:
             rows = rows[:limit]
-
-        return {"dimension": dimension, "rows": rows, "totals": totals}
+        return rows, totals
 
     def jobs_timeseries(
         self,
@@ -3433,9 +3550,11 @@ class JobQueries:
         window is covered. ``qos``/``exit_status`` dimensions and any per-job
         filter fall back to the scan. The window is always explicitly bounded
         here — the caller routes in only when both bounds are given — so unlike
-        the timeseries path there is no domain to derive.
+        the timeseries path there is no domain to derive. ``dimension`` is one
+        key or a tuple of them (:meth:`jobs_usage_by_pair`).
         """
-        if dimension not in ("user", "account", "queue"):
+        dimensions = (dimension,) if isinstance(dimension, str) else tuple(dimension)
+        if any(d not in ("user", "account", "queue") for d in dimensions):
             logger.debug(
                 "jobs_usage_by %s..%s: jobs-scan path (dimension=%r is not a "
                 "rollup key)", win_start, win_end, dimension)
@@ -3452,13 +3571,13 @@ class JobQueries:
         return self._summary_window_fully_covered(
             win_start, win_end, filters, log_label="jobs_usage_by")
 
-    def _usage_by_from_summary(self, dimension, filters, win_start, win_end,
-                               sort_by, limit):
-        """:meth:`jobs_usage_by` served off ``daily_summary``.
+    def _usage_by_from_summary(self, dimensions, filters, win_start, win_end,
+                               sort_by, limit, key_names):
+        """:meth:`jobs_usage_by` / :meth:`jobs_usage_by_pair` served off ``daily_summary``.
 
-        Returns the exact envelope the scan path builds — same row dicts, same
-        ``sort_by`` tie-break, ``totals`` summed over all rows *before*
-        ``limit`` — pinned by the equivalence tests. Grouping is the
+        Returns the exact rows and totals the scan path builds — same row
+        dicts, same ``sort_by`` tie-break, ``totals`` summed over all rows
+        *before* ``limit`` — pinned by the equivalence tests. Grouping is each
         dimension's FK on ``daily_summary``; the five metrics come straight off
         the pre-summed ``*_hours`` / ``*_charges`` columns (qos-weighting
         already folded in, so a qos *filter* is unserviceable but the weighted
@@ -3471,15 +3590,15 @@ class JobQueries:
         limitation :meth:`_timeseries_uses_summary` documents, and a no-op in
         practice (0 of 21.0M rows on casper_jobs).
         """
-        group_fk = {"user": DailySummary.user_id,
-                    "account": DailySummary.account_id,
-                    "queue": DailySummary.queue_id}[dimension]
-        model, name_col = {"user": (User, User.username),
-                           "account": (Account, Account.account_name),
-                           "queue": (Queue, Queue.queue_name)}[dimension]
+        group_fks = [{"user": DailySummary.user_id,
+                      "account": DailySummary.account_id,
+                      "queue": DailySummary.queue_id}[d] for d in dimensions]
+        lookups = [{"user": (User, User.username),
+                    "account": (Account, Account.account_name),
+                    "queue": (Queue, Queue.queue_name)}[d] for d in dimensions]
 
         query = self.session.query(
-            group_fk,
+            *group_fks,
             func.sum(DailySummary.job_count),
             func.sum(DailySummary.cpu_hours),
             func.sum(DailySummary.gpu_hours),
@@ -3500,29 +3619,9 @@ class JobQueries:
         if filters.get("queue"):
             query = query.filter(self._lookup_fk_clause(
                 "queue", filters["queue"], fk_col=DailySummary.queue_id))
-        raw = query.group_by(group_fk).all()
-
-        names = self._resolve_lookup_names(
-            model, name_col, {r[0] for r in raw if r[0] is not None})
-
-        rows = []
-        for key, *metric_cols in raw:
-            if key is None:
-                continue        # NO_JOBS markers / NULL FK — never a real group
-            acc = _zero_metrics()
-            _accumulate(acc, *metric_cols)
-            rows.append({"value": names.get(key), **_metrics_dict(acc)})
-        rows.sort(key=lambda r: (
-            -_usage_rank(sort_by, r),
-            r["value"] is None,
-            str(r["value"]),
-        ))
-
-        totals = {key: sum(r[key] for r in rows) for key in _METRIC_KEYS}
-        if limit is not None:
-            rows = rows[:limit]
-
-        return {"dimension": dimension, "rows": rows, "totals": totals}
+        raw = query.group_by(*group_fks).all()
+        return self._usage_rows(raw, lookups, key_names, sort_by, limit,
+                                skip_null=True)
 
     def _resolve_timeseries_window(self, start, end, filters):
         """``(win_start, win_end, null_count)`` for the band vector.

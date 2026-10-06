@@ -1268,6 +1268,7 @@ class TestFilterSignatureParity:
     FACET_ONLY = {"facets", "self_exclude", "limit"}
     HIST_ONLY = {"dimension", "owners_limit", "owners_sort_by", "owners_by"}
     USAGE_ONLY = {"dimension", "limit", "sort_by"}
+    USAGE_PAIR_ONLY = {"dimensions", "sort_by"}
     TIMESERIES_ONLY = {"period", "owners_limit", "owners_sort_by", "owners_by"}
 
     @staticmethod
@@ -1290,6 +1291,11 @@ class TestFilterSignatureParity:
     def test_jobs_usage_by_accepts_every_jobs_search_filter(self):
         search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
         assert search == self._params(JobQueries.jobs_usage_by) - self.USAGE_ONLY
+
+    def test_jobs_usage_by_pair_accepts_every_jobs_search_filter(self):
+        search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
+        assert search == (
+            self._params(JobQueries.jobs_usage_by_pair) - self.USAGE_PAIR_ONLY)
 
     def test_jobs_timeseries_accepts_every_jobs_search_filter(self):
         search = self._params(JobQueries.jobs_search) - self.SEARCH_ONLY
@@ -3736,6 +3742,123 @@ class TestUsageByPathEquivalence:
         scan = q.jobs_usage_by(
             dimension, start=_TS_START, end=_TS_END, **kwargs)
         self._assert_same(fast, scan, f"{dimension}/{label}")
+
+
+@pytest.fixture
+def pair_jobs(in_memory_session, timeseries_jobs):
+    """``timeseries_jobs`` plus alice charging NCAR0002 once (805, 07-02,
+    3 cpu-h at factor 1.0): the one user under two accounts a pair rollup
+    must split and a single-dimension one must merge."""
+    end = datetime(2025, 7, 2, 18, tzinfo=timezone.utc).replace(tzinfo=None)
+    job = Job(job_id="805.desched1", short_id=805, name="t5", user="alice",
+              account="NCAR0002", queue="main", status="0",
+              submit=end - timedelta(hours=1), start=end - timedelta(hours=1),
+              end=end, eligible_secs=60, numnodes=1, numcpus=8, numgpus=0,
+              elapsed=3600, reqmem=_GIB, memory=_GIB // 2)
+    in_memory_session.add(job)
+    in_memory_session.flush()
+    in_memory_session.add(JobCharge(
+        job_id=job.id, cpu_hours=3.0, gpu_hours=0.0, memory_hours=0.0,
+        qos_factor=1.0, charge_version=1))
+    in_memory_session.commit()
+    return timeseries_jobs + [job]
+
+
+@pytest.fixture
+def summarized_pair_jobs(in_memory_session, pair_jobs):
+    day = _TS_START
+    while day <= _TS_END:
+        generate_daily_summary(in_memory_session, "casper", day, replace=True)
+        day += timedelta(days=1)
+    in_memory_session.commit()
+    return _TS_END
+
+
+class TestJobsUsageByPair:
+    """Contract for the two-dimension rollup (user x account on pair_jobs:
+    alice/NCAR0001 35 cpu-h over 3 jobs, alice/NCAR0002 3 cpu-h,
+    bob/NCAR0002 40 cpu-h + 8 gpu-h at factor 0.5, carol/NCAR0002 charge-less)."""
+
+    _METRICS = {"job_count", "cpu_hours", "gpu_hours", "cpu_charges", "gpu_charges"}
+
+    def test_rows_are_pairs_in_rank_order(self, in_memory_session, pair_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by_pair(("user", "account"))
+        assert out["dimensions"] == ("user", "account")
+        for row in out["rows"]:
+            assert set(row) == {"user", "account"} | self._METRICS
+        assert [(r["user"], r["account"]) for r in out["rows"]] == [
+            ("bob", "NCAR0002"), ("alice", "NCAR0001"), ("alice", "NCAR0002"),
+            ("carol", "NCAR0002")]
+        alice1 = out["rows"][1]
+        assert alice1["job_count"] == 3
+        assert alice1["cpu_hours"] == pytest.approx(35.0)
+        assert alice1["cpu_charges"] == pytest.approx(30.0)   # 803 is uncharged
+
+    def test_pairs_fold_to_the_single_dimension(self, in_memory_session, pair_jobs):
+        """Summing a user's pairs gives jobs_usage_by('user')'s row, and the
+        totals are the same vector: the pair is a split, not a different slice."""
+        q = JobQueries(in_memory_session)
+        pairs = q.jobs_usage_by_pair(("user", "account"))
+        single = q.jobs_usage_by("user")
+        assert pairs["totals"] == single["totals"]
+        alice = sum(r["cpu_hours"] for r in pairs["rows"] if r["user"] == "alice")
+        assert alice == pytest.approx(
+            next(r["cpu_hours"] for r in single["rows"] if r["value"] == "alice"))
+
+    def test_filters_apply_to_both_dimensions(self, in_memory_session, pair_jobs):
+        out = JobQueries(in_memory_session).jobs_usage_by_pair(
+            ("user", "account"), account="NCAR0002", sort_by="job_count")
+        assert {r["account"] for r in out["rows"]} == {"NCAR0002"}
+        assert out["totals"]["job_count"] == 3
+
+    @pytest.mark.parametrize("dimensions", [
+        ("user",), ("user", "user"), ("user", "panel"), ("user", "account", "queue")])
+    def test_rejects_anything_but_two_distinct_dimensions(
+            self, in_memory_session, dimensions):
+        with pytest.raises(ValueError, match="two distinct"):
+            JobQueries(in_memory_session).jobs_usage_by_pair(dimensions)
+
+    def test_rejects_unknown_sort_key(self, in_memory_session):
+        with pytest.raises(ValueError):
+            JobQueries(in_memory_session).jobs_usage_by_pair(
+                ("user", "account"), sort_by="memory")
+
+    def test_rollup_keys_route_to_summary_and_others_do_not(
+            self, in_memory_session, summarized_pair_jobs):
+        q = JobQueries(in_memory_session)
+        filters = _ts_filters(start=_TS_START, end=_TS_END)
+        assert q._usage_by_uses_summary(
+            ("user", "account"), filters, _TS_START, _TS_END) is True
+        assert q._usage_by_uses_summary(
+            ("user", "qos"), filters, _TS_START, _TS_END) is False
+
+    CASES = [
+        ("plain", {}),
+        ("account filter", {"account": "NCAR0002"}),
+        ("user filter", {"user": "alice"}),
+        ("sort_by charges", {"sort_by": "charges"}),
+        ("sort_by job_count", {"sort_by": "job_count"}),
+        ("reversed dimensions", {"dimensions": ("account", "user")}),
+    ]
+
+    @pytest.mark.parametrize("label,kwargs", CASES, ids=[c[0] for c in CASES])
+    def test_paths_agree(self, in_memory_session, summarized_pair_jobs,
+                         monkeypatch, label, kwargs):
+        kwargs = dict(kwargs)
+        dims = kwargs.pop("dimensions", ("user", "account"))
+        q = JobQueries(in_memory_session)
+        fast = q.jobs_usage_by_pair(dims, start=_TS_START, end=_TS_END, **kwargs)
+        _force_usage_scan(monkeypatch)
+        scan = q.jobs_usage_by_pair(dims, start=_TS_START, end=_TS_END, **kwargs)
+        assert fast["dimensions"] == scan["dimensions"] == dims
+        assert [(r[dims[0]], r[dims[1]]) for r in fast["rows"]] == \
+               [(r[dims[0]], r[dims[1]]) for r in scan["rows"]], label
+        assert fast["totals"]["job_count"] == scan["totals"]["job_count"]
+        for fr, sr in zip(fast["rows"], scan["rows"]):
+            assert fr["job_count"] == sr["job_count"], label
+            for key in TestUsageByPathEquivalence._FLOAT_KEYS:
+                assert fr[key] == pytest.approx(sr[key]), f"{label}: {key}"
+                assert fast["totals"][key] == pytest.approx(scan["totals"][key])
 
 
 class TestQueryWorkMem:
