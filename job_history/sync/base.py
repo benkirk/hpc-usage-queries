@@ -748,9 +748,13 @@ class SyncBase(ABC):
             return 0
 
         # 1. Bulk-update Job fields (only when there are actual field changes).
+        #    bulk_update_mappings bypasses the identity map: expire the loaded
+        #    Jobs or the recalc below prices them with the old qos_id/qos_obj.
         if update_mappings:
             self.session.bulk_update_mappings(Job, update_mappings)
             self.session.flush()
+            for job in existing_jobs:
+                self.session.expire(job)
 
         # 2. Recalculate charges for ALL matched jobs (field-updated or not).
         #    For field-updated jobs: delete existing charges first so the fresh
