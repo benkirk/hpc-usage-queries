@@ -19,6 +19,7 @@ from job_history.database.session import (
     get_engine,
     VALID_MACHINES,
 )
+from job_history.sync.charging import SystemCharging
 
 # ── Columns to ADD ──────────────────────────────────────────────────────────
 # Each entry: (table, column, SQL type + default)
@@ -67,8 +68,13 @@ def drop_column_if_exists(conn, inspector, table, column):
 DEFAULT_BACKFILL_CHUNK_SIZE = 100_000
 
 
-def backfill_qos_id(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
+def backfill_qos_id(engine, machine: str | None = None, *,
+                    chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
     """Populate jobs.qos_id from existing priority + queue strings.
+
+    Queue rules come from *machine*'s ``QUEUE_TO_QOS_NAME`` (the base
+    SystemCharging map when None), the same mapping sync uses, and take
+    precedence over priority.
 
     Chunked by primary-key range with per-chunk commit, so the migration:
       - never holds a write lock on jobs for more than one chunk's duration
@@ -86,23 +92,37 @@ def backfill_qos_id(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
     chunks.
     """
     dialect = engine.dialect.name
+    charging = SystemCharging.for_machine(machine) if machine else SystemCharging
+    queue_map = charging.QUEUE_TO_QOS_NAME
 
     # Resolve seed-row ids once (cheap autocommit read).
     with engine.connect() as conn:
         rows = conn.execute(text("SELECT name, id FROM job_qos")).all()
     qos_ids = {name: qid for name, qid in rows}
-    required = {"premium", "regular", "economy", "uncharged", "special"}
+    required = {"premium", "regular", "economy", "special"} | set(queue_map.values())
     missing = required - set(qos_ids)
     if missing:
         raise RuntimeError(f"Missing JobQoS seed rows: {missing}")
 
     base_params = {
-        "unc":  qos_ids["uncharged"],
         "prem": qos_ids["premium"],
         "spec": qos_ids["special"],
         "econ": qos_ids["economy"],
         "reg":  qos_ids["regular"],
     }
+    queue_whens = []
+    for i, (queue, qos_name) in enumerate(sorted(queue_map.items())):
+        base_params[f"qn{i}"] = queue.lower()
+        base_params[f"qq{i}"] = qos_ids[qos_name]
+        queue_whens.append(f"WHEN {{queue}} = :qn{i} THEN :qq{i}")
+
+    def _case(queue_expr: str, priority_expr: str) -> str:
+        whens = [w.format(queue=queue_expr) for w in queue_whens] + [
+            f"WHEN {priority_expr} = 'premium' THEN :prem",
+            f"WHEN {priority_expr} = 'special' THEN :spec",
+            f"WHEN {priority_expr} = 'economy' THEN :econ",
+        ]
+        return "CASE " + " ".join(whens) + " ELSE :reg END"
 
     with engine.connect() as conn:
         bounds = conn.execute(text("SELECT MIN(id), MAX(id) FROM jobs")).one()
@@ -112,18 +132,12 @@ def backfill_qos_id(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
         return
 
     if dialect == "postgresql":
-        update_sql = text("""
+        case = _case("LOWER(COALESCE(q.queue_name, ''))", "LOWER(COALESCE(j2.priority, ''))")
+        update_sql = text(f"""
             UPDATE jobs j
             SET qos_id = sub.qid
             FROM (
-                SELECT j2.id,
-                       CASE
-                         WHEN LOWER(COALESCE(q.queue_name, '')) = 'jhublogin' THEN :unc
-                         WHEN LOWER(COALESCE(j2.priority, ''))  = 'premium'   THEN :prem
-                         WHEN LOWER(COALESCE(j2.priority, ''))  = 'special'   THEN :spec
-                         WHEN LOWER(COALESCE(j2.priority, ''))  = 'economy'   THEN :econ
-                         ELSE :reg
-                       END AS qid
+                SELECT j2.id, {case} AS qid
                 FROM jobs j2
                 LEFT JOIN queues q ON q.id = j2.queue_id
                 WHERE j2.id >= :lo AND j2.id < :hi
@@ -131,23 +145,15 @@ def backfill_qos_id(engine, *, chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
             WHERE j.id = sub.id AND j.qos_id IS DISTINCT FROM sub.qid;
         """)
     else:  # SQLite
-        update_sql = text("""
+        case = _case(
+            "LOWER(COALESCE((SELECT queue_name FROM queues q WHERE q.id = jobs.queue_id), ''))",
+            "LOWER(COALESCE(jobs.priority, ''))",
+        )
+        update_sql = text(f"""
             UPDATE jobs
-            SET qos_id = CASE
-                WHEN LOWER(COALESCE((SELECT queue_name FROM queues q WHERE q.id = jobs.queue_id), '')) = 'jhublogin' THEN :unc
-                WHEN LOWER(COALESCE(jobs.priority, '')) = 'premium' THEN :prem
-                WHEN LOWER(COALESCE(jobs.priority, '')) = 'special' THEN :spec
-                WHEN LOWER(COALESCE(jobs.priority, '')) = 'economy' THEN :econ
-                ELSE :reg
-            END
+            SET qos_id = {case}
             WHERE id >= :lo AND id < :hi
-              AND (qos_id IS NULL OR qos_id != CASE
-                WHEN LOWER(COALESCE((SELECT queue_name FROM queues q WHERE q.id = jobs.queue_id), '')) = 'jhublogin' THEN :unc
-                WHEN LOWER(COALESCE(jobs.priority, '')) = 'premium' THEN :prem
-                WHEN LOWER(COALESCE(jobs.priority, '')) = 'special' THEN :spec
-                WHEN LOWER(COALESCE(jobs.priority, '')) = 'economy' THEN :econ
-                ELSE :reg
-              END);
+              AND (qos_id IS NULL OR qos_id != {case});
         """)
 
     total_chunks = (hi - lo) // chunk_size + 1
@@ -345,7 +351,7 @@ def migrate(machine):
     _ensure_qos_seed_rows(engine)
     _ensure_db_triggers(engine)
     # Backfill jobs.qos_id from existing priority + queue strings
-    backfill_qos_id(engine)
+    backfill_qos_id(engine, machine)
     # Backfill PBS timestamp/wait fields from archived raw records
     backfill_pbs_time_fields(engine)
     engine.dispose()

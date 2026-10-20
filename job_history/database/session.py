@@ -355,6 +355,7 @@ JOB_QOS_SEED = [
     ("economy",   0.7, True),
     ("uncharged", 0.0, True),
     ("special",   1.0, True),
+    ("preempt",   0.2, True),
 ]
 
 

@@ -60,8 +60,8 @@ class TestSeedRows:
     def test_seed_rows_present(self, seeded_session):
         rows = seeded_session.query(JobQoS).order_by(JobQoS.name).all()
         names = sorted(r.name for r in rows)
-        assert names == ["economy", "premium", "regular", "special", "uncharged"]
-        assert len(rows) == 5
+        assert names == ["economy", "preempt", "premium", "regular", "special", "uncharged"]
+        assert len(rows) == 6
 
     def test_seed_factors_match_constants(self, seeded_session):
         by_name = {r.name: r for r in seeded_session.query(JobQoS).all()}
@@ -73,7 +73,7 @@ class TestSeedRows:
     def test_seed_is_idempotent(self, seeded_engine, seeded_session):
         _ensure_qos_seed_rows(seeded_engine)
         _ensure_qos_seed_rows(seeded_engine)
-        assert seeded_session.query(JobQoS).count() == 5
+        assert seeded_session.query(JobQoS).count() == 6
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +177,22 @@ class TestLookupCacheQoS:
         assert obj.factor == 2.0
         assert seeded_session.query(JobQoS).filter_by(name="custom_tier").one().factor == 2.0
 
+    def test_unseeded_db_creates_seed_name_at_seed_factor(self):
+        """Sync can meet a new seed name (preempt) before init_db seeds it."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = sessionmaker(bind=engine)()
+        try:
+            cache = LookupCache(session)
+            assert cache.get_or_create_qos("preempt").factor == 0.2
+            assert cache.get_or_create_qos("not_a_seed").factor == 1.0
+            session.commit()
+            _ensure_qos_seed_rows(engine)
+            assert session.query(JobQoS).filter_by(name="preempt").one().factor == 0.2
+        finally:
+            session.close()
+            engine.dispose()
+
     def test_dedupes_within_session(self, seeded_session):
         cache = LookupCache(seeded_session)
         a = cache.get_or_create_qos("premium")
@@ -227,7 +243,63 @@ class TestResolveQoSName:
 
 
 # ---------------------------------------------------------------------------
-# _get_qos_factor: prefers FK-resolved factor, falls back to seed mapping
+# Per-machine queue rules: Derecho preempt queues
+# ---------------------------------------------------------------------------
+
+class TestPreemptQueues:
+    @pytest.mark.parametrize("queue", ["pcpu", "pgpu", "PGPU"])
+    @pytest.mark.parametrize("priority", ["none", "", None, "regular", "premium", "economy"])
+    def test_derecho_preempt_queue_overrides_priority(self, queue, priority):
+        rec = {"queue": queue, "priority": priority}
+        assert DerechoCharging._resolve_qos_name(rec) == "preempt"
+        assert SystemCharging.resolve_qos_name("derecho", rec) == "preempt"
+
+    @pytest.mark.parametrize("queue", ["pcpu", "pgpu"])
+    def test_casper_has_no_preempt_queues(self, queue):
+        rec = {"queue": queue, "priority": "premium"}
+        assert SystemCharging.resolve_qos_name("casper", rec) == "premium"
+
+    def test_base_map_has_no_preempt_queues(self):
+        rec = {"queue": "pgpu", "priority": "none"}
+        assert SystemCharging._resolve_qos_name(rec) == "regular"
+
+    @pytest.mark.parametrize("machine", ["derecho", "casper"])
+    def test_jhublogin_kept_on_every_machine(self, machine):
+        rec = {"queue": "jhublogin", "priority": "premium"}
+        assert SystemCharging.resolve_qos_name(machine, rec) == "uncharged"
+
+    def test_unknown_machine_raises(self):
+        with pytest.raises(ValueError, match="Unknown machine"):
+            SystemCharging.resolve_qos_name("cheyenne", {"queue": "pgpu"})
+
+    def test_derecho_pgpu_charges_gpus_at_preempt_factor(self):
+        job = types.SimpleNamespace(
+            elapsed=3600, numnodes=2, numcpus=128, numgpus=8,
+            memory=0, queue="pgpu", priority="none",
+        )
+        result = DerechoCharging.calculate(job)
+        assert result["qos_factor"] == 0.2
+        assert result["gpu_hours"] == 8.0
+        assert result["cpu_hours"] == 256.0
+
+    def test_derecho_pcpu_charges_cpus_at_preempt_factor(self):
+        job = types.SimpleNamespace(
+            elapsed=3600, numnodes=1, numcpus=128, numgpus=0,
+            memory=0, queue="pcpu", priority="premium",
+        )
+        result = DerechoCharging.calculate(job)
+        assert result["qos_factor"] == 0.2
+        assert result["cpu_hours"] == 128.0
+        assert result["gpu_hours"] == 0
+
+    def test_casper_pgpu_keeps_priority_factor(self):
+        job = types.SimpleNamespace(
+            elapsed=3600, numcpus=1, numgpus=1, memory=0,
+            queue="pgpu", priority="economy",
+        )
+        assert CasperCharging.calculate(job)["qos_factor"] == 0.7
+
+
 # ---------------------------------------------------------------------------
 
 class TestGetQoSFactorFallback:
@@ -304,6 +376,58 @@ class TestBackfill:
         assert by_jobid["c"] == "regular"
         assert by_jobid["d"] == "regular"      # NULL priority → regular
         assert by_jobid["e"] == "uncharged"    # jhublogin queue → uncharged
+
+    @staticmethod
+    def _insert_preempt_jobs(session):
+        pcpu_q = Queue(queue_name="pcpu")
+        pgpu_q = Queue(queue_name="pgpu")
+        session.add_all([pcpu_q, pgpu_q])
+        session.flush()
+        session.execute(text(
+            "INSERT INTO jobs (job_id, submit, priority, queue_id) VALUES "
+            "('c1', :s, 'none',    :cq), "
+            "('c2', :s, 'premium', :cq), "
+            "('g1', :s, NULL,      :gq), "
+            "('g2', :s, 'economy', :gq)"
+        ), {"s": datetime(2026, 5, 1).isoformat(), "cq": pcpu_q.id, "gq": pgpu_q.id})
+        session.commit()
+
+    def _qos_by_jobid(self, session):
+        return dict(session.execute(text(
+            "SELECT j.job_id, q.name FROM jobs j JOIN job_qos q ON q.id = j.qos_id"
+        )).all())
+
+    def test_backfill_derecho_preempt_queues(self, seeded_engine, seeded_session):
+        self._insert_preempt_jobs(seeded_session)
+        from bin.update_jobs_db import backfill_qos_id
+        backfill_qos_id(seeded_engine, "derecho")
+        assert self._qos_by_jobid(seeded_session) == {
+            "c1": "preempt", "c2": "preempt", "g1": "preempt", "g2": "preempt",
+        }
+
+    def test_backfill_casper_leaves_preempt_queue_names_alone(self, seeded_engine, seeded_session):
+        self._insert_preempt_jobs(seeded_session)
+        from bin.update_jobs_db import backfill_qos_id
+        backfill_qos_id(seeded_engine, "casper")
+        assert self._qos_by_jobid(seeded_session) == {
+            "c1": "regular", "c2": "premium", "g1": "regular", "g2": "economy",
+        }
+
+    def test_backfill_reclassifies_existing_regular_rows(self, seeded_engine, seeded_session):
+        """Rows already backfilled as regular move to preempt on a re-run."""
+        self._insert_preempt_jobs(seeded_session)
+        from bin.update_jobs_db import backfill_qos_id
+        backfill_qos_id(seeded_engine)
+        assert self._qos_by_jobid(seeded_session)["c1"] == "regular"
+        backfill_qos_id(seeded_engine, "derecho", chunk_size=1)
+        assert set(self._qos_by_jobid(seeded_session).values()) == {"preempt"}
+
+    def test_backfill_requires_seeded_target_qos(self, seeded_engine, seeded_session):
+        seeded_session.execute(text("DELETE FROM job_qos WHERE name = 'preempt'"))
+        seeded_session.commit()
+        from bin.update_jobs_db import backfill_qos_id
+        with pytest.raises(RuntimeError, match="preempt"):
+            backfill_qos_id(seeded_engine, "derecho")
 
     def test_backfill_handles_special_priority(self, seeded_engine, seeded_session):
         main_q = Queue(queue_name="main")
@@ -519,7 +643,7 @@ class TestListQoSNames:
     def test_returns_seeded_names_alphabetical(self, seeded_session):
         from job_history.queries.jobs import JobQueries
         names = JobQueries(seeded_session).list_qos_names()
-        assert names == ["economy", "premium", "regular", "special", "uncharged"]
+        assert names == ["economy", "preempt", "premium", "regular", "special", "uncharged"]
 
     def test_excludes_inactive_by_default(self, seeded_session):
         from job_history.queries.jobs import JobQueries
@@ -529,7 +653,7 @@ class TestListQoSNames:
         seeded_session.commit()
         names = JobQueries(seeded_session).list_qos_names()
         assert "economy" not in names
-        assert names == ["premium", "regular", "special", "uncharged"]
+        assert names == ["preempt", "premium", "regular", "special", "uncharged"]
 
     def test_active_only_false_includes_inactive(self, seeded_session):
         from job_history.queries.jobs import JobQueries
@@ -539,4 +663,4 @@ class TestListQoSNames:
         seeded_session.commit()
         names = JobQueries(seeded_session).list_qos_names(active_only=False)
         assert "economy" in names
-        assert len(names) == 5
+        assert len(names) == 6
