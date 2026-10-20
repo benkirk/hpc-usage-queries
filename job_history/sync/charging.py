@@ -36,13 +36,6 @@ _PRIORITY_TO_QOS_NAME: dict = {
     None:      "regular",
 }
 
-# Queues that bypass priority-based charging and map directly to a specific
-# JobQoS row.  Extend this dict (no other code changes required) to route a
-# new queue to an uncharged / specially-rated QoS.
-_QUEUE_TO_QOS_NAME: dict = {
-    "jhublogin": "uncharged",
-}
-
 # Fallback factors used when a job has no resolved JobQoS row (test
 # fixtures using SimpleNamespace, legacy data pre-migration).  Must match
 # the canonical seed values in session.JOB_QOS_SEED.
@@ -52,6 +45,7 @@ _FALLBACK_QOS_FACTORS: dict = {
     "economy":   0.7,
     "uncharged": 0.0,
     "special":   1.0,
+    "preempt":   0.2,
 }
 
 
@@ -73,6 +67,13 @@ class SystemCharging(ABC):
     """
 
     MACHINE_NAME: str = ""
+
+    # Queues that bypass priority-based charging and map directly to a JobQoS
+    # row.  Per machine: a subclass extends this dict to route its own queues.
+    # bin/update_jobs_db.py backfills jobs.qos_id from the same mapping.
+    QUEUE_TO_QOS_NAME: dict = {
+        "jhublogin": "uncharged",
+    }
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -103,9 +104,23 @@ class SystemCharging(ABC):
         Raises:
             ValueError: if machine is not registered
         """
+        return cls.for_machine(machine).calculate(job)
+
+    @classmethod
+    def resolve_qos_name(cls, machine: str, job) -> str:
+        """Canonical JobQoS row name for *job* under *machine*'s queue rules."""
+        return cls.for_machine(machine)._resolve_qos_name(job)
+
+    @classmethod
+    def for_machine(cls, machine: str) -> type["SystemCharging"]:
+        """The registered subclass for *machine*.
+
+        Raises:
+            ValueError: if machine is not registered
+        """
         if machine not in _REGISTRY:
             raise ValueError(f"Unknown machine: {machine!r}. Known machines: {sorted(_REGISTRY)}")
-        return _REGISTRY[machine].calculate(job)
+        return _REGISTRY[machine]
 
     # ── Shared helpers ────────────────────────────────────────────────────────
 
@@ -135,13 +150,12 @@ class SystemCharging(ABC):
     def _get_memory(job: "Job") -> float:
         return getattr(job, "memory", None) or 0  # in bytes
 
-    @staticmethod
-    def _resolve_qos_name(job) -> str:
+    @classmethod
+    def _resolve_qos_name(cls, job) -> str:
         """Map a job's queue + priority to a canonical JobQoS row name.
 
-        Queue takes precedence: any queue listed in _QUEUE_TO_QOS_NAME
-        short-circuits the priority check (preserves the historical
-        jhublogin → uncharged behavior).  Accepts either an ORM Job
+        Queue takes precedence: any queue listed in cls.QUEUE_TO_QOS_NAME
+        short-circuits the priority check.  Accepts either an ORM Job
         (or SimpleNamespace) or a raw record dict.
         """
         if isinstance(job, dict):
@@ -150,12 +164,12 @@ class SystemCharging(ABC):
         else:
             queue = (getattr(job, "queue", None) or "").lower()
             priority = (getattr(job, "priority", None) or "").lower()
-        if queue in _QUEUE_TO_QOS_NAME:
-            return _QUEUE_TO_QOS_NAME[queue]
+        if queue in cls.QUEUE_TO_QOS_NAME:
+            return cls.QUEUE_TO_QOS_NAME[queue]
         return _PRIORITY_TO_QOS_NAME.get(priority, "regular")
 
-    @staticmethod
-    def _get_qos_factor(job: "Job") -> float:
+    @classmethod
+    def _get_qos_factor(cls, job: "Job") -> float:
         """Return the QoS multiplier for *job*.
 
         Prefers the resolved JobQoS row (job.qos_obj.factor) when present.
@@ -166,7 +180,7 @@ class SystemCharging(ABC):
         qos_obj = getattr(job, "qos_obj", None)
         if qos_obj is not None:
             return qos_obj.factor
-        name = SystemCharging._resolve_qos_name(job)
+        name = cls._resolve_qos_name(job)
         return _FALLBACK_QOS_FACTORS.get(name, 1.0)
 
     @classmethod
@@ -192,6 +206,14 @@ class DerechoCharging(SystemCharging):
 
     CORES_PER_NODE = 128  # CPU cores per compute node
     GPUS_PER_NODE = 4     # GPUs per GPU node
+
+    # pcpu/pgpu are the execution queues behind `-q preempt`; preempt pricing
+    # wins over whatever job_priority the job carries.
+    QUEUE_TO_QOS_NAME = {
+        **SystemCharging.QUEUE_TO_QOS_NAME,
+        "pcpu": "preempt",
+        "pgpu": "preempt",
+    }
 
     @classmethod
     def calculate(cls, job: "Job") -> dict:

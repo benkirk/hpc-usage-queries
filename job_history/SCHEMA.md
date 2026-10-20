@@ -304,14 +304,19 @@ from `init_db()` and `bin/update_jobs_db.py`).
 | `active` | BOOLEAN | When `false`, no new jobs should be assigned this row (existing FKs preserved) |
 
 **Seed rows:** `premium=1.5`, `regular=1.0`, `economy=0.7`, `uncharged=0.0`,
-`special=1.0`.
+`special=1.0`, `preempt=0.2`.
 
 QoS resolution happens at sync time in `_insert_batch()` via
-`SystemCharging._resolve_qos_name(record)`.  Queue takes precedence over
-priority: any queue listed in `_QUEUE_TO_QOS_NAME` (currently
-`jhublogin → uncharged`) short-circuits the priority check.  Add another
-non-chargeable or specially-rated queue with a one-line edit to that
-dict — no schema change required.
+`SystemCharging.resolve_qos_name(machine, record)`.  Queue takes precedence
+over priority: any queue in the machine's `QUEUE_TO_QOS_NAME` class attribute
+short-circuits the priority check.  Every machine inherits
+`jhublogin → uncharged`; Derecho adds `pcpu`/`pgpu → preempt`.  Route another
+queue with a one-line edit to the machine's dict, then re-run
+`bin/update_jobs_db.py <machine>` (seeds a new QoS row before backfilling
+`jobs.qos_id` from the same dict) and `jobhist sync --recalculate` over the
+affected window.  Add a new QoS name to `JOB_QOS_SEED`: `get_or_create_qos`
+creates a row at its seed factor (sync can meet the name before `init_db`
+seeds it), but an unseeded name at 1.0, and the seed never overwrites a row.
 
 The resolved `JobQoS.factor` is copied into `job_charges.qos_factor` at
 sync time as a materialized cache so `daily_summary` SQL can compute
@@ -343,6 +348,7 @@ Materialized charging calculations — **1:1 with jobs**, enforced by DB trigger
 | regular / unset | 1.0 |
 | `special` | 1.0 |
 | `economy` | 0.7 |
+| `preempt` (Derecho `pcpu`/`pgpu` queues) | 0.2 |
 | `uncharged` (e.g. `jhublogin` queue) | 0.0 (free) |
 
 These values are seeded into the `job_qos` lookup table by `init_db()`;

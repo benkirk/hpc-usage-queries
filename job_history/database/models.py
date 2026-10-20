@@ -102,14 +102,17 @@ class LookupCache:
             self._queues[queue_name] = obj
         return self._queues[queue_name]
 
-    def get_or_create_qos(self, name, factor=1.0):
+    def get_or_create_qos(self, name, factor=None):
         """Get an existing JobQoS row or create a new one.
 
-        The seed table provides canonical factors for known names; the
-        factor arg is only used when creating a previously unseen row
-        (existing rows keep their stored factor).
+        A new row takes *factor*, else its JOB_QOS_SEED factor, else 1.0, so
+        sync creating a seeded name before init_db ran still prices it right.
+        Existing rows keep their stored factor.
         """
         if name not in self._qos:
+            if factor is None:
+                from .session import JOB_QOS_SEED
+                factor = {n: f for n, f, _ in JOB_QOS_SEED}.get(name, 1.0)
             obj = self._get_or_create_qos(name, factor)
             self._qos[name] = obj
         return self._qos[name]

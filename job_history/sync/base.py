@@ -344,7 +344,7 @@ class SyncBase(ABC):
                 rec['queue_id'] = self.cache.get_or_create_queue(rec['queue']).id
             # QoS depends on both priority and queue; resolve here where both
             # are merged into the record, then assign the FK from the cache.
-            qos_name = SystemCharging._resolve_qos_name(rec)
+            qos_name = SystemCharging.resolve_qos_name(self.machine, rec)
             rec['qos'] = qos_name
             rec['qos_id'] = self.cache.get_or_create_qos(qos_name).id
             prepared.append(rec)
@@ -729,7 +729,7 @@ class SyncBase(ABC):
             # upserts pick up any priority changes (e.g. an uncharged-queue
             # re-classification or premium/economy corrections).
             if 'qos_id' not in r:
-                qos_name = SystemCharging._resolve_qos_name(r)
+                qos_name = SystemCharging.resolve_qos_name(self.machine, r)
                 r['qos_id'] = self.cache.get_or_create_qos(qos_name).id
 
             mapping = {'id': existing_job.id}
