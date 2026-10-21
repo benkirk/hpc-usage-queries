@@ -9,7 +9,10 @@ Charges are computed in Python during job import and stored in the job_charges t
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from ..database.session import JOB_QOS_SEED
 
 if TYPE_CHECKING:
     from ..database.models import Job
@@ -36,17 +39,40 @@ _PRIORITY_TO_QOS_NAME: dict = {
     None:      "regular",
 }
 
-# Fallback factors used when a job has no resolved JobQoS row (test
-# fixtures using SimpleNamespace, legacy data pre-migration).  Must match
-# the canonical seed values in session.JOB_QOS_SEED.
-_FALLBACK_QOS_FACTORS: dict = {
-    "premium":   1.5,
-    "regular":   1.0,
-    "economy":   0.7,
-    "uncharged": 0.0,
-    "special":   1.0,
-    "preempt":   0.2,
-}
+# Factors for a job with no resolved JobQoS row (SimpleNamespace fixtures,
+# pre-migration rows): the canonical seed values.
+_FALLBACK_QOS_FACTORS: dict = {name: factor for name, factor, _ in JOB_QOS_SEED}
+
+
+@dataclass(frozen=True)
+class NodeType:
+    cores: int
+    gpus: int
+
+
+def select_chunks(select: str | None) -> list[tuple[int, int]]:
+    """(node count, ngpus per node) for each ``+`` chunk of a PBS select string."""
+    chunks = []
+    for chunk in (select or "").split("+"):
+        parts = [p for p in chunk.strip().split(":") if p]
+        if not parts:
+            continue
+        count = int(parts.pop(0)) if parts[0].isdigit() else 1
+        ngpus = 0
+        for part in parts:
+            key, _, value = part.partition("=")
+            if key == "ngpus" and value.isdigit():
+                ngpus = int(value)
+        chunks.append((count, ngpus))
+    return chunks
+
+
+@dataclass(frozen=True)
+class QueueRule:
+    """A queue's charging rule; an unlisted queue is exclusive-node, priority QoS."""
+
+    shared: bool = False     # charge allocated ncpus/ngpus, not whole nodes
+    qos: str | None = None   # JobQoS name that overrides job_priority
 
 
 # ============================================================================
@@ -68,11 +94,10 @@ class SystemCharging(ABC):
 
     MACHINE_NAME: str = ""
 
-    # Queues that bypass priority-based charging and map directly to a JobQoS
-    # row.  Per machine: a subclass extends this dict to route its own queues.
-    # bin/update_jobs_db.py backfills jobs.qos_id from the same mapping.
-    QUEUE_TO_QOS_NAME: dict = {
-        "jhublogin": "uncharged",
+    # Per-machine queue rules; a subclass extends this dict.
+    # bin/update_jobs_db.py backfills jobs.qos_id from the same qos overrides.
+    QUEUE_RULES: dict[str, QueueRule] = {
+        "jhublogin": QueueRule(qos="uncharged"),
     }
 
     def __init_subclass__(cls, **kwargs: object) -> None:
@@ -112,6 +137,20 @@ class SystemCharging(ABC):
         return cls.for_machine(machine)._resolve_qos_name(job)
 
     @classmethod
+    def queue_rule(cls, queue: str | None) -> QueueRule:
+        return cls.QUEUE_RULES.get((queue or "").lower(), QueueRule())
+
+    @classmethod
+    def qos_overrides(cls) -> dict[str, str]:
+        """Queue -> JobQoS name for every queue whose rule overrides priority."""
+        return {q: r.qos for q, r in cls.QUEUE_RULES.items() if r.qos}
+
+    @classmethod
+    def priority_overrides(cls) -> dict[str, str]:
+        """PBS priority -> JobQoS name for every priority that is not the regular default."""
+        return {p: q for p, q in _PRIORITY_TO_QOS_NAME.items() if p and q != "regular"}
+
+    @classmethod
     def for_machine(cls, machine: str) -> type["SystemCharging"]:
         """The registered subclass for *machine*.
 
@@ -125,24 +164,6 @@ class SystemCharging(ABC):
     # ── Shared helpers ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _get_pbs_record(job: "Job"):
-        """Safely retrieve the PbsRecord for a job.
-
-        pbs_record requires a live SQLAlchemy session (it lazy-loads job_record_obj
-        via a relationship).  It may be unavailable for:
-          - historical jobs imported before the JobRecord feature was added
-          - test fixtures that use SimpleNamespace rather than a real ORM object
-          - jobs accessed outside an active session (DetachedInstanceError)
-
-        Returns:
-            PbsRecord object, or None if unavailable for any reason
-        """
-        try:
-            return job.pbs_record
-        except Exception:
-            return None
-
-    @staticmethod
     def _get_elapsed(job: "Job") -> float:
         return getattr(job, "elapsed", None) or 0
 
@@ -154,18 +175,19 @@ class SystemCharging(ABC):
     def _resolve_qos_name(cls, job) -> str:
         """Map a job's queue + priority to a canonical JobQoS row name.
 
-        Queue takes precedence: any queue listed in cls.QUEUE_TO_QOS_NAME
-        short-circuits the priority check.  Accepts either an ORM Job
-        (or SimpleNamespace) or a raw record dict.
+        Queue takes precedence: a queue rule with a qos short-circuits the
+        priority check.  Accepts either an ORM Job (or SimpleNamespace) or a
+        raw record dict.
         """
         if isinstance(job, dict):
-            queue = (job.get("queue") or "").lower()
+            queue = job.get("queue")
             priority = (job.get("priority") or "").lower()
         else:
-            queue = (getattr(job, "queue", None) or "").lower()
+            queue = getattr(job, "queue", None)
             priority = (getattr(job, "priority", None) or "").lower()
-        if queue in cls.QUEUE_TO_QOS_NAME:
-            return cls.QUEUE_TO_QOS_NAME[queue]
+        rule_qos = cls.queue_rule(queue).qos
+        if rule_qos:
+            return rule_qos
         return _PRIORITY_TO_QOS_NAME.get(priority, "regular")
 
     @classmethod
@@ -196,55 +218,53 @@ class SystemCharging(ABC):
 class DerechoCharging(SystemCharging):
     """Charging rules for the Derecho cluster.
 
-    CPU/GPU hours depend on queue type (dev vs production):
-      - Production: charge by node (cores/GPUs per node * numnodes)
-      - Dev:        charge by actual allocated CPUs/GPUs
-    Memory hours use actual memory consumed.
+    Exclusive-node queues charge whole nodes of the type the job requested:
+    a select chunk with ngpus > 0 is a GPU node, the rest are CPU nodes.
+    Shared (dev) queues charge the allocated ncpus/ngpus.  Memory hours use
+    actual memory consumed.
     """
 
     MACHINE_NAME = "derecho"
 
-    CORES_PER_NODE = 128  # CPU cores per compute node
-    GPUS_PER_NODE = 4     # GPUs per GPU node
+    CPU_NODE = NodeType(cores=128, gpus=0)
+    GPU_NODE = NodeType(cores=64, gpus=4)
 
     # pcpu/pgpu are the execution queues behind `-q preempt`; preempt pricing
     # wins over whatever job_priority the job carries.
-    QUEUE_TO_QOS_NAME = {
-        **SystemCharging.QUEUE_TO_QOS_NAME,
-        "pcpu": "preempt",
-        "pgpu": "preempt",
+    QUEUE_RULES = {
+        **SystemCharging.QUEUE_RULES,
+        "cpudev": QueueRule(shared=True),
+        "gpudev": QueueRule(shared=True),
+        "pcpu":   QueueRule(qos="preempt"),
+        "pgpu":   QueueRule(qos="preempt"),
     }
 
     @classmethod
-    def calculate(cls, job: "Job") -> dict:
-        # Future expansion: pbs_record exposes the full original PBS accounting
-        # record and can be used to refine charging (e.g., actual node topology,
-        # exec_host breakdown, resource_list overrides).
-        _pbs_record = cls._get_pbs_record(job)  # noqa: F841 (unused until implemented)
+    def _gpu_nodes(cls, job: "Job", numnodes: int) -> int:
+        """Nodes of the job's request that are GPU nodes; numgpus decides without a select."""
+        gpu_nodes = sum(n for n, ngpus in select_chunks(getattr(job, "resources", None)) if ngpus)
+        if not gpu_nodes and (getattr(job, "numgpus", None) or 0) > 0:
+            gpu_nodes = numnodes
+        return min(gpu_nodes, numnodes)
 
-        elapsed = cls._get_elapsed(job)
+    @classmethod
+    def calculate(cls, job: "Job") -> dict:
+        elapsed  = cls._get_elapsed(job)
         numnodes = getattr(job, "numnodes", None) or 0
         numcpus  = getattr(job, "numcpus",  None) or 0
         numgpus  = getattr(job, "numgpus",  None) or 0
-        queue    = (getattr(job, "queue",   None) or "").lower()
 
-        is_dev_queue = "dev" in queue
-        is_gpu_queue = "gpu" in queue
-
-        # dev queues use actual CPUs/GPUs, production uses cores/GPU per node
-        if is_dev_queue:
-            cpu_hours = elapsed * numcpus / SECONDS_PER_HOUR
-            gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
+        if cls.queue_rule(getattr(job, "queue", None)).shared:
+            cpus, gpus = numcpus, numgpus
         else:
-            cpu_hours = elapsed * numnodes * cls.CORES_PER_NODE / SECONDS_PER_HOUR
-            gpu_hours = elapsed * numnodes * cls.GPUS_PER_NODE / SECONDS_PER_HOUR
-
-        if not is_gpu_queue:
-            gpu_hours = 0
+            gpu_nodes = cls._gpu_nodes(job, numnodes)
+            cpu_nodes = numnodes - gpu_nodes
+            cpus = cpu_nodes * cls.CPU_NODE.cores + gpu_nodes * cls.GPU_NODE.cores
+            gpus = gpu_nodes * cls.GPU_NODE.gpus
 
         return {
-            "cpu_hours":    cpu_hours,
-            "gpu_hours":    gpu_hours,
+            "cpu_hours":    elapsed * cpus / SECONDS_PER_HOUR,
+            "gpu_hours":    elapsed * gpus / SECONDS_PER_HOUR,
             "memory_hours": cls._get_memory_hours(job),
             "qos_factor":   cls._get_qos_factor(job),
         }
@@ -265,11 +285,6 @@ class CasperCharging(SystemCharging):
 
     @classmethod
     def calculate(cls, job: "Job") -> dict:
-        # Future expansion: pbs_record exposes the full original PBS accounting
-        # record and can be used to refine charging (e.g., actual node topology,
-        # exec_host breakdown, resource_list overrides).
-        _pbs_record = cls._get_pbs_record(job)  # noqa: F841 (unused until implemented)
-
         elapsed = cls._get_elapsed(job)
         numcpus = getattr(job, "numcpus", None) or 0
         numgpus = getattr(job, "numgpus", None) or 0

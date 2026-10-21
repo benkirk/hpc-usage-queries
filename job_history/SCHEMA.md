@@ -308,12 +308,12 @@ from `init_db()` and `bin/update_jobs_db.py`).
 
 QoS resolution happens at sync time in `_insert_batch()` via
 `SystemCharging.resolve_qos_name(machine, record)`.  Queue takes precedence
-over priority: any queue in the machine's `QUEUE_TO_QOS_NAME` class attribute
-short-circuits the priority check.  Every machine inherits
+over priority: a queue whose rule in the machine's `QUEUE_RULES` carries a
+`qos` short-circuits the priority check.  Every machine inherits
 `jhublogin → uncharged`; Derecho adds `pcpu`/`pgpu → preempt`.  Route another
-queue with a one-line edit to the machine's dict, then re-run
+queue with a one-line `QueueRule(qos=...)` entry, then re-run
 `bin/update_jobs_db.py <machine>` (seeds a new QoS row before backfilling
-`jobs.qos_id` from the same dict) and `jobhist sync --recalculate` over the
+`jobs.qos_id` from the same rules) and `jobhist sync --recalculate` over the
 affected window.  Add a new QoS name to `JOB_QOS_SEED`: `get_or_create_qos`
 creates a row at its seed factor (sync can meet the name before `init_db`
 seeds it), but an unseeded name at 1.0, and the seed never overwrites a row.
@@ -358,10 +358,14 @@ from the resolved `JobQoS.factor` for each job's `qos_id`.
 **Charging rules** (implemented in `sync/charging.py`):
 
 *Derecho (`DerechoCharging`):*
-- Production CPU: `numnodes × 128 cores/node × elapsed_hours`
-- Production GPU: `numnodes × 4 GPUs/node × elapsed_hours`
-- Dev queues (queue name contains `dev`): actual `numcpus` / `numgpus`
-- GPU hours only charged for queues with `gpu` in the name
+- Exclusive-node queues (every queue without a `shared` rule, reservations
+  included) charge whole nodes of the requested type. A select chunk
+  (`jobs.resources`, split on `+`) with `ngpus > 0` is a GPU node; with no
+  select, `numgpus > 0` makes every node a GPU node.
+  - CPU node: 128 cores, 0 GPUs. GPU node: 64 cores, 4 GPUs.
+  - CPU-h = `elapsed_hours × (cpu_nodes × 128 + gpu_nodes × 64)`;
+    GPU-h = `elapsed_hours × gpu_nodes × 4`.
+- Shared queues (`cpudev`, `gpudev`): actual `numcpus` / `numgpus`
 
 *Casper (`CasperCharging`):*
 - CPU: `numcpus × elapsed_hours`

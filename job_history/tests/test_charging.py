@@ -4,7 +4,13 @@ import types
 
 import pytest
 
-from job_history.sync.charging import CasperCharging, DerechoCharging
+from job_history.sync.charging import (
+    CasperCharging,
+    DerechoCharging,
+    QueueRule,
+    SystemCharging,
+    select_chunks,
+)
 
 
 class TestDerechoCharging:
@@ -34,8 +40,42 @@ class TestDerechoCharging:
         # GPU queue uses 4 GPUs per node for production
         # 1 hour * 2 nodes * 4 = 8 GPU-hours
         assert result["gpu_hours"] == 8.0
-        # CPU hours still calculated (production rate)
-        assert result["cpu_hours"] == 256.0
+        # GPU nodes have 64 cores: 1 hour * 2 nodes * 64 = 128 CPU-hours
+        assert result["cpu_hours"] == 128.0
+
+    def test_gpu_select_on_unnamed_queue_charges_gpu_nodes(self):
+        """Node type comes from the request, not the queue name (hybrid, system, reservations)."""
+        for queue in ("hybrid", "system", "R6678947"):
+            job = types.SimpleNamespace(
+                elapsed=3600, numnodes=4, numcpus=256, numgpus=16, memory=0,
+                queue=queue, resources="4:ncpus=64:ngpus=4:ompthreads=1",
+            )
+            result = DerechoCharging.calculate(job)
+            assert (result["cpu_hours"], result["gpu_hours"]) == (256.0, 16.0), queue
+
+    def test_mixed_cpu_and_gpu_nodes(self):
+        """A 1 GPU + 4 CPU node hybrid job: each node at its own type's rate."""
+        job = types.SimpleNamespace(
+            elapsed=3600, numnodes=5, numcpus=321, numgpus=1, memory=0, queue="hybrid",
+            resources="1:ncpus=1:mpiprocs=1:ngpus=1:gpu_type=a100+4:ncpus=80:mpiprocs=80",
+        )
+        result = DerechoCharging.calculate(job)
+        assert result["cpu_hours"] == 64.0 + 4 * 128.0
+        assert result["gpu_hours"] == 4.0
+
+    def test_cpu_select_charges_cpu_nodes(self, derecho_cpu_job):
+        job = types.SimpleNamespace(**{**vars(derecho_cpu_job), "resources": "2:ncpus=128"})
+        result = DerechoCharging.calculate(job)
+        assert (result["cpu_hours"], result["gpu_hours"]) == (256.0, 0.0)
+
+    def test_gpu_nodes_capped_at_numnodes(self):
+        """Chunks packed onto fewer nodes never charge more nodes than ran."""
+        job = types.SimpleNamespace(
+            elapsed=3600, numnodes=1, numcpus=8, numgpus=2, memory=0, queue="gpu",
+            resources="2:ncpus=4:ngpus=1",
+        )
+        result = DerechoCharging.calculate(job)
+        assert (result["cpu_hours"], result["gpu_hours"]) == (64.0, 4.0)
 
     def test_cpu_dev_queue(self, derecho_cpu_dev_job):
         """CPU dev: elapsed * numcpus / 3600."""
@@ -119,6 +159,42 @@ class TestDerechoCharging:
         assert result["qos_factor"] == 0.0
         assert result["cpu_hours"] * result["qos_factor"] == 0.0
         assert result["memory_hours"] * result["qos_factor"] == 0.0
+
+
+class TestSelectChunks:
+    @pytest.mark.parametrize("select, expected", [
+        ("1:ncpus=64:mem=487GB:mpiprocs=4:ngpus=4", [(1, 4)]),
+        ("2:ncpus=128", [(2, 0)]),
+        ("ncpus=8:ngpus=1", [(1, 1)]),
+        ("1:ncpus=128+1:ncpus=64:ngpus=4:ompthreads=1", [(1, 0), (1, 4)]),
+        ("", []),
+        (None, []),
+    ])
+    def test_chunks(self, select, expected):
+        assert select_chunks(select) == expected
+
+
+class TestQueueRules:
+    def test_unlisted_queue_is_exclusive_with_priority_qos(self):
+        assert DerechoCharging.queue_rule("cpu") == QueueRule()
+        assert DerechoCharging.queue_rule(None) == QueueRule()
+
+    @pytest.mark.parametrize("queue", ["cpudev", "gpudev", "GPUDEV"])
+    def test_derecho_dev_queues_are_shared(self, queue):
+        assert DerechoCharging.queue_rule(queue).shared
+
+    def test_qos_overrides(self):
+        assert SystemCharging.qos_overrides() == {"jhublogin": "uncharged"}
+        assert CasperCharging.qos_overrides() == {"jhublogin": "uncharged"}
+        assert DerechoCharging.qos_overrides() == {
+            "jhublogin": "uncharged", "pcpu": "preempt", "pgpu": "preempt",
+        }
+
+    def test_priority_overrides(self):
+        """The backfill's priority CASE: every priority that is not the regular default."""
+        assert SystemCharging.priority_overrides() == {
+            "premium": "premium", "economy": "economy", "special": "special",
+        }
 
 
 class TestCasperCharging:

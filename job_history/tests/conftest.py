@@ -144,7 +144,7 @@ def derecho_cpu_dev_job():
         numcpus=32,
         numgpus=0,
         memory=32212254720,  # 30 GB
-        queue="develop",
+        queue="cpudev",
     )
 
 

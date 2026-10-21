@@ -72,8 +72,8 @@ def backfill_qos_id(engine, machine: str | None = None, *,
                     chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
     """Populate jobs.qos_id from existing priority + queue strings.
 
-    Queue rules come from *machine*'s ``QUEUE_TO_QOS_NAME`` (the base
-    SystemCharging map when None), the same mapping sync uses, and take
+    Queue overrides come from *machine*'s ``QUEUE_RULES`` (the base
+    SystemCharging rules when None), the same rules sync uses, and take
     precedence over priority.
 
     Chunked by primary-key range with per-chunk commit, so the migration:
@@ -93,35 +93,33 @@ def backfill_qos_id(engine, machine: str | None = None, *,
     """
     dialect = engine.dialect.name
     charging = SystemCharging.for_machine(machine) if machine else SystemCharging
-    queue_map = charging.QUEUE_TO_QOS_NAME
+    queue_map = charging.qos_overrides()
 
     # Resolve seed-row ids once (cheap autocommit read).
     with engine.connect() as conn:
         rows = conn.execute(text("SELECT name, id FROM job_qos")).all()
     qos_ids = {name: qid for name, qid in rows}
-    required = {"premium", "regular", "economy", "special"} | set(queue_map.values())
+    priority_map = charging.priority_overrides()
+    required = {"regular"} | set(priority_map.values()) | set(queue_map.values())
     missing = required - set(qos_ids)
     if missing:
         raise RuntimeError(f"Missing JobQoS seed rows: {missing}")
 
-    base_params = {
-        "prem": qos_ids["premium"],
-        "spec": qos_ids["special"],
-        "econ": qos_ids["economy"],
-        "reg":  qos_ids["regular"],
-    }
-    queue_whens = []
+    # Same precedence as SystemCharging._resolve_qos_name: queue, then priority.
+    base_params = {"reg": qos_ids["regular"]}
+    queue_whens, priority_whens = [], []
     for i, (queue, qos_name) in enumerate(sorted(queue_map.items())):
         base_params[f"qn{i}"] = queue.lower()
         base_params[f"qq{i}"] = qos_ids[qos_name]
         queue_whens.append(f"WHEN {{queue}} = :qn{i} THEN :qq{i}")
+    for i, (priority, qos_name) in enumerate(sorted(priority_map.items())):
+        base_params[f"pn{i}"] = priority
+        base_params[f"pq{i}"] = qos_ids[qos_name]
+        priority_whens.append(f"WHEN {{priority}} = :pn{i} THEN :pq{i}")
 
     def _case(queue_expr: str, priority_expr: str) -> str:
-        whens = [w.format(queue=queue_expr) for w in queue_whens] + [
-            f"WHEN {priority_expr} = 'premium' THEN :prem",
-            f"WHEN {priority_expr} = 'special' THEN :spec",
-            f"WHEN {priority_expr} = 'economy' THEN :econ",
-        ]
+        whens = ([w.format(queue=queue_expr) for w in queue_whens]
+                 + [w.format(priority=priority_expr) for w in priority_whens])
         return "CASE " + " ".join(whens) + " ELSE :reg END"
 
     with engine.connect() as conn:
