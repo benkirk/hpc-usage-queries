@@ -308,12 +308,12 @@ from `init_db()` and `bin/update_jobs_db.py`).
 
 QoS resolution happens at sync time in `_insert_batch()` via
 `SystemCharging.resolve_qos_name(machine, record)`.  Queue takes precedence
-over priority: any queue in the machine's `QUEUE_TO_QOS_NAME` class attribute
-short-circuits the priority check.  Every machine inherits
+over priority: a queue whose rule in the machine's `QUEUE_RULES` carries a
+`qos` short-circuits the priority check.  Every machine inherits
 `jhublogin → uncharged`; Derecho adds `pcpu`/`pgpu → preempt`.  Route another
-queue with a one-line edit to the machine's dict, then re-run
+queue with a one-line `QueueRule(qos=...)` entry, then re-run
 `bin/update_jobs_db.py <machine>` (seeds a new QoS row before backfilling
-`jobs.qos_id` from the same dict) and `jobhist sync --recalculate` over the
+`jobs.qos_id` from the same rules) and `jobhist sync --recalculate` over the
 affected window.  Add a new QoS name to `JOB_QOS_SEED`: `get_or_create_qos`
 creates a row at its seed factor (sync can meet the name before `init_db`
 seeds it), but an unseeded name at 1.0, and the seed never overwrites a row.

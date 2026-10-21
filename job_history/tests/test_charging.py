@@ -4,7 +4,12 @@ import types
 
 import pytest
 
-from job_history.sync.charging import CasperCharging, DerechoCharging
+from job_history.sync.charging import (
+    CasperCharging,
+    DerechoCharging,
+    QueueRule,
+    SystemCharging,
+)
 
 
 class TestDerechoCharging:
@@ -119,6 +124,23 @@ class TestDerechoCharging:
         assert result["qos_factor"] == 0.0
         assert result["cpu_hours"] * result["qos_factor"] == 0.0
         assert result["memory_hours"] * result["qos_factor"] == 0.0
+
+
+class TestQueueRules:
+    def test_unlisted_queue_is_exclusive_with_priority_qos(self):
+        assert DerechoCharging.queue_rule("cpu") == QueueRule()
+        assert DerechoCharging.queue_rule(None) == QueueRule()
+
+    @pytest.mark.parametrize("queue", ["cpudev", "gpudev", "GPUDEV"])
+    def test_derecho_dev_queues_are_shared(self, queue):
+        assert DerechoCharging.queue_rule(queue).shared
+
+    def test_qos_overrides(self):
+        assert SystemCharging.qos_overrides() == {"jhublogin": "uncharged"}
+        assert CasperCharging.qos_overrides() == {"jhublogin": "uncharged"}
+        assert DerechoCharging.qos_overrides() == {
+            "jhublogin": "uncharged", "pcpu": "preempt", "pgpu": "preempt",
+        }
 
 
 class TestCasperCharging:

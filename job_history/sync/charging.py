@@ -9,6 +9,7 @@ Charges are computed in Python during job import and stored in the job_charges t
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..database.session import JOB_QOS_SEED
@@ -43,6 +44,14 @@ _PRIORITY_TO_QOS_NAME: dict = {
 _FALLBACK_QOS_FACTORS: dict = {name: factor for name, factor, _ in JOB_QOS_SEED}
 
 
+@dataclass(frozen=True)
+class QueueRule:
+    """A queue's charging rule; an unlisted queue is exclusive-node, priority QoS."""
+
+    shared: bool = False     # charge allocated ncpus/ngpus, not whole nodes
+    qos: str | None = None   # JobQoS name that overrides job_priority
+
+
 # ============================================================================
 # Base class
 # ============================================================================
@@ -62,11 +71,10 @@ class SystemCharging(ABC):
 
     MACHINE_NAME: str = ""
 
-    # Queues that bypass priority-based charging and map directly to a JobQoS
-    # row.  Per machine: a subclass extends this dict to route its own queues.
-    # bin/update_jobs_db.py backfills jobs.qos_id from the same mapping.
-    QUEUE_TO_QOS_NAME: dict = {
-        "jhublogin": "uncharged",
+    # Per-machine queue rules; a subclass extends this dict.
+    # bin/update_jobs_db.py backfills jobs.qos_id from the same qos overrides.
+    QUEUE_RULES: dict[str, QueueRule] = {
+        "jhublogin": QueueRule(qos="uncharged"),
     }
 
     def __init_subclass__(cls, **kwargs: object) -> None:
@@ -106,6 +114,15 @@ class SystemCharging(ABC):
         return cls.for_machine(machine)._resolve_qos_name(job)
 
     @classmethod
+    def queue_rule(cls, queue: str | None) -> QueueRule:
+        return cls.QUEUE_RULES.get((queue or "").lower(), QueueRule())
+
+    @classmethod
+    def qos_overrides(cls) -> dict[str, str]:
+        """Queue -> JobQoS name for every queue whose rule overrides priority."""
+        return {q: r.qos for q, r in cls.QUEUE_RULES.items() if r.qos}
+
+    @classmethod
     def for_machine(cls, machine: str) -> type["SystemCharging"]:
         """The registered subclass for *machine*.
 
@@ -130,18 +147,19 @@ class SystemCharging(ABC):
     def _resolve_qos_name(cls, job) -> str:
         """Map a job's queue + priority to a canonical JobQoS row name.
 
-        Queue takes precedence: any queue listed in cls.QUEUE_TO_QOS_NAME
-        short-circuits the priority check.  Accepts either an ORM Job
-        (or SimpleNamespace) or a raw record dict.
+        Queue takes precedence: a queue rule with a qos short-circuits the
+        priority check.  Accepts either an ORM Job (or SimpleNamespace) or a
+        raw record dict.
         """
         if isinstance(job, dict):
-            queue = (job.get("queue") or "").lower()
+            queue = job.get("queue")
             priority = (job.get("priority") or "").lower()
         else:
-            queue = (getattr(job, "queue", None) or "").lower()
+            queue = getattr(job, "queue", None)
             priority = (getattr(job, "priority", None) or "").lower()
-        if queue in cls.QUEUE_TO_QOS_NAME:
-            return cls.QUEUE_TO_QOS_NAME[queue]
+        rule_qos = cls.queue_rule(queue).qos
+        if rule_qos:
+            return rule_qos
         return _PRIORITY_TO_QOS_NAME.get(priority, "regular")
 
     @classmethod
@@ -185,10 +203,12 @@ class DerechoCharging(SystemCharging):
 
     # pcpu/pgpu are the execution queues behind `-q preempt`; preempt pricing
     # wins over whatever job_priority the job carries.
-    QUEUE_TO_QOS_NAME = {
-        **SystemCharging.QUEUE_TO_QOS_NAME,
-        "pcpu": "preempt",
-        "pgpu": "preempt",
+    QUEUE_RULES = {
+        **SystemCharging.QUEUE_RULES,
+        "cpudev": QueueRule(shared=True),
+        "gpudev": QueueRule(shared=True),
+        "pcpu":   QueueRule(qos="preempt"),
+        "pgpu":   QueueRule(qos="preempt"),
     }
 
     @classmethod
@@ -199,11 +219,10 @@ class DerechoCharging(SystemCharging):
         numgpus  = getattr(job, "numgpus",  None) or 0
         queue    = (getattr(job, "queue",   None) or "").lower()
 
-        is_dev_queue = "dev" in queue
         is_gpu_queue = "gpu" in queue
 
-        # dev queues use actual CPUs/GPUs, production uses cores/GPU per node
-        if is_dev_queue:
+        # shared (dev) queues use actual CPUs/GPUs, the rest charge whole nodes
+        if cls.queue_rule(queue).shared:
             cpu_hours = elapsed * numcpus / SECONDS_PER_HOUR
             gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
         else:

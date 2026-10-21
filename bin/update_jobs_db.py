@@ -72,8 +72,8 @@ def backfill_qos_id(engine, machine: str | None = None, *,
                     chunk_size: int = DEFAULT_BACKFILL_CHUNK_SIZE):
     """Populate jobs.qos_id from existing priority + queue strings.
 
-    Queue rules come from *machine*'s ``QUEUE_TO_QOS_NAME`` (the base
-    SystemCharging map when None), the same mapping sync uses, and take
+    Queue overrides come from *machine*'s ``QUEUE_RULES`` (the base
+    SystemCharging rules when None), the same rules sync uses, and take
     precedence over priority.
 
     Chunked by primary-key range with per-chunk commit, so the migration:
@@ -93,7 +93,7 @@ def backfill_qos_id(engine, machine: str | None = None, *,
     """
     dialect = engine.dialect.name
     charging = SystemCharging.for_machine(machine) if machine else SystemCharging
-    queue_map = charging.QUEUE_TO_QOS_NAME
+    queue_map = charging.qos_overrides()
 
     # Resolve seed-row ids once (cheap autocommit read).
     with engine.connect() as conn:
