@@ -280,7 +280,7 @@ class TestPreemptQueues:
         result = DerechoCharging.calculate(job)
         assert result["qos_factor"] == 0.2
         assert result["gpu_hours"] == 8.0
-        assert result["cpu_hours"] == 256.0
+        assert result["cpu_hours"] == 128.0   # 64-core GPU nodes
 
     def test_derecho_pcpu_charges_cpus_at_preempt_factor(self):
         job = types.SimpleNamespace(

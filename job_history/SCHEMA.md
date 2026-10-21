@@ -358,10 +358,14 @@ from the resolved `JobQoS.factor` for each job's `qos_id`.
 **Charging rules** (implemented in `sync/charging.py`):
 
 *Derecho (`DerechoCharging`):*
-- Production CPU: `numnodes × 128 cores/node × elapsed_hours`
-- Production GPU: `numnodes × 4 GPUs/node × elapsed_hours`
-- Dev queues (queue name contains `dev`): actual `numcpus` / `numgpus`
-- GPU hours only charged for queues with `gpu` in the name
+- Exclusive-node queues (every queue without a `shared` rule, reservations
+  included) charge whole nodes of the requested type. A select chunk
+  (`jobs.resources`, split on `+`) with `ngpus > 0` is a GPU node; with no
+  select, `numgpus > 0` makes every node a GPU node.
+  - CPU node: 128 cores, 0 GPUs. GPU node: 64 cores, 4 GPUs.
+  - CPU-h = `elapsed_hours × (cpu_nodes × 128 + gpu_nodes × 64)`;
+    GPU-h = `elapsed_hours × gpu_nodes × 4`.
+- Shared queues (`cpudev`, `gpudev`): actual `numcpus` / `numgpus`
 
 *Casper (`CasperCharging`):*
 - CPU: `numcpus × elapsed_hours`

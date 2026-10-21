@@ -545,9 +545,10 @@ stats = syncer.sync(None, start_date="2026-01-01", end_date="2026-01-31", resumm
 Computed at import time by `sync/charging.py`, stored in `job_charges`.
 
 **Derecho:**
-- Production CPU: `numnodes × 128 cores/node × elapsed_hours`
-- Production GPU: `numnodes × 4 GPUs/node × elapsed_hours`
-- Dev queues: actual resources (`numcpus` / `numgpus`)
+- Exclusive-node queues: whole nodes of the requested type, from the select
+  string. A CPU node is 128 cores; a GPU node (a chunk with `ngpus > 0`) is
+  64 cores + 4 GPUs.
+- Dev queues (`cpudev`, `gpudev`): actual resources (`numcpus` / `numgpus`)
 - Memory: `memory_gb × elapsed_hours`
 
 **Casper:**

@@ -45,6 +45,29 @@ _FALLBACK_QOS_FACTORS: dict = {name: factor for name, factor, _ in JOB_QOS_SEED}
 
 
 @dataclass(frozen=True)
+class NodeType:
+    cores: int
+    gpus: int
+
+
+def select_chunks(select: str | None) -> list[tuple[int, int]]:
+    """(node count, ngpus per node) for each ``+`` chunk of a PBS select string."""
+    chunks = []
+    for chunk in (select or "").split("+"):
+        parts = [p for p in chunk.strip().split(":") if p]
+        if not parts:
+            continue
+        count = int(parts.pop(0)) if parts[0].isdigit() else 1
+        ngpus = 0
+        for part in parts:
+            key, _, value = part.partition("=")
+            if key == "ngpus" and value.isdigit():
+                ngpus = int(value)
+        chunks.append((count, ngpus))
+    return chunks
+
+
+@dataclass(frozen=True)
 class QueueRule:
     """A queue's charging rule; an unlisted queue is exclusive-node, priority QoS."""
 
@@ -190,16 +213,16 @@ class SystemCharging(ABC):
 class DerechoCharging(SystemCharging):
     """Charging rules for the Derecho cluster.
 
-    CPU/GPU hours depend on queue type (dev vs production):
-      - Production: charge by node (cores/GPUs per node * numnodes)
-      - Dev:        charge by actual allocated CPUs/GPUs
-    Memory hours use actual memory consumed.
+    Exclusive-node queues charge whole nodes of the type the job requested:
+    a select chunk with ngpus > 0 is a GPU node, the rest are CPU nodes.
+    Shared (dev) queues charge the allocated ncpus/ngpus.  Memory hours use
+    actual memory consumed.
     """
 
     MACHINE_NAME = "derecho"
 
-    CORES_PER_NODE = 128  # CPU cores per compute node
-    GPUS_PER_NODE = 4     # GPUs per GPU node
+    CPU_NODE = NodeType(cores=128, gpus=0)
+    GPU_NODE = NodeType(cores=64, gpus=4)
 
     # pcpu/pgpu are the execution queues behind `-q preempt`; preempt pricing
     # wins over whatever job_priority the job carries.
@@ -212,29 +235,31 @@ class DerechoCharging(SystemCharging):
     }
 
     @classmethod
+    def _gpu_nodes(cls, job: "Job", numnodes: int) -> int:
+        """Nodes of the job's request that are GPU nodes; numgpus decides without a select."""
+        gpu_nodes = sum(n for n, ngpus in select_chunks(getattr(job, "resources", None)) if ngpus)
+        if not gpu_nodes and (getattr(job, "numgpus", None) or 0) > 0:
+            gpu_nodes = numnodes
+        return min(gpu_nodes, numnodes)
+
+    @classmethod
     def calculate(cls, job: "Job") -> dict:
-        elapsed = cls._get_elapsed(job)
+        elapsed  = cls._get_elapsed(job)
         numnodes = getattr(job, "numnodes", None) or 0
         numcpus  = getattr(job, "numcpus",  None) or 0
         numgpus  = getattr(job, "numgpus",  None) or 0
-        queue    = (getattr(job, "queue",   None) or "").lower()
 
-        is_gpu_queue = "gpu" in queue
-
-        # shared (dev) queues use actual CPUs/GPUs, the rest charge whole nodes
-        if cls.queue_rule(queue).shared:
-            cpu_hours = elapsed * numcpus / SECONDS_PER_HOUR
-            gpu_hours = elapsed * numgpus / SECONDS_PER_HOUR
+        if cls.queue_rule(getattr(job, "queue", None)).shared:
+            cpus, gpus = numcpus, numgpus
         else:
-            cpu_hours = elapsed * numnodes * cls.CORES_PER_NODE / SECONDS_PER_HOUR
-            gpu_hours = elapsed * numnodes * cls.GPUS_PER_NODE / SECONDS_PER_HOUR
-
-        if not is_gpu_queue:
-            gpu_hours = 0
+            gpu_nodes = cls._gpu_nodes(job, numnodes)
+            cpu_nodes = numnodes - gpu_nodes
+            cpus = cpu_nodes * cls.CPU_NODE.cores + gpu_nodes * cls.GPU_NODE.cores
+            gpus = gpu_nodes * cls.GPU_NODE.gpus
 
         return {
-            "cpu_hours":    cpu_hours,
-            "gpu_hours":    gpu_hours,
+            "cpu_hours":    elapsed * cpus / SECONDS_PER_HOUR,
+            "gpu_hours":    elapsed * gpus / SECONDS_PER_HOUR,
             "memory_hours": cls._get_memory_hours(job),
             "qos_factor":   cls._get_qos_factor(job),
         }
