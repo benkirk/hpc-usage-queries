@@ -19,7 +19,7 @@ from job_history.database.session import (
     get_engine,
     VALID_MACHINES,
 )
-from job_history.sync.charging import _PRIORITY_TO_QOS_NAME, SystemCharging
+from job_history.sync.charging import SystemCharging
 
 # ── Columns to ADD ──────────────────────────────────────────────────────────
 # Each entry: (table, column, SQL type + default)
@@ -99,7 +99,7 @@ def backfill_qos_id(engine, machine: str | None = None, *,
     with engine.connect() as conn:
         rows = conn.execute(text("SELECT name, id FROM job_qos")).all()
     qos_ids = {name: qid for name, qid in rows}
-    priority_map = {p: q for p, q in _PRIORITY_TO_QOS_NAME.items() if p and q != "regular"}
+    priority_map = charging.priority_overrides()
     required = {"regular"} | set(priority_map.values()) | set(queue_map.values())
     missing = required - set(qos_ids)
     if missing:

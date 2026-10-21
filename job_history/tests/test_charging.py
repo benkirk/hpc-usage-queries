@@ -190,6 +190,12 @@ class TestQueueRules:
             "jhublogin": "uncharged", "pcpu": "preempt", "pgpu": "preempt",
         }
 
+    def test_priority_overrides(self):
+        """The backfill's priority CASE: every priority that is not the regular default."""
+        assert SystemCharging.priority_overrides() == {
+            "premium": "premium", "economy": "economy", "special": "special",
+        }
+
 
 class TestCasperCharging:
     """Tests for Casper charging calculations."""

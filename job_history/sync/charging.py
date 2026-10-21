@@ -146,6 +146,11 @@ class SystemCharging(ABC):
         return {q: r.qos for q, r in cls.QUEUE_RULES.items() if r.qos}
 
     @classmethod
+    def priority_overrides(cls) -> dict[str, str]:
+        """PBS priority -> JobQoS name for every priority that is not the regular default."""
+        return {p: q for p, q in _PRIORITY_TO_QOS_NAME.items() if p and q != "regular"}
+
+    @classmethod
     def for_machine(cls, machine: str) -> type["SystemCharging"]:
         """The registered subclass for *machine*.
 
