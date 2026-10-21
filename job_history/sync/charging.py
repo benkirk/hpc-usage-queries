@@ -125,24 +125,6 @@ class SystemCharging(ABC):
     # ── Shared helpers ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _get_pbs_record(job: "Job"):
-        """Safely retrieve the PbsRecord for a job.
-
-        pbs_record requires a live SQLAlchemy session (it lazy-loads job_record_obj
-        via a relationship).  It may be unavailable for:
-          - historical jobs imported before the JobRecord feature was added
-          - test fixtures that use SimpleNamespace rather than a real ORM object
-          - jobs accessed outside an active session (DetachedInstanceError)
-
-        Returns:
-            PbsRecord object, or None if unavailable for any reason
-        """
-        try:
-            return job.pbs_record
-        except Exception:
-            return None
-
-    @staticmethod
     def _get_elapsed(job: "Job") -> float:
         return getattr(job, "elapsed", None) or 0
 
@@ -217,11 +199,6 @@ class DerechoCharging(SystemCharging):
 
     @classmethod
     def calculate(cls, job: "Job") -> dict:
-        # Future expansion: pbs_record exposes the full original PBS accounting
-        # record and can be used to refine charging (e.g., actual node topology,
-        # exec_host breakdown, resource_list overrides).
-        _pbs_record = cls._get_pbs_record(job)  # noqa: F841 (unused until implemented)
-
         elapsed = cls._get_elapsed(job)
         numnodes = getattr(job, "numnodes", None) or 0
         numcpus  = getattr(job, "numcpus",  None) or 0
@@ -265,11 +242,6 @@ class CasperCharging(SystemCharging):
 
     @classmethod
     def calculate(cls, job: "Job") -> dict:
-        # Future expansion: pbs_record exposes the full original PBS accounting
-        # record and can be used to refine charging (e.g., actual node topology,
-        # exec_host breakdown, resource_list overrides).
-        _pbs_record = cls._get_pbs_record(job)  # noqa: F841 (unused until implemented)
-
         elapsed = cls._get_elapsed(job)
         numcpus = getattr(job, "numcpus", None) or 0
         numgpus = getattr(job, "numgpus", None) or 0
