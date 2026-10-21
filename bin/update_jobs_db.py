@@ -19,7 +19,7 @@ from job_history.database.session import (
     get_engine,
     VALID_MACHINES,
 )
-from job_history.sync.charging import SystemCharging
+from job_history.sync.charging import _PRIORITY_TO_QOS_NAME, SystemCharging
 
 # ── Columns to ADD ──────────────────────────────────────────────────────────
 # Each entry: (table, column, SQL type + default)
@@ -99,29 +99,27 @@ def backfill_qos_id(engine, machine: str | None = None, *,
     with engine.connect() as conn:
         rows = conn.execute(text("SELECT name, id FROM job_qos")).all()
     qos_ids = {name: qid for name, qid in rows}
-    required = {"premium", "regular", "economy", "special"} | set(queue_map.values())
+    priority_map = {p: q for p, q in _PRIORITY_TO_QOS_NAME.items() if p and q != "regular"}
+    required = {"regular"} | set(priority_map.values()) | set(queue_map.values())
     missing = required - set(qos_ids)
     if missing:
         raise RuntimeError(f"Missing JobQoS seed rows: {missing}")
 
-    base_params = {
-        "prem": qos_ids["premium"],
-        "spec": qos_ids["special"],
-        "econ": qos_ids["economy"],
-        "reg":  qos_ids["regular"],
-    }
-    queue_whens = []
+    # Same precedence as SystemCharging._resolve_qos_name: queue, then priority.
+    base_params = {"reg": qos_ids["regular"]}
+    queue_whens, priority_whens = [], []
     for i, (queue, qos_name) in enumerate(sorted(queue_map.items())):
         base_params[f"qn{i}"] = queue.lower()
         base_params[f"qq{i}"] = qos_ids[qos_name]
         queue_whens.append(f"WHEN {{queue}} = :qn{i} THEN :qq{i}")
+    for i, (priority, qos_name) in enumerate(sorted(priority_map.items())):
+        base_params[f"pn{i}"] = priority
+        base_params[f"pq{i}"] = qos_ids[qos_name]
+        priority_whens.append(f"WHEN {{priority}} = :pn{i} THEN :pq{i}")
 
     def _case(queue_expr: str, priority_expr: str) -> str:
-        whens = [w.format(queue=queue_expr) for w in queue_whens] + [
-            f"WHEN {priority_expr} = 'premium' THEN :prem",
-            f"WHEN {priority_expr} = 'special' THEN :spec",
-            f"WHEN {priority_expr} = 'economy' THEN :econ",
-        ]
+        whens = ([w.format(queue=queue_expr) for w in queue_whens]
+                 + [w.format(priority=priority_expr) for w in priority_whens])
         return "CASE " + " ".join(whens) + " ELSE :reg END"
 
     with engine.connect() as conn:

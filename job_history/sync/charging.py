@@ -11,6 +11,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from ..database.session import JOB_QOS_SEED
+
 if TYPE_CHECKING:
     from ..database.models import Job
 
@@ -36,17 +38,9 @@ _PRIORITY_TO_QOS_NAME: dict = {
     None:      "regular",
 }
 
-# Fallback factors used when a job has no resolved JobQoS row (test
-# fixtures using SimpleNamespace, legacy data pre-migration).  Must match
-# the canonical seed values in session.JOB_QOS_SEED.
-_FALLBACK_QOS_FACTORS: dict = {
-    "premium":   1.5,
-    "regular":   1.0,
-    "economy":   0.7,
-    "uncharged": 0.0,
-    "special":   1.0,
-    "preempt":   0.2,
-}
+# Factors for a job with no resolved JobQoS row (SimpleNamespace fixtures,
+# pre-migration rows): the canonical seed values.
+_FALLBACK_QOS_FACTORS: dict = {name: factor for name, factor, _ in JOB_QOS_SEED}
 
 
 # ============================================================================
