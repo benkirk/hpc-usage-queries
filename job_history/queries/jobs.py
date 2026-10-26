@@ -344,6 +344,16 @@ def _period_case(field, bands: List[Dict[str, Any]]):
     return case(*whens, else_=bands[-1]["label"]).label("period_label")
 
 
+def _percentile_cont(sorted_values: Sequence[float], q: float) -> Optional[float]:
+    """PostgreSQL ``percentile_cont`` (linear interpolation) over sorted values."""
+    if not sorted_values:
+        return None
+    pos = q * (len(sorted_values) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (pos - lo)
+
+
 def _charge_expr(hours_col):
     """SUM-able charge expression: raw hours x the job's QoS factor.
 
@@ -673,7 +683,7 @@ class QueryConfig:
         kept[-1] = (f">{lo - 1}", lo, None)
         return kept
 
-    # Queue-wait distribution buckets (seconds). eligible_secs masses near
+    # Queue-wait distribution buckets (seconds). Job.wait_secs masses near
     # zero with a tail out to days, so log-ish spacing gives resolution at
     # both ends. A NEW table: job_waits_by_resource buckets by *size* and
     # averages the wait — a distribution needs wait-valued bands.
@@ -690,6 +700,17 @@ class QueryConfig:
         ("12-24h", 43200,  86399),
         ("1-2d",   86400,  172799),
         (">2d",    172800, None),
+    ]
+
+    # Node bands for wait_history(): the queue's size classes, coarser than
+    # NODE_HIST_BUCKETS so each band holds enough jobs for a stable p90.
+    WAIT_HISTORY_NODE_BANDS = [
+        ("1",      0,   1),
+        ("2-4",    2,   4),
+        ("5-16",   5,   16),
+        ("17-64",  17,  64),
+        ("65-256", 65,  256),
+        ("257+",   257, None),
     ]
 
     # Elapsed-runtime distribution buckets (seconds). Labels and integer
@@ -896,8 +917,8 @@ _MEMORY_WASTED = (Job.reqmem - Job.memory).label('memory_wasted')
 #: memory actually consumed (``Job.memory``) and ``memory_wasted`` their
 #: difference; per-rank used-memory physics stays with job_memory_per_rank.
 _HISTOGRAM_SPECS: Dict[str, Tuple[Any, List[tuple], str, str, str]] = {
-    'wait':     (Job.eligible_secs, QueryConfig.WAIT_BUCKETS,
-                 'seconds', 'min_eligible_secs', 'max_eligible_secs'),
+    'wait':     (Job.wait_secs,     QueryConfig.WAIT_BUCKETS,
+                 'seconds', 'min_wait_secs',     'max_wait_secs'),
     'nodes':    (Job.numnodes,      QueryConfig.NODE_HIST_BUCKETS,
                  'count',   'min_nodes',         'max_nodes'),
     'cpus':     (Job.numcpus,       QueryConfig.CPU_HIST_BUCKETS,
@@ -924,6 +945,7 @@ def _build_machine_bucket_tables():
     """
     for dim, spec in _HISTOGRAM_SPECS.items():
         _validate_bucket_table(spec[1], dim)
+    _validate_bucket_table(QueryConfig.WAIT_HISTORY_NODE_BANDS, "wait_history/nodes")
 
     tables: Dict[str, Dict[str, List[tuple]]] = {}
     for machine, caps in QueryConfig.MACHINE_HIST_CAPS.items():
@@ -1242,28 +1264,17 @@ class JobQueries:
             # Convert bytes to GB for memory ranges
             field = Job.reqmem / (1024**3)
 
-        # Build range case and wait time calculation.
-        #
-        # Wait time is PBS's own eligible_time accrual, not start - eligible.
-        # start - eligible (i.e. start - etime) is effectively submit -> start:
-        # qtime == etime on 77,152 of 77,154 sampled derecho E records, so it
-        # counts time the job spent held, dependency-blocked, or deferred by
-        # `qsub -a` -- none of which is the site making the user wait.
-        # eligible_secs counts only time blocked on resource scarcity.
+        # Wait is the fair Job.wait_secs, never start - submit (SCHEMA.md § Wait time).
         range_case = self._build_range_case(ranges, overflow, field)
-        wait_time_hours = Job.eligible_secs / 3600.0
+        wait_time_hours = Job.wait_secs / 3600.0
 
-        # Build subquery.  The IS NOT NULL filter is required, not redundant:
-        # func.avg already skips NULLs, but func.count(id) below would not, so
-        # without it #-Jobs would count jobs excluded from the average.  Jobs
-        # predating `eligible_time_enable` (derecho before 2025-01-07
-        # 17:47:50 UTC) are
-        # dropped rather than silently mixed with a different wait definition.
+        # The IS NOT NULL filter is required: func.avg skips NULLs but
+        # func.count(id) below does not, so #-Jobs would count unmeasured jobs.
         subquery = self.session.query(
             Job.id,
             range_case,
             wait_time_hours.label("wait_hours")
-        ).filter(Job.queue.in_(queues), Job.eligible_secs.isnot(None))
+        ).filter(Job.queue.in_(queues), Job.wait_secs.isnot(None))
 
         subquery = self._apply_date_filter(subquery, start, end)
         subquery = subquery.subquery()
@@ -1287,6 +1298,72 @@ class JobQueries:
             }
             for row in results
         ]
+
+    def wait_history(
+        self,
+        start: date,
+        end: date,
+        *,
+        period: str = "month",
+        queues: Sequence[str] = ("cpu",),
+    ) -> List[Dict[str, Any]]:
+        """Fair-wait percentiles by period (of ``end``) x node band x QoS, as tidy rows.
+
+        Each row is ``{period, band, qos, jobs, measured, p50_secs, p90_secs}``;
+        ``measured`` counts jobs with a non-NULL :attr:`Job.wait_secs`, and the
+        percentiles (linear, as ``percentile_cont``) are over those, None when
+        none. Rows exist only for groups with jobs, in period, band, QoS order.
+        QoS comes from ``job_qos``, not the raw ``priority`` string.
+        """
+        bands = _period_bands(start, end, period)
+        if not bands:
+            return []
+        node_bands = QueryConfig.WAIT_HISTORY_NODE_BANDS
+        period_col = _period_case(Job.end, bands)
+        band_col = _bucket_case(Job.numnodes, node_bands)
+        wait = Job.wait_secs
+        group_cols = (period_col, band_col, JobQoS.name)
+
+        def _scoped(query):
+            query = query.outerjoin(JobQoS, JobQoS.id == Job.qos_id)
+            query = query.filter(self._lookup_fk_clause("queue", queues))
+            return self._apply_date_filter(query, start, end)
+
+        if self.session.get_bind().dialect.name == "postgresql":
+            query = _scoped(self.session.query(
+                *group_cols, func.count(Job.id), func.count(wait),
+                func.percentile_cont(0.5).within_group(wait),
+                func.percentile_cont(0.9).within_group(wait),
+            ))
+            raw = query.group_by(*group_cols).all()
+        else:
+            # No percentile aggregate outside PostgreSQL: fold in Python.
+            groups: Dict[Tuple, List] = {}
+            for p_label, b_label, qos, w in _scoped(
+                    self.session.query(*group_cols, wait)).all():
+                groups.setdefault((p_label, b_label, qos), []).append(w)
+            raw = []
+            for key, values in groups.items():
+                measured = sorted(v for v in values if v is not None)
+                raw.append((*key, len(values), len(measured),
+                            _percentile_cont(measured, 0.5),
+                            _percentile_cont(measured, 0.9)))
+
+        period_order = {b["label"]: i for i, b in enumerate(bands)}
+        band_order = {label: i for i, (label, _lo, _hi) in enumerate(node_bands)}
+        rows = [
+            {
+                "period": p_label, "band": b_label, "qos": qos,
+                "jobs": jobs, "measured": measured,
+                "p50_secs": None if p50 is None else float(p50),
+                "p90_secs": None if p90 is None else float(p90),
+            }
+            for p_label, b_label, qos, jobs, measured, p50, p90 in raw
+        ]
+        rows.sort(key=lambda r: (period_order.get(r["period"], len(period_order)),
+                                 band_order.get(r["band"], -1),
+                                 r["qos"] is None, r["qos"] or ""))
+        return rows
 
     def job_sizes_by_resource(
         self,
@@ -1823,6 +1900,8 @@ class JobQueries:
         job_id: Optional[str] = None,
         name: Optional[Union[str, Sequence[str]]] = None,
         ignore_case: bool = False,
+        min_wait_secs: Optional[int] = None,
+        max_wait_secs: Optional[int] = None,
         min_eligible_secs: Optional[int] = None,
         max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
@@ -1915,18 +1994,17 @@ class JobQueries:
                 never match any pattern.
             ignore_case: Case-insensitive matching for ``name`` only.
                 Default False, matching the ``fs-scans query -N/-i`` pair.
-            min_eligible_secs: Lower bound (inclusive) on
-                ``Job.eligible_secs`` — PBS ``eligible_time``, i.e. wall time
-                blocked purely by resource scarcity.
-            max_eligible_secs: Upper bound (inclusive) on the same column.
+            min_wait_secs: Lower bound (inclusive) on ``Job.wait_secs``, the
+                fair queue wait: PBS ``eligible_time`` when recorded, else
+                ``start - eligible`` for jobs started before 2025-07-28.
+            max_wait_secs: Upper bound (inclusive) on the same expression.
+            min_eligible_secs, max_eligible_secs: Deprecated aliases of the
+                wait pair (the wait name wins when both are given).
 
-                **Both bounds exclude jobs with a NULL ``eligible_secs``.**
-                That is plain SQL three-valued logic and it is the behaviour
-                we want: ``eligible_time_enable`` was off on derecho until
-                2025-01-07 17:47:50 UTC, so every job ending before then has
-                *no wait measurement at all* — not a wait of zero. Folding
-                those into a ``max_eligible_secs`` result would claim "these
-                jobs waited less than N" about jobs whose wait is unknown.
+                **Both bounds exclude jobs with a NULL ``wait_secs``** — no
+                wait measurement at all, not a wait of zero. Folding those
+                into a ``max_wait_secs`` result would claim "these jobs
+                waited less than N" about jobs whose wait is unknown.
                 :meth:`job_waits_by_resource` makes the same exclusion
                 explicit because ``AVG`` and ``COUNT`` disagreed about NULLs;
                 here the comparison operator does it, and because
@@ -1959,7 +2037,7 @@ class JobQueries:
                 All fourteen range bounds are NULL-strict: a NULL column
                 value fails both comparisons and the row drops out.
 
-                Performance: ``name``, ``eligible_secs``, ``numnodes``,
+                Performance: ``name``, ``wait_secs``, ``numnodes``,
                 ``numcpus``, ``numgpus``, ``elapsed``, ``reqmem`` and
                 ``memory`` are **unindexed**. Each of these filters is
                 evaluated as a scan of whatever slice ``start``/``end``
@@ -2008,6 +2086,8 @@ class JobQueries:
             start=start, end=end, user=user,
             queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
             name=name, ignore_case=ignore_case,
+            min_wait_secs=min_wait_secs,
+            max_wait_secs=max_wait_secs,
             min_eligible_secs=min_eligible_secs,
             max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
@@ -2079,6 +2159,8 @@ class JobQueries:
         job_id: Optional[str] = None,
         name: Optional[Union[str, Sequence[str]]] = None,
         ignore_case: bool = False,
+        min_wait_secs: Optional[int] = None,
+        max_wait_secs: Optional[int] = None,
         min_eligible_secs: Optional[int] = None,
         max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
@@ -2106,7 +2188,7 @@ class JobQueries:
         ``job_id`` matches the shape-classifier described in
         :meth:`jobs_search`.
 
-        The NULL-exclusion built into ``min_/max_eligible_secs`` applies
+        The NULL-exclusion built into ``min_/max_wait_secs`` applies
         identically here — this method and ``jobs_search`` push the *same*
         predicates through :meth:`_apply_jobs_search_filters`, so there is no
         ``AVG``-skips-NULL / ``COUNT``-doesn't split like the one
@@ -2118,6 +2200,8 @@ class JobQueries:
             query, start=start, end=end, user=user, account=account,
             queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
             name=name, ignore_case=ignore_case,
+            min_wait_secs=min_wait_secs,
+            max_wait_secs=max_wait_secs,
             min_eligible_secs=min_eligible_secs,
             max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
@@ -2145,6 +2229,8 @@ class JobQueries:
         job_id: Optional[str] = None,
         name: Optional[Union[str, Sequence[str]]] = None,
         ignore_case: bool = False,
+        min_wait_secs: Optional[int] = None,
+        max_wait_secs: Optional[int] = None,
         min_eligible_secs: Optional[int] = None,
         max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
@@ -2239,6 +2325,8 @@ class JobQueries:
             start=start, end=end, user=user, account=account, queue=queue,
             qos=qos, exit_status=exit_status, job_id=job_id, name=name,
             ignore_case=ignore_case,
+            min_wait_secs=min_wait_secs,
+            max_wait_secs=max_wait_secs,
             min_eligible_secs=min_eligible_secs,
             max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
@@ -2341,6 +2429,8 @@ class JobQueries:
         job_id: Optional[str] = None,
         name: Optional[Union[str, Sequence[str]]] = None,
         ignore_case: bool = False,
+        min_wait_secs: Optional[int] = None,
+        max_wait_secs: Optional[int] = None,
         min_eligible_secs: Optional[int] = None,
         max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
@@ -2372,7 +2462,7 @@ class JobQueries:
         disagree with the job table it sits next to.
 
         Args:
-            dimension: One of ``wait`` (``eligible_secs``), ``nodes``,
+            dimension: One of ``wait`` (``wait_secs``), ``nodes``,
                 ``cpus``, ``gpus``, ``memory`` (**requested** memory,
                 ``reqmem``), ``duration`` (``elapsed``), ``memory_used``
                 (peak memory actually consumed, ``Job.memory``) or
@@ -2405,10 +2495,10 @@ class JobQueries:
 
             {
               "dimension": "wait",
-              "column": "eligible_secs",
+              "column": "wait_secs",
               "unit": "seconds",                # 'seconds' | 'count' | 'bytes'
-              "min_param": "min_eligible_secs", # jobs_search kwargs that
-              "max_param": "max_eligible_secs", #   replay one band as filters
+              "min_param": "min_wait_secs",     # jobs_search kwargs that
+              "max_param": "max_wait_secs",     #   replay one band as filters
               "buckets": [
                 {"label": "<1m", "lo": 0, "hi": 59,
                  "job_count": 12, "cpu_hours": 190.0, "gpu_hours": 0.0,
@@ -2438,10 +2528,10 @@ class JobQueries:
 
         ``null_count`` is the "N jobs unmeasured" story: rows that match
         the filters but have a NULL *dimension* column land there, never in
-        a band. In practice only ``wait`` has them — derecho did not record
-        ``eligible_time`` before 2025-01-07 17:47:50 UTC (casper history is
-        complete), and ``numnodes``/``numcpus``/``numgpus``/``name`` are
-        NULL-free across 34M production rows.
+        a band. In practice only ``wait`` has them, and rarely: a job with
+        neither ``eligible_time`` nor a pre-2025-07-28 start (see
+        :attr:`Job.wait_secs`). ``numnodes``/``numcpus``/``numgpus``/``name``
+        are NULL-free across 34M production rows.
 
         There is no ``self_exclude`` and no ``limit``: filters mean exactly
         what they say. A caller who wants the histogram unconstrained by its
@@ -2543,6 +2633,8 @@ class JobQueries:
             query, start=start, end=end, user=user, account=account,
             queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
             name=name, ignore_case=ignore_case,
+            min_wait_secs=min_wait_secs,
+            max_wait_secs=max_wait_secs,
             min_eligible_secs=min_eligible_secs,
             max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
@@ -2644,6 +2736,8 @@ class JobQueries:
         job_id: Optional[str] = None,
         name: Optional[Union[str, Sequence[str]]] = None,
         ignore_case: bool = False,
+        min_wait_secs: Optional[int] = None,
+        max_wait_secs: Optional[int] = None,
         min_eligible_secs: Optional[int] = None,
         max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
@@ -2752,6 +2846,8 @@ class JobQueries:
             start=start, end=end, user=user, account=account, queue=queue,
             qos=qos, exit_status=exit_status, job_id=job_id, name=name,
             ignore_case=ignore_case,
+            min_wait_secs=min_wait_secs,
+            max_wait_secs=max_wait_secs,
             min_eligible_secs=min_eligible_secs,
             max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
@@ -2795,6 +2891,8 @@ class JobQueries:
         job_id: Optional[str] = None,
         name: Optional[Union[str, Sequence[str]]] = None,
         ignore_case: bool = False,
+        min_wait_secs: Optional[int] = None,
+        max_wait_secs: Optional[int] = None,
         min_eligible_secs: Optional[int] = None,
         max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
@@ -2859,6 +2957,8 @@ class JobQueries:
             start=start, end=end, user=user, account=account, queue=queue,
             qos=qos, exit_status=exit_status, job_id=job_id, name=name,
             ignore_case=ignore_case,
+            min_wait_secs=min_wait_secs,
+            max_wait_secs=max_wait_secs,
             min_eligible_secs=min_eligible_secs,
             max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
@@ -2943,6 +3043,8 @@ class JobQueries:
         job_id: Optional[str] = None,
         name: Optional[Union[str, Sequence[str]]] = None,
         ignore_case: bool = False,
+        min_wait_secs: Optional[int] = None,
+        max_wait_secs: Optional[int] = None,
         min_eligible_secs: Optional[int] = None,
         max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
@@ -3085,6 +3187,8 @@ class JobQueries:
             start=start, end=end, user=user, account=account,
             queue=queue, qos=qos, exit_status=exit_status, job_id=job_id,
             name=name, ignore_case=ignore_case,
+            min_wait_secs=min_wait_secs,
+            max_wait_secs=max_wait_secs,
             min_eligible_secs=min_eligible_secs,
             max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
@@ -3761,6 +3865,7 @@ class JobQueries:
     def _apply_jobs_search_filters(
         self, query, *, start, end, user, account, queue, qos, exit_status,
         job_id, name, ignore_case,
+        min_wait_secs, max_wait_secs,
         min_eligible_secs, max_eligible_secs,
         min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus,
         min_elapsed, max_elapsed, min_reqmem, max_reqmem,
@@ -3832,11 +3937,16 @@ class JobQueries:
             )
             if clause is not None:
                 query = query.filter(clause)
+        # min/max_eligible_secs are deprecated aliases of the wait pair; the new name wins.
+        if min_wait_secs is None:
+            min_wait_secs = min_eligible_secs
+        if max_wait_secs is None:
+            max_wait_secs = max_eligible_secs
         # Numeric range bounds: all inclusive, all NULL-strict (a NULL column
         # value fails both comparisons, so those rows drop out). `is not None`
         # rather than truthiness throughout — 0 is a meaningful bound.
         for _column, _lo, _hi in (
-            (Job.eligible_secs, min_eligible_secs, max_eligible_secs),
+            (Job.wait_secs,     min_wait_secs,     max_wait_secs),
             (Job.numnodes,      min_nodes,         max_nodes),
             (Job.numcpus,       min_cpus,          max_cpus),
             (Job.numgpus,       min_gpus,          max_gpus),

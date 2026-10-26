@@ -239,14 +239,14 @@ class TestSearchCommand:
         search_ctx.output_format = "json"
         assert SearchCommand(search_ctx).execute(min_wait_hours=1.5) == 0
         parsed = json.loads(capsys.readouterr().out)
-        assert parsed["filters"]["min_eligible_secs"] == 5400
-        assert parsed["filters"]["max_eligible_secs"] is None
+        assert parsed["filters"]["min_wait_secs"] == 5400
+        assert parsed["filters"]["max_wait_secs"] is None
 
     def test_zero_wait_hours_is_not_treated_as_unset(self, search_ctx, capsys):
         search_ctx.output_format = "json"
         assert SearchCommand(search_ctx).execute(max_wait_hours=0.0) == 0
         parsed = json.loads(capsys.readouterr().out)
-        assert parsed["filters"]["max_eligible_secs"] == 0
+        assert parsed["filters"]["max_wait_secs"] == 0
 
     def test_resource_range_flags_appear_in_filters(self, search_ctx, capsys):
         search_ctx.output_format = "json"

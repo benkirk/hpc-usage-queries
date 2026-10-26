@@ -226,15 +226,14 @@ def daily_summary(jh_ctx: Context):
               help="Make -N/--name-pattern matching case-insensitive.")
 @click.option("--min-wait-hours", type=click.FloatRange(min=0), default=None,
               metavar="H",
-              help="Only jobs whose PBS eligible_time (queue wait caused by "
-                   "resource scarcity) was at least H hours. Jobs with no "
-                   "recorded eligible_time are excluded - derecho did not "
-                   "record it before 2025-01-07.")
+              help="Only jobs whose fair queue wait (PBS eligible_time, else "
+                   "start - etime for jobs started before 2025-07-28) was at "
+                   "least H hours. Jobs with no wait measurement are excluded.")
 @click.option("--max-wait-hours", type=click.FloatRange(min=0), default=None,
               metavar="H",
-              help="Only jobs whose PBS eligible_time was at most H hours. "
-                   "Jobs with no recorded eligible_time are excluded, NOT "
-                   "treated as a zero wait.")
+              help="Only jobs whose fair queue wait was at most H hours. "
+                   "Jobs with no wait measurement are excluded, NOT treated "
+                   "as a zero wait.")
 @click.option("--min-nodes", type=click.IntRange(min=0), default=None,
               help="Only jobs using at least N nodes. UNINDEXED - pair with "
                    "--start-date/--end-date.")

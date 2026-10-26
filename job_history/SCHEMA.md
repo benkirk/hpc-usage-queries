@@ -158,7 +158,7 @@ Core job records with foreign keys to normalized tables.
 | `status` | TEXT | YES | PBS `Exit_status` — an exit **code**, not a state (see note below). Exposed as `exit_status` on every query/CLI surface |
 | `submit` | DATETIME | YES | PBS `ctime` — job creation (naive UTC — see note below) |
 | `queued` | DATETIME | NO | PBS `qtime` — entered *current* queue; reset by routing |
-| `eligible` | DATETIME | NO | PBS `etime` — reset by queue move **and** hold/release |
+| `eligible` | DATETIME | NO | PBS `etime` — reset by queue move; by hold/release only until 2025-07-27 |
 | `start` | DATETIME | YES | Start time (naive UTC) |
 | `end` | DATETIME | YES | End time (naive UTC) |
 | `elapsed` | INTEGER | NO | Runtime (seconds) |
@@ -190,43 +190,48 @@ Core job records with foreign keys to normalized tables.
 > Mountain-Time server).  Naive values are stored and compared as-is on both
 > SQLite and PostgreSQL regardless of server timezone.
 
-#### Wait time: use `eligible_secs`, not `start - submit`
+#### Wait time: use `Job.wait_secs`, not `start - submit`
+
+`Job.wait_secs` is the fair queue wait, a hybrid property (Python and SQL, no
+column):
+
+> `eligible_secs` when present, else `start - eligible` when the job started
+> before `ETIME_RESETS_UNTIL` (2025-07-28 UTC), else NULL.
 
 `eligible_secs` is PBS's own `eligible_time` accrual: the cumulative wall time a
 job was blocked **purely by resource scarcity**.  Time blocked by user or system
 holds, unsatisfied dependencies, `qsub -a` start-time deferral, or project/user/
 group run limits accrues instead to PBS's `ineligible_time`, which PBS **never**
 writes to accounting logs.  `eligible_time` survives requeue and `qmove` — PBS
-guarantees it only ever increases over a job's life.
-
-Neither `submit` nor `eligible` is a substitute:
-
-- `start - submit` counts held, dependency-blocked, and deferred time as if the
-  site had made the user wait.
-- `start - eligible` looks better but is *the same measurement in practice*:
-  `qtime == etime` on 77,152 of 77,154 sampled derecho E records, and
-  `eligible == submit` on 98.7% of rows in the live DB.  Measured against
-  `eligible_time` on 77k records, the medians are 141 s vs 30 s and the p90s are
-  23,437 s vs 11,721 s; 27% of non-array jobs disagree by more than 60 s.  For
-  unconstrained jobs the two agree within ~2 s — the entire divergence is a
-  negative tail, e.g. a job showing a 35-day `start - submit` wait has 17 s of
-  eligible time.
-
-`NULL` means "PBS did not record it" and is distinct from `0`.  Availability is
-gated by the `eligible_time_enable` server attribute, which was enabled at
-different times per machine:
+guarantees it only ever increases over a job's life.  `NULL` means "PBS did not
+record it" and is distinct from `0`.  Availability is gated by the
+`eligible_time_enable` server attribute:
 
 | machine | `queued` / `run_count` | `eligible_secs` |
 |---|---|---|
 | casper | all history (2024-01 →) | all history (2024-01 →) |
 | derecho | all history | **2025-01-07 17:47:50 UTC →** only |
 
-`JobQueries.job_waits_by_resource()` filters `eligible_secs IS NOT NULL`, so
-derecho reports covering dates before 2025-01-07 17:47:50 UTC exclude those jobs rather than
-silently mixing two different wait definitions. `JobQueries.jobs_histogram('wait', …)`
-makes the same exclusion visible instead of silent: NULL rows are counted into the
-response's `null_count` (the dashboard's "N jobs unmeasured" caption), never into
-a wait band.
+`start - eligible` (PBS `etime`) fills Derecho's earlier history.  Until
+2025-07-27 PBS reset `etime` when a hold or dependency released, so it measured
+the same thing: on cpu-queue jobs ending 2025-01-08 to 2025-06-30, where both
+exist, the two medians agree at every node band (p90s within 2% except 5-16
+nodes).  CESM `st_archive` jobs, which always wait on a dependency, show the
+change: `etime` was reset on 99% of them in 2024 and on none since 2025 Q4.  The
+last reset is a job started 2025-07-27 18:48 UTC.  Since then `etime == qtime`,
+so `start - eligible` is submit-to-start, holds included, and is not used.
+Casper's resets stopped later (2025 Q4), so the one cutoff is safe on both
+machines.  Evidence: hpc-usage-queries#128.
+
+`start - submit` is never a substitute: it counts held, dependency-blocked and
+deferred time as if the site had made the user wait.
+
+`JobQueries.job_waits_by_resource()` filters `wait_secs IS NOT NULL`, and
+`jobs_histogram('wait', …)` counts NULL rows into the response's `null_count`
+(the dashboard's "N jobs unmeasured" caption), never into a wait band.  The
+`min_/max_wait_secs` filters are NULL-strict; `min_/max_eligible_secs` are
+deprecated aliases of them.  `JobQueries.wait_history()` reports p50/p90 of
+`wait_secs` by period, node band and QoS.
 
 > **Array-parent caveat**: array-*parent* rows (job ids like `6896760[].desched1`,
 > ~1% of rows) carry an `eligible_time` accrued across the whole array's
@@ -497,24 +502,28 @@ ORDER BY s.date;
 
 ### Queue Wait Times
 
-Portable across SQLite and PostgreSQL — `eligible_secs` is already an integer
-count of seconds, so no dialect-specific date arithmetic is needed.
+From Python, use `Job.wait_secs`, which compiles the rule per dialect.  In raw
+SQL (PostgreSQL shown), spell out the rule:
 
 ```sql
 SELECT q.queue_name,
        COUNT(*) as jobs,
-       AVG(j.eligible_secs)/60.0 as avg_wait_min,
-       MAX(j.eligible_secs)/60.0 as max_wait_min
-FROM jobs j
-JOIN queues q ON j.queue_id = q.id
-WHERE j.eligible_secs IS NOT NULL
-  AND j.end >= '2025-01-01'
+       AVG(w.wait)/60.0 as avg_wait_min,
+       MAX(w.wait)/60.0 as max_wait_min
+FROM (SELECT j.queue_id,
+             CASE WHEN j.eligible_secs IS NOT NULL THEN j.eligible_secs
+                  WHEN j.start < '2025-07-28' THEN EXTRACT(EPOCH FROM j.start - j.eligible)
+             END AS wait
+      FROM jobs j
+      WHERE j.end >= '2024-01-01') w
+JOIN queues q ON w.queue_id = q.id
+WHERE w.wait IS NOT NULL
 GROUP BY q.queue_name
 ORDER BY avg_wait_min DESC;
 ```
 
 The `IS NOT NULL` guard matters: without it `COUNT(*)` counts jobs that `AVG`
-skipped.  See *Wait time: use `eligible_secs`* above for why `start - submit` is
+skipped.  See *Wait time: use `Job.wait_secs`* above for why `start - submit` is
 not a valid substitute.
 
 ## Performance Characteristics

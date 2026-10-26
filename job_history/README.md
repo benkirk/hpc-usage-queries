@@ -247,9 +247,10 @@ job id) there are:
 - `-N/--name-pattern` (repeatable, OR'd) + `-i/--ignore-case` — shell-glob
   matching on the job name, dialect-aware via
   `queries/builders.py:glob_match_clause`.
-- `--min-wait-hours` / `--max-wait-hours` — bounds on PBS `eligible_time`.
-  The CLI takes hours; the API takes `min_/max_eligible_secs`. Both
-  exclude jobs where PBS never recorded a wait (NULL is not zero).
+- `--min-wait-hours` / `--max-wait-hours` — bounds on the fair queue wait
+  (`Job.wait_secs`). The CLI takes hours; the API takes `min_/max_wait_secs`
+  (`min_/max_eligible_secs` are deprecated aliases). Both exclude jobs with
+  no wait measurement (NULL is not zero).
 - `--min-nodes/--max-nodes`, `--min-cpus/--max-cpus`,
   `--min-gpus/--max-gpus` — inclusive, NULL-strict. `--min-gpus 1`
   selects GPU jobs, `--max-gpus 0` CPU-only ones.
@@ -288,7 +289,7 @@ already serve the terminal case:
   delta, bytes; a leading `over request` band collects negative deltas).
   Returns the full bucket vector (zeros included) with per-bucket
   `job_count` + `cpu_hours`/`gpu_hours`, a `null_count` for rows whose
-  column is NULL (derecho waits before 2025-01-07; either-column NULLs for
+  column is NULL (jobs with no `wait_secs`; either-column NULLs for
   `memory_wasted`), and self-describing `min_param`/`max_param` so a
   clicked bar replays as `jobs_search` bounds. One CASE-grouped aggregate
   scan.
@@ -407,10 +408,10 @@ If the underlying query method needs the `--group-by` value as a
 - **Naive UTC timestamps**: `submit`, `queued`, `eligible`, `start`, `end` stored as
   timezone-naive UTC datetimes so they round-trip correctly through both PostgreSQL
   (any server timezone) and SQLite without conversion skew
-- **Wait time is `eligible_secs`** (PBS `eligible_time`), not `start - submit`: it counts
-  only time blocked on resource scarcity, excluding holds, dependencies, and `qsub -a`
-  deferral.  NULL where PBS never recorded it (derecho before 2025-01-07 17:47:50 UTC).
-  See `SCHEMA.md` § *Wait time: use `eligible_secs`*
+- **Wait time is `Job.wait_secs`**, not `start - submit`: PBS `eligible_time` when
+  recorded (it excludes holds, dependencies and `qsub -a` deferral), else `start - eligible`
+  for jobs started before 2025-07-28, while PBS still reset `etime` on hold release.
+  See `SCHEMA.md` § *Wait time: use `Job.wait_secs`*
 - Unique constraint on `(job_id, submit)` prevents duplicates
 
 **users / accounts / queues** — Normalized lookup tables (integer FK joins)

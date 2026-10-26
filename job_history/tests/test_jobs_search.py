@@ -1020,38 +1020,88 @@ def wait_jobs(in_memory_session):
 class TestJobsSearchWaitFilters:
     def test_min_wait_excludes_shorter(self, in_memory_session, wait_jobs):
         rows = JobQueries(in_memory_session).jobs_search(
-            min_eligible_secs=1800, columns=("job_id",))
+            min_wait_secs=1800, columns=("job_id",))
         assert {r["job_id"] for r in rows} == {"401.desched1", "402.desched1"}
 
     def test_max_wait_excludes_longer(self, in_memory_session, wait_jobs):
         rows = JobQueries(in_memory_session).jobs_search(
-            max_eligible_secs=1800, columns=("job_id",))
+            max_wait_secs=1800, columns=("job_id",))
         assert {r["job_id"] for r in rows} == {"400.desched1", "401.desched1"}
 
-    def test_null_eligible_secs_excluded_by_min(self, in_memory_session, wait_jobs):
-        # min=0 is not "everything": the NULL row (derecho before
-        # eligible_time_enable) has no wait measurement and drops out.
+    def test_null_wait_excluded_by_min(self, in_memory_session, wait_jobs):
+        # min=0 is not "everything": the row with no wait measurement drops out.
         rows = JobQueries(in_memory_session).jobs_search(
-            min_eligible_secs=0, columns=("job_id",))
+            min_wait_secs=0, columns=("job_id",))
         assert "403.desched1" not in {r["job_id"] for r in rows}
         assert len(rows) == 3
 
-    def test_null_eligible_secs_excluded_by_max(self, in_memory_session, wait_jobs):
+    def test_null_wait_excluded_by_max(self, in_memory_session, wait_jobs):
         # The dangerous direction: "jobs that waited at most 1h" must NOT
         # silently include jobs whose wait is unknown.
         rows = JobQueries(in_memory_session).jobs_search(
-            max_eligible_secs=3600, columns=("job_id",))
+            max_wait_secs=3600, columns=("job_id",))
         assert "403.desched1" not in {r["job_id"] for r in rows}
 
     def test_zero_bound_is_not_none(self, in_memory_session, wait_jobs):
-        # 0 is falsy — guards against an `if min_eligible_secs:` regression.
-        assert JobQueries(in_memory_session).jobs_count(max_eligible_secs=0) == 1
+        # 0 is falsy — guards against an `if min_wait_secs:` regression.
+        assert JobQueries(in_memory_session).jobs_count(max_wait_secs=0) == 1
 
     def test_count_agrees_with_search(self, in_memory_session, wait_jobs):
         q = JobQueries(in_memory_session)
-        for kw in ({"min_eligible_secs": 1800}, {"max_eligible_secs": 3600},
-                   {"min_eligible_secs": 0, "max_eligible_secs": 7200}):
+        for kw in ({"min_wait_secs": 1800}, {"max_wait_secs": 3600},
+                   {"min_wait_secs": 0, "max_wait_secs": 7200}):
             assert q.jobs_count(**kw) == len(q.jobs_search(**kw))
+
+    def test_eligible_secs_names_are_aliases(self, in_memory_session, wait_jobs):
+        q = JobQueries(in_memory_session)
+        for old, new in (({"min_eligible_secs": 1800}, {"min_wait_secs": 1800}),
+                         ({"max_eligible_secs": 1800}, {"max_wait_secs": 1800})):
+            assert q.jobs_search(**old, columns=("job_id",)) == \
+                q.jobs_search(**new, columns=("job_id",))
+
+    def test_wait_name_wins_over_alias(self, in_memory_session, wait_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_wait_secs=7200, min_eligible_secs=0, columns=("job_id",))
+        assert {r["job_id"] for r in rows} == {"402.desched1"}
+
+
+@pytest.fixture
+def fallback_wait_jobs(in_memory_session):
+    """No eligible_secs: one started before the etime-reset cutoff, one after."""
+    specs = [("500.desched1", datetime(2024, 5, 31, 12), 9000),
+             ("501.desched1", datetime(2025, 9, 1, 12), 9000)]
+    jobs = [
+        Job(job_id=jid, short_id=500 + i, name=f"f{i}", user="alice",
+            account="NCAR0001", queue="main", status="0",
+            submit=start - timedelta(hours=5), eligible=start - timedelta(seconds=wait),
+            start=start, end=start + timedelta(hours=1), elapsed=3600,
+            eligible_secs=None, numcpus=128, numgpus=0, numnodes=1)
+        for i, (jid, start, wait) in enumerate(specs)
+    ]
+    in_memory_session.add_all(jobs)
+    in_memory_session.commit()
+    return jobs
+
+
+class TestFallbackWait:
+    """A pre-2025 job with no eligible_secs is measured by start - etime."""
+
+    def test_filters_select_the_pre_cutoff_job(self, in_memory_session, fallback_wait_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_wait_secs=3600, max_wait_secs=10000, columns=("job_id", "wait_secs"))
+        assert rows == [{"job_id": "500.desched1", "wait_secs": 9000}]
+
+    def test_histogram_bands_the_pre_cutoff_job(self, in_memory_session, fallback_wait_jobs):
+        out = JobQueries(in_memory_session).jobs_histogram("wait")
+        assert out["null_count"] == 1          # the post-cutoff job
+        band = next(b for b in out["buckets"] if b["job_count"])
+        assert band["label"] == "2-4h"
+        assert out["total_count"] == 2
+
+    def test_sorts_on_wait(self, in_memory_session, fallback_wait_jobs, wait_jobs):
+        rows = JobQueries(in_memory_session).jobs_search(
+            min_wait_secs=0, sort_by="wait_secs", sort_dir="desc", columns=("job_id",))
+        assert [r["job_id"] for r in rows][:2] == ["500.desched1", "402.desched1"]
 
 
 _GIB = 1024 ** 3  # matches sync/charging.BYTES_PER_GB
@@ -2006,9 +2056,9 @@ class TestJobsHistogram:
     def test_envelope_is_self_describing(self, in_memory_session, histogram_jobs):
         q = JobQueries(in_memory_session)
         wait = q.jobs_histogram("wait")
-        assert (wait["column"], wait["unit"]) == ("eligible_secs", "seconds")
+        assert (wait["column"], wait["unit"]) == ("wait_secs", "seconds")
         assert (wait["min_param"], wait["max_param"]) == \
-            ("min_eligible_secs", "max_eligible_secs")
+            ("min_wait_secs", "max_wait_secs")
         mem = q.jobs_histogram("memory")
         assert (mem["column"], mem["unit"]) == ("reqmem", "bytes")
 
@@ -2547,7 +2597,7 @@ def _ts_filters(**overrides):
     it when probing an unsummarized gap. Production always passes the full
     dict; only these tests need to build one.
     """
-    filters = dict.fromkeys(['start', 'end', 'user', 'account', 'queue', 'qos', 'exit_status', 'job_id', 'name', 'ignore_case', 'min_eligible_secs', 'max_eligible_secs', 'min_nodes', 'max_nodes', 'min_cpus', 'max_cpus', 'min_gpus', 'max_gpus', 'min_elapsed', 'max_elapsed', 'min_reqmem', 'max_reqmem', 'min_memory_used', 'max_memory_used', 'min_memory_wasted', 'max_memory_wasted'])
+    filters = dict.fromkeys(['start', 'end', 'user', 'account', 'queue', 'qos', 'exit_status', 'job_id', 'name', 'ignore_case', 'min_wait_secs', 'max_wait_secs', 'min_eligible_secs', 'max_eligible_secs', 'min_nodes', 'max_nodes', 'min_cpus', 'max_cpus', 'min_gpus', 'max_gpus', 'min_elapsed', 'max_elapsed', 'min_reqmem', 'max_reqmem', 'min_memory_used', 'max_memory_used', 'min_memory_wasted', 'max_memory_wasted'])
     filters["ignore_case"] = False
     filters.update(overrides)
     return filters

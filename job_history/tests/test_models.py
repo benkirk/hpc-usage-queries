@@ -1,11 +1,14 @@
 """Tests for ORM models."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 
 from job_history.database import Job, DailySummary, JobRecord
+from job_history.database.models import ETIME_RESETS_UNTIL
 
 
 # Mock PbsRecord class for testing (must be module-level to be pickleable)
@@ -107,6 +110,37 @@ class TestJobModel:
         assert retrieved.user is None
         assert retrieved.elapsed is None
         assert retrieved.memory is None
+
+
+class TestWaitSecs:
+    """Job.wait_secs: eligible_secs, else start - etime before the cutoff, else None."""
+
+    BEFORE = ETIME_RESETS_UNTIL - timedelta(days=1)
+    AFTER = ETIME_RESETS_UNTIL
+
+    # (eligible_secs, start, eligible, expected)
+    CASES = [
+        (120,  BEFORE, BEFORE - timedelta(hours=1), 120),    # counter wins
+        (0,    AFTER,  AFTER - timedelta(hours=1),  0),      # 0 is a measurement
+        (None, BEFORE, BEFORE - timedelta(seconds=4321), 4321),
+        (None, AFTER,  AFTER - timedelta(seconds=4321),  None),
+        (None, BEFORE, None, None),
+        (None, None,   BEFORE, None),
+    ]
+
+    @pytest.mark.parametrize("secs,start,eligible,expected", CASES)
+    def test_python_and_sql_agree(self, in_memory_session, secs, start, eligible, expected):
+        job = Job(job_id="9.desched1", submit=eligible or start or self.BEFORE,
+                  start=start, eligible=eligible, eligible_secs=secs)
+        in_memory_session.add(job)
+        in_memory_session.flush()
+        assert job.wait_secs == expected
+        assert in_memory_session.execute(
+            select(Job.wait_secs).where(Job.id == job.id)).scalar_one() == expected
+
+    def test_postgres_compiles_epoch_difference(self):
+        sql = str(select(Job.wait_secs).compile(dialect=postgresql.dialect()))
+        assert "EXTRACT(epoch FROM jobs.start - jobs.eligible)" in sql
 
 
 class TestDailySummaryModel:

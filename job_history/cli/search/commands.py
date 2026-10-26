@@ -65,10 +65,10 @@ class SearchCommand(BaseHistoryCommand):
         # *resolved* seconds in the envelope, so a consumer can replay
         # ``filters`` straight into jobs_search() without redoing the
         # conversion. 0.0 is a meaningful bound, hence ``is not None``.
-        min_eligible_secs = (
+        min_wait_secs = (
             int(min_wait_hours * 3600) if min_wait_hours is not None else None
         )
-        max_eligible_secs = (
+        max_wait_secs = (
             int(max_wait_hours * 3600) if max_wait_hours is not None else None
         )
         # Same boundary conversion for the elapsed (hours → seconds) and
@@ -120,8 +120,8 @@ class SearchCommand(BaseHistoryCommand):
                 job_id=job_id,
                 name=name_patterns,
                 ignore_case=ignore_case,
-                min_eligible_secs=min_eligible_secs,
-                max_eligible_secs=max_eligible_secs,
+                min_wait_secs=min_wait_secs,
+                max_wait_secs=max_wait_secs,
                 min_nodes=min_nodes, max_nodes=max_nodes,
                 min_cpus=min_cpus, max_cpus=max_cpus,
                 min_gpus=min_gpus, max_gpus=max_gpus,
@@ -147,8 +147,8 @@ class SearchCommand(BaseHistoryCommand):
                     "job_id": job_id,
                     "name": list(name_patterns) if name_patterns else None,
                     "ignore_case": ignore_case,
-                    "min_eligible_secs": min_eligible_secs,
-                    "max_eligible_secs": max_eligible_secs,
+                    "min_wait_secs": min_wait_secs,
+                    "max_wait_secs": max_wait_secs,
                     "min_nodes": min_nodes,
                     "max_nodes": max_nodes,
                     "min_cpus": min_cpus,
