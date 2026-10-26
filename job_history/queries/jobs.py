@@ -1902,8 +1902,6 @@ class JobQueries:
         ignore_case: bool = False,
         min_wait_secs: Optional[int] = None,
         max_wait_secs: Optional[int] = None,
-        min_eligible_secs: Optional[int] = None,
-        max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
         max_nodes: Optional[int] = None,
         min_cpus: Optional[int] = None,
@@ -1998,8 +1996,6 @@ class JobQueries:
                 fair queue wait: PBS ``eligible_time`` when recorded, else
                 ``start - eligible`` for jobs started before 2025-07-28.
             max_wait_secs: Upper bound (inclusive) on the same expression.
-            min_eligible_secs, max_eligible_secs: Deprecated aliases of the
-                wait pair (the wait name wins when both are given).
 
                 **Both bounds exclude jobs with a NULL ``wait_secs``** — no
                 wait measurement at all, not a wait of zero. Folding those
@@ -2088,8 +2084,6 @@ class JobQueries:
             name=name, ignore_case=ignore_case,
             min_wait_secs=min_wait_secs,
             max_wait_secs=max_wait_secs,
-            min_eligible_secs=min_eligible_secs,
-            max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
@@ -2161,8 +2155,6 @@ class JobQueries:
         ignore_case: bool = False,
         min_wait_secs: Optional[int] = None,
         max_wait_secs: Optional[int] = None,
-        min_eligible_secs: Optional[int] = None,
-        max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
         max_nodes: Optional[int] = None,
         min_cpus: Optional[int] = None,
@@ -2202,8 +2194,6 @@ class JobQueries:
             name=name, ignore_case=ignore_case,
             min_wait_secs=min_wait_secs,
             max_wait_secs=max_wait_secs,
-            min_eligible_secs=min_eligible_secs,
-            max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
@@ -2231,8 +2221,6 @@ class JobQueries:
         ignore_case: bool = False,
         min_wait_secs: Optional[int] = None,
         max_wait_secs: Optional[int] = None,
-        min_eligible_secs: Optional[int] = None,
-        max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
         max_nodes: Optional[int] = None,
         min_cpus: Optional[int] = None,
@@ -2327,8 +2315,6 @@ class JobQueries:
             ignore_case=ignore_case,
             min_wait_secs=min_wait_secs,
             max_wait_secs=max_wait_secs,
-            min_eligible_secs=min_eligible_secs,
-            max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
@@ -2431,8 +2417,6 @@ class JobQueries:
         ignore_case: bool = False,
         min_wait_secs: Optional[int] = None,
         max_wait_secs: Optional[int] = None,
-        min_eligible_secs: Optional[int] = None,
-        max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
         max_nodes: Optional[int] = None,
         min_cpus: Optional[int] = None,
@@ -2635,8 +2619,6 @@ class JobQueries:
             name=name, ignore_case=ignore_case,
             min_wait_secs=min_wait_secs,
             max_wait_secs=max_wait_secs,
-            min_eligible_secs=min_eligible_secs,
-            max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
@@ -2738,8 +2720,6 @@ class JobQueries:
         ignore_case: bool = False,
         min_wait_secs: Optional[int] = None,
         max_wait_secs: Optional[int] = None,
-        min_eligible_secs: Optional[int] = None,
-        max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
         max_nodes: Optional[int] = None,
         min_cpus: Optional[int] = None,
@@ -2848,8 +2828,6 @@ class JobQueries:
             ignore_case=ignore_case,
             min_wait_secs=min_wait_secs,
             max_wait_secs=max_wait_secs,
-            min_eligible_secs=min_eligible_secs,
-            max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
@@ -2893,8 +2871,6 @@ class JobQueries:
         ignore_case: bool = False,
         min_wait_secs: Optional[int] = None,
         max_wait_secs: Optional[int] = None,
-        min_eligible_secs: Optional[int] = None,
-        max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
         max_nodes: Optional[int] = None,
         min_cpus: Optional[int] = None,
@@ -2959,8 +2935,6 @@ class JobQueries:
             ignore_case=ignore_case,
             min_wait_secs=min_wait_secs,
             max_wait_secs=max_wait_secs,
-            min_eligible_secs=min_eligible_secs,
-            max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
@@ -3045,8 +3019,6 @@ class JobQueries:
         ignore_case: bool = False,
         min_wait_secs: Optional[int] = None,
         max_wait_secs: Optional[int] = None,
-        min_eligible_secs: Optional[int] = None,
-        max_eligible_secs: Optional[int] = None,
         min_nodes: Optional[int] = None,
         max_nodes: Optional[int] = None,
         min_cpus: Optional[int] = None,
@@ -3189,8 +3161,6 @@ class JobQueries:
             name=name, ignore_case=ignore_case,
             min_wait_secs=min_wait_secs,
             max_wait_secs=max_wait_secs,
-            min_eligible_secs=min_eligible_secs,
-            max_eligible_secs=max_eligible_secs,
             min_nodes=min_nodes, max_nodes=max_nodes,
             min_cpus=min_cpus, max_cpus=max_cpus,
             min_gpus=min_gpus, max_gpus=max_gpus,
@@ -3866,7 +3836,6 @@ class JobQueries:
         self, query, *, start, end, user, account, queue, qos, exit_status,
         job_id, name, ignore_case,
         min_wait_secs, max_wait_secs,
-        min_eligible_secs, max_eligible_secs,
         min_nodes, max_nodes, min_cpus, max_cpus, min_gpus, max_gpus,
         min_elapsed, max_elapsed, min_reqmem, max_reqmem,
         min_memory_used, max_memory_used,
@@ -3937,11 +3906,6 @@ class JobQueries:
             )
             if clause is not None:
                 query = query.filter(clause)
-        # min/max_eligible_secs are deprecated aliases of the wait pair; the new name wins.
-        if min_wait_secs is None:
-            min_wait_secs = min_eligible_secs
-        if max_wait_secs is None:
-            max_wait_secs = max_eligible_secs
         # Numeric range bounds: all inclusive, all NULL-strict (a NULL column
         # value fails both comparisons, so those rows drop out). `is not None`
         # rather than truthiness throughout — 0 is a meaningful bound.

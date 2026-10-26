@@ -1052,17 +1052,11 @@ class TestJobsSearchWaitFilters:
                    {"min_wait_secs": 0, "max_wait_secs": 7200}):
             assert q.jobs_count(**kw) == len(q.jobs_search(**kw))
 
-    def test_eligible_secs_names_are_aliases(self, in_memory_session, wait_jobs):
-        q = JobQueries(in_memory_session)
-        for old, new in (({"min_eligible_secs": 1800}, {"min_wait_secs": 1800}),
-                         ({"max_eligible_secs": 1800}, {"max_wait_secs": 1800})):
-            assert q.jobs_search(**old, columns=("job_id",)) == \
-                q.jobs_search(**new, columns=("job_id",))
-
-    def test_wait_name_wins_over_alias(self, in_memory_session, wait_jobs):
-        rows = JobQueries(in_memory_session).jobs_search(
-            min_wait_secs=7200, min_eligible_secs=0, columns=("job_id",))
-        assert {r["job_id"] for r in rows} == {"402.desched1"}
+    @pytest.mark.parametrize("old", ["min_eligible_secs", "max_eligible_secs"])
+    def test_eligible_secs_names_are_rejected(self, in_memory_session, old):
+        # The wait filter is min_/max_wait_secs; the old names must fail loudly.
+        with pytest.raises(TypeError):
+            JobQueries(in_memory_session).jobs_count(**{old: 1800})
 
 
 @pytest.fixture
@@ -2597,7 +2591,7 @@ def _ts_filters(**overrides):
     it when probing an unsummarized gap. Production always passes the full
     dict; only these tests need to build one.
     """
-    filters = dict.fromkeys(['start', 'end', 'user', 'account', 'queue', 'qos', 'exit_status', 'job_id', 'name', 'ignore_case', 'min_wait_secs', 'max_wait_secs', 'min_eligible_secs', 'max_eligible_secs', 'min_nodes', 'max_nodes', 'min_cpus', 'max_cpus', 'min_gpus', 'max_gpus', 'min_elapsed', 'max_elapsed', 'min_reqmem', 'max_reqmem', 'min_memory_used', 'max_memory_used', 'min_memory_wasted', 'max_memory_wasted'])
+    filters = dict.fromkeys(['start', 'end', 'user', 'account', 'queue', 'qos', 'exit_status', 'job_id', 'name', 'ignore_case', 'min_wait_secs', 'max_wait_secs', 'min_nodes', 'max_nodes', 'min_cpus', 'max_cpus', 'min_gpus', 'max_gpus', 'min_elapsed', 'max_elapsed', 'min_reqmem', 'max_reqmem', 'min_memory_used', 'max_memory_used', 'min_memory_wasted', 'max_memory_wasted'])
     filters["ignore_case"] = False
     filters.update(overrides)
     return filters
