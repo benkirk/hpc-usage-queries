@@ -248,9 +248,8 @@ job id) there are:
   matching on the job name, dialect-aware via
   `queries/builders.py:glob_match_clause`.
 - `--min-wait-hours` / `--max-wait-hours` — bounds on the fair queue wait
-  (`Job.wait_secs`). The CLI takes hours; the API takes `min_/max_wait_secs`
-  (`min_/max_eligible_secs` are deprecated aliases). Both exclude jobs with
-  no wait measurement (NULL is not zero).
+  (`Job.wait_secs`). The CLI takes hours; the API takes `min_/max_wait_secs`.
+  Both exclude jobs with no wait measurement (NULL is not zero).
 - `--min-nodes/--max-nodes`, `--min-cpus/--max-cpus`,
   `--min-gpus/--max-gpus` — inclusive, NULL-strict. `--min-gpus 1`
   selects GPU jobs, `--max-gpus 0` CPU-only ones.

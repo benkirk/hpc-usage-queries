@@ -229,9 +229,8 @@ deferred time as if the site had made the user wait.
 `JobQueries.job_waits_by_resource()` filters `wait_secs IS NOT NULL`, and
 `jobs_histogram('wait', …)` counts NULL rows into the response's `null_count`
 (the dashboard's "N jobs unmeasured" caption), never into a wait band.  The
-`min_/max_wait_secs` filters are NULL-strict; `min_/max_eligible_secs` are
-deprecated aliases of them.  `JobQueries.wait_history()` reports p50/p90 of
-`wait_secs` by period, node band and QoS.
+`min_/max_wait_secs` filters are NULL-strict.  `JobQueries.wait_history()`
+reports p50/p90 of `wait_secs` by period, node band and QoS.
 
 > **Array-parent caveat**: array-*parent* rows (job ids like `6896760[].desched1`,
 > ~1% of rows) carry an `eligible_time` accrued across the whole array's
