@@ -16,7 +16,8 @@ def _format_cell(value: Any, fmt: str) -> str:
 
     ``format(None, '<9d')`` raises TypeError, and several projected columns are
     legitimately NULL — ``eligible_secs`` is NULL for every derecho job that
-    ended before PBS ``eligible_time_enable`` was switched on, and ``short_id``
+    ended before PBS ``eligible_time_enable`` was switched on (``wait_secs``
+    for a few), and ``short_id``
     is NULL on every array-job row. An empty string is the right rendering for
     "no value"; the Rich exporter already does this, so this brings the
     fixed-width and Markdown writers in line.

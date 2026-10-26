@@ -3,14 +3,49 @@
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, Text, UniqueConstraint, select
+from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, Text, UniqueConstraint, case, cast, func, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import declarative_base, declared_attr, relationship
+from sqlalchemy.sql.expression import FunctionElement
 
 logger = logging.getLogger(__name__)
 
 Base = declarative_base()
+
+# PBS reset etime when a hold or dependency released until this date (naive UTC;
+# the last reset was a job started 2025-07-27 18:48), so start - etime is a fair
+# wait only for jobs started before it. See Job.wait_secs and SCHEMA.md.
+ETIME_RESETS_UNTIL = datetime(2025, 7, 28)
+
+
+class _SecondsBetween(FunctionElement):
+    """Whole seconds from *earlier* to *later*, compiled per dialect."""
+    inherit_cache = True
+    name = 'seconds_between'
+    type = Integer()
+
+    def __init__(self, later, earlier):
+        self.later = later
+        self.earlier = earlier
+        super().__init__(later, earlier)
+
+
+@compiles(_SecondsBetween)
+def _compile_seconds_between_default(element, compiler, **kw):
+    """SQLite: strftime('%s') is integer epoch seconds."""
+    def epoch(col):
+        return cast(func.strftime('%s', col), Integer)
+    return compiler.process(epoch(element.later) - epoch(element.earlier), **kw)
+
+
+@compiles(_SecondsBetween, 'postgresql')
+def _compile_seconds_between_pg(element, compiler, **kw):
+    """PostgreSQL: EXTRACT(EPOCH FROM interval)."""
+    return compiler.process(
+        cast(func.extract('epoch', element.later - element.earlier), Integer), **kw
+    )
 
 
 class User(Base):
@@ -338,7 +373,7 @@ class Job(LookupMixin, Base):
     # Timestamps (stored in UTC)
     submit = Column(DateTime, index=True)   # PBS ctime — job creation; never reset
     queued = Column(DateTime)               # PBS qtime — entered *current* queue; reset by routing
-    eligible = Column(DateTime)             # PBS etime — reset by queue move AND hold/release
+    eligible = Column(DateTime)             # PBS etime — reset by queue move; by hold/release only until 2025-07-27
     start = Column(DateTime, index=True)
     end = Column(DateTime, index=True)
 
@@ -404,6 +439,25 @@ class Job(LookupMixin, Base):
         result['queue'] = self.queue
         result['qos'] = self.qos
         return result
+
+    @hybrid_property
+    def wait_secs(self):
+        """Fair queue wait: eligible_secs, else start - etime before ETIME_RESETS_UNTIL, else None."""
+        if self.eligible_secs is not None:
+            return self.eligible_secs
+        if (self.start is not None and self.eligible is not None
+                and self.start < ETIME_RESETS_UNTIL):
+            return int((self.start - self.eligible).total_seconds())
+        return None
+
+    @wait_secs.expression
+    def wait_secs(cls):
+        # A NULL start or eligible fails or nulls the second arm, so it stays NULL.
+        return case(
+            (cls.eligible_secs.isnot(None), cls.eligible_secs),
+            (cls.start < ETIME_RESETS_UNTIL, _SecondsBetween(cls.start, cls.eligible)),
+            else_=None,
+        ).label('wait_secs')
 
     def calculate_charges(self, machine: str) -> dict:
         """Calculate charging hours for this job.

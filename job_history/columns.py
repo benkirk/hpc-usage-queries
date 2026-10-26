@@ -62,6 +62,8 @@ COLUMNS: Dict[str, Dict[str, Any]] = {
     "queued":         {"header": "Queued",    "width": 19, "format": "s",   "source": "job.queued"},
     "eligible":       {"header": "Eligible",  "width": 19, "format": "s",   "source": "job.eligible"},
     "eligible_secs":  {"header": "EligWait",  "width":  9, "format": "d",   "source": "job.eligible_secs"},
+    # Fair queue wait (Job.wait_secs): eligible_secs, else start - eligible before 2025-07-28.
+    "wait_secs":      {"header": "Wait",      "width":  9, "format": "d",   "source": "job.wait_secs"},
     "run_count":      {"header": "Runs",      "width":  5, "format": "d",   "source": "job.run_count"},
     "walltime":       {"header": "Walltime",  "width":  9, "format": "d",   "source": "job.walltime"},
     "mpiprocs":       {"header": "Ranks per Node", "rich_header": "Ranks\nper\nNode", "width": AUTO_COL_WIDTH, "format": "d", "source": "job.mpiprocs"},

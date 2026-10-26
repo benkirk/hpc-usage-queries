@@ -528,3 +528,60 @@ class TestJobsByEntityPeriod:
 
         assert len(results) == len(results_new)
         assert results == results_new
+
+
+@pytest.fixture
+def wait_history_jobs(in_memory_session):
+    """cpu-queue jobs over two months: counter-measured, fallback-measured and unmeasured."""
+    def job(i, end, nodes, qos, eligible_secs=None, wait=None, queue="cpu"):
+        start = end - timedelta(hours=1)
+        return Job(
+            job_id=f"{700 + i}.desched1", short_id=700 + i, user="alice",
+            account="NCAR0001", queue=queue, qos=qos, status="0",
+            submit=start - timedelta(hours=10),
+            eligible=None if wait is None else start - timedelta(seconds=wait),
+            start=start, end=end, elapsed=3600, eligible_secs=eligible_secs,
+            numcpus=128 * nodes, numgpus=0, numnodes=nodes,
+        )
+    jobs = [
+        # 2024-05: pre-cutoff, measured by start - etime
+        job(0, datetime(2024, 5, 10, 18), 1, "regular", wait=100),
+        job(1, datetime(2024, 5, 11, 18), 1, "regular", wait=300),
+        job(2, datetime(2024, 5, 12, 18), 1, "regular", wait=1100),
+        job(3, datetime(2024, 5, 13, 18), 20, "premium", wait=60),
+        job(4, datetime(2024, 5, 13, 18), 1, "regular", wait=50, queue="main"),  # other queue
+        # 2025-09: post-cutoff, counter or nothing
+        job(5, datetime(2025, 9, 10, 18), 1, "regular", eligible_secs=40),
+        job(6, datetime(2025, 9, 11, 18), 1, "regular", wait=5000),  # no counter: unmeasured
+    ]
+    in_memory_session.add_all(jobs)
+    in_memory_session.commit()
+    return jobs
+
+
+class TestFairWaitQueries:
+    def test_job_waits_by_resource_counts_the_fallback(self, in_memory_session, wait_history_jobs):
+        rows = JobQueries(in_memory_session, "derecho").job_waits_by_resource(
+            "cpu", "node", date(2024, 5, 1), date(2024, 5, 31))
+        by_band = {r["range_label"]: r for r in rows}
+        assert by_band["1"]["job_count"] == 3
+        assert by_band["1"]["avg_wait_hours"] == pytest.approx(1500 / 3 / 3600)
+
+    def test_wait_history_rows(self, in_memory_session, wait_history_jobs):
+        rows = JobQueries(in_memory_session, "derecho").wait_history(
+            date(2024, 5, 1), date(2025, 9, 30))
+        keyed = {(r["period"], r["band"], r["qos"]): r for r in rows}
+        assert list(keyed) == [("2024-05", "1", "regular"), ("2024-05", "17-64", "premium"),
+                               ("2025-09", "1", "regular")]
+        may = keyed[("2024-05", "1", "regular")]
+        assert (may["jobs"], may["measured"]) == (3, 3)
+        assert may["p50_secs"] == 300.0
+        assert may["p90_secs"] == pytest.approx(300 + 0.8 * 800)
+        sept = keyed[("2025-09", "1", "regular")]
+        assert (sept["jobs"], sept["measured"], sept["p50_secs"]) == (2, 1, 40.0)
+
+    def test_wait_history_unmeasured_group_has_no_percentiles(self, in_memory_session, wait_history_jobs):
+        rows = JobQueries(in_memory_session, "derecho").wait_history(
+            date(2025, 9, 11), date(2025, 9, 11))
+        assert rows == [{"period": "2025-09", "band": "1", "qos": "regular", "jobs": 1,
+                         "measured": 0, "p50_secs": None, "p90_secs": None}]
